@@ -24,7 +24,8 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
-const bool FA_SPARSE       = (Flags & 16) != 0;
+// Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
+const bool USE_SPARSE      = (Flags & 16) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -83,7 +84,7 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
-layout (binding = 7) readonly buffer IND {uint32_t data_ind[];};
+layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -147,22 +148,7 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride;
-
-// set when the pre-pass list of this tile is usable, with its slice of data_ind
-bool     sparse;
-uint32_t ind_base, ind_count;
-
-// Column "c" of the flash attention tile -> row of K/V. Without sparsity it is the column
-// itself. With it, the column indexes the list of cells that the pre-pass kept, and a column
-// past the end of the list gives KV, which the bounds checks then drop.
-uint32_t kv_row(const uint32_t c)
-{
-    if (!FA_SPARSE || !sparse) {
-        return c;
-    }
-    return c < ind_count ? data_ind[ind_base + c] : KV;
-}
+         q_stride, k_stride, v_stride, m_stride, sparse_base;
 
 void init_indices()
 {
@@ -195,30 +181,6 @@ void init_indices()
     start_j = split_k_index * p.split_kv / Bc;
     end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
 
-    sparse = false;
-    ind_base = 0;
-    ind_count = 0;
-
-    if (FA_SPARSE) {
-        const uint32_t rows_per_group = (p.gqa_ratio > 1) ? 1 : Br;
-        const uint32_t n_groups       = CEIL_DIV(p.ne2, rows_per_group);
-        const uint32_t group          = (p.gqa_ratio > 1) ? gqa_iq1 : i;
-        const uint32_t plane          = (gl_WorkGroupID.z % p.nem3) * p.nem2 + ((gl_WorkGroupID.y * p.gqa_ratio) % p.nem2);
-        const uint32_t g              = plane * n_groups + group;
-        const uint32_t capacity       = data_ind[0];
-
-        ind_count = data_ind[4 + g];
-        sparse    = ind_count <= capacity;
-        ind_base  = data_ind[1] + g * capacity;
-
-        // the list is shorter than KV, so the splits have to be recut over it. A group that
-        // did not fit keeps the full range, split over the same number of workgroups
-        const uint32_t total = sparse ? ind_count : KV;
-        const uint32_t sp    = CEIL_DIV(CEIL_DIV(total, p.k_num), Bc) * Bc;
-        start_j = split_k_index * sp / Bc;
-        end_j   = min(CEIL_DIV(total, Bc), (split_k_index + 1) * sp / Bc);
-    }
-
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
     iq2 = gl_WorkGroupID.y * p.gqa_ratio;
@@ -250,6 +212,33 @@ void init_indices()
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+
+    // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
+    // partitions the n_kv_max blocks.
+    if (USE_SPARSE) {
+        uint32_t qrow = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br);
+        sparse_base = (((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 + qrow) * p.split_kv;
+
+        uint32_t total_blocks = CEIL_DIV(p.split_kv, Bc);
+        uint32_t per_blocks   = CEIL_DIV(total_blocks, p.k_num);
+        start_j = min(split_k_index * per_blocks, total_blocks);
+        end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
+    }
+}
+
+// Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
+bool fa_kv_index(uint lin, out uint kv_col) {
+    if (USE_SPARSE) {
+        if (lin >= p.split_kv) {
+            kv_col = 0;
+            return false;
+        }
+        int idx = data_sparse[sparse_base + lin];
+        kv_col = idx >= 0 ? uint(idx) : 0;
+        return idx >= 0;
+    }
+    kv_col = lin;
+    return !KV_bounds_check || lin < KV;
 }
 
 // Bias applied to softmax to stay in fp16 range.
