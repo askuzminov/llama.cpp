@@ -23,6 +23,8 @@ layout (push_constant) uniform parameter {
     uint nbm2;
     uint nbm3;
     uint n_kv_max;
+    uint rows_per_group;
+    uint capacity;
 } p;
 
 #ifdef USE_SUBGROUPS
@@ -31,25 +33,32 @@ shared uvec4 ballots_sh[NUM_SUBGROUPS];
 shared uint scan[BLOCK_SIZE];
 #endif
 
-// One workgroup per mask row: compact the finite-mask KV positions into a
-// per-row index list of length n_kv_max, -1 padded. Emitted in ascending KV
-// order so the downstream attention accumulation is deterministic.
+// One workgroup per group of rows_per_group mask rows: compact the KV positions that any row
+// of the group keeps into one index list of capacity slots, -1 padded. Emitted in ascending KV
+// order so the downstream attention accumulation is deterministic. With rows_per_group == 1 the
+// list is exact; a wider group holds the union, which the attention shader then masks per row.
 void main() {
     const uint i1 = gl_WorkGroupID.x;
     const uint i2 = gl_WorkGroupID.y;
     const uint i3 = gl_WorkGroupID.z;
     const uint tid = gl_LocalInvocationIndex;
 
-    const uint m_base   = i3 * p.nbm3 + i2 * p.nbm2 + i1 * p.nbm1;
-    const uint out_base = ((i3 * p.nem2 + i2) * p.nem1 + i1) * p.n_kv_max;
+    const uint m_base   = i3 * p.nbm3 + i2 * p.nbm2 + i1 * p.rows_per_group * p.nbm1;
+    const uint out_base = ((i3 * p.nem2 + i2) * gl_NumWorkGroups.x + i1) * p.capacity;
+    const uint n_rows   = min(p.rows_per_group, p.nem1 - i1 * p.rows_per_group);
 
     uint base = 0;
     for (uint chunk = 0; chunk < p.KV; chunk += BLOCK_SIZE) {
         const uint k = chunk + tid;
         bool selected = false;
         if (k < p.KV) {
-            const float v = float(data_m[m_base + k]);
-            selected = !isinf(v) && !isnan(v);
+            for (uint r = 0; r < n_rows; ++r) {
+                const float v = float(data_m[m_base + r * p.nbm1 + k]);
+                if (!isinf(v) && !isnan(v)) {
+                    selected = true;
+                    break;
+                }
+            }
         }
 
 #ifdef USE_SUBGROUPS
@@ -89,14 +98,14 @@ void main() {
         const uint slot = base + inclusive - 1u;
 #endif
 
-        if (selected && slot < p.n_kv_max) {
+        if (selected && slot < p.capacity) {
             data_i[out_base + slot] = int32_t(k);
         }
         base += total;
         barrier();
     }
 
-    for (uint s = min(base, p.n_kv_max) + tid; s < p.n_kv_max; s += BLOCK_SIZE) {
+    for (uint s = min(base, p.capacity) + tid; s < p.capacity; s += BLOCK_SIZE) {
         data_i[out_base + s] = int32_t(-1);
     }
 }

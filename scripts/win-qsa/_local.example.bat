@@ -38,9 +38,9 @@ rem set "RUN_KL=0"
 rem set "RUN_DIAG=0"
 rem set "RUN_PLE=0"
 
-rem PLE row cache variants for 12-ple-real.bat: "budgetMiB blockBytes", and how many
+rem PLE row cache variants for 12-ple-real.bat: block size in bytes, and how many
 rem wikitext chunks it runs
-rem set "PLEREALVARIANTS="0 0" "off 0" "1024 0""
+rem set "PLEREALVARIANTS="0 4096""
 rem set "PLECHUNKS=8"
 
 rem diskspd for 13-disk-iops.bat: path to the exe if it cannot be downloaded here

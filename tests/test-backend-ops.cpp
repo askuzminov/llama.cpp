@@ -10745,6 +10745,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // tile so the sparse list applies
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
+    // the budget the model really asks for: top_k 2048 plus the tail of the last block, so 2052
+    // cells, which is not a multiple of the 64-cell tile the backends walk
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2052, 4));
 
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
@@ -11125,6 +11128,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // qwen4exp hyper-connections: all three read the same [hc*n_embd, n_tokens] stream.
+    // The inject projection has only hc=4 output rows, so the tile path wastes most of the tile.
+    // The last case is the same product with the operands swapped, which lands on mul_mat_vec.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,     4, 512, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   320, 512, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 512,   320, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   512,   4, 10240, {1, 1}, {1, 1}));
+    // the transpose back to [hc, n_tokens] that the swapped form needs
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 4, 1, 1}, false, {1, 0, 2, 3}));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

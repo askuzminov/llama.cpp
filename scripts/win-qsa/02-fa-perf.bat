@@ -24,6 +24,20 @@ echo writing %LOG%
 set "RC=%ERRORLEVEL%"
 echo exit=%RC% >> "%LOG%"
 
+rem the same cases with the pre-pass unioning the rows of the tile, so a per-token selection
+rem (sparse_grp=1) also gets a shared list. it only pays off if the rows of a tile overlap
+if not defined FAGROUP set "FAGROUP=1"
+if "%FAGROUP%"=="1" (
+    echo. >> "%LOG%"
+    echo ### GGML_VK_FA_SPARSE_GROUP=1, one list per tile >> "%LOG%"
+    set "GGML_VK_FA_SPARSE_GROUP=1"
+    "%BIN%\test-backend-ops.exe" perf -o FLASH_ATTN_EXT -p "kv=32768" >> "%LOG%" 2>&1
+    set "EC=!ERRORLEVEL!"
+    set "GGML_VK_FA_SPARSE_GROUP="
+    echo exit=!EC! >> "%LOG%"
+    if not "!EC!"=="0" set "RC=!EC!"
+)
+
 rem the same cases on the scalar path, where a query tile is 4 to 8 rows instead of 16
 if not defined FASCALAR set "FASCALAR=1"
 if "%FASCALAR%"=="1" (

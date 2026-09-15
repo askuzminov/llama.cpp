@@ -171,7 +171,12 @@ ACC_TYPE faAddSparseMask(const uint32_t row, const uint32_t col, const ACC_TYPE 
     const uint32_t kvslot = jblk * Bc + col;
     if (kvslot >= p.split_kv) { return ACC_TYPE(NEG); }
     const int r = data_sparse[sparse_base + kvslot];
-    return r < 0 ? ACC_TYPE(NEG) : elem + ACC_TYPE(data_mf16[g_m_off_elem + row * m_stride + uint(r)]);
+    if (r < 0) { return ACC_TYPE(NEG); }
+    // grouped query attention puts the whole tile on one mask row (m_stride == 0), else the tile
+    // covers Br rows of the mask and the list is their union, so each row masks itself
+    const uint32_t mrow = i * Br + row;
+    if (m_stride != 0 && mrow >= p.nem1) { return ACC_TYPE(NEG); }
+    return elem + ACC_TYPE(data_mf16[g_m_off_elem + mrow * m_stride + uint(r)]);
 }
 
 ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) {
@@ -328,6 +333,9 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        if (fa_sparse_tail(j * Bc)) {
+            break;
+        }
 
         coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mv = coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(0);
         if (MASK_ENABLE && !USE_SPARSE) {

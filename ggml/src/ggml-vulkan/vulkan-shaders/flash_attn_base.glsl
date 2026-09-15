@@ -213,17 +213,24 @@ void init_indices()
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
 
-    // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
-    // partitions the n_kv_max blocks.
+    // Sparse: one list per group of mask rows, of p.split_kv slots. The group is one row when
+    // grouped query attention makes the whole tile share it, else the Br rows of the tile.
+    // split_k partitions the slots.
     if (USE_SPARSE) {
-        uint32_t qrow = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br);
-        sparse_base = (((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 + qrow) * p.split_kv;
+        uint32_t n_groups = (p.gqa_ratio > 1) ? p.nem1 : CEIL_DIV(p.nem1, Br);
+        uint32_t group    = (p.gqa_ratio > 1) ? gqa_iq1 : i;
+        sparse_base = (((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * n_groups + group) * p.split_kv;
 
         uint32_t total_blocks = CEIL_DIV(p.split_kv, Bc);
         uint32_t per_blocks   = CEIL_DIV(total_blocks, p.k_num);
         start_j = min(split_k_index * per_blocks, total_blocks);
         end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
     }
+}
+
+// The list is ascending and -1 padded, so a block that starts on padding ends the walk.
+bool fa_sparse_tail(uint lin) {
+    return USE_SPARSE && data_sparse[sparse_base + lin] < 0;
 }
 
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).

@@ -28,6 +28,17 @@ rem for a while is slower than one a few GB have just gone through, so a second 
 rem in between tells apart "opening the model does it" from "diskspd does it"
 if not defined READPATHRUNS set "READPATHRUNS=2"
 
+rem two arms for the "cold file is slow" question, both off by default because both change
+rem something outside this folder.
+rem   DEFENDEREXCL=1  adds a Defender path exclusion for DISKFILE, runs the read path sweep
+rem                   again and removes the exclusion. needs an elevated shell. a real time
+rem                   scanner reads the file before the caller gets it, so if the sweep speeds
+rem                   up with the exclusion on, that is the answer
+rem   RAMMAP          full path to RAMMap64.exe (Sysinternals). "RAMMap64.exe -Ew" empties the
+rem                   standby list, which is the only way to get a cold page cache without a
+rem                   reboot. with it set, the sweep runs once more on a truly cold file
+if not defined DEFENDEREXCL set "DEFENDEREXCL=0"
+
 if not exist "%MODEL%" (
     echo model not found: %MODEL%
     echo set MODEL in _local.bat
@@ -45,6 +56,7 @@ echo writing %LOG%
 echo ### FILE=%MODEL% > "%LOG%"
 echo ### DISKSPD=%DISKSPD% >> "%LOG%"
 echo ### DISKVARIANTS=%DISKVARIANTS% DISKSECS=%DISKSECS% READPATHRUNS=%READPATHRUNS% >> "%LOG%"
+echo ### DEFENDEREXCL=%DEFENDEREXCL% RAMMAP=%RAMMAP% >> "%LOG%"
 
 rem a real time scanner reads a file it is asked about before the caller gets it, which is the
 rem best explanation left for a cold file being slow, so record whether one is on
@@ -73,6 +85,12 @@ call :after
 
 rem and the row cache read path again, on a file that is now warm in the page cache
 call :readpath warm
+
+rem the same sweep on a truly cold page cache, if RAMMap is there to empty the standby list
+if defined RAMMAP call :coldcache
+
+rem and the same sweep with the file excluded from the real time scanner
+if "%DEFENDEREXCL%"=="1" call :defender
 
 echo.
 echo === summary
@@ -128,6 +146,30 @@ set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"
 echo ### exit=%EC% >> "%LOG%"
 powershell -NoProfile -Command "Start-Sleep -Seconds 15"
+goto :eof
+
+rem empties the standby list, so the next sweep reads a file nothing has cached
+:coldcache
+if not exist "%RAMMAP%" (
+    echo skipping the cold cache sweep: %RAMMAP% not found
+    goto :eof
+)
+echo === emptying the standby list
+echo. >> "%LOG%"
+echo ### RAMMap -Ew, standby list emptied >> "%LOG%"
+"%RAMMAP%" -Ew >> "%LOG%" 2>&1
+powershell -NoProfile -Command "Start-Sleep -Seconds 5"
+call :readpath "cold cache"
+goto :eof
+
+rem excludes the file from the real time scanner for one sweep, then puts it back
+:defender
+echo === adding a Defender exclusion for %DISKFILE%
+echo. >> "%LOG%"
+echo ### Defender exclusion on %DISKFILE% >> "%LOG%"
+powershell -NoProfile -Command "try { Add-MpPreference -ExclusionPath '%DISKFILE%'; 'added' } catch { 'failed: ' + $_.Exception.Message }" >> "%LOG%" 2>&1
+call :readpath "defender excluded"
+powershell -NoProfile -Command "try { Remove-MpPreference -ExclusionPath '%DISKFILE%'; 'removed' } catch { 'failed: ' + $_.Exception.Message }" >> "%LOG%" 2>&1
 goto :eof
 
 rem %1 = block KiB, %2 = outstanding requests per thread, %3 = threads

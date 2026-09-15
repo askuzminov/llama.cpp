@@ -1442,13 +1442,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    // resolve AUTO on systems without mmap support (e.g. iGPUs): the row cache reads the file
+    // itself, so fall back to DIO and keep the AUTO size limit; see #28160
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
+                ml.lazy.mode      = LLAMA_LAZY_MODE_DIO;
+                ml.lazy.auto_size = true;
                 break;
             }
         }
@@ -2882,7 +2884,6 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
-        /*.lazy_cache_mib              =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

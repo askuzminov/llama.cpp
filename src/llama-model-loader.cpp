@@ -1138,7 +1138,7 @@ llama_model_loader::lazy_read::kind llama_model_loader::lazy_read::add(
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode == LLAMA_LAZY_MODE_AUTO && ggml_nbytes(t) <= auto_min_size) {
+    if ((mode == LLAMA_LAZY_MODE_AUTO || auto_size) && ggml_nbytes(t) <= auto_min_size) {
         return NONE;
     }
 

@@ -218,7 +218,7 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
-        LLAMA_LAZY_MODE_DIO  = 3, // same, but rows are gathered through an own block cache read with direct I/O
+        LLAMA_LAZY_MODE_DIO  = 3, // same, but rows are gathered through an own row cache, no mmap needed
     };
 
     enum llama_context_type {
@@ -323,7 +323,6 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
-        int32_t lazy_cache_mib;         // host budget of the LLAMA_LAZY_MODE_DIO block cache, 0 = default, < 0 = off
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

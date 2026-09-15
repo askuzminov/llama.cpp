@@ -14,11 +14,9 @@ rem   "read path:"         - развёртка пути чтения, если 
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem варианты кеша строк: "бюджетМиБ блокБайт", 0 = по умолчанию, off = пул выключен,
-rem по одному прогону на каждый. осталось два вопроса: стоит ли пул чего-нибудь поверх файлового
-rem кеша системы и что даёт блок больше строки. блок 4 КиБ читал 4.47 ГиБ там, где сами строки
-rem занимают 0.25 ГиБ
-if not defined PLEREALVARIANTS set "PLEREALVARIANTS="0 0" "off 0" "1024 0""
+rem варианты кеша строк: размер блока в байтах, 0 = по умолчанию (одна строка), по одному
+rem прогону на каждый. блок 4 КиБ читал 4.47 ГиБ там, где сами строки занимают 0.25 ГиБ
+if not defined PLEREALVARIANTS set "PLEREALVARIANTS=0""
 if not defined PLECHUNKS  set "PLECHUNKS=16"
 
 if not exist "%BIN%\llama-perplexity.exe" (
@@ -50,12 +48,11 @@ echo ### PLEREALVARIANTS=%PLEREALVARIANTS% >> "%LOG%"
 set "LLAMA_ROW_CACHE_STATS=1"
 set "RC=0"
 
-call :run on 0 0
+call :run on 0
 
-for %%v in (%PLEREALVARIANTS%) do for /f "tokens=1-2" %%a in (%%v) do call :run dio %%a %%b
+for %%v in (%PLEREALVARIANTS%) do call :run dio %%v
 
 set "LLAMA_ROW_CACHE_STATS="
-set "LLAMA_ROW_CACHE_MIB="
 set "LLAMA_ROW_CACHE_BLOCK="
 
 echo.
@@ -70,14 +67,12 @@ echo.
 echo done, %LOG%
 exit /b %RC%
 
-rem %1 = значение -lzm, %2 = бюджет кеша в МиБ (0 = по умолчанию, off = без пула),
-rem %3 = размер блока в байтах
+rem %1 = значение -lzm, %2 = размер блока в байтах (0 = по умолчанию)
 :run
-if "%~2"=="0" (set "LLAMA_ROW_CACHE_MIB=") else if /i "%~2"=="off" (set "LLAMA_ROW_CACHE_MIB=0") else (set "LLAMA_ROW_CACHE_MIB=%~2")
-if "%~3"=="0" (set "LLAMA_ROW_CACHE_BLOCK=") else (set "LLAMA_ROW_CACHE_BLOCK=%~3")
-echo === -lzm %~1 cache=%~2 MiB block=%~3
+if "%~2"=="0" (set "LLAMA_ROW_CACHE_BLOCK=") else (set "LLAMA_ROW_CACHE_BLOCK=%~2")
+echo === -lzm %~1 block=%~2
 echo. >> "%LOG%"
-echo ### -lzm %~1 LLAMA_ROW_CACHE_MIB=%~2 LLAMA_ROW_CACHE_BLOCK=%~3 >> "%LOG%"
+echo ### -lzm %~1 LLAMA_ROW_CACHE_BLOCK=%~2 >> "%LOG%"
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c 8192 --chunks %PLECHUNKS% -fa on -lm dio -lzm %~1 %EXTRA% -v >> "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"

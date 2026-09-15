@@ -210,15 +210,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             const auto * loc = ml.lazy.get_location(ple_name);
             GGML_ASSERT(loc != nullptr && loc->idx < ml.file_paths.size());
 
-            // the pool sits in front of the page cache, which already holds these pages, so its
-            // size hardly matters: a 16 chunk perplexity run took 342.6 t/s at 8 MiB and 343.1 t/s
-            // at 1024 MiB, with reads costing 4 s of its 382 s either way. -lzm dio:0 sets it to
-            // 0, which turns the pool off and leaves only the page cache
-            const int32_t cache_mib = params.lazy_cache_mib != 0 ? params.lazy_cache_mib : 8;
-            const size_t  budget    = cache_mib > 0 ? (size_t) cache_mib*1024*1024 : 0;
-
             ple_cache.reset(new llama_row_cache(ml.file_paths[loc->idx], loc->offs, loc->type,
-                                                loc->ne0, loc->ne1, budget, /*n_threads =*/ 0));
+                                                loc->ne0, loc->ne1, /*n_threads =*/ 0));
         }
     }
 
@@ -361,7 +354,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
+        // hc is 4, so the plain [hc_dim, hc] x [hc_dim, nt] product fills 4 rows of a matmul tile.
+        // Swapped it is [nt, hc], which backends can run as a mat-vec over nt rows; the transpose
+        // back is a few KiB. No lora support here, the hc weights are not adapter targets.
+        ggml_tensor * inj = ggml_mul_mat(ctx0, xn, w_inject);
+        *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj));
         cb(*inject, "hc_inject", il);
     }
 

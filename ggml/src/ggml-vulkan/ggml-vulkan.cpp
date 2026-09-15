@@ -1422,6 +1422,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
     uint32_t n_experts;
     uint32_t hoist_row_ids;
+    uint32_t fusion_flags;
 };
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
@@ -2212,6 +2213,8 @@ struct vk_op_flash_attn_sparse_compact_push_constants {
     uint32_t nbm2;
     uint32_t nbm3;
     uint32_t n_kv_max;
+    uint32_t rows_per_group;
+    uint32_t capacity;
 };
 
 // Allow pre-recording command buffers
@@ -4584,6 +4587,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile = { 256, 128, 128, 16, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, mm_warp_16, 64, 1, 4, 2, 1, mm_warp_16 };
+
+            // GGML_VK_MMID_WG256: the dense large tile above runs 256 threads on a 128x128 tile,
+            // but the mul_mat_id variants still run 128. Same BM/BN/BK, so the same shared memory,
+            // twice the threads per A/B tile load, half the accumulators per thread. A 256-expert
+            // MoE at ub=2048 sees about 64 rows per expert, so the medium tile is the one that
+            // runs; override both. See scripts/win-qsa/15-mmid.bat.
+            if (getenv("GGML_VK_MMID_WG256")) {
+                l_warptile_mmqid     = { 256, 128, 128, 32, mul_mat_subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, mul_mat_subgroup_size_8 };
+                l_warptile_mmqid_int = { 256, 128, 128, 32, mul_mat_subgroup_size_8, 64, 2, 4, 4, 1, mul_mat_subgroup_size_8 };
+                // BM=BN=64 at 4 warps needs WM=WN=32: (BM/WM)*(BN/WN) == 4, cms_per_row/col == 2
+                m_warptile_mmqid     = { 256, 64, 64, 32, 32, 32, 2, tm_m, tn_m, tk_m, mul_mat_subgroup_size_8 };
+                m_warptile_mmqid_int = { 256, 64, 64, 32, 32, 32, 2, 2, 2, 1, mul_mat_subgroup_size_8 };
+            }
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
@@ -4911,7 +4927,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     FOR_EACH_LUT_TYPE_NONFP4(X)  \
     FOR_EACH_LUT_FP4_TYPE(X)
 
-    const int mul_mat_id_param_count = 5;
+    const int mul_mat_id_param_count = 6;  // a, b, d, ids, expert_counts, fused scale
 
     using spec_fn_t = std::function<std::vector<uint32_t>(const std::vector<uint32_t>&, bool)>;
     auto const &create_mm_pipelines = [&](
@@ -9250,14 +9266,14 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        bool hoist_row_ids) {
+        bool hoist_row_ids, const vk_subbuffer & fused_scale, uint32_t fusion_flags) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids) };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+                                              nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids), fusion_flags };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, { m, nei1, n_as });
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -10517,7 +10533,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     }
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -10555,7 +10571,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    // With the following MUL fused in, the scaled result goes straight to the MUL destination.
+    const ggml_tensor * out_dst = fused_dst ? fused_dst : dst;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)out_dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
     ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
@@ -10737,7 +10755,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    const uint64_t d_buf_offset = vk_tensor_offset(out_dst) + out_dst->view_offs;
     GGML_ASSERT(d_D != nullptr);
     vk_buffer d_X;
     uint64_t x_buf_offset = 0;
@@ -10873,7 +10891,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, hoist_row_ids
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, hoist_row_ids,
+        fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
+        fused_scale ? 1u : 0u
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -11137,7 +11157,16 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
-        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
+        // Fused scale epilogue: the MUL operand is applied as the matmul writes out, and the
+        // result goes straight to the MUL destination.
+        const ggml_tensor * fused_scale = nullptr;
+        ggml_tensor * fused_dst = nullptr;
+        if (ctx->num_additional_fused_ops == 1) {
+            ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+            fused_scale = (mul->src[0] == dst) ? mul->src[1] : mul->src[0];
+            fused_dst   = mul;
+        }
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, fused_scale, fused_dst);
     }
 }
 
@@ -11362,11 +11391,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                             nem0 == KV &&
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max);
 
-    // A tile of several query rows cannot share one list, because each row selects its own cells.
-    // A one-row tile can, so prefill re-tunes to it and walks n_kv_max columns per row instead of
-    // KV. The one-row tile gives up the coopmat matmul, so it needs a larger reduction to win.
-    const int64_t row_tile_ratio = 8;
-    if (sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1 &&
+    // A tile of several query rows cannot share one exact list, because each row selects its own
+    // cells. Two ways out: GGML_VK_FA_SPARSE_GROUP makes the pre-pass union the rows of the tile,
+    // which keeps the coopmat matmul but walks a longer list; else prefill re-tunes to a one-row
+    // tile and walks n_kv_max columns per row instead of KV. The one-row tile gives up the coopmat
+    // matmul, so it needs a larger reduction to win. GGML_VK_FA_SPARSE_ROW_RATIO moves that
+    // threshold, see scripts/win-qsa/04-fa-sparse.bat.
+    static const bool sparse_group = getenv("GGML_VK_FA_SPARSE_GROUP") != nullptr;
+    static const int64_t row_tile_ratio = [] {
+        const char * val = getenv("GGML_VK_FA_SPARSE_ROW_RATIO");
+        const int64_t parsed = val ? atoll(val) : 0;
+        return parsed > 0 ? parsed : 8;
+    }();
+    if (!sparse_group && sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1 &&
         (int64_t)KV >= row_tile_ratio * (int64_t)n_kv_max) {
         const vk_fa_tuning_params row_params = get_fa_tuning_params(ctx->device, HSK, HSV, 1, KV, k_type_eff, v_type_eff, f32acc);
         if (row_params.block_rows == 1) {
@@ -11375,7 +11412,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // block_rows == 1 only happens on the scalar path, where the tile is one query row
-    const bool use_sparse = sparse_shape_ok && (gqa_ratio > 1 || tuning_params.block_rows == 1);
+    const bool use_sparse = sparse_shape_ok && (sparse_group || gqa_ratio > 1 || tuning_params.block_rows == 1);
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -11447,11 +11484,18 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
 
+    // Sparse list geometry: one list per group of mask rows. A group is one row when the tile
+    // shares it, else the Br rows of the tile, and then the list holds their union, whose worst
+    // case is rows_per_group * n_kv_max cells but never more than KV.
+    const uint32_t sparse_rows_per_group = (gqa_ratio > 1) ? 1 : Br;
+    const uint32_t sparse_n_groups       = CEIL_DIV(nem1, sparse_rows_per_group);
+    const uint32_t sparse_capacity       = std::min<uint32_t>(sparse_rows_per_group * (uint32_t)n_kv_max, KV);
+
     // Try to use split_k when KV is large enough to be worth the overhead.
-    // Sparse: split_kv carries n_kv_max, split_k partitions its blocks for occupancy.
+    // Sparse: split_kv carries the list capacity, split_k partitions its blocks for occupancy.
     if (use_sparse) {
-        split_kv = (uint32_t)n_kv_max;
-        const uint32_t total_blocks = CEIL_DIV((uint32_t)n_kv_max, Bc);
+        split_kv = sparse_capacity;
+        const uint32_t total_blocks = CEIL_DIV(sparse_capacity, Bc);
         const uint32_t base_wgs = (gqa_ratio > 1 ? workgroups_x : Tr) * workgroups_y * workgroups_z;
         if (base_wgs < shader_core_count * 2) {
             split_k = shader_core_count * 2 / base_wgs;
@@ -11518,7 +11562,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // Sparse index scratch reuses prealloc_y (mutually exclusive with mask opt).
     const uint64_t sparse_idx_size = use_sparse
-        ? sizeof(int32_t) * (uint64_t)n_kv_max * nem1 * nem2 * nem3
+        ? sizeof(int32_t) * (uint64_t)sparse_capacity * sparse_n_groups * nem2 * nem3
         : 0;
     vk_pipeline sparse_compact_pipeline = ctx->device->fa_sparse_compact_use_subgroups
         ? ctx->device->pipeline_fa_sparse_compact_subgroup
@@ -11608,11 +11652,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
             (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
             (uint32_t)n_kv_max,
+            sparse_rows_per_group,
+            sparse_capacity,
         };
 
         ggml_vk_dispatch_pipeline(ctx, subctx, sparse_compact_pipeline,
                                   { mask_buf, sparse_buf }, sc_pc,
-                                  { nem1, nem2, nem3 });
+                                  { sparse_n_groups, nem2, nem3 });
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
@@ -17561,9 +17607,24 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         if (mmid != mul->src[0]) {
             return false;
         }
-        // mat-vec only
+        // GGML_VK_MMID_SCALE_EPILOGUE: the tile shader can apply the scale as it writes out, which
+        // removes a full write and read back of the matmul result at prefill. The coopmat2 shader
+        // has the binding but not the epilogue, so it stays on the old path.
         if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
-            return false;
+            static const bool scale_epilogue = getenv("GGML_VK_MMID_SCALE_EPILOGUE") != nullptr;
+            if (!scale_epilogue || ctx->device->coopmat2) {
+                return false;
+            }
+            // The shader indexes the scale as [token * nei0 + expert_slot].
+            if (scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale)) {
+                return false;
+            }
+            if (get_misalign_bytes(ctx, scale) != 0) {
+                return false;
+            }
+            return scale->ne[0] == 1 &&
+                   scale->ne[1] == mmid->ne[1] && scale->ne[2] == mmid->ne[2] && scale->ne[3] == mmid->ne[3] &&
+                   ggml_are_same_shape(mul, mmid);
         }
         // shaders assume the types match
         if (mmid->type != scale->type) {

@@ -152,6 +152,9 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        if (fa_sparse_tail(j * Bc)) {
+            break;
+        }
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);

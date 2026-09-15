@@ -29,25 +29,9 @@ size_t row_cache_env(const char * name, size_t def) {
     return parsed > 0 ? (size_t) parsed : def;
 }
 
-// -1 when the variable is not set, so that a value of 0 keeps its own meaning
-int64_t row_cache_env_opt(const char * name) {
-    const char * val = getenv(name);
-
-    return val == nullptr ? -1 : atoll(val);
-}
-
-constexpr uint64_t ROW_CACHE_NO_BLOCK = UINT64_MAX;
-
 } // namespace
 
 struct llama_row_cache::impl {
-    // one slot holds one aligned block of the file
-    struct slot {
-        uint64_t block = ROW_CACHE_NO_BLOCK;
-        uint32_t chunk = 0;   // gather chunk that last needed it, protects it from its own eviction
-        uint8_t  hits  = 0;   // saturating use count, the clock hand decays it
-    };
-
     // one read request: n consecutive blocks of the file, landing in slots[i_first .. i_first + n)
     struct run {
         uint64_t block;
@@ -66,11 +50,8 @@ struct llama_row_cache::impl {
 
     ggml_to_float_t to_float = nullptr;
 
-    std::vector<uint8_t>                   pool;
-    std::vector<slot>                      slots;
-    std::unordered_map<uint64_t, uint32_t> resident;   // block -> slot
-    uint32_t                               hand    = 0;
-    uint32_t                               chunk   = 0;
+    std::vector<uint8_t> pool;       // one slot per block the chunk in flight holds
+    size_t               n_slots;
 
     std::vector<uint8_t> row_buf;    // staging for rows that straddle a block boundary
     std::mutex           mutex;      // one cache is shared by every context of the model
@@ -108,27 +89,23 @@ struct llama_row_cache::impl {
     // blocks per point of the read path sweep, 0 = do not run it
     size_t bench_n = 0;
 
-    // budget 0: the pool only stages the chunk in flight, no block survives a gather
-    bool no_reuse = false;
-
     // only tracked under LLAMA_ROW_CACHE_STATS, the set costs about 48 bytes per distinct block
     bool                        track_ws = false;
     std::unordered_set<uint64_t> seen;
 
     impl(const std::string & path, size_t offs, ggml_type type, int64_t n_cols, int64_t n_rows,
-         size_t budget, int n_threads);
+         int n_threads);
     ~impl();
 
     void read_run(size_t i_worker, const run & r, const uint32_t * to_slots);
     void run_jobs(const std::vector<run> & runs, const std::vector<uint32_t> & to_slots, size_t n_blocks);
     void bench(size_t n_bench);
 
-    uint32_t evict();
-    void     gather(const int32_t * rows, int64_t n, float * dst);
+    void gather(const int32_t * rows, int64_t n, float * dst);
 };
 
 llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type type,
-                            int64_t n_cols, int64_t n_rows, size_t budget, int n_threads) :
+                            int64_t n_cols, int64_t n_rows, int n_threads) :
         offs(offs), type(type), n_cols(n_cols), n_rows(n_rows) {
     row_size = ggml_row_size(type, n_cols);
     to_float = ggml_get_type_traits(type)->to_float;
@@ -151,37 +128,17 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
     // over real text cheap: neighbouring tokens ask for neighbouring rows
     run_max = std::max<size_t>(row_cache_env("LLAMA_ROW_CACHE_RUN", 64), 1);
 
-    // lets a sweep vary the budget without rebuilding, see scripts/win-qsa/11-ple-cache.bat
-    const int64_t budget_mib = row_cache_env_opt("LLAMA_ROW_CACHE_MIB");
-    if (budget_mib >= 0) {
-        budget = (size_t) budget_mib*1024*1024;
-    }
+    track_ws = row_cache_env("LLAMA_ROW_CACHE_STATS", 0) > 0;
+    bench_n  = row_cache_env("LLAMA_ROW_CACHE_BENCH", 0);
 
-    track_ws     = row_cache_env("LLAMA_ROW_CACHE_STATS", 0) > 0;
-    bench_n      = row_cache_env("LLAMA_ROW_CACHE_BENCH", 0);
-
-    // a chunk of the gather may need twice the blocks of a single row, and the clock needs slots
-    // it is allowed to evict on top of that
+    // the pool holds the chunk in flight and nothing else: keeping blocks between gathers was
+    // measured and gave 0.6 t/s of 342, because the page cache of the system holds the same
+    // pages anyway. Wide enough for a chunk to merge run_max adjacent blocks into one request
     const size_t blocks_per_row = row_size/blk_size + 2;
-    const size_t n_blocks_min   = 4*blocks_per_row + 16;
 
-    // a budget of 0 turns the cache off: the pool then holds only the blocks of the chunk in
-    // flight, so every row is read again and the page cache is all that is left in front of the
-    // file. Still wide enough for a chunk to merge run_max adjacent blocks into one request
-    no_reuse = budget == 0;
+    n_slots = 2*run_max*blocks_per_row;
 
-    size_t n_blocks = no_reuse ? 2*run_max*blocks_per_row : budget/blk_size;
-    if (n_blocks < n_blocks_min) {
-        if (!no_reuse) {
-            LLAMA_LOG_WARN("%s: cache budget of %zu KiB is too small, raising it to %zu KiB\n",
-                    __func__, budget/1024, n_blocks_min*blk_size/1024);
-        }
-        n_blocks = n_blocks_min;
-    }
-
-    pool.resize(n_blocks*blk_size);
-    slots.resize(n_blocks);
-    resident.reserve(2*n_blocks);
+    pool.resize(n_slots*blk_size);
     row_buf.resize(row_size);
 
     // random block reads are latency bound, so the reader count is really the queue depth the
@@ -253,12 +210,11 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
     // part, and a raw drive benchmark has to be pointed at that same part
     const size_t i_name = path.find_last_of("/\\");
 
-    LLAMA_LOG_INFO("%s: %.2f GiB table stays on disk in %s, cache %.1f MiB in %zu blocks of %zu B%s, "
-            "%d readers, up to %zu blocks per request\n",
+    LLAMA_LOG_INFO("%s: %.2f GiB table stays on disk in %s, blocks of %zu B, %d readers, "
+            "up to %zu blocks per request\n",
             __func__, ggml_row_size(type, n_cols)*n_rows/1024.0/1024.0/1024.0,
             path.c_str() + (i_name == std::string::npos ? 0 : i_name + 1),
-            n_blocks*blk_size/1024.0/1024.0, n_blocks, blk_size, no_reuse ? " (off, staging only)" : "",
-            n_threads, run_max);
+            blk_size, n_threads, run_max);
 
     if (bench_n > 0) {
         bench(bench_n);
@@ -282,13 +238,13 @@ void llama_row_cache::impl::bench(size_t n_bench) {
 
     for (size_t n_blk = 1; n_blk <= run_max; n_blk *= 4) {
         for (size_t depth = 1; depth <= files.size(); depth *= 2) {
-            const size_t batch = std::min(depth, slots.size()/n_blk);
+            const size_t batch = std::min(depth, n_slots/n_blk);
             if (batch == 0) {
                 break;
             }
 
             const size_t n_batches   = std::max<size_t>(n_bench/(n_blk*batch), 1);
-            const size_t n_slot_base = slots.size()/n_blk;
+            const size_t n_slot_base = n_slots/n_blk;
 
             to_slots.resize(batch*n_blk);
             runs.resize(batch);
@@ -339,10 +295,6 @@ void llama_row_cache::impl::bench(size_t n_bench) {
     t_wait_us = 0;
     t_io_us.store(0);
     n_inflight_max.store(0);
-
-    for (slot & s : slots) {
-        s = {};
-    }
 }
 
 llama_row_cache::impl::~impl() {
@@ -423,59 +375,16 @@ void llama_row_cache::impl::run_jobs(const std::vector<run> & runs, const std::v
     }
 }
 
-// clock over the slots: a block used since the hand last passed survives one round.
-// with hits capped at 3, four full rounds are enough to free any unpinned slot
-uint32_t llama_row_cache::impl::evict() {
-    for (int round = 0; round < 5; round++) {
-        for (size_t i = 0; i < slots.size(); i++) {
-            slot & s = slots[hand];
-            const uint32_t i_slot = hand;
-
-            hand = (hand + 1) % slots.size();
-
-            if (s.chunk == chunk) {
-                continue;   // pinned by the gather in flight
-            }
-
-            if (s.block == ROW_CACHE_NO_BLOCK) {
-                return i_slot;
-            }
-
-            if (s.hits > 0) {
-                s.hits--;
-                continue;
-            }
-
-            resident.erase(s.block);
-            s.block = ROW_CACHE_NO_BLOCK;
-
-            return i_slot;
-        }
-    }
-
-    throw std::runtime_error("row cache: no slot can be evicted");
-}
-
 void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst) {
     std::unordered_map<uint64_t, uint32_t> pinned;   // blocks this chunk holds -> slot
     std::vector<uint64_t>                  want;     // of those, the ones still to be read
     std::vector<uint32_t>                  want_slot;
     std::vector<run>                       runs;
 
-    // the rows are walked in chunks small enough that everything a chunk pins fits the pool with
-    // room left for the clock to evict, so nothing read for a chunk is dropped before it is copied
-    const size_t max_blocks = slots.size()/2;
-
+    // the rows are walked in chunks that fit the pool, so nothing a chunk reads is overwritten
+    // before its rows are copied out. The next chunk starts empty
     int64_t i = 0;
     while (i < n) {
-        chunk++;
-
-        if (no_reuse) {
-            // the cache is off, so the chunk starts empty and reads every row again
-            resident.clear();
-            std::fill(slots.begin(), slots.end(), slot());
-        }
-
         pinned.clear();
         want.clear();
         want_slot.clear();
@@ -497,23 +406,13 @@ void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst)
             }
 
             // one row always goes in, however many blocks it needs
-            if (i_end > i && pinned.size() + n_new > max_blocks) {
+            if (i_end > i && pinned.size() + n_new > n_slots) {
                 break;
             }
 
             for (uint64_t b = b0; b <= b1; b++) {
                 if (pinned.count(b) > 0) {
-                    n_hit++;
-                    continue;
-                }
-
-                const auto it = resident.find(b);
-                if (it != resident.end()) {
-                    slots[it->second].chunk = chunk;
-                    slots[it->second].hits  = std::min<uint8_t>(slots[it->second].hits + 1, 3);
-
-                    pinned[b] = it->second;
-                    n_hit++;
+                    n_hit++;   // two rows of the chunk share the block
                     continue;
                 }
 
@@ -529,12 +428,8 @@ void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst)
         want_slot.resize(want.size());
 
         for (size_t k = 0; k < want.size(); k++) {
-            const uint32_t i_slot = evict();
+            const uint32_t i_slot = (uint32_t) k;
 
-            // a fresh block starts cold: under a stream with little reuse it then leaves on the
-            // hand's first pass instead of costing a second one, and a block that is used again
-            // is bumped back up by the lookup above
-            slots[i_slot]  = { want[k], chunk, 0 };
             pinned[want[k]] = i_slot;
             want_slot[k]    = i_slot;
 
@@ -545,19 +440,7 @@ void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst)
             }
         }
 
-        try {
-            run_jobs(runs, want_slot, want.size());
-        } catch (...) {
-            for (uint32_t i_slot : want_slot) {
-                slots[i_slot].block = ROW_CACHE_NO_BLOCK;
-                slots[i_slot].chunk = 0;
-            }
-            throw;
-        }
-
-        for (size_t k = 0; k < want.size(); k++) {
-            resident[want[k]] = want_slot[k];
-        }
+        run_jobs(runs, want_slot, want.size());
 
         if (track_ws) {
             seen.insert(want.begin(), want.end());
@@ -598,8 +481,8 @@ void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst)
 }
 
 llama_row_cache::llama_row_cache(const std::string & path, size_t offs, ggml_type type,
-                                 int64_t n_cols, int64_t n_rows, size_t budget, int n_threads) :
-    pimpl(new impl(path, offs, type, n_cols, n_rows, budget, n_threads)) {}
+                                 int64_t n_cols, int64_t n_rows, int n_threads) :
+    pimpl(new impl(path, offs, type, n_cols, n_rows, n_threads)) {}
 
 llama_row_cache::~llama_row_cache() = default;
 
@@ -613,10 +496,6 @@ void llama_row_cache::get_rows(const int32_t * rows, int64_t n, float * dst) {
     pimpl->n_gather++;
     pimpl->n_row_ask   += n;
     pimpl->t_gather_us += ggml_time_us() - t_start;
-}
-
-size_t llama_row_cache::budget() const {
-    return pimpl->slots.size()*pimpl->blk_size;
 }
 
 size_t llama_row_cache::block_size() const {

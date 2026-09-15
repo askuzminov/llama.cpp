@@ -9,15 +9,14 @@ rem   "in flight"           - реальная глубина очереди: в
 rem                           на время ожидания. ~1 при многих читателях значит, что
 rem                           запросы где-то сериализуются, а не что диск медленный
 rem   "per request"         - задержка одного запроса и полученная полоса
-rem   "distinct blocks"     - рабочее множество: бюджет больше него бесполезен
+rem   "distinct blocks"     - рабочее множество реального прогона
 rem   таблицу llama-bench   - что это дало префилу на каждой глубине
 rem нужен -v, иначе llama-bench глушит лог загрузчика.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem каждый вариант это "бюджетМиБ читатели блокБайт блоковНаЗапрос", 0 = авто/по умолчанию,
-rem бюджет off = пул выключен
-if not defined PLEVARIANTS set "PLEVARIANTS="0 1 0 64" "0 4 0 64" "0 16 0 64" "0 32 0 64""
+rem каждый вариант это "читатели блокБайт блоковНаЗапрос", 0 = авто/по умолчанию
+if not defined PLEVARIANTS set "PLEVARIANTS="1 0 64" "4 0 64" "16 0 64" "32 0 64""
 if not defined REPS set "REPS=1"
 
 if not exist "%BIN%\llama-bench.exe" (
@@ -46,14 +45,13 @@ set "RC=0"
 set "FIRST=1"
 
 rem базовая линия: ленивое чтение через mmap, настройки кеша ни при чём
-call :run on 0 0 0 0
+call :run on 0 0 0
 
 for %%v in (%PLEVARIANTS%) do (
-    for /f "tokens=1-4" %%a in (%%v) do call :run dio %%a %%b %%c %%d
+    for /f "tokens=1-3" %%a in (%%v) do call :run dio %%a %%b %%c
 )
 
 set "LLAMA_ROW_CACHE_STATS="
-set "LLAMA_ROW_CACHE_MIB="
 set "LLAMA_ROW_CACHE_THREADS="
 set "LLAMA_ROW_CACHE_BLOCK="
 set "LLAMA_ROW_CACHE_RUN="
@@ -70,17 +68,15 @@ echo.
 echo done, %LOG%
 exit /b %RC%
 
-rem %1 = значение -lzm, дальше бюджет МиБ (off = без пула), читатели, блок байт, блоков на
-rem запрос; 0 = по умолчанию
+rem %1 = значение -lzm, дальше читатели, блок байт, блоков на запрос; 0 = по умолчанию
 :run
-if "%~2"=="0" (set "LLAMA_ROW_CACHE_MIB=") else if /i "%~2"=="off" (set "LLAMA_ROW_CACHE_MIB=0") else (set "LLAMA_ROW_CACHE_MIB=%~2")
-if "%~3"=="0" (set "LLAMA_ROW_CACHE_THREADS=") else (set "LLAMA_ROW_CACHE_THREADS=%~3")
-if "%~4"=="0" (set "LLAMA_ROW_CACHE_BLOCK=") else (set "LLAMA_ROW_CACHE_BLOCK=%~4")
-if "%~5"=="0" (set "LLAMA_ROW_CACHE_RUN=") else (set "LLAMA_ROW_CACHE_RUN=%~5")
+if "%~2"=="0" (set "LLAMA_ROW_CACHE_THREADS=") else (set "LLAMA_ROW_CACHE_THREADS=%~2")
+if "%~3"=="0" (set "LLAMA_ROW_CACHE_BLOCK=") else (set "LLAMA_ROW_CACHE_BLOCK=%~3")
+if "%~4"=="0" (set "LLAMA_ROW_CACHE_RUN=") else (set "LLAMA_ROW_CACHE_RUN=%~4")
 call :settle
-echo === -lzm %~1 cache=%~2 MiB readers=%~3 block=%~4 B run=%~5
+echo === -lzm %~1 readers=%~2 block=%~3 B run=%~4
 echo. >> "%LOG%"
-echo ### -lzm %~1 mib=%~2 readers=%~3 blockB=%~4 run=%~5 >> "%LOG%"
+echo ### -lzm %~1 readers=%~2 blockB=%~3 run=%~4 >> "%LOG%"
 "%BIN%\llama-bench.exe" -m "%MODEL%" -v -fa on -p %NPROMPT% -n 0 -b 4096 -ub 512 -d %DEPTHS% -r %REPS% -lm dio -lzm %~1 %EXTRA% --progress -o md >> "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"

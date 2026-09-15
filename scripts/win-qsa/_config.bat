@@ -35,9 +35,10 @@ rem пары "-lm -lzm" для 10-load-time.bat, по одной загрузк�
 rem тензор читается через mmap, а отображение файла заставляет windows согласовывать с
 rem page cache каждое unbuffered чтение того же файла, по одному. поэтому важен и набор,
 rem и порядок: сначала варианты без отображения, иначе следующий прогон читает файл уже
-rem прогретым. "dio auto" проверяет забытый -lzm: порог auto 4 GiB, таблица PLE больше,
-rem значит auto должен дать то же, что и on
-set "LOADVARIANTS="dio dio" "dio off" "dio auto" "dio on" "none on" "mmap on""
+rem прогретым. "dio auto" проверяет забытый -lzm: на устройстве без mmap auto сводится к
+rem dio, значит эти два прогона обязаны совпасть. -lzm off не меряем: он держит таблицу PLE
+rem в памяти целиком (27 ГБ) и ничего не ускоряет
+set "LOADVARIANTS="dio dio" "dio auto" "dio on" "none on" "mmap on""
 set "LOADREPS=2"
 
 rem how many times llama-bench repeats each measurement. llama-bench warms up before
@@ -76,11 +77,10 @@ rem dies in vkAllocateMemory
 set "SETTLE=30"
 
 rem PLE row cache settings compared by 11-ple-cache.bat, one model load each.
-rem a variant is "budgetMiB readers blockBytes blocksPerRequest", 0 = leave at the default,
-rem a budget of off turns the pool off.
+rem a variant is "readers blockBytes blocksPerRequest", 0 = leave at the default.
 rem the default sweep is the reader count, because that is the read queue depth: if the
 rem time does not fall as it grows, the requests are serialized somewhere
-set "PLEVARIANTS="0 1 0 64" "0 4 0 64" "0 16 0 64" "0 32 0 64""
+set "PLEVARIANTS="1 0 64" "4 0 64" "16 0 64" "32 0 64""
 
 rem what 13-disk-iops.bat asks diskspd for, one run each. a variant is
 rem "blockKiB queueDepth threads"; 4 KiB is the row cache block, the 256 KiB run shows the
@@ -90,10 +90,16 @@ rem queue depth gives when one thread keeps several requests in flight
 set "DISKVARIANTS="4 1 1" "4 1 8" "4 1 32" "4 8 4" "4 32 4" "256 32 4""
 set "DISKSECS=15"
 
-rem what 12-ple-real.bat compares on real text, one model load each. a variant is
-rem "budgetMiB blockBytes", 0 = leave at the default. the default is 8 MiB, off keeps no block
-rem between gathers and leaves only the page cache, and 1024 MiB holds the whole working set
-set "PLEREALVARIANTS="0 0" "off 0" "1024 0""
+rem two extra arms of 13, both off by default because both touch the machine outside this
+rem folder. DEFENDEREXCL=1 excludes the model file from the real time scanner for one sweep
+rem (needs an elevated shell); RAMMAP is the full path to RAMMap64.exe, which can empty the
+rem standby list and give the sweep a truly cold page cache
+set "DEFENDEREXCL=0"
+set "RAMMAP="
+
+rem what 12-ple-real.bat compares on real text, one model load each. a variant is the block
+rem size in bytes, 0 = leave at the default, which is one row
+set "PLEREALVARIANTS=0""
 set "PLECHUNKS=16"
 
 rem what run-all.bat runs, 1 = run, 0 = skip. all of them run by default: a full sweep
@@ -116,6 +122,8 @@ rem           text; one model load per variant, so both are slow
 set "RUN_PLE=1"
 rem   13 - raw disk IOPS behind -lzm dio, needs diskspd (downloaded on first run)
 set "RUN_DISK=1"
+rem   15 - MUL_MAT_ID tuning, one model load per arm, so it is slow
+set "RUN_MMID=1"
 
 rem ===================================================================
 rem  machine-specific overrides. _local.bat is not tracked by git, so

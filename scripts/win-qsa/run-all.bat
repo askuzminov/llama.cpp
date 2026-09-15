@@ -14,6 +14,7 @@ if not defined RUN_TIMING  set "RUN_TIMING=1"
 if not defined RUN_DIAG    set "RUN_DIAG=1"
 if not defined RUN_PLE     set "RUN_PLE=1"
 if not defined RUN_DISK    set "RUN_DISK=1"
+if not defined RUN_MMID    set "RUN_MMID=1"
 
 set "STEPS="
 if "%RUN_BUILD%"=="1"   set "STEPS=%STEPS% 00-build"
@@ -25,6 +26,7 @@ if "%RUN_DIAG%"=="1"    set "STEPS=%STEPS% 08-model-check"
 if "%RUN_TIMING%"=="1"  set "STEPS=%STEPS% 09-alloc-timing 10-load-time"
 if "%RUN_PLE%"=="1"     set "STEPS=%STEPS% 11-ple-cache 12-ple-real"
 if "%RUN_DISK%"=="1"    set "STEPS=%STEPS% 13-disk-iops"
+if "%RUN_MMID%"=="1"    set "STEPS=%STEPS% 15-mmid"
 
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do
