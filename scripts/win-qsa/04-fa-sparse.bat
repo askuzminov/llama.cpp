@@ -1,8 +1,8 @@
 @echo off
-rem the same prefill sweep with the sparse flash attention path on and off, one log per value
-rem of GGML_VK_FA_SPARSE plus a summary. the selection of cells is the same either way, so this
-rem is a pure speed question: does the gather beat the dense kernel on a real per-token mask.
-rem the gather also gives up the aligned kernel, so it can lose.
+rem the same prefill sweep with the sparse flash attention path on and off, one log per arm
+rem plus a summary. the selection of cells is the same either way, so this is a pure speed
+rem question: does the gather beat the dense kernel on a real per-token mask. the gather also
+rem drops the query tile to one row on prefill, so it can lose.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -27,22 +27,23 @@ set "RC=0"
 
 for %%v in (%FAVARIANTS%) do call :run %%v
 
-set "GGML_VK_FA_SPARSE="
+set "GGML_VK_FA_SPARSE_DISABLE="
 
 echo.
 echo summary in %SUM%
 type "%SUM%"
 exit /b %RC%
 
-rem %1 = value of GGML_VK_FA_SPARSE
+rem %1 = 1 gather on, 0 gather off
 :run
 set "LOG=%LOGS%\04-fa-sparse-%TS%-s%~1.log"
-set "GGML_VK_FA_SPARSE=%~1"
-echo === GGML_VK_FA_SPARSE=%~1 -^> %LOG%
+set "GGML_VK_FA_SPARSE_DISABLE="
+if "%~1"=="0" set "GGML_VK_FA_SPARSE_DISABLE=1"
+echo === sparse=%~1 -^> %LOG%
 "%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p %NPROMPT% -n 0 -b 4096 -ub %UBATCH% -d %DEPTHS% %LOADMODE% -r %REPS% %EXTRA% --progress -o md > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"
 echo. >> "%SUM%"
-echo ### GGML_VK_FA_SPARSE=%~1 exit=%EC% >> "%SUM%"
+echo ### sparse=%~1 exit=%EC% >> "%SUM%"
 type "%LOG%" >> "%SUM%"
 goto :eof

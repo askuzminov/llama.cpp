@@ -49,7 +49,7 @@ set "NPROMPT=2048"
 set "DEPTHS=0,32768,65536,122880"
 set "UBATCH=512,2048"
 
-rem values of GGML_VK_FA_SPARSE swept by 04, 06 and 07, one model load each. 1 is the gather
+rem arms swept by 04, 06 and 07, one model load each. 1 is the gather
 rem path: the kernel walks the list of cells the tile can see instead of all of KV. 0 is the
 rem plain dense kernel. the selection is the same in both, so this only moves speed
 set "FAVARIANTS=1 0"

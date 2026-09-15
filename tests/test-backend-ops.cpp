@@ -10735,16 +10735,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4, 64));
 
-    // sparse mask where the rows of a tile pick different cells: the list of the tile is their
-    // union, which is wider than one row but still a small part of kv
+    // sparse mask where the rows of a tile pick different cells, so a tile cannot share one list
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024, 4,  8));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024, 4,  8));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512, 1, 16));
 
     // the depth the model is measured at: a 64k cache and a per-token selection of 2048 cells.
-    // a backend that keeps a list per tile has to cap it somewhere, and this is where the cap
-    // bites - the union of the rows of a tile is near half of kv, so tiles that fit and tiles
-    // that do not are mixed in one call
+    // kv / n_kv_max is 32 here, which is where the Vulkan backend re-tunes prefill to a one-row
+    // tile so the sparse list applies
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
 

@@ -41,7 +41,7 @@ echo expect roughly 10 GB of disk for KLCTX=%KLCTX% KLCHUNKS=%KLCHUNKS%
 rem run-all.bat has already decided, do not stop there
 if not defined QSA_UNATTENDED pause
 
-set "GGML_VK_FA_SPARSE=0"
+set "GGML_VK_FA_SPARSE_DISABLE=1"
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %KLCTX% --chunks %KLCHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence-base "%BASEFILE%" > "%LOGS%\06-kl-%TS%-base.log" 2>&1
 if errorlevel 1 (
     echo base run failed, see %LOGS%\06-kl-%TS%-base.log
@@ -53,7 +53,7 @@ set "RC=0"
 
 for %%v in (%FAVARIANTS%) do call :run %%v
 
-set "GGML_VK_FA_SPARSE="
+set "GGML_VK_FA_SPARSE_DISABLE="
 
 del "%BASEFILE%"
 
@@ -61,15 +61,16 @@ echo.
 type "%SUM%"
 exit /b %RC%
 
-rem %1 = value of GGML_VK_FA_SPARSE. 0 repeats the base and measures the noise floor
+rem %1 = 1 gather on, 0 gather off. 0 repeats the base and measures the noise floor
 :run
 set "LOG=%LOGS%\06-kl-%TS%-s%~1.log"
-set "GGML_VK_FA_SPARSE=%~1"
-echo === GGML_VK_FA_SPARSE=%~1 -^> %LOG%
+set "GGML_VK_FA_SPARSE_DISABLE="
+if "%~1"=="0" set "GGML_VK_FA_SPARSE_DISABLE=1"
+echo === sparse=%~1 -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %KLCTX% --chunks %KLCHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"
 echo. >> "%SUM%"
-echo ### GGML_VK_FA_SPARSE=%~1 exit=%EC% >> "%SUM%"
+echo ### sparse=%~1 exit=%EC% >> "%SUM%"
 findstr /c:"KL divergence" /c:"Same top" /c:"Mean PPL ratio" /c:"Mean PPL(Q)/PPL(base)" /c:"Mean    KLD" /c:"RMS" "%LOG%" >> "%SUM%"
 goto :eof

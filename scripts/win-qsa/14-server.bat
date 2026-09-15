@@ -24,7 +24,7 @@ if not exist "%MODEL%" (
 )
 
 rem a sweep leaves this set in the shell it ran in, the server always runs the default
-set "GGML_VK_FA_SPARSE="
+set "GGML_VK_FA_SPARSE_DISABLE="
 
 echo === llama-server -c %SRVCTX% %LOADMODE% %EXTRA% %SRVARGS%
 "%BIN%\llama-server.exe" -m "%MODEL%" -c %SRVCTX% -fa on %LOADMODE% %EXTRA% %SRVARGS%

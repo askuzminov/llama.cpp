@@ -17,7 +17,7 @@ rem set "EXTRA=-ngl 99 -ncmoe 30"
 rem source of the wikitext text for 05 and 06, if huggingface is unreachable
 rem set "PPLURL=http://.../wikitext-2-raw-v1.zip"
 
-rem values of GGML_VK_FA_SPARSE for 04, 06 and 07: 1 = gather path, 0 = dense kernel
+rem arms of 04, 06 and 07: 1 = gather path, 0 = dense kernel
 rem set "FAVARIANTS=1 0"
 rem set "PERFDEPTH=122880"
 rem context and chunks of the quality runs, keep well above the ~513 block budget

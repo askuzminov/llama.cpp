@@ -1,9 +1,8 @@
 @echo off
-rem per-op timings from the vulkan backend at a deep context, one run per value of
-rem GGML_VK_FA_SPARSE in FAVARIANTS. produces a lot of output, keep the run short. cuda ignores
-rem GGML_VK_PERF_LOGGER.
-rem the point of the sweep: the gather path walks the list of cells a query tile can see, the
-rem dense path walks all of KV but keeps the aligned kernel. the FLASH_ATTN_EXT line says which
+rem per-op timings from the vulkan backend at a deep context, one run per arm of FAVARIANTS.
+rem produces a lot of output, keep the run short. cuda ignores GGML_VK_PERF_LOGGER.
+rem the point of the sweep: the gather path walks the list of cells a query row can see, the
+rem dense path walks all of KV but keeps the wide query tile. the FLASH_ATTN_EXT line says which
 rem one wins on the real per-token mask, and the lines around it say what the pre-pass costs.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
@@ -36,7 +35,7 @@ set "FIRST=1"
 for %%v in (%FAVARIANTS%) do call :run %%v
 
 set "GGML_VK_PERF_LOGGER="
-set "GGML_VK_FA_SPARSE="
+set "GGML_VK_FA_SPARSE_DISABLE="
 
 echo.
 type "%SUM%"
@@ -44,21 +43,22 @@ echo.
 echo done, %SUM%
 exit /b %RC%
 
-rem %1 = value of GGML_VK_FA_SPARSE
+rem %1 = 1 gather on, 0 gather off
 :run
 if "%FIRST%"=="1" (set "FIRST=0") else (
     echo === waiting %SETTLE%s for the gpu to be released
     powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"
 )
 set "LOG=%LOGS%\07-perf-%TS%-s%~1.log"
-set "GGML_VK_FA_SPARSE=%~1"
-echo === GGML_VK_FA_SPARSE=%~1
+set "GGML_VK_FA_SPARSE_DISABLE="
+if "%~1"=="0" set "GGML_VK_FA_SPARSE_DISABLE=1"
+echo === sparse=%~1
 "%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p 512 -n 0 -b 4096 -ub 2048 -d %PERFDEPTH% %LOADMODE% -r 1 --no-warmup %EXTRA% > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"
 
 echo. >> "%SUM%"
-echo ### GGML_VK_FA_SPARSE=%~1 exit=%EC% >> "%SUM%"
+echo ### sparse=%~1 exit=%EC% >> "%SUM%"
 findstr /C:"| qwen4exp" /C:"failed to load model" /C:"allocation of size" "%LOG%" >> "%SUM%"
 
 rem only the last graph is measured at the requested depth, the ones before it build the context
