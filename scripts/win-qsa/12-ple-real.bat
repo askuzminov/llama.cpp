@@ -14,10 +14,11 @@ rem   "read path:"         - развёртка пути чтения, если 
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem варианты кеша строк: "бюджетМиБ блокБайт", 0 = по умолчанию, по одному прогону на каждый.
-rem осталось два вопроса: стоит ли пул чего-нибудь поверх файлового кеша системы и что даёт
-rem блок больше строки. блок 4 КиБ читал 4.47 ГиБ там, где сами строки занимают 0.25 ГиБ
-if not defined PLEREALVARIANTS set "PLEREALVARIANTS="0 0" "8 0" "1024 0""
+rem варианты кеша строк: "бюджетМиБ блокБайт", 0 = по умолчанию, off = пул выключен,
+rem по одному прогону на каждый. осталось два вопроса: стоит ли пул чего-нибудь поверх файлового
+rem кеша системы и что даёт блок больше строки. блок 4 КиБ читал 4.47 ГиБ там, где сами строки
+rem занимают 0.25 ГиБ
+if not defined PLEREALVARIANTS set "PLEREALVARIANTS="0 0" "off 0" "1024 0""
 if not defined PLECHUNKS  set "PLECHUNKS=16"
 
 if not exist "%BIN%\llama-perplexity.exe" (
@@ -69,9 +70,10 @@ echo.
 echo done, %LOG%
 exit /b %RC%
 
-rem %1 = значение -lzm, %2 = бюджет кеша в МиБ (0 = по умолчанию), %3 = размер блока в байтах
+rem %1 = значение -lzm, %2 = бюджет кеша в МиБ (0 = по умолчанию, off = без пула),
+rem %3 = размер блока в байтах
 :run
-if "%~2"=="0" (set "LLAMA_ROW_CACHE_MIB=") else (set "LLAMA_ROW_CACHE_MIB=%~2")
+if "%~2"=="0" (set "LLAMA_ROW_CACHE_MIB=") else if /i "%~2"=="off" (set "LLAMA_ROW_CACHE_MIB=0") else (set "LLAMA_ROW_CACHE_MIB=%~2")
 if "%~3"=="0" (set "LLAMA_ROW_CACHE_BLOCK=") else (set "LLAMA_ROW_CACHE_BLOCK=%~3")
 echo === -lzm %~1 cache=%~2 MiB block=%~3
 echo. >> "%LOG%"

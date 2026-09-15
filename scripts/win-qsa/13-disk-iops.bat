@@ -54,7 +54,9 @@ set "RC=0"
 
 rem our own read path first: the same handles, readers and pool slots a gather uses, over
 rem the same request sizes and queue depths diskspd is asked for below
-for /l %%r in (1,1,%READPATHRUNS%) do call :readpath "cold %%r"
+rem only the first pass is cold: it leaves the pages it read in the cache for the next one
+call :readpath cold
+for /l %%r in (2,1,%READPATHRUNS%) do call :readpath "repeat %%r"
 
 for %%v in (%DISKVARIANTS%) do for /f "tokens=1-3" %%a in (%%v) do call :run %%a %%b %%c
 
@@ -146,7 +148,7 @@ if exist "%ZIP%" goto :unpack
 
 echo downloading %DISKSPDURL%
 where curl.exe >nul 2>&1
-if errorlevel 1 (
+if not "%ERRORLEVEL%"=="0" (
     powershell -NoProfile -Command "Invoke-WebRequest -Uri '%DISKSPDURL%' -OutFile '%ZIP%'"
 ) else (
     curl.exe -L --fail --retry 2 -o "%ZIP%" "%DISKSPDURL%"
@@ -164,7 +166,7 @@ if not exist "%ZIP%" (
 
 :unpack
 powershell -NoProfile -Command "Expand-Archive -Force -Path '%ZIP%' -DestinationPath '%~dp0diskspd'"
-if errorlevel 1 goto :eof
+if not "%ERRORLEVEL%"=="0" goto :eof
 del "%ZIP%"
 
 if not exist "%DISKSPD%" echo unpacked, but %DISKSPD% is still missing

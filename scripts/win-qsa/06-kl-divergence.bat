@@ -43,8 +43,16 @@ if not defined QSA_UNATTENDED pause
 
 set "GGML_VK_FA_SPARSE_DISABLE=1"
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %KLCTX% --chunks %KLCHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence-base "%BASEFILE%" > "%LOGS%\06-kl-%TS%-base.log" 2>&1
-if errorlevel 1 (
+if not "%ERRORLEVEL%"=="0" (
     echo base run failed, see %LOGS%\06-kl-%TS%-base.log
+    exit /b 1
+)
+rem a crash leaves a truncated .dat and every arm then fails to read it. the base run prints
+rem "Final estimate" as its last line, so its absence means the file is not usable
+findstr /c:"Final estimate" "%LOGS%\06-kl-%TS%-base.log" >nul
+if not "%ERRORLEVEL%"=="0" (
+    echo base run did not finish, see %LOGS%\06-kl-%TS%-base.log
+    if exist "%BASEFILE%" del "%BASEFILE%"
     exit /b 1
 )
 
@@ -69,6 +77,9 @@ if "%~1"=="0" set "GGML_VK_FA_SPARSE_DISABLE=1"
 echo === sparse=%~1 -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %KLCTX% --chunks %KLCHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
+rem llama-perplexity returns 0 even when kl_divergence gives up, so check the numbers are there
+findstr /c:"Mean    KLD" "%LOG%" >nul
+if not "%ERRORLEVEL%"=="0" set "EC=1"
 if not "%EC%"=="0" set "RC=%EC%"
 echo. >> "%SUM%"
 echo ### sparse=%~1 exit=%EC% >> "%SUM%"

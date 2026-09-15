@@ -25,10 +25,11 @@ rem   3090 + i9, moe experts on the cpu : -ngl 99 -ncmoe 30
 set "EXTRA=-ngl 99"
 
 rem how the weights are loaded. dio = unbuffered reads, none = read into memory without
-rem mmap, auto = let llama.cpp pick (mmap). lazy mode stays on: it saves both time and ram.
-rem -lzm dio reads the rows of the PLE table through an own block cache instead of the page
-rem cache; 11-ple-cache.bat compares the two before it is worth putting here
-set "LOADMODE=-lm dio -lzm on"
+rem mmap, auto = let llama.cpp pick (mmap). -lzm dio gathers the rows of the PLE table
+rem through an own block cache instead of the page cache: 12 gives it 343.3 t/s of prompt
+rem eval against 259.4 for -lzm on at the same PPL, and it leaves the 26.82 GiB table on
+rem disk instead of mapping it
+set "LOADMODE=-lm dio -lzm dio"
 
 rem пары "-lm -lzm" для 10-load-time.bat, по одной загрузке модели на прогон. ленивый
 rem тензор читается через mmap, а отображение файла заставляет windows согласовывать с
@@ -75,10 +76,11 @@ rem dies in vkAllocateMemory
 set "SETTLE=30"
 
 rem PLE row cache settings compared by 11-ple-cache.bat, one model load each.
-rem a variant is "budgetMiB readers blockKiB blocksPerRequest", 0 = leave at the default.
+rem a variant is "budgetMiB readers blockBytes blocksPerRequest", 0 = leave at the default,
+rem a budget of off turns the pool off.
 rem the default sweep is the reader count, because that is the read queue depth: if the
 rem time does not fall as it grows, the requests are serialized somewhere
-set "PLEVARIANTS="2048 1 4 64" "2048 4 4 64" "2048 16 4 64" "2048 32 4 64""
+set "PLEVARIANTS="0 1 0 64" "0 4 0 64" "0 16 0 64" "0 32 0 64""
 
 rem what 13-disk-iops.bat asks diskspd for, one run each. a variant is
 rem "blockKiB queueDepth threads"; 4 KiB is the row cache block, the 256 KiB run shows the
@@ -89,8 +91,9 @@ set "DISKVARIANTS="4 1 1" "4 1 8" "4 1 32" "4 8 4" "4 32 4" "256 32 4""
 set "DISKSECS=15"
 
 rem what 12-ple-real.bat compares on real text, one model load each. a variant is
-rem "budgetMiB blockBytes", 0 = leave at the default
-set "PLEREALVARIANTS="0 0" "8 0" "1024 0""
+rem "budgetMiB blockBytes", 0 = leave at the default. the default is 8 MiB, off keeps no block
+rem between gathers and leaves only the page cache, and 1024 MiB holds the whole working set
+set "PLEREALVARIANTS="0 0" "off 0" "1024 0""
 set "PLECHUNKS=16"
 
 rem what run-all.bat runs, 1 = run, 0 = skip. all of them run by default: a full sweep

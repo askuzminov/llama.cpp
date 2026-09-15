@@ -323,7 +323,7 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
-        int32_t lazy_cache_mib;         // host budget of the LLAMA_LAZY_MODE_DIO block cache, 0 = default
+        int32_t lazy_cache_mib;         // host budget of the LLAMA_LAZY_MODE_DIO block cache, 0 = default, < 0 = off
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

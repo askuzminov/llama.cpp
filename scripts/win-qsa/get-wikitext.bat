@@ -18,7 +18,7 @@ if exist "%ZIP%" goto :unpack
 
 echo downloading %PPLURL%
 where curl.exe >nul 2>&1
-if errorlevel 1 (
+if not "%ERRORLEVEL%"=="0" (
     powershell -NoProfile -Command "Invoke-WebRequest -Uri '%PPLURL%' -OutFile '%ZIP%'"
 ) else (
     curl.exe -L --fail --retry 2 -o "%ZIP%" "%PPLURL%"
@@ -37,7 +37,7 @@ if not exist "%ZIP%" (
 
 :unpack
 powershell -NoProfile -Command "Expand-Archive -Force -Path '%ZIP%' -DestinationPath '%DIR%'"
-if errorlevel 1 exit /b 1
+if not "%ERRORLEVEL%"=="0" exit /b 1
 del "%ZIP%"
 
 if not exist "%PPLFILE%" (

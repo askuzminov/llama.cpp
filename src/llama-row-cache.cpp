@@ -29,6 +29,13 @@ size_t row_cache_env(const char * name, size_t def) {
     return parsed > 0 ? (size_t) parsed : def;
 }
 
+// -1 when the variable is not set, so that a value of 0 keeps its own meaning
+int64_t row_cache_env_opt(const char * name) {
+    const char * val = getenv(name);
+
+    return val == nullptr ? -1 : atoll(val);
+}
+
 constexpr uint64_t ROW_CACHE_NO_BLOCK = UINT64_MAX;
 
 } // namespace
@@ -101,6 +108,9 @@ struct llama_row_cache::impl {
     // blocks per point of the read path sweep, 0 = do not run it
     size_t bench_n = 0;
 
+    // budget 0: the pool only stages the chunk in flight, no block survives a gather
+    bool no_reuse = false;
+
     // only tracked under LLAMA_ROW_CACHE_STATS, the set costs about 48 bytes per distinct block
     bool                        track_ws = false;
     std::unordered_set<uint64_t> seen;
@@ -142,9 +152,9 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
     run_max = std::max<size_t>(row_cache_env("LLAMA_ROW_CACHE_RUN", 64), 1);
 
     // lets a sweep vary the budget without rebuilding, see scripts/win-qsa/11-ple-cache.bat
-    const size_t budget_mib = row_cache_env("LLAMA_ROW_CACHE_MIB", 0);
-    if (budget_mib > 0) {
-        budget = budget_mib*1024*1024;
+    const int64_t budget_mib = row_cache_env_opt("LLAMA_ROW_CACHE_MIB");
+    if (budget_mib >= 0) {
+        budget = (size_t) budget_mib*1024*1024;
     }
 
     track_ws     = row_cache_env("LLAMA_ROW_CACHE_STATS", 0) > 0;
@@ -155,10 +165,17 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
     const size_t blocks_per_row = row_size/blk_size + 2;
     const size_t n_blocks_min   = 4*blocks_per_row + 16;
 
-    size_t n_blocks = budget/blk_size;
+    // a budget of 0 turns the cache off: the pool then holds only the blocks of the chunk in
+    // flight, so every row is read again and the page cache is all that is left in front of the
+    // file. Still wide enough for a chunk to merge run_max adjacent blocks into one request
+    no_reuse = budget == 0;
+
+    size_t n_blocks = no_reuse ? 2*run_max*blocks_per_row : budget/blk_size;
     if (n_blocks < n_blocks_min) {
-        LLAMA_LOG_WARN("%s: cache budget of %zu KiB is too small, raising it to %zu KiB\n",
-                __func__, budget/1024, n_blocks_min*blk_size/1024);
+        if (!no_reuse) {
+            LLAMA_LOG_WARN("%s: cache budget of %zu KiB is too small, raising it to %zu KiB\n",
+                    __func__, budget/1024, n_blocks_min*blk_size/1024);
+        }
         n_blocks = n_blocks_min;
     }
 
@@ -236,11 +253,12 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
     // part, and a raw drive benchmark has to be pointed at that same part
     const size_t i_name = path.find_last_of("/\\");
 
-    LLAMA_LOG_INFO("%s: %.2f GiB table stays on disk in %s, cache %.1f MiB in %zu blocks of %zu B, "
+    LLAMA_LOG_INFO("%s: %.2f GiB table stays on disk in %s, cache %.1f MiB in %zu blocks of %zu B%s, "
             "%d readers, up to %zu blocks per request\n",
             __func__, ggml_row_size(type, n_cols)*n_rows/1024.0/1024.0/1024.0,
             path.c_str() + (i_name == std::string::npos ? 0 : i_name + 1),
-            n_blocks*blk_size/1024.0/1024.0, n_blocks, blk_size, n_threads, run_max);
+            n_blocks*blk_size/1024.0/1024.0, n_blocks, blk_size, no_reuse ? " (off, staging only)" : "",
+            n_threads, run_max);
 
     if (bench_n > 0) {
         bench(bench_n);
@@ -451,6 +469,12 @@ void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst)
     int64_t i = 0;
     while (i < n) {
         chunk++;
+
+        if (no_reuse) {
+            // the cache is off, so the chunk starts empty and reads every row again
+            resident.clear();
+            std::fill(slots.begin(), slots.end(), slot());
+        }
 
         pinned.clear();
         want.clear();

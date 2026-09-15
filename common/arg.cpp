@@ -2750,7 +2750,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- dio[:MiB]: on, but gather the rows one at a time through an own row cache in front of\n"
-        "  the page cache, no mmap needed; MiB sets the host budget of that cache\n"
+        "  the page cache, no mmap needed; MiB sets the host budget of that cache, 0 turns it off\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
@@ -2759,7 +2759,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else if (value == "dio" || string_starts_with(value, "dio:")) {
                 params.lazy_mode = LLAMA_LAZY_MODE_DIO;
                 if (value.size() > 4) {
-                    params.lazy_cache_mib = std::stoi(value.substr(4));
+                    // dio:0 means no cache, and 0 is already taken by "use the default"
+                    const int mib = std::stoi(value.substr(4));
+                    params.lazy_cache_mib = mib > 0 ? mib : -1;
                 }
             }
             else { throw std::invalid_argument("invalid value"); }
