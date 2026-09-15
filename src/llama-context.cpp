@@ -3325,6 +3325,56 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
     return io.n_bytes();
 }
 
+size_t llama_context::state_seq_get_delta(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos) {
+    if (memory) {
+        return memory->state_write_delta(io, seq_id, flags, base_pos);
+    }
+
+    // Final fallback: full state for models without memory layer
+    return 0;
+}
+
+int32_t llama_context::state_seq_apply_delta(
+        const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos) {
+    // Create a temporary io_read wrapper for the delta data
+    struct memory_buffer_io : llama_io_read_i {
+        const uint8_t * data;
+        size_t pos = 0;
+        size_t len;
+
+        memory_buffer_io(const uint8_t * src, size_t size) : data(src), len(size) {}
+
+        void read(void * dst, size_t n) override {
+            if (n > len - pos) {
+                throw std::runtime_error("buffer overflow in memory_buffer_io::read");
+            }
+            memcpy(dst, data + pos, n);
+            pos += n;
+        }
+
+        void read_tensor(ggml_tensor * tensor, size_t offset, size_t size_read) override {
+            if (size_read > len - pos) {
+                throw std::runtime_error("buffer overflow in memory_buffer_io::read_tensor");
+            }
+            ggml_backend_tensor_set(tensor, data + pos, offset, size_read);
+            pos += size_read;
+        }
+
+        size_t n_bytes() override {
+            return pos;
+        }
+    };
+
+    memory_buffer_io io(src, size);
+
+    if (memory) {
+        bool success = memory->state_read_delta(io, seq_id, flags, base_pos);
+        return success && io.n_bytes() == size ? 0 : -1;
+    }
+
+    return -1;
+}
+
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -4209,6 +4259,50 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_delta_ext(
+        llama_context * ctx,
+                uint8_t * dst,
+                 size_t   size,
+            llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+            llama_pos     base_pos) {
+    ctx->synchronize();
+
+    try {
+        if (dst == nullptr) {
+            llama_io_write_dummy io(false);
+            return ctx->state_seq_get_delta(io, seq_id, flags, base_pos);
+        }
+
+        llama_io_write_host io(dst, size);
+        return ctx->state_seq_get_delta(io, seq_id, flags, base_pos);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error writing delta state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+int32_t llama_state_seq_apply_delta(
+        llama_context * ctx,
+               const uint8_t * src,
+                        size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                    llama_pos     base_pos) {
+    if (src == nullptr || size == 0) {
+        return -1;
+    }
+
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_apply_delta(src, size, seq_id, flags, base_pos);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error applying delta state: %s\n", __func__, err.what());
+        return -1;
+    }
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

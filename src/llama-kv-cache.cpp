@@ -2332,13 +2332,15 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool clear_seq) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
     if (dest_seq_id != -1) {
         // single sequence
-        seq_rm(dest_seq_id, -1, -1);
+        if (clear_seq) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2812,4 +2814,134 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+//
+// Delta state write/read for KV cache
+//
+
+size_t llama_kv_cache::state_write_delta(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) const {
+    GGML_UNUSED(flags);
+
+    const size_t start_bytes = io.n_bytes();
+
+    // Write a magic header to indicate this is a delta checkpoint
+    static const uint32_t DELTA_MAGIC = 0x4B56444C; // "KVdL"
+    io.write(&DELTA_MAGIC, sizeof(DELTA_MAGIC));
+
+    // Write base position
+    io.write(&base_pos, sizeof(base_pos));
+
+    // For KV cache delta: write only cells with pos > base_pos
+    io.write(&n_stream, sizeof(n_stream));
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        cell_ranges_t cr { s, {} };
+
+        uint32_t cell_count = 0;
+        const auto & cells = v_cells[s];
+
+        // Find cells with seq_id AND pos > base_pos
+        uint32_t cell_range_begin = cells.size();
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            bool add_cell = true;
+
+            add_cell = add_cell && !cells.is_empty(i);
+            add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && cells.pos_get(i) > base_pos; // KEY: only cells after base_pos
+
+            if (add_cell) {
+                ++cell_count;
+                if (cell_range_begin == cells.size()) {
+                    cell_range_begin = i;
+                }
+            } else {
+                if (cell_range_begin != cells.size()) {
+                    cr.data.emplace_back(cell_range_begin, i);
+                    cell_range_begin = cells.size();
+                }
+            }
+        }
+
+        if (cell_range_begin != cells.size()) {
+            cr.data.emplace_back(cell_range_begin, cells.size());
+        }
+
+        // Write cell count explicitly for delta reader
+        io.write(&cell_count, sizeof(cell_count));
+
+        if (cell_count == 0) {
+            continue;
+        }
+
+        state_write_meta(io, cr, seq_id);
+        state_write_data(io, cr);
+    }
+
+    return io.n_bytes() - start_bytes;
+}
+
+bool llama_kv_cache::state_read_delta(
+        llama_io_read_i  & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) {
+    GGML_UNUSED(flags);
+
+    // Read and verify magic header
+    uint32_t delta_magic;
+    io.read(&delta_magic, sizeof(delta_magic));
+
+    if (delta_magic != 0x4B56444C) { // "KVdL"
+        LLAMA_LOG_ERROR("%s: invalid delta magic: 0x%08X\n", __func__, delta_magic);
+        return false;
+    }
+
+    llama_pos delta_base_pos;
+    io.read(&delta_base_pos, sizeof(delta_base_pos));
+
+    if (delta_base_pos != base_pos) {
+        LLAMA_LOG_ERROR("%s: base_pos mismatch: checkpoint has %d, expected %d\n",
+                        __func__, (int)delta_base_pos, (int)base_pos);
+        return false;
+    }
+
+    uint32_t n_stream_read;
+    io.read(&n_stream_read, sizeof(n_stream_read));
+
+    if (n_stream_read != n_stream) {
+        LLAMA_LOG_ERROR("%s: stream count mismatch\n", __func__);
+        return false;
+    }
+
+    if (seq_id < 0) {
+        LLAMA_LOG_ERROR("%s: whole-cache delta restore is not supported\n", __func__);
+        return false;
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        uint32_t cell_count;
+        io.read(&cell_count, sizeof(cell_count));
+
+        if (cell_count == 0) {
+            continue;
+        }
+
+        const uint32_t strm = seq_to_stream[seq_id];
+        slot_info sinfo;
+
+        if (!state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, false)) {
+            return false;
+        }
+        if (!state_read_data(io, strm, cell_count, sinfo)) {
+            return false;
+        }
+    }
+
+    return true;
 }

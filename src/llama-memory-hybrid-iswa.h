@@ -76,6 +76,19 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // delta state: iSWA attention KV as a delta + full recurrent state (see llama_memory_hybrid)
+    size_t state_write_delta(
+            llama_io_write_i & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) const override;
+
+    bool state_read_delta(
+            llama_io_read_i  & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) override;
+
     //
     // llama_memory_hybrid_iswa specific API
     //

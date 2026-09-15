@@ -218,6 +218,7 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_DIO  = 3, // same, but rows are gathered through an own block cache read with direct I/O
     };
 
     enum llama_context_type {
@@ -322,6 +323,7 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
+        int32_t lazy_cache_mib;         // host budget of the LLAMA_LAZY_MODE_DIO block cache, 0 = default
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -935,6 +937,28 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Saves append-only sequence state after base_pos. Returns the required size when dst is NULL.
+    // Returns 0 when the memory implementation does not support delta state.
+    LLAMA_API size_t llama_state_seq_get_delta_ext(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                     llama_pos   base_pos);
+
+    /// @details Apply a delta checkpoint on top of already loaded BASE state.
+    /// The BASE state must be loaded first via llama_state_seq_set_data_ext().
+    /// This function reads the delta data and updates only the cells with pos > base_pos.
+    /// @returns 0 on success, negative value on error
+    LLAMA_API int32_t llama_state_seq_apply_delta(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                     llama_pos   base_pos);
 
     //
     // Decoding

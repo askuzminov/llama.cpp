@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid-iswa.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -200,6 +201,37 @@ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id s
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     mem_attn->state_read(io, seq_id, flags);
     mem_recr->state_read(io, seq_id, flags);
+}
+
+size_t llama_memory_hybrid_iswa::state_write_delta(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) const {
+    const size_t n_bytes_start = io.n_bytes();
+
+    // mem_attn is an iSWA cache and applies the PARTIAL_ONLY flag to its own sub-caches
+    if (mem_attn->state_write_delta(io, seq_id, flags, base_pos) == 0) {
+        return 0; // the attention cache cannot produce a delta
+    }
+
+    mem_recr->state_write(io, seq_id, flags); // full recurrent state (order matters)
+
+    return io.n_bytes() - n_bytes_start;
+}
+
+bool llama_memory_hybrid_iswa::state_read_delta(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) {
+    if (!mem_attn->state_read_delta(io, seq_id, flags, base_pos)) {
+        return false;
+    }
+
+    mem_recr->state_read(io, seq_id, flags);
+
+    return true;
 }
 
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {

@@ -35,6 +35,7 @@
         #define PATH_MAX MAX_PATH
     #endif
     #include <io.h>
+    #include <malloc.h>
 #endif
 
 #if defined(__APPLE__)
@@ -66,9 +67,28 @@ static std::string llama_format_win_err(DWORD err) {
 
 // llama_file
 
+// unaligned direct I/O is staged through a bounce buffer; 64 MiB keeps the read large enough
+// for an NVMe drive without sizing the buffer after the tensor
+static size_t dio_staging_size(size_t alignment) {
+    return (64ull*1024*1024 + alignment - 1) & ~(alignment - 1);
+}
+
 struct llama_file::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
+    HANDLE fp_dio = INVALID_HANDLE_VALUE;
+
+    // an unbuffered read is issued one request at a time. the handle is overlapped, its own file
+    // pointer is never used, and pos_dio is the position the callers see.
+    // measured on strix halo reading 76 GiB: more requests in flight only cost
+    // (1 -> 3.27 GiB/s, 2 -> 2.98, 4 -> 2.81, 8 -> 2.53), and 16 MiB is the best request size
+    // (4 MiB -> 2.67, 16 -> 3.41, 32 -> 3.35). the overlapped handle is worth keeping even with a
+    // single request in flight: the same reads on a synchronous handle run at 2.66 GiB/s
+    static constexpr size_t dio_request_size = 16ull*1024*1024;
+
+    HANDLE dio_event = NULL;
+    size_t pos_dio   = 0;
+
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -84,7 +104,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -93,6 +113,13 @@ struct llama_file::impl {
         seek(0, SEEK_END);
         size = tell();
         seek(0, SEEK_SET);
+
+        // Try unbuffered I/O for read only. fp stays open: file_id() still has to hand a
+        // usable handle to llama_mmap when the same file is also mapped.
+        if (use_direct_io && std::strcmp(mode, "rb") == 0 && !init_dio()) {
+            LLAMA_LOG_WARN("%s: failed to reopen '%s' unbuffered: %s. Falling back to buffered I/O\n",
+                           __func__, fname, GetErrorMessageWin32(GetLastError()).c_str());
+        }
     }
 
     impl(FILE * file) : owns_fp(false) {
@@ -103,44 +130,238 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
+    size_t sector_size(HANDLE handle) const {
+        // FILE_FLAG_NO_BUFFERING requires offsets, sizes and buffer addresses to be
+        // multiples of the volume sector size; 4096 covers both 512e and 4Kn drives
+        size_t sector = 4096;
+#if _WIN32_WINNT >= 0x602
+        FILE_STORAGE_INFO info = {};
+        if (GetFileInformationByHandleEx(handle, FileStorageInfo, &info, sizeof(info))) {
+            sector = std::max<size_t>(sector, info.LogicalBytesPerSector);
+            sector = std::max<size_t>(sector, info.PhysicalBytesPerSectorForAtomicity);
+        }
+#else
+        GGML_UNUSED(handle);
+#endif
+        return sector;
+    }
+
+    bool init_dio() {
+        // ReOpenFile avoids a second UTF-8 -> UTF-16 path conversion
+        HANDLE (WINAPI *pReOpenFile) (HANDLE, DWORD, DWORD, DWORD);
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+
+        pReOpenFile = (decltype(pReOpenFile))(void *) GetProcAddress(hKernel32, "ReOpenFile");
+        if (!pReOpenFile) {
+            return false;
+        }
+
+        HANDLE handle = pReOpenFile(fp_win32, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        const size_t sector = sector_size(handle);
+        if (sector < 2 || (sector & (sector - 1)) != 0) {
+            CloseHandle(handle);
+            return false;
+        }
+
+        dio_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (dio_event == NULL) {
+            CloseHandle(handle);
+            return false;
+        }
+
+        fp_dio    = handle;
+        alignment = sector;
+        pos_dio   = 0;
+        return true;
+    }
+
+    void close_dio_event() {
+        if (dio_event != NULL) {
+            CloseHandle(dio_event);
+            dio_event = NULL;
+        }
+    }
+
+    HANDLE read_handle() const {
+        return fp_dio != INVALID_HANDLE_VALUE ? fp_dio : fp_win32;
+    }
+
     size_t tell() const {
+        if (has_direct_io()) {
+            return pos_dio;
+        }
+
         LARGE_INTEGER li;
         li.QuadPart = 0;
-        BOOL ret = SetFilePointerEx(fp_win32, li, &li, FILE_CURRENT);
+        BOOL ret = SetFilePointerEx(read_handle(), li, &li, FILE_CURRENT);
         if (!ret) {
-            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            throw std::runtime_error(format("seek error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
         }
 
         return li.QuadPart;
     }
 
-    void seek(size_t offset, int whence) const {
+    void seek_raw(size_t offset, int whence) const {
         static_assert(SEEK_SET == FILE_BEGIN, "SEEK_SET != FILE_BEGIN");
         static_assert(SEEK_CUR == FILE_CURRENT, "SEEK_CUR != FILE_CURRENT");
         static_assert(SEEK_END == FILE_END, "SEEK_END != FILE_END");
 
         LARGE_INTEGER li;
         li.QuadPart = offset;
-        BOOL ret = SetFilePointerEx(fp_win32, li, NULL, whence);
+        BOOL ret = SetFilePointerEx(read_handle(), li, NULL, whence);
         if (!ret) {
-            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            throw std::runtime_error(format("seek error: %s (offset %zu, whence %d)",
+                                            GetErrorMessageWin32(GetLastError()).c_str(), offset, whence));
         }
     }
 
-    void read_raw(void * ptr, size_t len) {
+    void seek(size_t offset, int whence) {
+        if (!has_direct_io()) {
+            seek_raw(offset, whence);
+            return;
+        }
+
+        // overlapped reads carry their own offset, so the handle's file pointer stays unused
+        size_t pos = offset;
+        if (whence == SEEK_CUR) {
+            pos += pos_dio;
+        } else if (whence == SEEK_END) {
+            pos += size;
+        }
+
+        pos_dio = pos;
+    }
+
+    // the caller is responsible for alignment when direct I/O is active
+    void read_raw_unsafe(void * ptr, size_t len) {
+        if (has_direct_io()) {
+            read_dio(ptr, len);
+            return;
+        }
+
+        HANDLE handle = read_handle();
         size_t bytes_read = 0;
         while (bytes_read < len) {
+            char * dst = reinterpret_cast<char *>(ptr) + bytes_read;
             size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
             DWORD chunk_read = 0;
-            BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
+            BOOL result = ReadFile(handle, dst, chunk_size, &chunk_read, NULL);
             if (!result) {
                 throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
             }
-            if (chunk_read < chunk_size || chunk_read == 0) {
+            if (chunk_read < chunk_size) {
                 throw std::runtime_error("unexpectedly reached end of file");
             }
 
             bytes_read += chunk_read;
+        }
+    }
+
+    // reads [pos_dio, pos_dio + len) one request at a time. offsets, sizes and the destination
+    // have to be sector multiples, the tail past the end of the file is zero filled like the
+    // buffered path does
+    void read_dio(void * ptr, size_t len) {
+        char *       dst       = reinterpret_cast<char *>(ptr);
+        const size_t pos_start = pos_dio;
+
+        for (size_t done = 0; done < len; ) {
+            const size_t abs  = pos_start + done;
+            const size_t want = std::min<size_t>(len - done, dio_request_size);
+
+            OVERLAPPED ov = {};
+            ov.Offset     = (DWORD) (abs & 0xffffffff);
+            ov.OffsetHigh = (DWORD) (abs >> 32);
+
+            ov.hEvent     = dio_event;
+            ResetEvent(dio_event);
+
+            // the byte count is taken from GetOverlappedResult: a pending read would write into a
+            // local long after it went out of scope
+            DWORD read_now = 0;
+            DWORD err      = ReadFile(fp_dio, dst + done, (DWORD) want, NULL, &ov) ? 0 : GetLastError();
+            if (err == 0 || err == ERROR_IO_PENDING) {
+                err = GetOverlappedResult(fp_dio, &ov, &read_now, TRUE) ? 0 : GetLastError();
+            }
+
+            const size_t got = err == 0 ? read_now : 0;
+
+            if (err != 0 && err != ERROR_HANDLE_EOF) {
+                throw std::runtime_error(format("read error: %s (offset %zu, size %zu, dst %p, alignment %zu)",
+                                                GetErrorMessageWin32(err).c_str(), abs, want,
+                                                (void *) (dst + done), alignment));
+            }
+
+            if (got < want) {
+                // short read: only the padding past the end of the file may be missing
+                if (abs + got < size) {
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+                std::memset(dst + done + got, 0, want - got);
+            }
+
+            done += want;
+        }
+
+        pos_dio = pos_start + len;
+    }
+
+    void read_aligned_chunk(void * dest, size_t len) {
+        if (len == 0) {
+            return;
+        }
+
+        const size_t offset                = tell();
+        const size_t aligned_offset        = offset & ~(alignment - 1);
+        const size_t offset_from_alignment = offset - aligned_offset;
+        const size_t bytes_to_read         = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
+
+        // a single tensor can be tens of gigabytes, so stage the read through a bounded buffer
+        const size_t buf_size = std::min<size_t>(bytes_to_read, dio_staging_size(alignment));
+
+        void * raw_buffer = _aligned_malloc(buf_size, alignment);
+        if (raw_buffer == nullptr) {
+            throw std::runtime_error(format("_aligned_malloc failed for %zu bytes", buf_size));
+        }
+
+        struct aligned_buffer_deleter {
+            void operator()(void * p) const { _aligned_free(p); }
+        };
+        std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
+
+        seek(aligned_offset, SEEK_SET);
+
+        char * out  = reinterpret_cast<char *>(dest);
+        size_t read = 0;  // pulled from the file, padding included
+        size_t done = 0;  // handed to the caller
+
+        while (done < len) {
+            const size_t want = std::min(buf_size, bytes_to_read - read);
+            read_raw_unsafe(buffer.get(), want);
+
+            // the first pass starts inside the buffer, the last one stops before its padding
+            const size_t skip = read == 0 ? offset_from_alignment : 0;
+            const size_t take = std::min(want - skip, len - done);
+
+            memcpy(out + done, reinterpret_cast<char *>(buffer.get()) + skip, take);
+
+            read += want;
+            done += take;
+        }
+
+        // the read rounded up to the sector, a buffered one would have stopped at len
+        seek(offset + len, SEEK_SET);
+    }
+
+    void read_raw(void * ptr, size_t len) {
+        if (has_direct_io()) {
+            read_aligned_chunk(ptr, len);
+        } else {
+            read_raw_unsafe(ptr, len);
         }
     }
 
@@ -172,10 +393,14 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        return fp_dio != INVALID_HANDLE_VALUE && alignment > 1;
     }
 
     ~impl() {
+        close_dio_event();
+        if (fp_dio != INVALID_HANDLE_VALUE) {
+            CloseHandle(fp_dio);
+        }
         if (fp && owns_fp) {
             std::fclose(fp);
         }
@@ -317,14 +542,21 @@ struct llama_file::impl {
         }
     }
 
-    void read_aligned_chunk(void * dest, size_t size) {
-        size_t offset = tell();
-        off_t aligned_offset = offset & ~(alignment - 1);
-        off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+    void read_aligned_chunk(void * dest, size_t len) {
+        if (len == 0) {
+            return;
+        }
+
+        const size_t offset                = tell();
+        const size_t aligned_offset        = offset & ~(alignment - 1);
+        const size_t offset_from_alignment = offset - aligned_offset;
+        const size_t bytes_to_read         = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
+
+        // a single tensor can be tens of gigabytes, so stage the read through a bounded buffer
+        const size_t buf_size = std::min<size_t>(bytes_to_read, dio_staging_size(alignment));
 
         void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
+        int ret = posix_memalign(&raw_buffer, alignment, buf_size);
         if (ret != 0) {
             throw std::runtime_error(format("posix_memalign failed with error %d", ret));
         }
@@ -335,10 +567,27 @@ struct llama_file::impl {
         std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
 
         seek(aligned_offset, SEEK_SET);
-        read_raw_unsafe(buffer.get(), bytes_to_read);
 
-        uintptr_t actual_data = reinterpret_cast<uintptr_t>(buffer.get()) + offset_from_alignment;
-        memcpy(dest, reinterpret_cast<void *>(actual_data), size);
+        char * out  = reinterpret_cast<char *>(dest);
+        size_t read = 0;  // pulled from the file, padding included
+        size_t done = 0;  // handed to the caller
+
+        while (done < len) {
+            const size_t want = std::min(buf_size, bytes_to_read - read);
+            read_raw_unsafe(buffer.get(), want);
+
+            // the first pass starts inside the buffer, the last one stops before its padding
+            const size_t skip = read == 0 ? offset_from_alignment : 0;
+            const size_t take = std::min(want - skip, len - done);
+
+            memcpy(out + done, reinterpret_cast<char *>(buffer.get()) + skip, take);
+
+            read += want;
+            done += take;
+        }
+
+        // the read rounded up to the block, a buffered one would have stopped at len
+        seek(offset + len, SEEK_SET);
     }
 
     void read_raw(void * ptr, size_t len) {
@@ -426,11 +675,7 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#ifdef _WIN32
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#else
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
-#endif
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 

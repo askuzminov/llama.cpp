@@ -1,5 +1,29 @@
 #include "llama-memory.h"
 
+size_t llama_memory_i::state_write_delta(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) const {
+    GGML_UNUSED(io);
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(flags);
+    GGML_UNUSED(base_pos);
+    return 0;
+}
+
+bool llama_memory_i::state_read_delta(
+        llama_io_read_i  & io_delta,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) {
+    GGML_UNUSED(io_delta);
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(flags);
+    GGML_UNUSED(base_pos);
+    return false;
+}
+
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
 

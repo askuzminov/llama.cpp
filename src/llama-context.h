@@ -156,6 +156,12 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    // serialize only the cells added after base_pos (0 = the memory cannot produce a delta)
+    size_t state_seq_get_delta(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
+
+    // apply a delta on top of an already loaded BASE state
+    int32_t state_seq_apply_delta(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,

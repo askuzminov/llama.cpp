@@ -1,3 +1,100 @@
+# Чем этот форк отличается от апстрима
+
+Форк [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), рабочая ветка `cache`.
+Раздел ведётся вручную: каждое изменение относительно апстрима дописывается сюда.
+
+Целевое железо: AMD AI Max 395 (Strix Halo, 128 GB, Vulkan, всё на GPU) и i9-12900 + RTX 3090
+(128 GB, MoE на CPU). Целевые модели: Qwen3.8-Flash-Next (`qwen4exp`), Qwen3.5 122B.
+Развёртывание на Windows, mmap не используется: `--load-mode dio --lazy-mode on`.
+
+## Загрузка модели
+
+- Выделение буферов бэкенда совмещено с чтением файла. `ggml_backend_alloc_ctx_tensors_from_buft_cb`
+  ([ggml/include/ggml-alloc.h](ggml/include/ggml-alloc.h)) отдаёт диапазоны тензоров по мере
+  готовности буферов, загрузчик читает их, пока выделяется следующий буфер.
+- Direct I/O на Windows: `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`, запросы по 16 MiB, один
+  в полёте ([src/llama-mmap.cpp](src/llama-mmap.cpp)). В апстриме direct I/O есть только под POSIX,
+  под Windows `-lm dio` молча сводится к обычному `fread`.
+- Заголовок GGUF читается тем же хендлом, что и тензоры ([src/llama-model-loader.cpp](src/llama-model-loader.cpp)).
+  В апстриме `gguf_init_from_file` открывает файл отдельно и читает его через page cache, так что
+  часть файла попадает в кеш ещё до весов. Пока по файлу идёт буферизованное чтение,
+  небуферизованное по нему же почти останавливается: diskspd `-b4K -o1 -t32 -Suw` даёт 489.9 MiB/s
+  и 125408 IOPS, при параллельном буферизованном читателе - 10.7 MiB/s и 2731 IOPS, и сразу после
+  его окончания снова 489.7 MiB/s. Проверка -
+  [scripts/win-qsa/13-disk-iops.bat](scripts/win-qsa/13-disk-iops.bat). `-lm dio -lzm on` смешивает
+  два режима: ленивый тензор требует mmap, и загрузчик предупреждает об этом. `-lzm dio` оставляет
+  файл неотображённым.
+- Таблица PLE (`per_layer_token_embd.weight`, 26.82 GiB у `qwen4exp`) может остаться на диске:
+  `-lzm dio` собирает её построчно ([src/llama-row-cache.cpp](src/llama-row-cache.cpp)) - пул
+  читателей и небольшой кеш блоков с часовым вытеснением перед файловым кешем системы. Один блок -
+  одна строка: блок в 4 KiB отдавал 90 полезных байт и вычитывал 4.47 GiB там, где сами строки
+  занимают 0.25 GiB. Чтение буферизованное, поэтому страничный кеш держит выданные строки в любой
+  свободной памяти и переживает выход процесса. В апстриме у `-lzm` есть только `on`, который
+  требует mmap. Настройки через `LLAMA_ROW_CACHE_*`, замеры:
+  [scripts/win-qsa/README.md](scripts/win-qsa/README.md).
+- Замер на Strix Halo, llama-perplexity, 16 чанков wikitext, тёплый страничный кеш: `-lzm on`
+  25.57 s/pass, `-lzm dio` 25.98 s/pass, PPL 3.9400 в обоих. Небуферизованное чтение той же
+  таблицы давало 38.57 s/pass: на этом файле оно не набирает глубины очереди совсем - 6997
+  запросов/с и на одном читателе, и на 32, при том что diskspd тем же шаблоном даёт 125408 IOPS.
+  После нескольких GB чтений по файлу тот же путь выдаёт 71734 запроса/с. Причина не найдена, на
+  машине включён Defender.
+- Замер на Strix Halo, Qwen3.8-Flash-Next Q4_K_XL, 76.23 GiB на GPU:
+
+  | | чтение | загрузка целиком |
+  |---|---|---|
+  | буферизованное чтение, выделение последовательно (как в апстриме) | 35.4 s @ 2.15 GiB/s | ~46-47 s, оценка |
+  | direct I/O 16 MiB + совмещение | 23.3 s @ 3.27 GiB/s | 24.6 s |
+
+  Размер запроса и overlapped-хендл нужны оба: те же 16 MiB на синхронном хендле дают 2.66 GiB/s,
+  overlapped при 4 MiB - 2.67, больше одного запроса в полёте только замедляет (2 -> 2.98, 8 -> 2.53).
+
+## Кэш промпта на сервере
+
+- Контекстные чекпойнты хранятся деревом ветвлений, а не линейной цепочкой: `--ctx-checkpoints-tree`
+  ([common/checkpoint-tree.h](common/checkpoint-tree.h)). Агент, который пробует несколько
+  продолжений от общего префикса, возвращается к любой ветке без пересчёта префикса.
+- Дельта-чекпойнты: `llama_state_seq_get_delta_ext` и `llama_state_seq_apply_delta`
+  ([include/llama.h](include/llama.h)) сохраняют и накатывают только ячейки после `base_pos`.
+- Вытеснение по остатку свободной RAM: `-crr, --cache-ram-reserve N`. Проверяется при создании
+  каждого чекпойнта, поэтому учитывает и память, занятую другими процессами.
+- Сброс холодных состояний на диск вместо выбрасывания: `--cache-spill-dir PATH`, бюджет
+  `--cache-disk N`. Файлы переживают перезапуск и подхватываются при совпадении модели и
+  конфигурации KV, то есть кэш работает и на холодном старте.
+- Тесты: `tests/test-checkpoint-*.cpp`, `tests/test-prompt-cache-spill.cpp`,
+  `tools/server/tests/unit/test_cache_spill.py`, `tools/server/tests/unit/test_ctx_checkpoint_tree.py`.
+
+## Архитектура `qwen4exp`
+
+- QSA: выбор блоков кэша идёт на каждый токен отдельно, как в референсе
+  ([src/models/qwen4exp.cpp](src/models/qwen4exp.cpp)). Общее ранжирование на группу токенов было
+  добавлено и удалено: ядро flash attention выбрасывает тайл маски только когда он замаскирован
+  для всех строк запроса, и общий выбор давал до 2.1x на префиле, но это другой выбор, и он стоил
+  от 0.26% до 1.04% PPL. Замеры и причина удаления: [scripts/win-qsa/README.md](scripts/win-qsa/README.md).
+- MTP-голова: тензоры `NEXTN_HC_HEAD_{NORM,DOWN,UP}` в загрузчике и конвертере
+  ([conversion/qwen4exp.py](conversion/qwen4exp.py)).
+
+## Vulkan
+
+- Разреженный flash attention: ядро получает список ячеек KV, которые видит группа строк тайла,
+  и читает только их. Порт пути из CUDA (`ggml/src/ggml-cuda/fattn.cu`), в Vulkan его не было.
+  Ёмкость списка считается на группу строк, а не на одну строку: в префиле `gqa_ratio == 1`,
+  строк в группе `Br`, и список группы это объединение их выборов. Группа, у которой объединение
+  больше половины KV, остаётся на плотном пути. На qwen4exp с контекстом 65536 это даёт
+  префилу +34% при `-ub 512` и +107% при `-ub 2048`, время `FLASH_ATTN_EXT` падает вдвое.
+  `GGML_VK_FA_SPARSE=0` выключает гатер и возвращает плотное ядро.
+- `GGML_VK_ALLOC_TIMING=1` печатает, куда уходит время создания буферов: create, allocate, map.
+- Порог hoisting row ids в `mul_mat_id` берётся из `maxComputeSharedMemorySize` устройства вместо
+  зашитых 256 экспертов.
+
+## Прочее
+
+- [docs/build-windows-vulkan-cuda.md](docs/build-windows-vulkan-cuda.md) - сборка под Windows.
+- [scripts/win-qsa/](scripts/win-qsa/) - батники для замеров на целевой Windows-машине, свой README.
+  Там же ведётся список отброшенных вариантов и опровергнутых гипотез с числами, чтобы не
+  возвращаться к ним по второму разу.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

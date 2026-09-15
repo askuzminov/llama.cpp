@@ -10,7 +10,26 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
+
+#if defined(_WIN32)
+#   ifndef NOMINMAX
+#       define NOMINMAX
+#   endif
+#   ifndef WIN32_LEAN_AND_MEAN
+#       define WIN32_LEAN_AND_MEAN
+#   endif
+#   include <windows.h>
+#   include <malloc.h>
+#else
+#   include <cerrno>
+#   include <fcntl.h>
+#   include <sys/stat.h>
+#   include <unistd.h>
+#endif
 
 //
 // task_params
@@ -1688,11 +1707,638 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// on-disk layout of a spilled prompt-cache state: header, then the prompt tokens, then the two
+// state blobs. Self-describing so that a spill dir can be picked up again after a restart.
+namespace {
+
+struct spill_header {
+    char     magic[8];
+    uint32_t version;
+    uint32_t n_used;
+    uint64_t uid;
+    uint64_t signature;
+    uint64_t n_tokens;
+    uint64_t n_main;
+    uint64_t n_drft;
+};
+
+static_assert(sizeof(spill_header) == 56, "unexpected spill_header layout");
+
+constexpr char     SPILL_MAGIC[8] = { 'L', 'C', 'P', 'C', 'A', 'C', 'H', 'E' };
+constexpr uint32_t SPILL_VERSION  = 2;
+
+// Spill files bypass the OS file cache. A spilled state is written once and read back at most
+// once, so caching it buys nothing and costs memory - on a host sized for a large model those
+// pages compete with the model itself, and on Windows they are reported as available memory,
+// which feeds straight back into the context-checkpoint budget.
+//
+// Bypassing the cache constrains the layout: file offset, transfer length and buffer address must
+// all be multiples of the device block size. 4096 covers both 512e and 4Kn media. Every section is
+// padded up to it, so the file is larger than its payload and the logical sizes live in the header.
+constexpr uint64_t SPILL_ALIGN = 4096;
+constexpr size_t   SPILL_CHUNK = 4*1024*1024; // transfer size; large enough to reach device speed
+
+constexpr uint64_t spill_align_up(uint64_t n) {
+    return (n + SPILL_ALIGN - 1) & ~(SPILL_ALIGN - 1);
+}
+
+// the sizes come from a file that may have been truncated or tampered with
+bool spill_header_sane(const spill_header & h) {
+    constexpr uint64_t max_bytes = 1ull << 40; // far above any real state
+    return h.n_tokens < max_bytes/sizeof(llama_token) && h.n_main < max_bytes && h.n_drft < max_bytes;
+}
+
+// UTF-8 -> filesystem path. On Windows a narrow string is taken to be in the ANSI codepage, which
+// mangles everything outside it (a Cyrillic user directory, say), so convert explicitly.
+std::filesystem::path spill_fs_path(const std::string & utf8) {
+#if defined(_WIN32)
+    if (utf8.empty()) {
+        return {};
+    }
+
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int) utf8.size(), nullptr, 0);
+    if (n <= 0) {
+        return {};
+    }
+
+    std::wstring wide((size_t) n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int) utf8.size(), &wide[0], n);
+
+    return std::filesystem::path(wide);
+#else
+    return std::filesystem::path(utf8);
+#endif
+}
+
+// filesystem path -> UTF-8, for log lines (path::string() would go through the ANSI codepage)
+std::string spill_fs_utf8(const std::filesystem::path & path) {
+#if defined(_WIN32)
+    const std::wstring wide = path.wstring();
+    if (wide.empty()) {
+        return {};
+    }
+
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int) wide.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) {
+        return {};
+    }
+
+    std::string utf8((size_t) n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int) wide.size(), &utf8[0], n, nullptr, nullptr);
+
+    return utf8;
+#else
+    return path.string();
+#endif
+}
+
+// section offsets implied by a header
+struct spill_layout {
+    uint64_t off_tokens;
+    uint64_t off_main;
+    uint64_t off_drft;
+    uint64_t size;
+};
+
+spill_layout spill_layout_of(const spill_header & h) {
+    spill_layout l = {};
+    l.off_tokens = SPILL_ALIGN;
+    l.off_main   = l.off_tokens + spill_align_up(h.n_tokens*sizeof(llama_token));
+    l.off_drft   = l.off_main   + spill_align_up(h.n_main);
+    l.size       = l.off_drft   + spill_align_up(h.n_drft);
+    return l;
+}
+
+// One spill file, read or written with the cache bypassed. Every device transfer goes through an
+// aligned bounce buffer, so callers pass ordinary unaligned pointers and sizes. Falls back to
+// cached I/O when the platform or filesystem refuses the unbuffered open - the layout stays valid
+// either way.
+class spill_file {
+public:
+    spill_file() = default;
+
+    ~spill_file() {
+        close();
+    }
+
+    spill_file(const spill_file &)             = delete;
+    spill_file & operator=(const spill_file &) = delete;
+
+    bool open_read (const std::filesystem::path & path) { return open_impl(path, false); }
+    bool open_write(const std::filesystem::path & path) { return open_impl(path, true);  }
+
+    void close() {
+#if defined(_WIN32)
+        if (fh != INVALID_HANDLE_VALUE) {
+            CloseHandle(fh);
+            fh = INVALID_HANDLE_VALUE;
+        }
+        if (buf) {
+            _aligned_free(buf);
+            buf = nullptr;
+        }
+#else
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+        if (buf) {
+            free(buf);
+            buf = nullptr;
+        }
+#endif
+        used = 0;
+    }
+
+    uint64_t size() const {
+#if defined(_WIN32)
+        LARGE_INTEGER li;
+        return GetFileSizeEx(fh, &li) ? (uint64_t) li.QuadPart : 0;
+#else
+        struct stat st = {};
+        return fstat(fd, &st) == 0 ? (uint64_t) st.st_size : 0;
+#endif
+    }
+
+    // append `n` bytes, then zero-pad up to the next SPILL_ALIGN boundary
+    bool write_section(const void * src, size_t n) {
+        const uint8_t * p = (const uint8_t *) src;
+
+        while (n > 0) {
+            const size_t k = std::min(n, SPILL_CHUNK - used);
+            memcpy(buf + used, p, k);
+            used += k;
+            p    += k;
+            n    -= k;
+
+            if (used == SPILL_CHUNK && !flush()) {
+                return false;
+            }
+        }
+
+        const size_t pad = (size_t) (spill_align_up(used) - used);
+        if (pad > 0) {
+            memset(buf + used, 0, pad);
+            used += pad;
+        }
+
+        return used < SPILL_CHUNK || flush();
+    }
+
+    // write out whatever is still buffered (always a whole number of blocks)
+    bool finish() {
+        return used == 0 || flush();
+    }
+
+    // read `n` bytes starting at a block-aligned file offset
+    bool read_at(uint64_t offset, void * dst, size_t n) {
+        if (offset % SPILL_ALIGN != 0) {
+            return false;
+        }
+
+        uint8_t * p = (uint8_t *) dst;
+
+        while (n > 0) {
+            const size_t want = (size_t) std::min<uint64_t>(SPILL_CHUNK, spill_align_up(n));
+            const size_t got  = read_raw(offset, want);
+            if (got == 0) {
+                return false;
+            }
+
+            const size_t k = std::min(n, got);
+            memcpy(p, buf, k);
+
+            p      += k;
+            n      -= k;
+            offset += got;
+        }
+
+        return true;
+    }
+
+private:
+    bool open_impl(const std::filesystem::path & path, bool write) {
+        close();
+
+#if defined(_WIN32)
+        buf = (uint8_t *) _aligned_malloc(SPILL_CHUNK, (size_t) SPILL_ALIGN);
+        if (!buf) {
+            return false;
+        }
+
+        const std::wstring name = path.wstring();
+
+        const DWORD access = write ? GENERIC_WRITE : GENERIC_READ;
+        const DWORD share  = write ? 0 : FILE_SHARE_READ;
+        const DWORD disp   = write ? CREATE_ALWAYS : OPEN_EXISTING;
+
+        fh = CreateFileW(name.c_str(), access, share, nullptr, disp,
+                FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (fh == INVALID_HANDLE_VALUE) {
+            // the volume may not support unbuffered access
+            fh = CreateFileW(name.c_str(), access, share, nullptr, disp, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        }
+        if (fh == INVALID_HANDLE_VALUE) {
+            close();
+            return false;
+        }
+#else
+        const std::string name = path.string();
+        if (posix_memalign((void **) &buf, (size_t) SPILL_ALIGN, SPILL_CHUNK) != 0) {
+            buf = nullptr;
+            return false;
+        }
+
+        const int flags = write ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY;
+
+#if defined(O_DIRECT)
+        fd = ::open(name.c_str(), flags | O_DIRECT, 0644);
+        if (fd < 0) {
+            fd = ::open(name.c_str(), flags, 0644); // filesystem without O_DIRECT support
+        }
+#else
+        fd = ::open(name.c_str(), flags, 0644);
+#endif
+        if (fd < 0) {
+            close();
+            return false;
+        }
+
+#if defined(F_NOCACHE)
+        fcntl(fd, F_NOCACHE, 1); // macOS has no O_DIRECT; this is the equivalent
+#endif
+#endif
+        used = 0;
+        return true;
+    }
+
+    bool flush() {
+        const size_t n = used;
+        used = 0;
+
+#if defined(_WIN32)
+        DWORD written = 0;
+        return WriteFile(fh, buf, (DWORD) n, &written, nullptr) && written == n;
+#else
+        size_t off = 0;
+        while (off < n) {
+            const ssize_t k = ::write(fd, buf + off, n - off);
+            if (k <= 0) {
+                if (k < 0 && errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            off += (size_t) k;
+        }
+        return true;
+#endif
+    }
+
+    size_t read_raw(uint64_t offset, size_t len) {
+#if defined(_WIN32)
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG) offset;
+        if (!SetFilePointerEx(fh, li, nullptr, FILE_BEGIN)) {
+            return 0;
+        }
+        DWORD got = 0;
+        if (!ReadFile(fh, buf, (DWORD) len, &got, nullptr)) {
+            return 0;
+        }
+        return (size_t) got;
+#else
+        const ssize_t got = ::pread(fd, buf, len, (off_t) offset);
+        return got > 0 ? (size_t) got : 0;
+#endif
+    }
+
+#if defined(_WIN32)
+    HANDLE fh = INVALID_HANDLE_VALUE;
+#else
+    int fd = -1;
+#endif
+
+    uint8_t * buf  = nullptr; // aligned bounce buffer, SPILL_CHUNK bytes
+    size_t    used = 0;       // bytes buffered on the write path
+};
+
+} // namespace
+
+server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes,
+                                         const std::string & spill_dir, size_t spill_limit_bytes,
+                                         uint64_t signature) {
+    this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens;
+    this->reserve_size = reserve_bytes;
+    this->spill_dir    = spill_dir;
+    this->spill_limit  = spill_limit_bytes;
+    this->signature    = signature;
+
+    if (!this->spill_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(spill_dir_path(), ec);
+        if (ec) {
+            SRV_WRN(" - could not create prompt-cache spill dir '%s' (%s) - disabling spill\n",
+                    this->spill_dir.c_str(), ec.message().c_str());
+            this->spill_dir.clear();
+        } else {
+            const size_t n = restore_spilled();
+            if (n > 0) {
+                SRV_INF(" - adopted %zu prompt-cache state(s) from '%s' (%.3f MiB on disk)\n",
+                        n, this->spill_dir.c_str(), disk_size() / (1024.0 * 1024.0));
+            }
+        }
+    }
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    persist();
+}
+
+std::filesystem::path server_prompt_cache::spill_dir_path() const {
+    return spill_fs_path(spill_dir);
+}
+
+std::filesystem::path server_prompt_cache::spill_path(uint64_t uid) const {
+    return spill_dir_path() / ("state-" + std::to_string(uid) + ".bin");
+}
+
+size_t server_prompt_cache::restore_spilled() {
+    std::error_code ec;
+    std::filesystem::directory_iterator it(spill_dir_path(), ec);
+    if (ec) {
+        return 0;
+    }
+
+    // adopt in a stable order so that the list stays oldest-first by uid
+    std::vector<server_prompt_cache_state> found;
+
+    for (const auto & entry : it) {
+        if (!entry.is_regular_file(ec) || ec) {
+            continue;
+        }
+
+        const std::filesystem::path path = entry.path();
+
+        spill_file f;
+        if (!f.open_read(path)) {
+            continue;
+        }
+
+        spill_header h = {};
+        if (!f.read_at(0, &h, sizeof(h))) {
+            continue; // not one of ours
+        }
+        if (memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) != 0 || h.version != SPILL_VERSION) {
+            continue;
+        }
+
+        // a different model or KV layout, or a truncated file - the state cannot be restored
+        const spill_layout lay = spill_header_sane(h) ? spill_layout_of(h) : spill_layout{};
+        if (h.signature != signature || lay.size == 0 || lay.size != f.size()) {
+            f.close();
+            std::filesystem::remove(path, ec);
+            continue;
+        }
+
+        llama_tokens tokens(h.n_tokens);
+        if (h.n_tokens && !f.read_at(lay.off_tokens, tokens.data(), h.n_tokens*sizeof(llama_token))) {
+            f.close();
+            std::filesystem::remove(path, ec);
+            continue;
+        }
+        f.close();
+
+        server_prompt_cache_state st;
+        st.prompt.tokens = server_tokens(tokens, false);
+        st.uid           = h.uid;
+        st.prompt.n_used = h.n_used;
+        st.on_disk       = true;
+        st.disk_bytes    = lay.size;
+
+        next_uid = std::max(next_uid, h.uid + 1);
+
+        found.push_back(std::move(st));
+    }
+
+    std::sort(found.begin(), found.end(),
+            [](const server_prompt_cache_state & a, const server_prompt_cache_state & b) { return a.uid < b.uid; });
+
+    for (auto & st : found) {
+        states.push_back(std::move(st));
+    }
+
+    enforce_disk_limit();
+
+    return found.size();
+}
+
+void server_prompt_cache::persist() {
+    if (spill_dir.empty()) {
+        // no spill dir: nothing was written, nothing to clean up
+        return;
+    }
+
+    for (auto & st : states) {
+        spill_state(st);
+    }
+
+    enforce_disk_limit();
+}
+
+bool server_prompt_cache::spill_state(server_prompt_cache_state & st) {
+    if (spill_dir.empty() || st.on_disk) {
+        return false;
+    }
+    if (st.data.main.empty() && st.data.drft.empty()) {
+        return false; // nothing big to move out of RAM
+    }
+
+    // the tokens are stored alongside the state so the file can be picked up after a restart;
+    // media chunks are not serialized, so such prompts are kept in RAM only
+    const llama_tokens tokens = st.prompt.tokens.get_text_tokens();
+    for (llama_token tok : tokens) {
+        if (tok == LLAMA_TOKEN_NULL) {
+            return false;
+        }
+    }
+
+    if (st.uid == 0) {
+        st.uid = next_uid++;
+    }
+
+    const std::filesystem::path path = spill_path(st.uid);
+
+    spill_file f;
+    if (!f.open_write(path)) {
+        return false;
+    }
+
+    spill_header h = {};
+    memcpy(h.magic, SPILL_MAGIC, sizeof(h.magic));
+    h.version   = SPILL_VERSION;
+    h.n_used    = st.prompt.n_used;
+    h.uid       = st.uid;
+    h.signature = signature;
+    h.n_tokens  = tokens.size();
+    h.n_main    = st.data.main.size();
+    h.n_drft    = st.data.drft.size();
+
+    // sections are written in the order spill_layout_of() describes; an empty one writes nothing
+    // and contributes no padding, so the offsets still line up
+    const bool ok =
+        f.write_section(&h, sizeof(h)) &&
+        (h.n_tokens == 0 || f.write_section(tokens.data(), h.n_tokens*sizeof(llama_token))) &&
+        (h.n_main   == 0 || f.write_section(st.data.main.data(), h.n_main)) &&
+        (h.n_drft   == 0 || f.write_section(st.data.drft.data(), h.n_drft)) &&
+        f.finish();
+
+    f.close();
+
+    if (!ok) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return false;
+    }
+
+    st.disk_bytes = spill_layout_of(h).size;
+    st.data.main.clear();  st.data.main.shrink_to_fit();
+    st.data.drft.clear();  st.data.drft.shrink_to_fit();
+    st.on_disk = true;
+    return true;
+}
+
+bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
+    if (!st.on_disk) {
+        return true;
+    }
+
+    const std::filesystem::path path = spill_path(st.uid);
+
+    spill_file f;
+    if (!f.open_read(path)) {
+        SRV_ERR(" - failed to read spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+        return false;
+    }
+
+    spill_header h = {};
+    if (!f.read_at(0, &h, sizeof(h)) ||
+            memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) != 0 ||
+            h.version != SPILL_VERSION ||
+            h.signature != signature ||
+            !spill_header_sane(h) ||
+            spill_layout_of(h).size != f.size()) {
+        SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+        return false;
+    }
+
+    const spill_layout lay = spill_layout_of(h);
+
+    const auto rd = [&](std::vector<uint8_t> & v, uint64_t off, uint64_t n) -> bool {
+        v.resize(n);
+        return n == 0 || f.read_at(off, v.data(), n);
+    };
+    if (!rd(st.data.main, lay.off_main, h.n_main) || !rd(st.data.drft, lay.off_drft, h.n_drft)) {
+        SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+        st.data.main.clear(); st.data.main.shrink_to_fit();
+        st.data.drft.clear(); st.data.drft.shrink_to_fit();
+        return false;
+    }
+    f.close();
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    st.on_disk    = false;
+    st.disk_bytes = 0;
+    return true;
+}
+
+void server_prompt_cache::erase_spill(const server_prompt_cache_state & st) {
+    if (st.on_disk && !spill_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(spill_path(st.uid), ec);
+    }
+}
+
+void server_prompt_cache::enforce_disk_limit() {
+    if (spill_dir.empty() || spill_limit == 0) {
+        return;
+    }
+    // drop the least frequently used on-disk state (oldest first on a tie) until within budget,
+    // so a cold start keeps the prompts that actually get reused
+    while (disk_size() > spill_limit) {
+        auto sel = states.end();
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (!it->on_disk) {
+                continue;
+            }
+            if (sel == states.end() || it->prompt.n_used < sel->prompt.n_used) {
+                sel = it;
+            }
+        }
+        if (sel == states.end()) {
+            break; // nothing on disk left to drop
+        }
+        SRV_WRN(" - prompt-cache disk budget exceeded, dropping spilled state (%.3f MiB, used %u time(s))\n",
+                sel->disk_bytes / (1024.0 * 1024.0), sel->prompt.n_used);
+        erase_spill(*sel);
+        states.erase(sel);
+    }
+}
+
+size_t server_prompt_cache::free_ram(size_t need) {
+    size_t freed = 0;
+
+    if (!spill_dir.empty()) {
+        // spill oldest resident states to disk: this frees their RAM but keeps them restorable, so
+        // we never drop a state just to satisfy a RAM deficit. Spilling the whole (bounded) cache
+        // is the most we can do for host-RAM pressure; the disk budget alone decides what is
+        // dropped for good (enforce_disk_limit).
+        for (auto & st : states) {
+            if (freed >= need) {
+                break;
+            }
+            if (st.on_disk || st.data.size() == 0) {
+                continue;
+            }
+            const size_t big = st.data.size();
+            if (spill_state(st)) {
+                freed += big;
+            }
+        }
+        enforce_disk_limit();
+        return freed;
+    }
+
+    // no spill dir: fall back to dropping oldest states outright (front = oldest)
+    while (freed < need && !states.empty()) {
+        SRV_WRN(" - dropping oldest prompt-cache entry (%.3f MiB)\n",
+                states.front().size() / (1024.0 * 1024.0));
+        freed += states.front().size();
+        states.pop_front();
+    }
+
+    return freed;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
         res += state.size();
+    }
+
+    return res;
+}
+
+size_t server_prompt_cache::disk_size() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (state.on_disk) {
+            res += state.disk_bytes;
+        }
     }
 
     return res;
@@ -1724,6 +2370,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (const auto & ckpt : prompt.checkpoints) {
         checkpoints_size += ckpt.size();
     }
+    checkpoints_size += prompt.checkpoint_tree.size_bytes();
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
@@ -1741,21 +2388,21 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            erase_spill(*it);
             it = states.erase(it);
         } else {
             ++it;
         }
     }
 
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
+    if (limit_size > 0 && size() + state_size_new > limit_size) {
+        // make room before allocating the new vectors to avoid breaching the RAM limit; with a
+        // spill dir this moves cold states to disk instead of dropping them
+        free_ram(size() + state_size_new - limit_size);
     }
+
+    // make room so the new state keeps host RAM above the reserve
+    evict_for_reserve(state_size_new);
 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
@@ -1778,8 +2425,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     states.push_back({
         /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.tokens          =*/ prompt.tokens.clone(),
+            /*.checkpoints     =*/ prompt.checkpoints,
+            /*.checkpoint_tree =*/ prompt.checkpoint_tree,
+            /*.checkpoint_cur  =*/ prompt.checkpoint_cur,
+            /*.n_used          =*/ prompt.n_used,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1825,6 +2475,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        // pull the state back from disk if it was spilled
+        if (it_best->on_disk && !unspill_state(*it_best)) {
+            SRV_ERR("%s", "failed to load spilled prompt-cache state\n");
+            return false;
+        }
+
         {
             auto & data = it_best->data.main;
 
@@ -1860,6 +2516,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(it_best->prompt);
+        prompt.n_used++;
 
         states.erase(it_best);
     }
@@ -1867,14 +2524,41 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
-void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
+void server_prompt_cache::evict_for_reserve(size_t extra) {
+    if (reserve_size == 0) {
+        return;
     }
+
+    const size_t avail = common_host_mem_available();
+    if (avail == 0) {
+        return; // could not determine available RAM -> don't act on it
+    }
+
+    const size_t want = reserve_size + extra;
+    if (avail >= want) {
+        return;
+    }
+
+    // free the deficit only (freed heap may not return to the OS immediately, so re-querying
+    // available RAM here would over-evict). free_ram spills cold states to disk when a spill dir
+    // is configured, and only drops them outright as a last resort.
+    const size_t need = want - avail;
+    SRV_WRN(" - host memory pressure, relieving %.3f MiB from the prompt cache (available %.3f MiB < reserve %.3f MiB)\n",
+            need / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
+    free_ram(need);
+}
+
+void server_prompt_cache::update() {
+    if (limit_size > 0 && size() > limit_size) {
+        // spill cold states to disk (or drop them without a spill dir) to fit the RAM limit
+        free_ram(size() - limit_size);
+    }
+
+    // keep the on-disk spill within its budget
+    enforce_disk_limit();
+
+    // keep host RAM above the reserve (adapts to memory taken by other processes over time)
+    evict_for_reserve(0);
 
     // average size per token
     const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
@@ -1887,6 +2571,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            erase_spill(states.front());
             states.pop_front();
         }
     }

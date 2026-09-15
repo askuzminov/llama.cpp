@@ -1,0 +1,109 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer M {float16_t data_m[];};
+layout (binding = 1) buffer D {uint data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint KV;
+    uint nem1;
+    uint rows_used;
+    uint rows_per_group;
+    uint n_groups;
+    uint n_total;
+    uint capacity;
+    uint idx_base;
+    uint init;
+};
+
+const uint COLS_PER_THREAD = 4;
+
+shared uint sh_n;
+shared uint sh_run;
+
+float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+// Compact the mask into the list of key cells that a flash attention tile can see. A group is
+// one tile of "rows_per_group" mask rows, and a cell goes in the list of the group if any row
+// of the group leaves it unmasked. The layout of data_d is a four dword header, then one count
+// per group, then the lists, "capacity" dwords each.
+//
+// The count keeps the true number of cells, also when it is larger than the capacity. The
+// flash attention shader compares the two and stays on the dense path for a group that did
+// not fit.
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+
+    if (init != 0) {
+        const uint idx = gl_GlobalInvocationID.x;
+        if (idx == 0) {
+            data_d[0] = capacity;
+            data_d[1] = idx_base;
+            data_d[2] = n_groups;
+            data_d[3] = 0;
+        }
+        if (idx < n_total) {
+            data_d[4 + idx] = 0;
+        }
+        return;
+    }
+
+    const uint group = gl_WorkGroupID.y;
+    const uint plane = gl_WorkGroupID.z;
+    const uint g     = plane * n_groups + group;
+
+    const uint row0 = group * rows_per_group;
+    const uint row1 = min(row0 + rows_per_group, rows_used);
+
+    const uint c0 = gl_WorkGroupID.x * BLOCK_SIZE * COLS_PER_THREAD;
+
+    if (tid == 0) {
+        sh_n = 0;
+    }
+    barrier();
+
+    bool sel[COLS_PER_THREAD];
+    [[unroll]] for (uint v = 0; v < COLS_PER_THREAD; ++v) {
+        sel[v] = false;
+    }
+
+    // rows outer and columns inner, so that one row of the group is read as one run of values
+    for (uint r = row0; r < row1; ++r) {
+        const uint m_off = (plane * nem1 + r) * KV;
+        [[unroll]] for (uint v = 0; v < COLS_PER_THREAD; ++v) {
+            const uint c = c0 + v * BLOCK_SIZE + tid;
+            if (c < KV && !sel[v] && float(data_m[m_off + c]) > NEG_FLT_MAX_OVER_2) {
+                sel[v] = true;
+            }
+        }
+    }
+
+    uint rank[COLS_PER_THREAD];
+    [[unroll]] for (uint v = 0; v < COLS_PER_THREAD; ++v) {
+        if (sel[v]) {
+            rank[v] = atomicAdd(sh_n, 1);
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+        sh_run = atomicAdd(data_d[4 + g], sh_n);
+    }
+    barrier();
+
+    // the start of the run comes from an atomic, so the list is not sorted. Flash attention
+    // reads the cells of a tile in any order
+    const uint run = sh_run;
+    [[unroll]] for (uint v = 0; v < COLS_PER_THREAD; ++v) {
+        const uint dst = run + rank[v];
+        if (sel[v] && dst < capacity) {
+            data_d[idx_base + g * capacity + dst] = c0 + v * BLOCK_SIZE + tid;
+        }
+    }
+}

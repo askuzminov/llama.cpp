@@ -1,6 +1,7 @@
 #include "llama-kv-cache-iswa.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
 
@@ -262,6 +263,41 @@ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id
     }
 
     kv_swa->state_write(io, seq_id, flags);
+}
+
+size_t llama_kv_cache_iswa::state_write_delta(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) const {
+    const size_t n_bytes_start = io.n_bytes();
+
+    // must mirror state_write(): the base cache is skipped for a partial checkpoint
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (kv_base->state_write_delta(io, seq_id, flags, base_pos) == 0) {
+            return 0; // sub-cache cannot produce a delta
+        }
+    }
+
+    if (kv_swa->state_write_delta(io, seq_id, flags, base_pos) == 0) {
+        return 0;
+    }
+
+    return io.n_bytes() - n_bytes_start;
+}
+
+bool llama_kv_cache_iswa::state_read_delta(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (!kv_base->state_read_delta(io, seq_id, flags, base_pos)) {
+            return false;
+        }
+    }
+
+    return kv_swa->state_read_delta(io, seq_id, flags, base_pos);
 }
 
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {

@@ -25,14 +25,18 @@ layout (push_constant) uniform parameter
 
 #define BLOCK_SIZE 256
 
+// hoisting indexes the shared tables by expert, so this bounds the expert count the host
+// may hoist; the non-hoisted reduction indexes vals by invocation, hence never below BLOCK_SIZE
+layout (constant_id = 0) const uint MAX_EXPERTS = BLOCK_SIZE;
+
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {uint data_a[];};
 layout (binding = 1) writeonly buffer D {uint data_d[];};
 
-shared uint vals[BLOCK_SIZE];
-shared uint offsets[BLOCK_SIZE];
-shared uint cursors[BLOCK_SIZE];
+shared uint vals[MAX_EXPERTS];
+shared uint offsets[MAX_EXPERTS];
+shared uint cursors[MAX_EXPERTS];
 
 // data_d layout when p.hoist_row_ids is set:
 //   [0,              n_experts)   per-expert row count
@@ -46,8 +50,8 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
 
     if (p.hoist_row_ids != 0) {
-        if (tid < p.n_experts) {
-            vals[tid] = 0;
+        for (uint expert = tid; expert < p.n_experts; expert += BLOCK_SIZE) {
+            vals[expert] = 0;
         }
         barrier();
 
