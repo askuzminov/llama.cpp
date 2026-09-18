@@ -1,5 +1,7 @@
 #include "ggml-vulkan-common.h"
 
+#include <atomic>
+
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_vk_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_alloc_buffer,
@@ -59,6 +61,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         buffer_create_info.setPNext(&external_memory_bci);
     }
 
+    const int64_t t_start = vk_alloc_timing_enabled ? ggml_time_us() : 0;
+
     buf->buffer = device->device.createBuffer(buffer_create_info);
 
     vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
@@ -72,6 +76,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     if (device->memory_priority) {
         mem_flags_info.setPNext(&mem_priority_info);
     }
+
+    const int64_t t_created = vk_alloc_timing_enabled ? ggml_time_us() : 0;
 
     if (import_ptr) {
         vk::MemoryHostPointerPropertiesEXT host_pointer_props;
@@ -155,6 +161,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         throw vk::OutOfDeviceMemoryError("No suitable memory type found");
     }
 
+    const int64_t t_allocated = vk_alloc_timing_enabled ? ggml_time_us() : 0;
+
     buf->ptr = nullptr;
 
     if (import_ptr) {
@@ -163,6 +171,20 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
             buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
         }
+    }
+
+    if (vk_alloc_timing_enabled) {
+        static std::atomic<int64_t> tot_create(0), tot_alloc(0), tot_map(0), tot_size(0);
+
+        const int64_t t_mapped = ggml_time_us();
+
+        const int64_t create = tot_create += t_created   - t_start;
+        const int64_t alloc  = tot_alloc  += t_allocated - t_created;
+        const int64_t map    = tot_map    += t_mapped    - t_allocated;
+        const int64_t total  = tot_size   += size;
+
+        GGML_LOG_INFO("ggml_vulkan alloc timing: %.2f GiB so far, create %.2f s, allocate %.2f s, map %.2f s\n",
+                      total/1024.0/1024.0/1024.0, create/1e6, alloc/1e6, map/1e6);
     }
 
     device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);

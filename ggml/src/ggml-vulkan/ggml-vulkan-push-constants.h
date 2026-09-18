@@ -64,6 +64,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
     uint32_t n_experts;
     uint32_t hoist_row_ids;
+    uint32_t fusion_flags;
 };
 
 struct vk_mat_vec_id_push_constants {
@@ -861,6 +862,8 @@ struct vk_op_flash_attn_sparse_compact_push_constants {
     uint32_t nbm2;
     uint32_t nbm3;
     uint32_t n_kv_max;
+    uint32_t rows_per_group;
+    uint32_t capacity;
 };
 
 template <typename T> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, T &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {

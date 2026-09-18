@@ -124,6 +124,22 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // delta state write/read (for checkpoint compression)
+    // write the delta (difference) from a previous state at base_pos
+    virtual size_t state_write_delta(
+            llama_io_write_i & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) const;
+
+    // Apply delta on top of already loaded state (delta only)
+    virtual bool state_read_delta(
+            llama_io_read_i  & io_delta,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos);
+
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

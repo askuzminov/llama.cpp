@@ -4,6 +4,8 @@
 // shared globals
 extern ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface;
 extern bool vk_memory_logger_enabled;
+// GGML_VK_ALLOC_TIMING: where buffer creation spends its time, summed over every buffer so far
+extern bool vk_alloc_timing_enabled;
 extern bool vk_perf_logger_enabled;
 extern bool vk_perf_logger_concurrent;
 extern bool vk_enable_sync_logger;

@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <filesystem>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -568,9 +569,15 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // how many times this prompt was restored from the prompt cache. Travels with the prompt in
+    // and out of the cache and survives a restart via the spill file, so the disk budget can keep
+    // the most frequently used prompts.
+    uint32_t n_used = 0;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        n_used = 0;
     }
 
     int n_tokens() const {
@@ -581,6 +588,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            n_used,
         };
     }
 };
@@ -598,6 +606,14 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // spill bookkeeping: when on_disk, `data` (the big full-state blob) is freed from RAM and held
+    // in a file named after `uid`; disk_bytes is what it occupies there.
+    uint64_t uid        = 0;
+    bool     on_disk    = false;
+    size_t   disk_bytes = 0;
+
+    // RAM-resident bytes: the state blobs plus the context checkpoints. A spilled state contributes
+    // 0 for `data` (written out and freed), but its checkpoints stay in RAM until free_ram drops them.
     size_t size() const {
         size_t res = data.size();
 
@@ -610,10 +626,12 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    // limit_size_mib 0 = no size limit; --cache-ram -1 (auto) is resolved to a positive size by the
+    // caller, and --cache-ram 0 means the cache is never created
+    server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes = 0,
+                        const std::string & spill_dir = "", size_t spill_limit_bytes = 0,
+                        uint64_t signature = 0);
+    ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
 
@@ -623,7 +641,21 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    size_t size() const;
+    // keep at least this much host RAM free by evicting cached prompts, in bytes (0 = disabled)
+    size_t reserve_size = 0;
+
+    // [experimental] disk spill: when spill_dir is set, cold states are written to disk instead of
+    // being dropped under memory pressure; spill_limit caps total on-disk bytes (0 = unlimited).
+    std::string spill_dir;
+    size_t      spill_limit = 0;
+    uint64_t    next_uid    = 1;
+
+    // identifies the model / context configuration the spilled states belong to. Files carrying a
+    // different signature are from another model or another KV layout and are discarded on load.
+    uint64_t signature = 0;
+
+    size_t size() const;      // RAM-resident bytes across all states
+    size_t disk_size() const; // bytes currently spilled to disk
 
     size_t n_tokens() const;
 
@@ -632,6 +664,30 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // evict oldest cached prompts until host RAM stays above the reserve, assuming `extra`
+    // more bytes are about to be allocated. No-op when the reserve is disabled/unknown.
+    void evict_for_reserve(size_t extra);
+
+    // spill support (no-ops when spill_dir is empty)
+    // paths are std::filesystem::path rather than std::string: spill_dir arrives as UTF-8, and the
+    // narrow filesystem APIs on Windows interpret narrow strings in the ANSI codepage instead
+    std::filesystem::path spill_dir_path() const;
+    std::filesystem::path spill_path(uint64_t uid) const;
+    bool spill_state(server_prompt_cache_state & st);   // RAM -> disk (frees st.data), keeps st in the list
+    bool unspill_state(server_prompt_cache_state & st); // disk -> RAM (reads st.data back, erases the file)
+    void erase_spill(const server_prompt_cache_state & st); // delete the backing file, if any
+    void enforce_disk_limit(); // drop the least-used on-disk states over spill_limit
+
+    // cold start: adopt the spill files left by a previous run whose signature matches. Returns
+    // the number of states adopted.
+    size_t restore_spilled();
+
+    // shutdown: push everything still resident to disk and keep the files for the next run
+    void persist();
+    // spill oldest resident states (and, if there is no spill dir, drop them) until at least `need`
+    // RAM bytes are relieved; then enforce the disk budget. Returns RAM bytes relieved.
+    size_t free_ram(size_t need);
 };
 
 // used exclusively by router mode

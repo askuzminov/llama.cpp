@@ -83,6 +83,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint hoist_row_ids;
+    uint fusion_flags;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -183,6 +184,8 @@ f16vec4 mmDecodeA_v(const in decodeBufA bl_in, const in uint blockCoords[2], con
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// Descriptor parity only: the host refuses the fused scale epilogue on coopmat2.
+layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
 
 shared u16vec4 row_ids[BN];
 

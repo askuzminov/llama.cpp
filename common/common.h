@@ -35,6 +35,11 @@
 #define COM_ERR(fmt, ...) LOG_ERR("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define COM_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
+// Host (system) RAM introspection. Returns 0 when the value cannot be determined.
+// Unlike ggml's CPU device query, these report the real available memory on all platforms.
+size_t common_host_mem_total();     // total physical RAM in bytes
+size_t common_host_mem_available(); // currently available/free RAM in bytes
+
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
@@ -626,10 +631,13 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
-    int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t n_ctx_checkpoints   = -1;    // explicit count cap on context checkpoints per slot; -1 = no count limit (bounded by available host RAM), 0 = disabled
+    int32_t cache_ram_reserve_mib = -1;  // keep at least this much host RAM free by evicting checkpoints; -1 = auto (fraction of total RAM), 0 = disabled
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_ram_mib       = -1;    // -1 = auto (fraction of total RAM), 0 = disable, 1 = 1 MiB, etc.
+    std::string cache_spill_dir = "";    // [experimental] spill cold prompt-cache states to this dir (on disk) instead of dropping them ("" = disabled)
+    int32_t cache_disk_mib      = 0;     // disk budget (MiB) for spilled prompt-cache states; least-recently-used dropped over this (0 = unlimited)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -1163,13 +1171,16 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 
 struct common_prompt_checkpoint {
-    int64_t n_tokens;
+    int64_t n_tokens = 0;
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
-    llama_pos pos_min;
-    llama_pos pos_max;
+    llama_pos pos_min = 0;
+    llama_pos pos_max = 0;
+
+    // Base position for delta checkpoints (-1 = BASE checkpoint)
+    llama_pos base_pos = -1;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
@@ -1183,6 +1194,8 @@ struct common_prompt_checkpoint {
     bool empty() const;
     void clear();
 
+    bool is_delta() const { return base_pos >= 0; }
+
     void update_pos(
             int64_t n_tokens,
             llama_pos pos_min,
@@ -1191,7 +1204,8 @@ struct common_prompt_checkpoint {
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            llama_pos base_pos = -1);
 
     void update_dft(
             llama_context * ctx,
@@ -1210,4 +1224,16 @@ struct common_prompt_checkpoint {
 
     void clear_tgt();
     void clear_dft();
+
+    // Apply checkpoint: full restore (base_pos < 0) or delta (base_pos >= 0)
+    // Returns true if checkpoint was successfully applied
+    bool apply(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    bool apply_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
 };

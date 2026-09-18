@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -199,6 +200,45 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_attn->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
+}
+
+size_t llama_memory_hybrid::state_write_delta(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) const {
+    const size_t n_bytes_start = io.n_bytes();
+
+    // must mirror state_write(): a partial checkpoint holds the recurrent state only
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        // attention: only the cells added after base_pos (small)
+        if (mem_attn->state_write_delta(io, seq_id, flags, base_pos) == 0) {
+            return 0; // the attention cache cannot produce a delta
+        }
+    }
+
+    // recurrent: full state - it is small and cannot be reconstructed from a delta, so it is
+    // always written in full (order must match state_read_delta)
+    mem_recr->state_write(io, seq_id, flags);
+
+    return io.n_bytes() - n_bytes_start;
+}
+
+bool llama_memory_hybrid::state_read_delta(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (!mem_attn->state_read_delta(io, seq_id, flags, base_pos)) {
+            return false;
+        }
+    }
+
+    // recurrent full state (mem_recr->state_read throws on failure, caught by the caller)
+    mem_recr->state_read(io, seq_id, flags);
+
+    return true;
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

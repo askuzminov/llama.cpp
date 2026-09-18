@@ -37,7 +37,11 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1429,6 +1433,22 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// hands a freshly allocated buffer's tensors to the loader thread, see load_tensors below
+static void llama_alloc_range_cb(ggml_tensor * first, ggml_tensor * last, void * user_data) {
+    llama_tensor_range_queue * ranges = (llama_tensor_range_queue *) user_data;
+    if (first == nullptr) {
+        // allocation failed, the buffers handed over so far are about to be freed
+        ranges->drain();
+        return;
+    }
+    // mark the buffer before the loader can see it: ggml_backend_tensor_set reads the usage on some
+    // backends, so setting it after the handover would race with the loader thread
+    if (first->buffer) {
+        ggml_backend_buffer_set_usage(first->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    ranges->push(first, last);
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1452,13 +1472,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    // resolve AUTO on systems without mmap support (e.g. iGPUs): the row cache reads the file
+    // itself, so fall back to DIO and keep the AUTO size limit; see #28160.
+    // only tensors marked TENSOR_READ_CACHE take that path - the rest still get a host mapping,
+    // which works because a lazy tensor lives in a CPU buffer, not in a buffer of that device
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
+                ml.lazy.mode      = LLAMA_LAZY_MODE_DIO;
+                ml.lazy.auto_size = true;
                 break;
             }
         }
@@ -1735,19 +1759,109 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
-    std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
-    ctx_buf_maps.reserve(ml.ctx_map.size());
+    int64_t t_alloc_us = 0;
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+    // allocating the buffers and reading the tensor data run in parallel: this thread allocates and
+    // hands every buffer over as soon as it exists, the loader thread below reads into it.
+    // without mmap the non-host contexts go first, their tensors are staged through a temporary
+    // buffer which is cheapest while the fewest weights are resident
+    std::vector<decltype(ml.ctx_map)::iterator> ctx_order;
+    for (auto it = ml.ctx_map.begin(); it != ml.ctx_map.end(); ++it) {
+        ctx_order.push_back(it);
+    }
+    if (!ml.use_mmap) {
+        std::stable_partition(ctx_order.begin(), ctx_order.end(), [](const auto & it) {
+            return !ggml_backend_buft_is_host(it->first.buft);
+        });
+    }
+
+    struct load_stage {
+        ggml_context *           ctx = nullptr;
+        llama_buf_map            bufs;
+        llama_tensor_range_queue ranges;
+    };
+
+    std::vector<load_stage> stages(ctx_order.size());
+
+    std::mutex              stage_mutex;
+    std::condition_variable stage_cv;
+    size_t                  n_published = 0;
+    bool                    alloc_done  = false;
+    std::atomic<bool>       loader_ok(true);
+    std::exception_ptr      loader_exc;
+
+    std::thread loader;
+    if (!ml.no_alloc) {
+        loader = std::thread([&] {
+            try {
+                for (size_t i = 0; ; i++) {
+                    {
+                        std::unique_lock<std::mutex> lock(stage_mutex);
+                        stage_cv.wait(lock, [&] { return n_published > i || alloc_done; });
+                        if (n_published <= i) {
+                            return;
+                        }
+                    }
+                    if (stages[i].ctx == nullptr) {
+                        continue; // context without tensors
+                    }
+                    if (!ml.load_all_data(stages[i].ctx, stages[i].bufs, use_mlock ? &pimpl->mlock_mmaps : NULL,
+                                          params.progress_callback, params.progress_callback_user_data,
+                                          &stages[i].ranges)) {
+                        loader_ok = false;
+                        return;
+                    }
+                }
+            } catch (...) {
+                loader_exc = std::current_exception();
+                loader_ok  = false;
+            }
+        });
+    }
+
+    auto publish = [&](size_t i) {
+        {
+            std::lock_guard<std::mutex> lock(stage_mutex);
+            n_published = i + 1;
+        }
+        stage_cv.notify_all();
+    };
+
+    // idempotent, also runs from the guard below when this function throws or returns early
+    auto stop_loader = [&]() {
+        if (!loader.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(stage_mutex);
+            alloc_done = true;
+        }
+        stage_cv.notify_all();
+        for (auto & stage : stages) {
+            stage.ranges.close();
+        }
+        loader.join();
+    };
+
+    struct loader_guard {
+        std::function<void()> stop;
+        ~loader_guard() { stop(); }
+    } guard { stop_loader };
+
+    for (size_t i_ctx = 0; i_ctx < ctx_order.size() && loader_ok; i_ctx++) {
+        auto & ctx_key = ctx_order[i_ctx]->first;
+        auto & ctx_ptr = ctx_order[i_ctx]->second;
+
         ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
+            publish(i_ctx);
             continue;
         }
 
@@ -1794,6 +1908,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
+
+            // same as above: the loader must never see a buffer whose usage is still being written
+            for (auto & buf : bufs) {
+                ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
+
+            stages[i_ctx].ctx  = ctx;
+            stages[i_ctx].bufs = buf_map;
+            publish(i_ctx);
+            stages[i_ctx].ranges.push(ggml_get_first_tensor(ctx), nullptr);
+            stages[i_ctx].ranges.close();
         } else {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
@@ -1801,8 +1926,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
+                // no loader thread here, so nothing observes this buffer concurrently
+                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                // the loader thread starts on this context now, the ranges arrive as they are allocated
+                stages[i_ctx].ctx = ctx;
+                publish(i_ctx);
+
+                const int64_t t_alloc_start = ggml_time_us();
+                buf = ggml_backend_alloc_ctx_tensors_from_buft_cb(ctx, buft, llama_alloc_range_cb, &stages[i_ctx].ranges); // real buffer
+                t_alloc_us += ggml_time_us() - t_alloc_start;
+
+                stages[i_ctx].ranges.close();
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1819,15 +1954,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
 
-        for (auto & buf : bufs) {
-            // indicate that this buffer contains weights
-            // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
-            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        }
+        // the buffers were marked as holding weights above, before the loader could see them. a
+        // multi-buffer wrapper is left alone: its sub-buffers, which the tensors point at, are marked
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
-
-        ctx_buf_maps.emplace_back(ctx, buf_map);
     }
 
     if (llama_supports_gpu_offload()) {
@@ -1854,23 +1984,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (t_alloc_us > 0) {
+        LLAMA_LOG_INFO("%s: buffer allocation took %.2f s\n", __func__, t_alloc_us/1e6);
+    }
+
     if (ml.no_alloc) {
         return true;
     }
 
-    // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
-    if (!ml.use_mmap) {
-        std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
-            const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
-        });
-    }
+    stop_loader();
 
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
+    if (loader_exc) {
+        std::rethrow_exception(loader_exc);
+    }
+    if (!loader_ok) {
+        return false;
     }
 
     if (use_mmap_buffer) {
@@ -2539,7 +2667,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -3243,7 +3371,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_READ_CACHE     (llama_model_loader::TENSOR_READ_CACHE) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

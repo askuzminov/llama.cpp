@@ -2050,6 +2050,60 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+llama_kv_cache::cell_ranges_t llama_kv_cache::state_ranges(uint32_t strm, llama_seq_id seq_id, llama_pos pos_min, uint32_t & cell_count) const {
+    cell_ranges_t cr { strm, {} };
+
+    cell_count = 0;
+
+    const auto & cells = v_cells[strm];
+
+    // Count the number of cells with the specified seq_id
+    // Find all the ranges of cells with this seq id (or all, when -1)
+    uint32_t cell_range_begin = cells.size();
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        bool add_cell = true;
+
+        add_cell = add_cell && !cells.is_empty(i);
+        add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+
+        // a delta holds only what came after the base checkpoint; pos_min = -1 keeps everything
+        add_cell = add_cell && cells.pos_get(i) > pos_min;
+
+        // check the cell is not SWA-masked
+        if (add_cell && seq_id != -1) {
+            const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+
+            add_cell = !is_masked;
+        }
+
+        if (add_cell) {
+            ++cell_count;
+            if (cell_range_begin == cells.size()) {
+                cell_range_begin = i;
+            }
+        } else {
+            if (cell_range_begin != cells.size()) {
+                cr.data.emplace_back(cell_range_begin, i);
+                cell_range_begin = cells.size();
+            }
+        }
+    }
+
+    if (cell_range_begin != cells.size()) {
+        cr.data.emplace_back(cell_range_begin, cells.size());
+    }
+
+    // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
+    uint32_t cell_count_check = 0;
+    for (const auto & range : cr.data) {
+        cell_count_check += range.second - range.first;
+    }
+    GGML_ASSERT(cell_count == cell_count_check);
+
+    return cr;
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2061,52 +2115,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        cell_ranges_t cr { s, {} };
-
         uint32_t cell_count = 0;
 
-        const auto & cells = v_cells[s];
-
-        // Count the number of cells with the specified seq_id
-        // Find all the ranges of cells with this seq id (or all, when -1)
-        uint32_t cell_range_begin = cells.size();
-
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            bool add_cell = true;
-
-            add_cell = add_cell && !cells.is_empty(i);
-            add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
-
-            // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
-
-                add_cell = !is_masked;
-            }
-
-            if (add_cell) {
-                ++cell_count;
-                if (cell_range_begin == cells.size()) {
-                    cell_range_begin = i;
-                }
-            } else {
-                if (cell_range_begin != cells.size()) {
-                    cr.data.emplace_back(cell_range_begin, i);
-                    cell_range_begin = cells.size();
-                }
-            }
-        }
-
-        if (cell_range_begin != cells.size()) {
-            cr.data.emplace_back(cell_range_begin, cells.size());
-        }
-
-        // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
-        uint32_t cell_count_check = 0;
-        for (const auto & range : cr.data) {
-            cell_count_check += range.second - range.first;
-        }
-        GGML_ASSERT(cell_count == cell_count_check);
+        const cell_ranges_t cr = state_ranges(s, seq_id, -1, cell_count);
 
         io.write(&cell_count, sizeof(cell_count));
 
@@ -2332,13 +2343,15 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool clear_seq) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
     if (dest_seq_id != -1) {
         // single sequence
-        seq_rm(dest_seq_id, -1, -1);
+        if (clear_seq) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2812,4 +2825,167 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+//
+// Delta state write/read for KV cache
+//
+
+// a delta checkpoint starts with this, so a full state can never be mistaken for one
+static constexpr uint32_t KV_DELTA_MAGIC = 0x4B56444C; // "KVdL"
+
+size_t llama_kv_cache::state_write_delta(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // a mirrored cache writes nothing in state_write, so it has no delta of its own either
+    if (other) {
+        return 0;
+    }
+
+    // the reader restores into a single sequence, so a whole-context delta has no way back
+    if (seq_id < 0) {
+        return 0;
+    }
+
+    GGML_UNUSED(flags);
+
+    GGML_ASSERT((size_t) seq_id < seq_to_stream.size());
+
+    const size_t start_bytes = io.n_bytes();
+
+    const uint32_t magic = KV_DELTA_MAGIC;
+    io.write(&magic, sizeof(magic));
+
+    io.write(&base_pos, sizeof(base_pos));
+    io.write(&n_stream, sizeof(n_stream));
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        uint32_t cell_count = 0;
+
+        // only the cells added after base_pos: everything up to it is in the base checkpoint
+        const cell_ranges_t cr = state_ranges(s, seq_id, base_pos, cell_count);
+
+        io.write(&cell_count, sizeof(cell_count));
+
+        if (cell_count == 0) {
+            continue;
+        }
+
+        state_write_meta(io, cr, seq_id);
+        state_write_data(io, cr);
+    }
+
+    return io.n_bytes() - start_bytes;
+}
+
+bool llama_kv_cache::state_read_delta(
+        llama_io_read_i  & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos) {
+    return state_read_delta_sinfo(io, seq_id, flags, base_pos, nullptr, nullptr);
+}
+
+bool llama_kv_cache::state_read_delta_sinfo(
+        llama_io_read_i  & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        llama_pos base_pos,
+      slot_info_vec_t *   sinfos_out,
+const slot_info_vec_t *   sinfos_in) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // nothing was written for a mirrored cache, so there is nothing to restore
+    if (other) {
+        return true;
+    }
+
+    if (sinfos_out) {
+        sinfos_out->assign(n_stream, slot_info{});
+    }
+
+    if (sinfos_in && sinfos_in->size() != n_stream) {
+        LLAMA_LOG_ERROR("%s: mirrored slot layout has the wrong stream count\n", __func__);
+        return false;
+    }
+
+    GGML_UNUSED(flags);
+
+    uint32_t delta_magic;
+    io.read(&delta_magic, sizeof(delta_magic));
+
+    if (delta_magic != KV_DELTA_MAGIC) {
+        LLAMA_LOG_ERROR("%s: invalid delta magic: 0x%08X\n", __func__, delta_magic);
+        return false;
+    }
+
+    llama_pos delta_base_pos;
+    io.read(&delta_base_pos, sizeof(delta_base_pos));
+
+    if (delta_base_pos != base_pos) {
+        LLAMA_LOG_ERROR("%s: base_pos mismatch: checkpoint has %d, expected %d\n",
+                        __func__, (int) delta_base_pos, (int) base_pos);
+        return false;
+    }
+
+    uint32_t n_stream_cur;
+    io.read(&n_stream_cur, sizeof(n_stream_cur));
+
+    if (n_stream_cur != n_stream) {
+        LLAMA_LOG_ERROR("%s: stream count mismatch\n", __func__);
+        return false;
+    }
+
+    // must match the write side, which refuses to produce a whole-context delta
+    if (seq_id < 0) {
+        LLAMA_LOG_ERROR("%s: whole-cache delta restore is not supported\n", __func__);
+        return false;
+    }
+
+    GGML_ASSERT((size_t) seq_id < seq_to_stream.size());
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        uint32_t cell_count;
+        io.read(&cell_count, sizeof(cell_count));
+
+        if (cell_count == 0) {
+            // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
+            if (sinfos_in && !(*sinfos_in)[s].empty()) {
+                LLAMA_LOG_ERROR("%s: mirrored cache holds cells this one does not\n", __func__);
+                seq_rm(seq_id, -1, -1);
+
+                return false;
+            }
+
+            continue;
+        }
+
+        slot_info sinfo;
+
+        // clear_seq = false: the delta adds to the cells the base checkpoint already put in place
+        bool res = state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, false);
+
+        try {
+            res = res && state_read_data(io, strm, cell_count, sinfo);
+        } catch (...) {
+            res = false;
+        }
+
+        if (!res) {
+            // half a delta is neither the base nor the checkpoint - drop the sequence, the caller recomputes it
+            seq_rm(seq_id, -1, -1);
+
+            return false;
+        }
+
+        if (sinfos_out) {
+            (*sinfos_out)[s] = sinfo;
+        }
+    }
+
+    return true;
 }

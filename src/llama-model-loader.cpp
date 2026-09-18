@@ -529,6 +529,53 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
 
+// a non cached read of a file that also has pages in the page cache has to be kept coherent with
+// them, and windows serialises those reads across every handle of the file. So the header of a
+// model opened for direct I/O is parsed through that same handle: gguf asks for a few bytes at a
+// time and a window serves them out of one large aligned read
+struct llama_gguf_window {
+    llama_file *         file;
+    std::vector<uint8_t> buf;
+    uint64_t             begin = 0;  // file offset of buf[0]
+    size_t               len   = 0;  // valid bytes in buf
+
+    llama_gguf_window(llama_file * file) : file(file), buf(4*MiB) {}
+
+    static size_t read(void * userdata, void * output, uint64_t offset, size_t len) {
+        llama_gguf_window & w    = *(llama_gguf_window *) userdata;
+        const uint64_t      size = w.file->size();
+
+        if (offset >= size) {
+            return 0;
+        }
+        len = std::min<uint64_t>(len, size - offset);
+
+        for (size_t done = 0; done < len; ) {
+            const uint64_t pos = offset + done;
+
+            if (pos < w.begin || pos >= w.begin + w.len) {
+                w.begin = pos;
+                w.len   = std::min<uint64_t>(w.buf.size(), size - pos);
+                w.file->seek(w.begin, SEEK_SET);
+                w.file->read_raw(w.buf.data(), w.len);
+            }
+
+            const size_t from = (size_t) (pos - w.begin);
+            const size_t take = std::min(w.len - from, len - done);
+
+            memcpy((uint8_t *) output + done, w.buf.data() + from, take);
+            done += take;
+        }
+
+        return len;
+    }
+};
+
+static struct gguf_context * llama_gguf_init_from_file(llama_file * file, struct gguf_init_params params) {
+    llama_gguf_window window(file);
+    return gguf_init_from_callback(llama_gguf_window::read, &window, 0, file->size(), params);
+}
+
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -567,7 +614,10 @@ llama_model_loader::llama_model_loader(
             /*.ctx      = */ &ctx,
         };
 
-        metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
+        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
+
+        metadata_ptr.reset(llama_gguf_init_from_file(files.back().get(), params));
         metadata = metadata_ptr.get();
         if (metadata == nullptr) {
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
@@ -576,7 +626,6 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -627,7 +676,11 @@ llama_model_loader::llama_model_loader(
                     /*.no_alloc = */ true,
                     /*.ctx      = */ &ctx,
                 };
-                gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_split, split_params) };
+
+                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
+
+                gguf_context_ptr ctx_gguf { llama_gguf_init_from_file(files.back().get(), split_params) };
                 if (!ctx_gguf) {
                     throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
                 }
@@ -644,7 +697,6 @@ llama_model_loader::llama_model_loader(
                     }
                 }
 
-                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1085,21 +1137,34 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
+llama_model_loader::lazy_read::kind llama_model_loader::lazy_read::add(
+        const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool can_cache) {
     if (mode == LLAMA_LAZY_MODE_OFF) {
-        return false;
+        return NONE;
     }
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
-        return false;
+    if ((mode == LLAMA_LAZY_MODE_AUTO || auto_size) && ggml_nbytes(t) <= auto_min_size) {
+        return NONE;
+    }
+
+    if (mode == LLAMA_LAZY_MODE_DIO && can_cache) {
+        // the rows go through llama_row_cache, which reads the file itself
+        if (w) {
+            locations[name] = { w->idx, w->offs, t->type, t->ne[0], t->ne[1] };
+
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) stays on disk, read through the row cache\n",
+                    __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        }
+
+        return CACHE;
     }
 
     if (!llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not available, so tensor %s (size = %zu MiB) is loaded into RAM in full\n",
                 __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
-        return false;
+        return NONE;
     }
 
     if (w) {
@@ -1110,7 +1175,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
                 __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
     }
 
-    return true;
+    return MMAP;
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor(
@@ -1341,7 +1406,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        const lazy_read::kind lazy_kind = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()),
+                flags & TENSOR_READ_CACHE);
+
+        // the row cache reads the file directly, so no tensor is created for it at all
+        if (lazy_kind == lazy_read::CACHE) {
+            size_data -= ggml_nbytes(cur);
+            n_created++;
+            return nullptr;
+        }
+
+        is_lazy = lazy_kind == lazy_read::MMAP;
     }
 
     ggml_tensor t_meta = *cur;
@@ -1408,6 +1483,12 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    // a mapping puts pages of the file in the page cache, and every unbuffered read of that file
+    // is then kept coherent with them, one at a time. -lzm dio keeps the file unmapped
+    if (use_direct_io && !use_mmap && lazy.any()) {
+        LLAMA_LOG_WARN("%s: lazy tensors are mapped, which serialises the direct I/O reads of the same file\n", __func__);
+    }
+
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1495,7 +1576,8 @@ bool llama_model_loader::load_all_data(
         llama_buf_map & bufs,
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
-        void * progress_callback_user_data) {
+        void * progress_callback_user_data,
+        llama_tensor_range_queue * ranges) {
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
@@ -1503,6 +1585,16 @@ bool llama_model_loader::load_all_data(
         return true;
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+
+    // tells the allocating thread when the tensors it handed over are no longer in use
+    struct range_guard {
+        llama_tensor_range_queue * q;
+        ~range_guard() { if (q) { q->leave(); } }
+    } guard { ranges };
+
+    if (ranges) {
+        ranges->enter();
+    }
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
@@ -1516,13 +1608,24 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    // 64MB works well for NVMe drives
-    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+    // 64MB works well for NVMe drives.
+    // the read lands at the first aligned address inside the staging buffer, so the buffer
+    // holds one alignment unit more than the largest read can be
+    const size_t chunk_size  = alignment != 1 ? 64 * 1024 * 1024 : 1 * 1024 * 1024;
+    const size_t buffer_size = chunk_size + 2 * alignment;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+
+    // when the ranges arrive from the allocating thread the context's buffer map is still empty,
+    // so the first range is taken up front and its buffer stands in when probing for async uploads
+    llama_tensor_range range = { ggml_get_first_tensor(ctx), nullptr };
+    bool have_range = ranges ? ranges->pop(range) : range.first != nullptr;
+
+    ggml_backend_buffer_t probe_buf = nullptr;
+
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
@@ -1530,10 +1633,20 @@ bool llama_model_loader::load_all_data(
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
         // First determine if the backend supports the necessary features for async uploads.
         auto * buf = bufs.count(0) ? bufs.at(0) : nullptr;
+        // without a range there is nothing to probe: the queue was drained and the tensors it held are gone
+        if (!buf && have_range) {
+            for (ggml_tensor * t = range.first; t != range.last; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->buffer) {
+                    buf = t->buffer;
+                    break;
+                }
+            }
+        }
         if (!buf) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
         }
+        probe_buf = buf;
 
         auto * buft = ggml_backend_buffer_get_type(buf);
         auto * dev = ggml_backend_buft_get_device(buft);
@@ -1600,154 +1713,180 @@ bool llama_model_loader::load_all_data(
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
+            ggml_backend_buft_name(ggml_backend_buffer_get_type(probe_buf)),
             ggml_backend_name(upload_backend));
     }
 
+    // where the time goes: reading from the file, or waiting for the previous upload to land
+    int64_t t_read_us   = 0;
+    int64_t t_upload_us = 0;
+    size_t  n_read      = 0;
+
     std::vector<ggml_tensor *> tensors;
-    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
-        tensors.push_back(cur);
-    }
 
-    // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
-    // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
-    if (!use_mmap) {
-        std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
-            const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
-            const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
-            if (staged_a != staged_b) {
-                return staged_a;
-            }
-            return staged_a && ggml_nbytes(a) > ggml_nbytes(b);
-        });
-    }
-
-    for (struct ggml_tensor * cur : tensors) {
-        const auto * weight = get_weight(ggml_get_name(cur));
-        if (weight == nullptr) {
-            // this can happen with split experts models
-            continue;
+    for (; have_range; have_range = ranges && ranges->pop(range)) {
+        tensors.clear();
+        for (struct ggml_tensor * cur = range.first; cur != range.last; cur = ggml_get_next_tensor(ctx, cur)) {
+            tensors.push_back(cur);
         }
 
-        if (progress_callback) {
-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
-                return false;
-            }
-        }
-
-        size_t n_size = ggml_nbytes(cur);
-
-        const bool from_mapping = use_mmap || lazy.has(cur);
-
-        if (from_mapping) {
-            const auto & mapping = mappings.at(weight->idx);
-            ggml_backend_buffer_t buf_mmap = nullptr;
-            if (bufs.count(weight->idx)) {
-                buf_mmap = bufs.at(weight->idx);
-            }
-            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
-
-            if (check_tensors) {
-                validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
-                    return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
-                }));
-            }
-
-            GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
-            if (buf_mmap && cur->data == nullptr) {
-                ggml_backend_tensor_alloc(buf_mmap, cur, data);
-
-                // locking a lazy tensor would fault all of it in, which is what lazy avoids
-                if (lmlocks && !lazy.has(cur)) {
-                    const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+        // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
+        // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
+        if (!use_mmap) {
+            std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
+                const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
+                const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
+                if (staged_a != staged_b) {
+                    return staged_a;
                 }
+                return staged_a && ggml_nbytes(a) > ggml_nbytes(b);
+            });
+        }
 
-                auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-            } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+        for (struct ggml_tensor * cur : tensors) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (weight == nullptr) {
+                // this can happen with split experts models
+                continue;
             }
-        } else {
-            const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+            if (progress_callback) {
+                if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+            }
+
+            size_t n_size = ggml_nbytes(cur);
+
+            const bool from_mapping = use_mmap || lazy.has(cur);
+
+            if (from_mapping) {
+                const auto & mapping = mappings.at(weight->idx);
+                ggml_backend_buffer_t buf_mmap = nullptr;
+                if (bufs.count(weight->idx)) {
+                    buf_mmap = bufs.at(weight->idx);
+                }
+                uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+
                 if (check_tensors) {
-                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                     }));
                 }
+
+                GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
+                if (buf_mmap && cur->data == nullptr) {
+                    ggml_backend_tensor_alloc(buf_mmap, cur, data);
+
+                    // locking a lazy tensor would fault all of it in, which is what lazy avoids
+                    if (lmlocks && !lazy.has(cur)) {
+                        const auto & lmlock = lmlocks->at(weight->idx);
+                        lmlock->grow_to(weight->offs + n_size);
+                    }
+
+                    auto & mmap_used = mmaps_used[weight->idx];
+                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                    mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
             } else {
-                // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
-                    size_t offset = weight->offs;
-                    alignment = file->read_alignment();
-                    size_t aligned_offset = offset & ~(alignment - 1);
-                    size_t offset_from_alignment = offset - aligned_offset;
-                    file->seek(aligned_offset, SEEK_SET);
+                const auto & file = files.at(weight->idx);
 
-                    // Calculate aligned read boundaries
-                    size_t read_start = aligned_offset;
-                    size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
-
-                    size_t bytes_read = 0;
-                    size_t data_read = 0;  // Actual tensor data copied (excluding padding)
-
-                    while (bytes_read < read_end - read_start) {
-                        size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
-
-                        // Align the destination pointer within the pinned buffer
-                        uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
-
-                        // Wait for previous upload to complete before reusing buffer
-                        ggml_backend_event_synchronize(events[buffer_idx]);
-
-                        // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
-
-                        // Calculate actual data portion (excluding alignment padding)
-                        uintptr_t ptr_data = ptr_dest_aligned;
-                        size_t data_to_copy = read_size;
-
-                        // Skip alignment padding at start of first chunk
-                        if (bytes_read == 0) {
-                            ptr_data += offset_from_alignment;
-                            data_to_copy -= offset_from_alignment;
-                        }
-
-                        // Trim alignment padding at end of last chunk
-                        if (aligned_offset + bytes_read + read_size > offset + n_size) {
-                            data_to_copy -= (read_end - (offset + n_size));
-                        }
-
-                        // Async upload actual data to GPU
-                        ggml_backend_tensor_set_async(upload_backend, cur,
-                                                      reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
-                        ggml_backend_event_record(events[buffer_idx], upload_backend);
-
-                        data_read += data_to_copy;
-                        bytes_read += read_size;
-
-                        ++buffer_idx;
-                        buffer_idx %= n_buffers;
+                if (ggml_backend_buffer_is_host(cur->buffer)) {
+                    const int64_t t_start = ggml_time_us();
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                    t_read_us += ggml_time_us() - t_start;
+                    n_read    += n_size;
+                    if (check_tensors) {
+                        validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                            return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                        }));
                     }
                 } else {
-                    // scoped to one tensor so only one staging buffer is alive at a time
-                    std::vector<no_init<uint8_t>> read_buf(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
+                    if (upload_backend) {
+                        size_t offset = weight->offs;
+                        alignment = file->read_alignment();
+                        size_t aligned_offset = offset & ~(alignment - 1);
+                        size_t offset_from_alignment = offset - aligned_offset;
+                        file->seek(aligned_offset, SEEK_SET);
+
+                        // Calculate aligned read boundaries
+                        size_t read_start = aligned_offset;
+                        size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
+
+                        size_t bytes_read = 0;
+                        size_t data_read = 0;  // Actual tensor data copied (excluding padding)
+
+                        while (bytes_read < read_end - read_start) {
+                            size_t read_size = std::min<size_t>(chunk_size, read_end - read_start - bytes_read);
+
+                            // Align the destination pointer within the pinned buffer
+                            uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
+
+                            // Wait for previous upload to complete before reusing buffer
+                            int64_t t_start = ggml_time_us();
+                            ggml_backend_event_synchronize(events[buffer_idx]);
+                            t_upload_us += ggml_time_us() - t_start;
+
+                            // Read aligned chunk from file
+                            t_start = ggml_time_us();
+                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                            t_read_us += ggml_time_us() - t_start;
+                            n_read    += read_size;
+
+                            // Calculate actual data portion (excluding alignment padding)
+                            uintptr_t ptr_data = ptr_dest_aligned;
+                            size_t data_to_copy = read_size;
+
+                            // Skip alignment padding at start of first chunk
+                            if (bytes_read == 0) {
+                                ptr_data += offset_from_alignment;
+                                data_to_copy -= offset_from_alignment;
+                            }
+
+                            // Trim alignment padding at end of last chunk
+                            if (aligned_offset + bytes_read + read_size > offset + n_size) {
+                                data_to_copy -= (read_end - (offset + n_size));
+                            }
+
+                            // Async upload actual data to GPU
+                            ggml_backend_tensor_set_async(upload_backend, cur,
+                                                          reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+                            ggml_backend_event_record(events[buffer_idx], upload_backend);
+
+                            data_read += data_to_copy;
+                            bytes_read += read_size;
+
+                            ++buffer_idx;
+                            buffer_idx %= n_buffers;
+                        }
+                    } else {
+                        // scoped to one tensor so only one staging buffer is alive at a time
+                        std::vector<no_init<uint8_t>> read_buf(n_size);
+                        const int64_t t_start = ggml_time_us();
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(read_buf.data(), n_size);
+                        t_read_us += ggml_time_us() - t_start;
+                        n_read    += n_size;
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
                     }
                 }
             }
-        }
 
-        size_done += n_size;
+            size_done += n_size;
+        }
+    }
+
+    if (n_read > 0) {
+        LLAMA_LOG_INFO("%s: read %.2f GiB in %.2f s (%.2f GiB/s), waited %.2f s for uploads\n", __func__,
+                       n_read/1024.0/1024.0/1024.0, t_read_us/1e6,
+                       n_read/1024.0/1024.0/1024.0/(t_read_us/1e6), t_upload_us/1e6);
     }
 
     // free temporary resources used for async uploads

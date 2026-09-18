@@ -107,12 +107,17 @@ class ServerProcess:
     reasoning: Literal['on', 'off', 'auto'] | None = None
     chat_template: str | None = None
     chat_template_file: str | None = None
+    n_ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
     server_path: str | None = None
     mmproj_url: str | None = None
     no_mmproj: bool | None = None
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    cache_ram_reserve: int | None = None
+    cache_spill_dir: str | None = None
+    cache_disk: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -241,6 +246,10 @@ class ServerProcess:
             server_args.append("--context-shift")
         if self.spec_type:
             server_args.extend(["--spec-type", self.spec_type])
+        if self.n_ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.n_ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:
@@ -278,6 +287,12 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.cache_ram_reserve is not None:
+            server_args.extend(["--cache-ram-reserve", self.cache_ram_reserve])
+        if self.cache_spill_dir is not None:
+            server_args.extend(["--cache-spill-dir", self.cache_spill_dir])
+        if self.cache_disk is not None:
+            server_args.extend(["--cache-disk", self.cache_disk])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

@@ -76,6 +76,21 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // delta state: attention KV as a delta (only cells with pos > base_pos) + full recurrent state
+    // (recurrent state is small and cannot be rolled back, so it is always stored in full). This
+    // makes hybrid context checkpoints small and instantly restorable (no token replay).
+    size_t state_write_delta(
+            llama_io_write_i & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) const override;
+
+    bool state_read_delta(
+            llama_io_read_i  & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) override;
+
     //
     // llama_memory_hybrid specific API
     //
