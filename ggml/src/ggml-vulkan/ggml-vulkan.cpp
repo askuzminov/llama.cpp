@@ -12812,6 +12812,22 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
+    // on UMA the weights are mapped, so write them in place instead of staging plus a queue copy
+    // weights only: nothing queued writes them during the load, and they are read only afterwards
+    if (tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+
+        if (size == stride_data && size == stride_tensor) {
+            deferred_memcpy((uint8_t *)buf->ptr + dst_offset, data, size * n_copies, &cpy_ctx->in_memcpys);
+        } else {
+            for (size_t i = 0; i < n_copies; i++) {
+                deferred_memcpy((uint8_t *)buf->ptr + dst_offset + i * stride_tensor, (const uint8_t *)data + i * stride_data, size, &cpy_ctx->in_memcpys);
+            }
+        }
+        return;
+    }
+
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
     if (!ret) {
@@ -14707,6 +14723,12 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     vkev->tl_semaphore.value++;
     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
     ggml_vk_ctx_end(compute_ctx);
+
+    // the event covers everything recorded on this context, so the deferred copies must land first
+    for (auto& cpy : compute_ctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    compute_ctx->in_memcpys.clear();
 
     ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
