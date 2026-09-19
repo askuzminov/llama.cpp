@@ -1612,6 +1612,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
 
+        // draft length of each seq when p_min stopped it, -1 while it is still above p_min
+        std::vector<int32_t> n_stop(n_seq, -1);
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1634,6 +1637,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
         }
+
+        // a seq with a shorter draft makes the target split its ubatch and pay one more pass per seq.
+        // keep such a seq drafting while another one is above p_min, then cut them all back together
+        const bool align = n_drafting > 1 && llama_n_rs_seq(params.ctx_tgt) > 0;
+
+        int n_above = n_drafting;
 
         int i = 0;
 
@@ -1686,18 +1695,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
+                    if (n_stop[seq_id] < 0) {
+                        n_stop[seq_id] = (int32_t) result.size();
+                        n_above--;
+                    }
 
-                    continue;
+                    if (!align) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
 
                 result.push_back(id);
 
@@ -1729,6 +1745,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
+            }
+
+            // every seq is past p_min now, so drop what they drafted after their own stop
+            if (align && n_above == 0) {
+                int32_t n_keep = 0;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    n_keep = std::max(n_keep, n_stop[seq_id]);
+                }
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (n_stop[seq_id] >= 0) {
+                        dparams[seq_id].result->resize(n_keep);
+                    }
+                }
+
+                break;
             }
 
             if (batch.n_tokens == 0) {

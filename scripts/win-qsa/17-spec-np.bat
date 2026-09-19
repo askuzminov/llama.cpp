@@ -195,9 +195,13 @@ for /f %%t in ('powershell -NoProfile -Command "(Get-Date).Ticks"') do set "TSTA
 curl.exe -s -S --max-time %SPECTIMEOUT% -H "Content-Type: application/json" --data-binary @"%WORK%\req-%BODY%.json" -o "%WORK%\%ARM%-resp.json" "http://127.0.0.1:%SPECPORT%/completion" 2> "%WORK%\%ARM%-curl.txt"
 set "CURLRC=%ERRORLEVEL%"
 
-for /f %%t in ('powershell -NoProfile -Command "[math]::Round(((Get-Date).Ticks - %TSTART%) / 10000000.0, 3)"') do set "ELAPSED=%%t"
 set /a "TOTTOK=NREQ*SPECNGEN"
-for /f %%r in ('powershell -NoProfile -Command "[math]::Round(%TOTTOK% / [math]::Max(%ELAPSED%, 0.001), 2)"') do set "AGGTPS=%%r"
+rem both numbers come out of one call, formatted with InvariantCulture: a russian locale renders
+rem Round() as 16,842 and the next command line then reads that as two arguments
+for /f "tokens=1,2" %%x in ('powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $e = ((Get-Date).Ticks - %TSTART%) / 10000000.0; $r = %TOTTOK% / [math]::Max($e, 0.001); '{0} {1}' -f [math]::Round($e, 3).ToString($c), [math]::Round($r, 2).ToString($c)"') do (
+    set "ELAPSED=%%x"
+    set "AGGTPS=%%y"
+)
 
 if not "%CURLRC%"=="0" (
     echo curl failed with %CURLRC%, see %WORK%\%ARM%-curl.txt
