@@ -161,7 +161,12 @@ start "17-spec-np-%ARM%" /min cmd /c "%SCMD%"
 
 call :waitup
 if not "%UP%"=="1" (
-    echo server did not come up within %SPECWAIT%s, see %SRVLOG%
+    if "%GONE%"=="1" (
+        echo llama-server.exe exited after %WAITED%s, last lines of %SRVLOG%:
+    ) else (
+        echo no 200 from /health after %WAITED%s, last lines of %SRVLOG%:
+    )
+    powershell -NoProfile -Command "Get-Content -Tail 20 -LiteralPath $env:SRVLOG"
     set "RC=1"
     call :teardown
     goto :eof
@@ -202,9 +207,11 @@ rem poll /health until it answers 200 or SPECWAIT runs out. the sleep comes firs
 rem needs a moment to appear in tasklist, and checking before that would call the arm dead
 :waitup
 set "UP=0"
+set "GONE=0"
 set "WAITED=0"
 :waitup_loop
 powershell -NoProfile -Command "Start-Sleep -Seconds 3"
+set /a "WAITED+=3"
 set "CODE="
 curl.exe -s -o nul -w "%%{http_code}" "http://127.0.0.1:%SPECPORT%/health" > "%WORK%\health.txt" 2>nul
 if exist "%WORK%\health.txt" set /p CODE=<"%WORK%\health.txt"
@@ -213,8 +220,10 @@ if "%CODE%"=="200" (
     goto :eof
 )
 tasklist /fi "imagename eq llama-server.exe" 2>nul | find /i "llama-server.exe" >nul
-if errorlevel 1 goto :eof
-set /a "WAITED+=3"
+if errorlevel 1 (
+    set "GONE=1"
+    goto :eof
+)
 if %WAITED% geq %SPECWAIT% goto :eof
 goto :waitup_loop
 
