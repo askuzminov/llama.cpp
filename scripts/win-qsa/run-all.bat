@@ -15,6 +15,7 @@ if not defined RUN_DIAG    set "RUN_DIAG=1"
 if not defined RUN_PLE     set "RUN_PLE=1"
 if not defined RUN_DISK    set "RUN_DISK=1"
 if not defined RUN_MMID    set "RUN_MMID=1"
+if not defined RUN_SPEC    set "RUN_SPEC=0"
 
 set "STEPS="
 if "%RUN_BUILD%"=="1"   set "STEPS=%STEPS% 00-build"
@@ -28,6 +29,7 @@ if "%RUN_PLE%"=="1"     set "STEPS=%STEPS% 11-ple-cache 12-ple-real"
 if "%RUN_DISK%"=="1"    set "STEPS=%STEPS% 13-disk-iops"
 if "%RUN_MMID%"=="1"    set "STEPS=%STEPS% 15-mmid"
 if "%RUN_DIAG%"=="1"    set "STEPS=%STEPS% 16-ctx"
+if "%RUN_SPEC%"=="1"    set "STEPS=%STEPS% 17-spec-np"
 
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do

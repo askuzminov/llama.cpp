@@ -76,6 +76,23 @@ rem context of qwen4exp, 0 takes it from the model
 set "SRVCTX=262144"
 set "SRVARGS=--host 127.0.0.1 --port 8080"
 
+rem 17-spec-np.bat: does -np pay off under speculative decoding. SPECDRAFT is the MTP draft
+rem gguf and has no default, the rest is a short run on purpose - the arms differ in how the
+rem slots batch together, not in how deep the context is. every arm generates exactly SPECNGEN
+rem tokens at temperature 0, so the arms are comparable; with sampling on they are not, two
+rem runs of the same setting came out 7 percent apart
+set "SPECDRAFT="
+set "SPECCTX=32768"
+set "SPECNMAX=6"
+set "SPECPMIN=0.6"
+set "SPECNGEN=512"
+set "SPECPORT=8099"
+set "SPECFIT=-fit off"
+set "SPECVERB=4"
+rem arms, see the header of 17-spec-np.bat. np2-lock minus np2-free is the price of splitting
+rem one target pass into two ubatches, np1-noreuse is the price of rebuilding the target graph
+set "SPECARMS=np1 np2-one np2-lock np2-free np1-noreuse"
+
 rem seconds to wait between two model loads in 07, 10 and 11. the model fills the gpu almost
 rem completely and the driver frees it lazily, so a run started right after the previous one
 rem dies in vkAllocateMemory
@@ -130,6 +147,9 @@ rem   13 - raw disk IOPS behind -lzm dio, needs diskspd (downloaded on first run
 set "RUN_DISK=1"
 rem   15 - MUL_MAT_ID tuning, one model load per arm, so it is slow
 set "RUN_MMID=1"
+rem   17 - does -np pay off under speculative decoding, one server start per arm. off by
+rem        default: it needs SPECDRAFT, which most setups do not have
+set "RUN_SPEC=0"
 
 rem ===================================================================
 rem  machine-specific overrides. _local.bat is not tracked by git, so

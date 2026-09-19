@@ -43,6 +43,16 @@ rem wikitext chunks it runs
 rem set "PLEREALVARIANTS="0 4096""
 rem set "PLECHUNKS=8"
 
+rem 17-spec-np.bat: the MTP draft gguf, and which arms to run. without SPECDRAFT the step
+rem refuses to start. point SPECPROMPTFILE1 and SPECPROMPTFILE2 at your own prompts to use
+rem those instead of the built-in pair; the two must differ or np2-free repeats np2-lock
+rem set "SPECDRAFT=C:\models\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+rem set "SPECARMS=np2-lock np2-free"
+rem set "SPECNGEN=1024"
+rem set "SPECPROMPTFILE1=%~dp0prompt-a.txt"
+rem set "SPECPROMPTFILE2=%~dp0prompt-b.txt"
+rem set "RUN_SPEC=1"
+
 rem diskspd for 13-disk-iops.bat: path to the exe if it cannot be downloaded here
 rem set "DISKSPD=C:\tools\diskspd\amd64\diskspd.exe"
 rem set "DISKVARIANTS="4 32 4" "256 32 4""
