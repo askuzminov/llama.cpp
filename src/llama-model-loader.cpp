@@ -1883,7 +1883,7 @@ bool llama_model_loader::load_all_data(
         }
     }
 
-    if (n_read > 0) {
+    if (n_read > 0 && t_read_us > 0) {
         LLAMA_LOG_INFO("%s: read %.2f GiB in %.2f s (%.2f GiB/s), waited %.2f s for uploads\n", __func__,
                        n_read/1024.0/1024.0/1024.0, t_read_us/1e6,
                        n_read/1024.0/1024.0/1024.0/(t_read_us/1e6), t_upload_us/1e6);

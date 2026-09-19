@@ -2508,7 +2508,8 @@ private:
 
         bool has_base = false;
         for (const common_prompt_checkpoint & cp : slot.prompt.checkpoints) {
-            if (!cp.is_delta()) {
+            // a replay marker or a failed capture holds no data, so it cannot serve as a base
+            if (!cp.is_delta() && !cp.data_tgt.empty()) {
                 has_base = true;
                 break;
             }
@@ -2532,8 +2533,8 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         // the recurrent state is a running state that cannot be delta-encoded, so every hybrid
-        // checkpoint is self-contained
-        if (is_base || is_hybrid) {
+        // checkpoint is self-contained, and a replay marker stores nothing at all
+        if (is_base || is_hybrid || replay_only) {
             cur.base_pos = -1;
         } else {
             auto it_parent = std::prev(slot.prompt.checkpoints.end(), 2);
@@ -2745,7 +2746,8 @@ private:
                 if (!do_reset) {
                     auto it_cur = std::prev(it.base());
                     auto it_base = it_cur;
-                    while (it_base != slot.prompt.checkpoints.begin() && it_base->is_delta()) {
+                    while (it_base != slot.prompt.checkpoints.begin() &&
+                            (it_base->is_delta() || it_base->data_tgt.empty())) {
                         --it_base;
                     }
 
@@ -2754,7 +2756,7 @@ private:
                     const bool replay_only = cur_cp.data_tgt.empty();
                     const common_prompt_checkpoint & restored_cp = replay_only ? base_cp : cur_cp;
 
-                    bool ok = !base_cp.is_delta();
+                    bool ok = !base_cp.is_delta() && !base_cp.data_tgt.empty();
                     if (ok) {
                         ok = base_cp.apply(
                                 ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);

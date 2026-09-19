@@ -1695,7 +1695,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("explicit count cap on context checkpoints per slot (default: %d; -1 = no count limit, 0 = disabled).\n"
             "The footprint is bounded in bytes by the host RAM left after the model, the prompt cache and "
-            "--cache-ram-reserve, so a count cap is normally unnecessary."
+            "--cache-ram-reserve, so a count cap is normally unnecessary. "
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
         [](common_params & params, int value) {
             params.n_ctx_checkpoints = value;

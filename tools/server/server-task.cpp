@@ -2648,8 +2648,9 @@ void server_prompt_cache::update() {
     size_t size_cur     = size();
     size_t n_tokens_cur = n_tokens();
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size_cur) / (std::max<size_t>(1, n_tokens_cur)));
+    // average size per token - spilled states hold their bytes on disk, so they count too,
+    // otherwise the estimate collapses and the token limit stops bounding the cache
+    const float size_per_token = std::max<float>(1.0f, float(size_cur + disk_size()) / (std::max<size_t>(1, n_tokens_cur)));
 
     // dynamically increase the token limit if it can fit in the memory limit
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
