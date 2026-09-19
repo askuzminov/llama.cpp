@@ -71,6 +71,20 @@ if not exist "%SPECDRAFT%" (
     exit /b 1
 )
 
+if /i "%SPECDRAFT%"=="%MODEL%" (
+    echo SPECDRAFT is the target model
+    echo it must be the MTP draft gguf, the one whose name starts with mtp-
+    exit /b 1
+)
+
+rem a split gguf is loaded through its first shard. picking any other shard by hand makes
+rem llama-server exit with "illegal split file idx" once the target is already loaded
+if not "!SPECDRAFT:-of-=!"=="!SPECDRAFT!" if "!SPECDRAFT:-00001-of-=!"=="!SPECDRAFT!" (
+    echo SPECDRAFT is not the first shard of a split gguf: %SPECDRAFT%
+    echo the draft here is the MTP gguf, one file, not a shard of the target model
+    exit /b 1
+)
+
 where curl.exe >nul 2>&1
 if errorlevel 1 (
     echo curl.exe not found in PATH
@@ -101,6 +115,7 @@ call :mkreq lock
 call :mkreq free
 if not "%RC%"=="0" exit /b 1
 
+set "ABORT=0"
 for %%a in (%SPECARMS%) do call :arm %%a
 
 set "LLAMA_GRAPH_REUSE_DISABLE="
@@ -132,6 +147,8 @@ goto :eof
 rem ------------------------------------------------------------------
 rem %1 = arm name
 :arm
+rem one arm failing to start means the next four fail the same way, so stop instead
+if "%ABORT%"=="1" goto :eof
 set "ARM=%~1"
 set "NP="
 set "BODY="
@@ -168,6 +185,7 @@ if not "%UP%"=="1" (
     )
     powershell -NoProfile -Command "Get-Content -Tail 20 -LiteralPath $env:SRVLOG"
     set "RC=1"
+    set "ABORT=1"
     call :teardown
     goto :eof
 )
