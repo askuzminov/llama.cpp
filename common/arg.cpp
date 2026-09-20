@@ -1734,9 +1734,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-spill-dir"}, "PATH",
         "[experimental] spill cold prompt-cache states to PATH (on disk) instead of dropping them under memory "
-        "pressure; loaded back on a cache hit. The files are kept on shutdown and picked up again on the next "
-        "start (cold-start reuse) as long as the model and KV configuration match. Best on fast NVMe. "
-        "(default: disabled)",
+        "pressure; loaded back on a cache hit. While the server is idle, resident states are copied out as well, "
+        "so a later eviction frees the RAM with no I/O and a crash does not lose the cache. The files are kept on "
+        "shutdown and picked up again on the next start (cold-start reuse) as long as the model and KV "
+        "configuration match. Best on fast NVMe. (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.cache_spill_dir = value;
         }
@@ -1752,6 +1753,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_disk_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-min-tokens"}, "N",
+        string_format("smallest piece of work worth a prompt-cache disk write, in tokens (default: %d, 0 = no minimum). "
+            "Prompts shorter than N are not cached at all: they are cheap to recompute, while a hybrid model stores the "
+            "same fixed recurrent state for any length, so caching one mostly takes room from the long prompts that pay "
+            "off. A state whose front is already on disk is also not written again until it grows N tokens past it, "
+            "which keeps a chat that gains a few hundred tokens per turn from rewriting gigabytes every turn. A crash "
+            "then costs up to N tokens of recompute", params.cache_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-min-tokens must be >= 0");
+            }
+            params.cache_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

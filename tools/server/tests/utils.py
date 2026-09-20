@@ -118,6 +118,7 @@ class ServerProcess:
     cache_ram_reserve: int | None = None
     cache_spill_dir: str | None = None
     cache_disk: int | None = None
+    cache_min_tokens: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -293,6 +294,8 @@ class ServerProcess:
             server_args.extend(["--cache-spill-dir", self.cache_spill_dir])
         if self.cache_disk is not None:
             server_args.extend(["--cache-disk", self.cache_disk])
+        if self.cache_min_tokens is not None:
+            server_args.extend(["--cache-min-tokens", self.cache_min_tokens])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

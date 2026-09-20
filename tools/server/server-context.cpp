@@ -860,6 +860,7 @@ public:
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
+            save_slots_to_cache();
             destroy();
         }
     }
@@ -947,6 +948,25 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // hand what the slots still hold to the prompt cache. Without this a state only enters the
+    // cache when the next task arrives, so a server that is stopped after its last request throws
+    // the live prompts away. Must run before destroy(), which drops the contexts they are read from
+    void save_slots_to_cache() {
+        if (!prompt_cache || !ctx_tgt) {
+            return;
+        }
+
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                continue;
+            }
+
+            if (slot.prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+        }
+    }
+
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -971,6 +991,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            save_slots_to_cache();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1401,6 +1422,12 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(
                     (size_t) cache_ram_mib_eff, n_ctx, cache_ram_reserve_bytes, params_base.cache_spill_dir, spill_limit,
                     prompt_cache_signature());
+            prompt_cache->min_tokens = (size_t) std::max(0, params_base.cache_min_tokens);
+
+            if (params_base.cache_min_tokens > 0) {
+                SRV_INF("prompt cache minimum prompt length: %d tokens\n", params_base.cache_min_tokens);
+            }
+
             if (!params_base.cache_spill_dir.empty()) {
                 const std::string budget = spill_limit ? (std::to_string(spill_limit >> 20) + " MiB") : std::string("unlimited");
                 SRV_INF("prompt cache disk spill enabled: dir = %s, disk budget = %s\n",
@@ -3279,6 +3306,18 @@ private:
 
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
+
+                // write-behind: nothing runs now, so hand the slots to the cache and copy what is
+                // still RAM-only out to disk. A later eviction then frees the RAM with no I/O, and
+                // a crash no longer takes the whole cache with it
+                if (prompt_cache && !params_base.cache_spill_dir.empty()) {
+                    // the same save cache_idle_slots does on a new task, only earlier
+                    if (params_base.cache_idle_slots) {
+                        save_slots_to_cache();
+                    }
+
+                    prompt_cache->write_behind([this]() { return queue_tasks.has_new_task(); });
+                }
 
                 metrics_flush_idle();
 

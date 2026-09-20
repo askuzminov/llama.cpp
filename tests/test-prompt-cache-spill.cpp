@@ -3,8 +3,8 @@
 // The spill path bypasses the OS file cache, so every transfer is block-aligned and the logical
 // payload sizes live in the file header. These tests drive server_prompt_cache directly - no model
 // is involved - over payload sizes that are deliberately awkward for an aligned layout (empty,
-// one byte, exactly one block, one below a block), plus the cold-start adoption, signature
-// mismatch and truncation paths.
+// one byte, exactly one block, one below a block, one block past the direct-transfer threshold),
+// plus the cold-start adoption, signature mismatch and truncation paths.
 
 #include "server-task.h"
 
@@ -64,8 +64,8 @@ static std::string fs_utf8(const std::filesystem::path & path) {
 #endif
 }
 
-static std::vector<uint8_t> make_blob(size_t n, uint32_t seed) {
-    std::vector<uint8_t> v(n);
+static server_state_buf make_blob(size_t n, uint32_t seed) {
+    server_state_buf v(n);
     std::mt19937 rng(seed);
     for (size_t i = 0; i < n; ++i) {
         v[i] = (uint8_t) (rng() & 0xff);
@@ -97,12 +97,14 @@ struct spill_case {
     size_t  n_drft;
 };
 
-// sizes chosen around the 4096-byte block boundary
+// sizes chosen around the 4096-byte block boundary, plus one payload past the 16 MiB point where
+// the spill stops using its bounce buffer and hands the blob to the device directly
 static const spill_case CASES[] = {
-    {  16, 100,       1,    0 },
-    {   0, 200,    4096,    7 },
-    { 333, 300, 1234567,   89 },
-    {   5, 400,       0, 4095 },
+    {  16, 100,             1,        0 },
+    {   0, 200,          4096,        7 },
+    { 333, 300,       1234567,       89 },
+    {   5, 400,             0,     4095 },
+    {   7, 500, 16*1024*1024 + 4095, 16*1024*1024 },
 };
 
 static void fill(server_prompt_cache & cache) {
@@ -113,6 +115,52 @@ static void fill(server_prompt_cache & cache) {
 
 static bool dir_empty(const std::string & dir) {
     return std::filesystem::directory_iterator(fs_path(dir)) == std::filesystem::directory_iterator();
+}
+
+// the cache never drops a state without erasing its file first, so a test must not either
+static void clear_cache(server_prompt_cache & cache) {
+    for (const auto & st : cache.states) {
+        cache.erase_spill(st);
+    }
+    cache.states.clear();
+}
+
+// a state whose front is already on disk waits until it grows a full minimum past it, and the
+// rewrite then takes the shorter file with it
+static void test_rewrite_step(const std::string & dir) {
+    server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+    cache.min_tokens = 64;
+
+    // turn 1: nothing on disk yet, so the state goes out whatever its length
+    cache.states.push_back(make_state(100, 1, 40960, 0));
+    assert(cache.write_behind(nullptr) == 1);
+
+    const uint64_t uid_100 = cache.states.front().uid;
+
+    cache.evict_state(cache.states.front()); // what alloc() does to a prefix of the next prompt
+
+    // turn 2: 32 tokens past the prefix is not worth moving the blob again
+    cache.states.push_back(make_state(132, 1, 40960, 0));
+    assert(cache.write_behind(nullptr) == 0);
+    assert(!cache.states.back().on_disk);
+    assert(std::filesystem::exists(cache.spill_path(uid_100)));
+
+    // turn 3: a full minimum past the prefix, so it is written and the prefix file is now redundant
+    cache.states.push_back(make_state(164, 1, 40960, 0));
+    assert(cache.write_behind(nullptr) == 1);
+    assert(cache.states.back().is_clean());
+    assert(!std::filesystem::exists(cache.spill_path(uid_100)));
+    assert(cache.states.size() == 2);
+
+    // without a minimum nothing is held back
+    cache.min_tokens = 0;
+    assert(cache.write_behind(nullptr) == 1);
+    for (const auto & st : cache.states) {
+        assert(st.is_clean());
+    }
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
 }
 
 // spill -> unspill within one run
@@ -140,13 +188,105 @@ static void test_roundtrip(const std::string & dir) {
     size_t i = 0;
     for (auto & st : cache.states) {
         assert(cache.unspill_state(st));
-        assert(!st.on_disk);
+        assert(st.is_clean());               // read back, and the file stays for the next cold start
         assert(st.data.main == ref[i].main);
         assert(st.data.drft == ref[i].drft);
-        assert(!std::filesystem::exists(cache.spill_path(st.uid)));
+        assert(std::filesystem::file_size(cache.spill_path(st.uid)) == st.disk_bytes);
         ++i;
     }
     assert(i == ref.size());
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
+// write-behind: the copy reaches the disk while the blobs stay in RAM
+static void test_write_behind(const std::string & dir) {
+    server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+
+    fill(cache);
+
+    std::vector<server_prompt_data> ref;
+    for (const auto & st : cache.states) {
+        ref.push_back(st.data);
+    }
+
+    assert(cache.write_behind(nullptr) == ref.size());
+    assert(cache.write_behind(nullptr) == 0); // nothing is dirty any more
+
+    size_t i = 0;
+    for (auto & st : cache.states) {
+        assert(st.is_clean());
+        assert(st.data.main == ref[i].main); // the blobs are left untouched
+        assert(st.data.drft == ref[i].drft);
+        assert(std::filesystem::file_size(cache.spill_path(st.uid)) == st.disk_bytes);
+        ++i;
+    }
+
+    // a hit on a clean state needs no read, and it does not cost the file either
+    auto & first = cache.states.front();
+    assert(cache.unspill_state(first));
+    assert(first.is_clean());
+    assert(first.data.main == ref[0].main);
+    assert(std::filesystem::exists(cache.spill_path(first.uid)));
+
+    // dropping the RAM of the rest costs no I/O and they still read back byte for byte
+    i = 1;
+    for (auto it = std::next(cache.states.begin()); it != cache.states.end(); ++it, ++i) {
+        cache.evict_state(*it);
+        assert(it->on_disk && it->data.size() == 0);
+
+        assert(cache.unspill_state(*it));
+        assert(it->is_clean());
+        assert(it->data.main == ref[i].main);
+        assert(it->data.drft == ref[i].drft);
+    }
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
+// a write stopped part way through leaves nothing behind and the state stays in RAM
+static void test_write_behind_cancel(const std::string & dir) {
+    server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+
+    // big enough to take the direct path, where the cancel is polled every 16 MiB
+    cache.states.push_back(make_state(7, 700, 16*1024*1024 + 4095, 0));
+
+    const server_state_buf ref = cache.states.front().data.main;
+
+    // false on the first poll (so the write starts), true on every one after
+    int n_polls = 0;
+    const std::function<bool()> stop_after_start = [&n_polls]() { return ++n_polls > 1; };
+
+    assert(cache.write_behind(stop_after_start) == 0);
+    assert(n_polls > 1);                       // the write was stopped, not skipped
+    assert(!cache.states.front().on_disk);
+    assert(cache.states.front().data.main == ref);
+    assert(dir_empty(dir));                    // no half-written file
+
+    // and the next idle writes it out for real
+    assert(cache.write_behind(nullptr) == 1);
+    assert(cache.states.front().is_clean());
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
+// the minimum prompt length keeps short prompts out of the cache
+static void test_min_tokens(const std::string & dir) {
+    server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+    cache.min_tokens = 64;
+
+    server_prompt prompt;
+
+    prompt.tokens = server_tokens(make_tokens(63, 1), false);
+    assert(cache.alloc(prompt, 1024, 0) == nullptr);
+    assert(cache.states.empty());
+
+    prompt.tokens = server_tokens(make_tokens(64, 1), false);
+    assert(cache.alloc(prompt, 1024, 0) != nullptr);
+    assert(cache.states.size() == 1);
 
     cache.states.clear();
     assert(dir_empty(dir));
@@ -182,7 +322,7 @@ static void test_cold_start(const std::string & dir) {
             ++i;
         }
 
-        cache.states.clear();
+        clear_cache(cache);
     }
 
     assert(dir_empty(dir));
@@ -234,6 +374,10 @@ int main() {
         void (*fn)(const std::string &);
     } tests[] = {
         { "roundtrip",          test_roundtrip          },
+        { "write-behind",       test_write_behind       },
+        { "write-behind-cancel", test_write_behind_cancel },
+        { "min-tokens",         test_min_tokens         },
+        { "rewrite-step",       test_rewrite_step       },
         { "cold-start",         test_cold_start         },
         { "signature-mismatch", test_signature_mismatch },
         { "truncated",          test_truncated          },

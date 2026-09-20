@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <new>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -593,9 +595,35 @@ struct server_prompt {
     }
 };
 
+// the spill writes the state blobs with the OS cache bypassed, which needs a sector-aligned source.
+// allocating them aligned lets the spill move them without a bounce buffer
+constexpr size_t SERVER_STATE_ALIGN = 4096;
+
+template <typename T>
+struct server_state_alloc {
+    using value_type = T;
+
+    server_state_alloc() = default;
+
+    template <typename U> server_state_alloc(const server_state_alloc<U> &) {}
+
+    T * allocate(size_t n) {
+        return (T *) ::operator new(n*sizeof(T), std::align_val_t(SERVER_STATE_ALIGN));
+    }
+
+    void deallocate(T * p, size_t) noexcept {
+        ::operator delete(p, std::align_val_t(SERVER_STATE_ALIGN));
+    }
+
+    template <typename U> bool operator==(const server_state_alloc<U> &) const { return true;  }
+    template <typename U> bool operator!=(const server_state_alloc<U> &) const { return false; }
+};
+
+using server_state_buf = std::vector<uint8_t, server_state_alloc<uint8_t>>;
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_buf main;
+    server_state_buf drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -606,11 +634,15 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
-    // spill bookkeeping: when on_disk, `data` (the big full-state blob) is freed from RAM and held
-    // in a file named after `uid`; disk_bytes is what it occupies there.
+    // spill bookkeeping: on_disk means a file named after `uid` holds this exact state and
+    // disk_bytes is what it occupies there. `data` may be freed from RAM or kept alongside it.
     uint64_t uid        = 0;
     bool     on_disk    = false;
     size_t   disk_bytes = 0;
+
+    // the disk copy is up to date and the blobs are still in RAM: dropping the RAM costs no I/O,
+    // and a cache hit needs no read back
+    bool is_clean() const { return on_disk && data.size() > 0; }
 
     // RAM-resident bytes: the state blobs plus the context checkpoints. A spilled state contributes
     // 0 for `data` (written out and freed), but its checkpoints stay in RAM until free_ram drops them.
@@ -640,6 +672,11 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // the smallest piece of work worth a disk write: prompts shorter than this are not cached at
+    // all, and a state whose front is already on disk is not written again until it grows this much
+    // past it (0 = no minimum)
+    size_t min_tokens = 0;
 
     // keep at least this much host RAM free by evicting cached prompts, in bytes (0 = disabled)
     size_t reserve_size = 0;
@@ -674,8 +711,17 @@ struct server_prompt_cache {
     // narrow filesystem APIs on Windows interpret narrow strings in the ANSI codepage instead
     std::filesystem::path spill_dir_path() const;
     std::filesystem::path spill_path(uint64_t uid) const;
-    bool spill_state(server_prompt_cache_state & st);   // RAM -> disk (frees st.data), keeps st in the list
-    bool unspill_state(server_prompt_cache_state & st); // disk -> RAM (reads st.data back, erases the file)
+    // RAM -> disk, keeps st.data (the state becomes clean). `cancel` is polled between device
+    // transfers: when it fires the partial file is removed and the state stays dirty
+    bool write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel = nullptr);
+    void evict_state(server_prompt_cache_state & st);   // free st.data of a clean state, no I/O
+    bool spill_state(server_prompt_cache_state & st);   // write_state + evict_state, keeps st in the list
+    bool unspill_state(server_prompt_cache_state & st); // disk -> RAM (reads st.data back, keeps the file)
+
+    // write-behind: copy dirty states to disk while nothing else runs, without freeing their RAM.
+    // `interrupted` is polled between states so a request that arrives does not wait for the rest.
+    // Returns the number of states written.
+    size_t write_behind(const std::function<bool()> & interrupted);
     void erase_spill(const server_prompt_cache_state & st); // delete the backing file, if any
     void enforce_disk_limit(); // drop the least-used on-disk states over spill_limit
 

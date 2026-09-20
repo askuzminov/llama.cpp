@@ -103,6 +103,12 @@ public:
     // tasks declined by callback_new_task are put back in the queue once this returns
     void yield_to_queue(std::function<void()> && work);
 
+    // whether work is waiting, so that a job running on the idle path can yield to it
+    bool has_new_task() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return !queue_tasks.empty();
+    }
+
     // for metrics
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
