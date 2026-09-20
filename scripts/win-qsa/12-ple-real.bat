@@ -16,7 +16,7 @@ call "%~dp0_config.bat"
 
 rem варианты кеша строк: размер блока в байтах, 0 = по умолчанию (одна строка), по одному
 rem прогону на каждый. блок 4 КиБ читал 4.47 ГиБ там, где сами строки занимают 0.25 ГиБ
-if not defined PLEREALVARIANTS set "PLEREALVARIANTS=0""
+if not defined PLEREALVARIANTS set "PLEREALVARIANTS=0"
 if not defined PLECHUNKS  set "PLECHUNKS=16"
 
 if not exist "%BIN%\llama-perplexity.exe" (

@@ -7874,12 +7874,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // A tile of several query rows cannot share one exact list, because each row selects its own
     // cells. Two ways out. The pre-pass can union the rows of the tile: the coopmat matmul stays,
-    // but the list grows to block_rows * n_kv_max cells, so this only pays while that stays well
-    // under KV. Else prefill re-tunes to a one-row tile: the list is exact, but the coopmat matmul
-    // is gone, so it needs a larger reduction to win. Both give the same result, only the speed
-    // differs. The union is tried first. GGML_VK_FA_SPARSE_GROUP is its KV / list threshold
-    // (0 = never union), GGML_VK_FA_SPARSE_ROW_RATIO is the one-row threshold,
-    // see scripts/win-qsa/04-fa-sparse.bat.
+    // but the list grows to at most block_rows * n_kv_max cells. Else prefill re-tunes to a
+    // one-row tile: the list is exact, but the coopmat matmul is gone, so it needs a larger
+    // reduction to win. Both give the same result, only the speed differs. The union is tried
+    // first, from the point where its worst case is shorter than KV. That worst case is
+    // pessimistic: rows that sit next to each other pick almost the same cells, so the real list
+    // is much shorter and the union wins well before the worst case says so.
+    // GGML_VK_FA_SPARSE_GROUP is its KV / list threshold (0 = never union),
+    // GGML_VK_FA_SPARSE_ROW_RATIO is the one-row threshold, see scripts/win-qsa/04-fa-sparse.bat.
     static const int64_t group_ratio_env = [] {
         const char * val = getenv("GGML_VK_FA_SPARSE_GROUP");
         return val ? atoll(val) : -1;
@@ -7890,7 +7892,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return parsed > 0 ? parsed : 8;
     }();
 
-    const int64_t group_ratio = group_ratio_env >= 0 ? group_ratio_env : min_ratio;
+    const int64_t group_ratio = group_ratio_env >= 0 ? group_ratio_env : 1;
     const bool    multi_row   = sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1;
 
     // the tile keeps its rows and walks their union. Without the tile size in the threshold the

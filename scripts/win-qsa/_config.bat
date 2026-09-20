@@ -127,7 +127,7 @@ set "RAMMAP="
 
 rem what 12-ple-real.bat compares on real text, one model load each. a variant is the block
 rem size in bytes, 0 = leave at the default, which is one row
-set "PLEREALVARIANTS=0""
+set "PLEREALVARIANTS=0"
 set "PLECHUNKS=16"
 
 rem what run-all.bat runs, 1 = run, 0 = skip. all of them run by default: a full sweep
