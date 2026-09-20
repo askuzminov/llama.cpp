@@ -56,10 +56,11 @@ set "NPROMPT=2048"
 set "DEPTHS=0,32768,65536,122880"
 set "UBATCH=512,2048"
 
-rem arms swept by 04, 06 and 07, one model load each. 1 is the gather
-rem path: the kernel walks the list of cells the tile can see instead of all of KV. 0 is the
-rem plain dense kernel. the selection is the same in both, so this only moves speed
-set "FAVARIANTS=1 0"
+rem arms swept by 04, 05, 06 and 07, one model load each. 1 is the build default, which
+rem walks the list of cells the tile can see instead of all of KV. 0 is the plain dense
+rem kernel. g and r are the two tile shapes of the gather, see 04-fa-sparse.bat. the
+rem selection is the same in all of them, so this only moves speed
+set "FAVARIANTS=1 0 g r"
 
 rem context and chunk count of the quality runs. the budget is a fixed ~513 blocks, so at a
 rem short context it already covers most of the cache and the indexer is bypassed. keep the

@@ -24,18 +24,14 @@ echo writing %LOG%
 set "RC=%ERRORLEVEL%"
 echo exit=%RC% >> "%LOG%"
 
-rem the same cases with the pre-pass unioning the rows of the tile, so a per-token selection
-rem (sparse_grp=1) also gets a shared list. it only pays off if the rows of a tile overlap
+rem the run above takes whichever tile shape the build picks. these two force each of them, so
+rem the log holds all three. the union gives a per-token selection (sparse_grp=1) a shared list
+rem and keeps the coopmat matmul, and only pays off if the rows of a tile overlap. the one-row
+rem tile gets an exact list and gives up the matmul
 if not defined FAGROUP set "FAGROUP=1"
 if "%FAGROUP%"=="1" (
-    echo. >> "%LOG%"
-    echo ### GGML_VK_FA_SPARSE_GROUP=1, one list per tile >> "%LOG%"
-    set "GGML_VK_FA_SPARSE_GROUP=1"
-    "%BIN%\test-backend-ops.exe" perf -o FLASH_ATTN_EXT -p "kv=32768" >> "%LOG%" 2>&1
-    set "EC=!ERRORLEVEL!"
-    set "GGML_VK_FA_SPARSE_GROUP="
-    echo exit=!EC! >> "%LOG%"
-    if not "!EC!"=="0" set "RC=!EC!"
+    call :arm 1 "one list per tile"
+    call :arm 0 "one row per tile"
 )
 
 rem the same cases on the scalar path, where a query tile is 4 to 8 rows instead of 16
@@ -53,3 +49,15 @@ if "%FASCALAR%"=="1" (
 
 type "%LOG%"
 exit /b %RC%
+
+rem %1 = value of GGML_VK_FA_SPARSE_GROUP, %2 = what it means in the log
+:arm
+echo. >> "%LOG%"
+echo ### GGML_VK_FA_SPARSE_GROUP=%~1, %~2 >> "%LOG%"
+set "GGML_VK_FA_SPARSE_GROUP=%~1"
+"%BIN%\test-backend-ops.exe" perf -o FLASH_ATTN_EXT -p "kv=32768" >> "%LOG%" 2>&1
+set "EC=%ERRORLEVEL%"
+set "GGML_VK_FA_SPARSE_GROUP="
+echo exit=%EC% >> "%LOG%"
+if not "%EC%"=="0" set "RC=%EC%"
+goto :eof

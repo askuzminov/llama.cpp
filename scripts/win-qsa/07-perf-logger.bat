@@ -1,13 +1,14 @@
 @echo off
 rem per-op timings from the vulkan backend at a deep context, one run per arm of FAVARIANTS.
 rem produces a lot of output, keep the run short. cuda ignores GGML_VK_PERF_LOGGER.
-rem the point of the sweep: the gather path walks the list of cells a query row can see, the
-rem dense path walks all of KV but keeps the wide query tile. the FLASH_ATTN_EXT line says which
-rem one wins on the real per-token mask, and the lines around it say what the pre-pass costs.
+rem the point of the sweep: the gather path walks the list of cells a query tile can see, the
+rem dense path walks all of KV. the FLASH_ATTN_EXT line says which one wins on the real
+rem per-token mask, and the lines around it say what the pre-pass costs. arms g and r are the
+rem two tile shapes of the gather, see 04-fa-sparse.bat.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-if not defined FAVARIANTS set "FAVARIANTS=1 0"
+if not defined FAVARIANTS set "FAVARIANTS=1 0 g r"
 if not defined SETTLE set "SETTLE=30"
 rem depth of the measured graph. the sparsity of the indexer grows with it: the budget is a
 rem fixed number of blocks, so the deeper the context the larger the share of skippable tiles
@@ -36,6 +37,7 @@ for %%v in (%FAVARIANTS%) do call :run %%v
 
 set "GGML_VK_PERF_LOGGER="
 set "GGML_VK_FA_SPARSE_DISABLE="
+set "GGML_VK_FA_SPARSE_GROUP="
 
 echo.
 type "%SUM%"
@@ -43,7 +45,7 @@ echo.
 echo done, %SUM%
 exit /b %RC%
 
-rem %1 = 1 gather on, 0 gather off
+rem %1 = плечо, как в 04: 0 плотное ядро, 1 умолчание, g объединение, r тайл в одну строку
 :run
 if "%FIRST%"=="1" (set "FIRST=0") else (
     echo === waiting %SETTLE%s for the gpu to be released
@@ -51,7 +53,10 @@ if "%FIRST%"=="1" (set "FIRST=0") else (
 )
 set "LOG=%LOGS%\07-perf-%TS%-s%~1.log"
 set "GGML_VK_FA_SPARSE_DISABLE="
+set "GGML_VK_FA_SPARSE_GROUP="
 if "%~1"=="0" set "GGML_VK_FA_SPARSE_DISABLE=1"
+if "%~1"=="g" set "GGML_VK_FA_SPARSE_GROUP=1"
+if "%~1"=="r" set "GGML_VK_FA_SPARSE_GROUP=0"
 echo === sparse=%~1
 "%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p 512 -n 0 -b 4096 -ub 2048 -d %PERFDEPTH% %LOADMODE% -r 1 --no-warmup %EXTRA% > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"

@@ -7873,19 +7873,32 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max);
 
     // A tile of several query rows cannot share one exact list, because each row selects its own
-    // cells. Two ways out: GGML_VK_FA_SPARSE_GROUP makes the pre-pass union the rows of the tile,
-    // which keeps the coopmat matmul but walks a longer list; else prefill re-tunes to a one-row
-    // tile and walks n_kv_max columns per row instead of KV. The one-row tile gives up the coopmat
-    // matmul, so it needs a larger reduction to win. GGML_VK_FA_SPARSE_ROW_RATIO moves that
-    // threshold, see scripts/win-qsa/04-fa-sparse.bat.
-    static const bool sparse_group = getenv("GGML_VK_FA_SPARSE_GROUP") != nullptr;
+    // cells. Two ways out. The pre-pass can union the rows of the tile: the coopmat matmul stays,
+    // but the list grows to block_rows * n_kv_max cells, so this only pays while that stays well
+    // under KV. Else prefill re-tunes to a one-row tile: the list is exact, but the coopmat matmul
+    // is gone, so it needs a larger reduction to win. Both give the same result, only the speed
+    // differs. The union is tried first. GGML_VK_FA_SPARSE_GROUP is its KV / list threshold
+    // (0 = never union), GGML_VK_FA_SPARSE_ROW_RATIO is the one-row threshold,
+    // see scripts/win-qsa/04-fa-sparse.bat.
+    static const int64_t group_ratio_env = [] {
+        const char * val = getenv("GGML_VK_FA_SPARSE_GROUP");
+        return val ? atoll(val) : -1;
+    }();
     static const int64_t row_tile_ratio = [] {
         const char * val = getenv("GGML_VK_FA_SPARSE_ROW_RATIO");
         const int64_t parsed = val ? atoll(val) : 0;
         return parsed > 0 ? parsed : 8;
     }();
-    if (!sparse_group && sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1 &&
-        (int64_t)KV >= row_tile_ratio * (int64_t)n_kv_max) {
+
+    const int64_t group_ratio = group_ratio_env >= 0 ? group_ratio_env : min_ratio;
+    const bool    multi_row   = sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1;
+
+    // the tile keeps its rows and walks their union. Without the tile size in the threshold the
+    // list can be as long as KV, and then the gather costs a pre-pass and buys nothing
+    const bool use_group = multi_row && group_ratio > 0 &&
+        (int64_t)KV >= group_ratio * (int64_t)tuning_params.block_rows * (int64_t)n_kv_max;
+
+    if (multi_row && !use_group && (int64_t)KV >= row_tile_ratio * (int64_t)n_kv_max) {
         const vk_fa_tuning_params row_params = get_fa_tuning_params(ctx->device, HSK, HSV, 1, KV, k_type_eff, v_type_eff, f32acc);
         if (row_params.block_rows == 1) {
             tuning_params = row_params;
@@ -7893,7 +7906,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // block_rows == 1 only happens on the scalar path, where the tile is one query row
-    const bool use_sparse = sparse_shape_ok && (sparse_group || gqa_ratio > 1 || tuning_params.block_rows == 1);
+    const bool use_sparse = sparse_shape_ok && (use_group || gqa_ratio > 1 || tuning_params.block_rows == 1);
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
