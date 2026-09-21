@@ -645,6 +645,12 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // Returns the bytes of the model files that a mapping can fault in, 0 if nothing is mapped.
+    // The OS counts these pages as available RAM, so a caller that budgets host memory must not
+    // claim them. The load mode does not answer this: a lazy tensor maps its file on any load
+    // mode, and then only its own rows are read through the mapping.
+    LLAMA_API uint64_t llama_model_mapped_size(const struct llama_model * model);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);

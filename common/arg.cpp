@@ -1694,8 +1694,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("explicit count cap on context checkpoints per slot (default: %d; -1 = no count limit, 0 = disabled).\n"
-            "The footprint is bounded in bytes by the host RAM left after the model, the prompt cache and "
-            "--cache-ram-reserve, so a count cap is normally unnecessary. "
+            "The footprint is bounded in bytes by the host RAM free at the moment a checkpoint is made, "
+            "less --cache-ram-reserve, so a count cap is normally unnecessary and does not help when RAM is short. "
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
         [](common_params & params, int value) {
             params.n_ctx_checkpoints = value;
@@ -1734,11 +1734,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-spill-dir"}, "PATH",
         "[experimental] spill cold prompt-cache states to PATH (on disk) instead of dropping them under memory "
-        "pressure; loaded back on a cache hit. While the server is idle, resident states are copied out as well, "
-        "so a later eviction frees the RAM with no I/O and a crash does not lose the cache. The files are kept on "
-        "shutdown and picked up again on the next start (cold-start reuse) as long as the model and KV "
-        "configuration match. Several models may share one directory: a file is named after the "
-        "configuration it belongs to, so a model only ever reads and drops its own. "
+        "pressure; loaded back on a cache hit, which leaves the file in place. While the server is idle, resident "
+        "states are copied out as well, so a later eviction frees the RAM with no I/O and a crash does not lose the "
+        "cache. The files are kept on shutdown and picked up again on the next start (cold-start reuse) as long as "
+        "the model and KV configuration match. The context checkpoints go out with the state, so a prompt that "
+        "matches only a prefix can still roll back after a restart. Several models may share one directory: a file "
+        "is named after the configuration it belongs to, so a model only ever reads and drops its own. "
         "Best on fast NVMe. (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.cache_spill_dir = value;
@@ -1746,9 +1747,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_SPILL_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk"}, "N",
-        string_format("[experimental] disk budget in MiB for spilled prompt-cache states (see --cache-spill-dir); "
-            "the least frequently used states are dropped once exceeded. The budget counts one model, so a "
-            "directory shared by several of them holds up to N MiB for each (default: %d, 0 = unlimited)", params.cache_disk_mib),
+        string_format("[experimental] disk budget in MiB for spilled prompt-cache states (see --cache-spill-dir). "
+            "This budget is the only thing that deletes them: once it is exceeded the least valuable states go "
+            "first, ranked by how often each was reused times how much work it saves. The budget counts one model, "
+            "so a directory shared by several of them holds up to N MiB for each (default: %d, 0 = unlimited)", params.cache_disk_mib),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("cache-disk must be >= 0");

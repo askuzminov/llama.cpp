@@ -328,7 +328,9 @@ static void test_cold_start(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
-// a run with a different model / KV layout must discard the files instead of restoring them
+// a run with a different model / KV layout must not restore the files. It must not delete them
+// either: the signature is in the file name, so from here they are indistinguishable from the
+// files of another model that spills into the same directory
 static void test_signature_mismatch(const std::string & dir) {
     {
         server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
@@ -339,6 +341,14 @@ static void test_signature_mismatch(const std::string & dir) {
     {
         server_prompt_cache cache(0, 0, 0, dir, 0, SIG ^ 1ull);
         assert(cache.states.empty());
+    }
+    assert(!dir_empty(dir));
+
+    // the run they belong to still finds them
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        assert(!cache.states.empty());
+        clear_cache(cache);
     }
     assert(dir_empty(dir));
 }

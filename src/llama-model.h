@@ -732,6 +732,7 @@ struct llama_model {
     llama_ftype ftype() const;
 
     size_t size() const; // file size
+    size_t mapped_size() const; // bytes of the model files that are memory mapped
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;

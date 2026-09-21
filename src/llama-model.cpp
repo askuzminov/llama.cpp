@@ -1187,6 +1187,9 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // of those mappings, the bytes that can be faulted in - see llama_model::mapped_size()
+    size_t mapped_bytes = 0;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -2002,8 +2005,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+        for (uint32_t idx = 0; idx < ml.mappings.size(); ++idx) {
+            // with mmap the whole mapping is read through, so all of it can end up in the page
+            // cache. A file mapped only for its lazy tensors is read through those ranges alone -
+            // the rest of it is never touched, so it never becomes resident.
+            if (ml.use_mmap) {
+                pimpl->mapped_bytes += ml.mappings[idx]->size();
+            } else {
+                for (const auto & range : ml.lazy.for_file(idx)) {
+                    pimpl->mapped_bytes += range.second - range.first;
+                }
+            }
+
+            pimpl->mappings.emplace_back(std::move(ml.mappings[idx]));
         }
     }
 
@@ -2035,6 +2049,10 @@ llama_ftype llama_model::ftype() const {
 
 size_t llama_model::size() const {
     return pimpl->n_bytes;
+}
+
+size_t llama_model::mapped_size() const {
+    return pimpl->mapped_bytes;
 }
 
 size_t llama_model::n_tensors() const {
@@ -3284,6 +3302,10 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
+}
+
+uint64_t llama_model_mapped_size(const llama_model * model) {
+    return model->mapped_size();
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

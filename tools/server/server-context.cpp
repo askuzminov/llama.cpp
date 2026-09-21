@@ -935,14 +935,17 @@ private:
     // resolved host-RAM reserve for context checkpoints, in bytes (0 = disabled)
     size_t cache_ram_reserve_bytes = 0;
 
-    // per-slot byte budget for context checkpoints (0 = no byte limit)
-    size_t ckpt_budget_bytes = 0;
+    // mapped model bytes; the OS reports them as available, but they are not free for checkpoints
+    size_t ckpt_weights_bytes = 0;
 
     // resolved count cap on context checkpoints per slot (0 = no count limit)
     int32_t ckpt_count_cap = 0;
 
-    // count cap used when neither the byte budget nor the host-RAM reserve can be resolved
+    // count cap used when the host cannot be probed, so no byte budget can be measured
     static constexpr int32_t CKPT_COUNT_CAP_FALLBACK = 32;
+
+    // smallest checkpoint pool handed out over all slots
+    static constexpr size_t CKPT_BUDGET_FLOOR = 512ull*1024*1024;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1403,8 +1406,6 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        size_t prompt_cache_bytes = 0;
-
         if (params_base.cache_ram_mib != 0) {
             int32_t cache_ram_mib_eff = params_base.cache_ram_mib;
             if (cache_ram_mib_eff < 0) {
@@ -1419,8 +1420,6 @@ private:
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", cache_ram_mib_eff);
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
-
-            prompt_cache_bytes = (size_t) cache_ram_mib_eff * 1024 * 1024;
 
             const size_t spill_limit = (size_t) std::max(0, params_base.cache_disk_mib) * 1024ull * 1024ull;
             prompt_cache = std::make_unique<server_prompt_cache>(
@@ -1445,50 +1444,38 @@ private:
         if (params_base.n_ctx_checkpoints != 0) {
             // Bound the checkpoint footprint in bytes, not in checkpoint count: one checkpoint is
             // a few KiB of recurrent state on a hybrid model and several GiB of attention KV on a
-            // dense model at long context, so a count says nothing about the memory used. The
-            // budget is what the host has free once the model is loaded, minus the anti-swap
-            // reserve and the prompt-cache archive, split evenly between the slots. The reserve is
-            // re-checked on every checkpoint creation and remains the backstop for memory taken by
-            // other processes later on.
-            const size_t avail = common_host_mem_available();
-            if (avail == 0) {
-                SRV_WRN("%s", "could not determine available host RAM; context checkpoints are bounded "
-                        "by a count cap only\n");
-            } else {
-                // mmap'd weights sit in the page cache, which the OS reports as available: on Linux
-                // MemAvailable counts reclaimable page cache, on Windows ullAvailPhys counts the
-                // standby list. Handing that memory to checkpoints would page the weights back out.
-                // There is no API for the host-resident share of the model, so subtract all of it -
-                // too conservative when the model is fully offloaded, but never wrong the other way.
-                size_t weights = 0;
-                if (model_tgt && (params_base.load_mode == LLAMA_LOAD_MODE_AUTO ||
-                                  params_base.load_mode == LLAMA_LOAD_MODE_MMAP ||
-                                  params_base.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK)) {
-                    weights = llama_model_size(model_tgt);
-                }
+            // dense model at long context, so a count says nothing about the memory used. How many
+            // bytes there are to spend is measured on every checkpoint creation - see ckpt_budget().
 
-                const size_t taken = cache_ram_reserve_bytes + prompt_cache_bytes + weights;
+            // Mapped weights sit in the page cache, which the OS reports as available: on Linux
+            // MemAvailable counts reclaimable page cache, on Windows ullAvailPhys counts the
+            // standby list. Handing that memory to checkpoints would page the weights back out.
+            // Ask the model what it mapped - --load-mode does not say: a lazy tensor maps its file
+            // on any load mode, and `auto` drops mmap on a device without support for it.
+            if (model_tgt) {
+                ckpt_weights_bytes = llama_model_mapped_size(model_tgt);
+            }
 
-                // floor: below this the checkpoints would be evicted as fast as they are made and
-                // buy nothing. The host-RAM reserve still evicts if the host really is that tight.
-                const size_t pool = std::max<size_t>(avail > taken ? avail - taken : 0, 512ull*1024*1024);
-
-                ckpt_budget_bytes = pool / std::max(1, params_base.n_parallel);
-
-                SRV_INF("context-checkpoint budget: %zu MiB per slot (host free %zu MiB, reserve %zu MiB, prompt cache %zu MiB, mmap'd weights %zu MiB, %d slots)\n",
-                        ckpt_budget_bytes >> 20, avail >> 20, cache_ram_reserve_bytes >> 20,
-                        prompt_cache_bytes >> 20, weights >> 20, params_base.n_parallel);
+            if (model_dft && model_dft != model_tgt) {
+                ckpt_weights_bytes += llama_model_mapped_size(model_dft);
             }
 
             ckpt_count_cap = std::max(0, params_base.n_ctx_checkpoints);
 
-            if (ckpt_budget_bytes == 0 && ckpt_count_cap == 0) {
-                // no byte budget and no explicit cap: the host-RAM reserve reads the same probe that
-                // just failed, so a count cap is all that is left to bound the footprint
-                ckpt_count_cap = CKPT_COUNT_CAP_FALLBACK;
+            if (common_host_mem_available() == 0) {
+                SRV_WRN("%s", "could not determine available host RAM; context checkpoints cannot be bounded in bytes\n");
 
-                SRV_WRN("context checkpoints fall back to a count cap of %d per slot; set --ctx-checkpoints to choose one\n",
-                        ckpt_count_cap);
+                if (ckpt_count_cap == 0) {
+                    // the host-RAM reserve reads the same probe that just failed, so a count cap is
+                    // all that is left to bound the footprint
+                    ckpt_count_cap = CKPT_COUNT_CAP_FALLBACK;
+
+                    SRV_WRN("context checkpoints fall back to a count cap of %d per slot; set --ctx-checkpoints to choose one\n",
+                            ckpt_count_cap);
+                }
+            } else {
+                SRV_INF("context-checkpoint budget: measured per checkpoint (host-RAM reserve %zu MiB, mapped weights %zu MiB, %d slots)\n",
+                        cache_ram_reserve_bytes >> 20, ckpt_weights_bytes >> 20, params_base.n_parallel);
             }
 
             const std::string cap = ckpt_count_cap > 0
@@ -2441,14 +2428,43 @@ private:
         return slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens;
     }
 
+    // Per-slot byte budget for context checkpoints, measured when a checkpoint is created and not
+    // once at startup: host RAM comes and goes while the server runs. 0 = the host cannot be
+    // probed, then only the count cap bounds the footprint.
+    size_t ckpt_budget() const {
+        const size_t avail = common_host_mem_available();
+        if (avail == 0) {
+            return 0;
+        }
+
+        // the checkpoints already held are out of `avail`, so add them back: the budget bounds the
+        // total footprint, and does not shrink by what it allowed a moment ago
+        size_t held = 0;
+        for (const server_slot & s : slots) {
+            for (const common_prompt_checkpoint & cp : s.prompt.checkpoints) {
+                held += cp.size();
+            }
+        }
+
+        // The prompt cache is not subtracted. What it holds is out of `avail` already, and --cache-ram
+        // bounds the rest of it, the checkpoints it carries included. Both sides stop at the reserve.
+        const size_t taken = cache_ram_reserve_bytes + ckpt_weights_bytes;
+
+        // floor: below this the checkpoints would be evicted as fast as they are made and buy
+        // nothing. The host-RAM reserve still evicts if the host really is that tight.
+        const size_t pool = std::max<size_t>(avail + held > taken ? avail + held - taken : 0, CKPT_BUDGET_FLOOR);
+
+        return pool / std::max(1, params_base.n_parallel);
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     // Keep one base and append deltas until the chain is evicted.
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
         // Optional cap on chain length (--ctx-checkpoints, or the fallback when the host-RAM probe
-        // failed). What normally bounds the footprint is ckpt_budget_bytes, enforced after the
-        // checkpoint is built and its real size is known.
+        // failed). A count does not help when the memory is short, so what normally bounds the
+        // footprint is ckpt_budget(), enforced after the checkpoint is built and its size is known.
         const bool count_cap_active = ckpt_count_cap > 0;
 
         // Evict checkpoints that sit within checkpoint_min_step of an earlier one (redundant
@@ -2537,14 +2553,27 @@ private:
             }
         }
 
-        bool has_base = false;
-        for (const common_prompt_checkpoint & cp : slot.prompt.checkpoints) {
+        // Walk back over the last chain: the deltas, then the base they hang off.
+        bool   has_base          = false;
+        size_t chain_base_bytes  = 0;
+        size_t chain_delta_bytes = 0;
+
+        for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
             // a replay marker or a failed capture holds no data, so it cannot serve as a base
-            if (!cp.is_delta() && !cp.data_tgt.empty()) {
-                has_base = true;
+            if (!it->is_delta() && !it->data_tgt.empty()) {
+                has_base         = true;
+                chain_base_bytes = it->size();
                 break;
             }
+
+            chain_delta_bytes += it->size();
         }
+
+        // Re-anchor once the deltas cost as much as the base they hang off. Eviction drops a chain
+        // as a unit, so a chain that never ends is one the byte budget below can never touch, and
+        // the whole list is then only dropped at once by the host-RAM reserve. This bounds a chain
+        // at about two full checkpoints and keeps the older chains evictable.
+        const bool re_anchor = has_base && chain_delta_bytes >= chain_base_bytes;
 
         const bool is_hybrid = llama_model_is_hybrid(model_tgt);
 
@@ -2552,7 +2581,7 @@ private:
         // PARTIAL_ONLY that is the recurrent state only, which is small - the attention KV is
         // rolled back from the live cache instead of being snapshotted.
         const bool replay_only = llama_model_is_recurrent(model_tgt) && !is_hybrid;
-        const bool is_base = !has_base;
+        const bool is_base = !has_base || re_anchor;
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
@@ -2574,20 +2603,31 @@ private:
 
         if (is_base || !replay_only) {
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, cur.base_pos);
-            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            // The draft state is stored only if the draft context cannot roll back in place. A
+            // plain KV cache can: the seq_rm that follows a restore trims it to the same position,
+            // the way the attention half of a hybrid target is already handled. The draft KV is the
+            // bigger half of a checkpoint on a long prompt - it grows with the prompt while the
+            // recurrent state does not.
+            if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+
             common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         }
 
-        // Byte budget: the real size is known only now that the checkpoint has been built. Never
-        // drop the newest chain - it would just be rebuilt on the next call.
-        if (ckpt_budget_bytes > 0) {
+        // Byte budget: the real size is known only now that the checkpoint has been built, and the
+        // host is probed now too, so the budget follows the memory that is free at this moment.
+        // Never drop the newest chain - it would just be rebuilt on the next call.
+        const size_t budget = ckpt_budget();
+        if (budget > 0) {
             size_t total = 0;
             for (const common_prompt_checkpoint & cp : slot.prompt.checkpoints) {
                 total += cp.size();
             }
 
             size_t freed = 0;
-            while (total > ckpt_budget_bytes && slot.prompt.checkpoints.size() > 1) {
+            while (total > budget && slot.prompt.checkpoints.size() > 1) {
                 // the front chain is a base plus its trailing deltas; if that is the whole list,
                 // evicting it would take the checkpoint just created with it
                 size_t n_chain = 1;
@@ -2609,15 +2649,15 @@ private:
 
             if (freed > 0) {
                 SLT_TRC(slot, "evicted %.3f MiB of context checkpoints over the budget (%zu MiB per slot)\n",
-                        (float) freed / 1024 / 1024, ckpt_budget_bytes >> 20);
+                        (float) freed / 1024 / 1024, budget >> 20);
             }
         }
 
         SLT_TRC(slot,
-                "created context checkpoint %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s)\n",
+                "created context checkpoint %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s, budget %zu MiB per slot)\n",
                 (int) slot.prompt.checkpoints.size(), cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
-                replay_only ? "REPLAY" : (cur.is_delta() ? "DELTA" : "BASE"));
+                replay_only ? "REPLAY" : (cur.is_delta() ? "DELTA" : "BASE"), budget >> 20);
     }
 
     // Prompt reconcile: reuse the longest common prefix with the live sequence, optionally
@@ -2799,6 +2839,8 @@ private:
                         }
                     }
                     if (ok) {
+                        // no-op when the checkpoint holds no draft state: the caller trims the
+                        // draft context to the restored position right after this
                         ok = restored_cp.apply_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                     }
 

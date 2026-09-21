@@ -351,10 +351,6 @@ set_tests_properties(test-checkpoint-delta PROPERTIES FIXTURES_REQUIRED test-dow
 llama_build_and_test(test-checkpoint-delta-chain.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-checkpoint-delta-chain PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# Test the context-checkpoint tree (node pool, token-span matching, leaf-LRU eviction) - no model
-
-# Test the checkpoint tree against a real (tiny) model: build branches, restore each, compare state
-
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()

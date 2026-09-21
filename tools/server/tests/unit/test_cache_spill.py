@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 import requests
 import struct
 import tempfile
@@ -303,7 +304,7 @@ def test_prompt_cache_spill_with_image():
         # the pixels must not be in there: the image is already encoded into the state blob, so the
         # prompt section carries the token list plus a chunk of a few dozen bytes
         with open(os.path.join(spill_dir, files[0]), "rb") as f:
-            magic, _, _, _, _, n_prompt, _, _ = struct.unpack("<8sIIQQQQQ", f.read(56))
+            magic, _, _, _, _, n_prompt, _, _, _, _ = struct.unpack("<8sIIQQQQQQQ", f.read(72))
         assert magic == b"LCPCACHE"
         assert n_prompt*4 < cold_prompt_n*4 + 1024, f"the prompt section holds {n_prompt*4} bytes"
 
@@ -489,6 +490,139 @@ def test_prompt_cache_spill_dir_shared_by_two_models():
         assert warm["prompt_n"] < cold["prompt_n"]
     finally:
         server.stop()
+        try:
+            for f in os.listdir(spill_dir):
+                os.remove(os.path.join(spill_dir, f))
+            os.rmdir(spill_dir)
+        except OSError:
+            pass
+
+
+def test_context_checkpoint_chain_re_anchors():
+    # A delta checkpoint hangs off a base, and eviction can only drop a base with all its deltas.
+    # One endless chain is therefore one the byte budget can never touch. The chain must re-anchor
+    # (start a new base) once its deltas cost as much as that base, so a base has to show up at an
+    # index above 1. tinygemma3 is used because only SWA models build delta chains.
+    server = ServerPreset.tinygemma3()
+    server.no_mmproj = True
+    server.n_slots = 1
+    server.n_predict = 4
+    server.temperature = 0.0
+    server.debug = True              # the checkpoint lines are trace level
+    server.n_batch = 32              # the prompt has to span several batches to be checkpointed
+    server.n_ubatch = 32
+    server.n_ctx_checkpoints = -1    # no count cap: the byte budget is what bounds the list
+    server.checkpoint_min_step = 0
+    server.cache_ram_reserve = 0     # no host-RAM guard: it would wipe the list and hide the chain
+    fd, server.log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+
+    try:
+        server.start()
+
+        # growing prompts: each one keeps the last as a prefix, so the checkpoints pile up in one list
+        prompt = LONG_PROMPT
+        for _ in range(4):
+            res = server.make_request("POST", "/completion", data={
+                "prompt": prompt, "cache_prompt": True, "temperature": 0.0,
+            })
+            assert res.status_code == 200, res.body
+            prompt = prompt + " The knight rode on past the river and the old stone bridge."
+
+        server.stop()
+
+        with open(server.log_path) as f:
+            made = re.findall(r"created context checkpoint (\d+) \(.*?, (BASE|DELTA),", f.read())
+
+        assert made, "the prompts were not checkpointed"
+        assert any(kind == "DELTA" for _, kind in made), "no delta checkpoint was built"
+        assert any(int(idx) > 1 and kind == "BASE" for idx, kind in made), \
+            f"the chain never re-anchored: {made}"
+    finally:
+        server.stop()
+        try:
+            os.remove(server.log_path)
+        except OSError:
+            pass
+
+
+def test_prompt_cache_spill_carries_checkpoints():
+    # Context checkpoints go out with the state and come back with it. They are what lets a prompt
+    # that matches only a prefix roll back on a model whose memory cannot be rolled back in place;
+    # without them the first request after a restart has to reprocess from the start.
+    # tinygemma3 is used here because a plain KV cache never makes checkpoints.
+    spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-ckpt-")
+    log_paths = []
+
+    def make_server():
+        server = ServerPreset.tinygemma3()
+        server.no_mmproj = True
+        server.n_slots = 1
+        server.n_predict = 4
+        server.temperature = 0.0
+        server.server_slots = True
+        server.debug = True          # the checkpoint lines are trace level
+        server.n_batch = 32          # the prompt has to span several batches to be checkpointed
+        server.n_ubatch = 32
+        server.n_ctx_checkpoints = 8
+        server.checkpoint_min_step = 16
+        server.cache_ram = 100
+        server.cache_spill_dir = spill_dir
+        server.cache_disk = 512
+        fd, server.log_path = tempfile.mkstemp(suffix=".log")
+        os.close(fd)
+        log_paths.append(server.log_path)
+        return server
+
+    server = make_server()
+
+    try:
+        server.start()
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT, "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["prompt_n"] > 1
+
+        with open(server.log_path) as f:
+            assert "created context checkpoint" in f.read(), "the prompt was not checkpointed"
+
+        server.stop()
+
+        files = os.listdir(spill_dir)
+        assert len(files) == 1, f"expected one spill file after a clean stop, got {files}"
+
+        with open(os.path.join(spill_dir, files[0]), "rb") as f:
+            magic, _, _, _, _, _, _, _, n_ckpt, n_ckpt_bytes = struct.unpack("<8sIIQQQQQQQ", f.read(72))
+        assert magic == b"LCPCACHE"
+        assert n_ckpt > 0, "the spill file carries no context checkpoints"
+        assert n_ckpt_bytes > 0
+
+        # cold start on the same directory: the restore has to run off the checkpoints in the file,
+        # none has been created in this process yet
+        server = make_server()
+        server.start()
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT, "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["cache_n"] > 0
+
+        with open(server.log_path) as f:
+            log = f.read()
+        assert "restored context checkpoint" in log, "no checkpoint came back from the spill file"
+        made = log.find("created context checkpoint")
+        assert made < 0 or log.index("restored context checkpoint") < made, \
+            "the restored checkpoint was made in this process, not read from disk"
+    finally:
+        server.stop()
+        for path in log_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         try:
             for f in os.listdir(spill_dir):
                 os.remove(os.path.join(spill_dir, f))

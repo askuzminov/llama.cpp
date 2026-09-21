@@ -1708,7 +1708,8 @@ json server_task_result_apply_lora::to_json() {
 // server_prompt_cache
 //
 // on-disk layout of a spilled prompt-cache state: header, then the serialized prompt, then the two
-// state blobs. Self-describing so that a spill dir can be picked up again after a restart.
+// state blobs, then the context checkpoints (an index of fixed records, then their blobs).
+// Self-describing so that a spill dir can be picked up again after a restart.
 namespace {
 
 struct spill_header {
@@ -1720,12 +1721,28 @@ struct spill_header {
     uint64_t n_prompt; // server_tokens::serialize() output, in llama_token units
     uint64_t n_main;
     uint64_t n_drft;
+    uint64_t n_ckpt;       // context checkpoints, i.e. spill_ckpt records in the index
+    uint64_t n_ckpt_bytes; // their blobs, padding included
 };
 
-static_assert(sizeof(spill_header) == 56, "unexpected spill_header layout");
+static_assert(sizeof(spill_header) == 72, "unexpected spill_header layout");
+
+// one context checkpoint in the index; its blobs follow in the same order, each padded
+struct spill_ckpt {
+    int64_t  n_tokens;
+    int32_t  id_task;
+    int32_t  pos_min;
+    int32_t  pos_max;
+    int32_t  base_pos;
+    uint64_t n_tgt;
+    uint64_t n_dft;
+    uint64_t n_spec;
+};
+
+static_assert(sizeof(spill_ckpt) == 48, "unexpected spill_ckpt layout");
 
 constexpr char     SPILL_MAGIC[8] = { 'L', 'C', 'P', 'C', 'A', 'C', 'H', 'E' };
-constexpr uint32_t SPILL_VERSION  = 3;
+constexpr uint32_t SPILL_VERSION  = 4;
 
 // Spill files bypass the OS file cache. A spilled state is written once and read back at most
 // once, so caching it buys nothing and costs memory - on a host sized for a large model those
@@ -1749,9 +1766,16 @@ bool spill_is_aligned(const void * p) {
 }
 
 // the sizes come from a file that may have been truncated or tampered with
+constexpr uint64_t SPILL_MAX_BYTES = 1ull << 40; // far above any real state
+constexpr uint64_t SPILL_MAX_CKPT  = 4096;       // far above any real checkpoint count
+
 bool spill_header_sane(const spill_header & h) {
-    constexpr uint64_t max_bytes = 1ull << 40; // far above any real state
-    return h.n_prompt < max_bytes/sizeof(llama_token) && h.n_main < max_bytes && h.n_drft < max_bytes;
+    return h.n_prompt < SPILL_MAX_BYTES/sizeof(llama_token) && h.n_main < SPILL_MAX_BYTES &&
+           h.n_drft < SPILL_MAX_BYTES && h.n_ckpt < SPILL_MAX_CKPT && h.n_ckpt_bytes < SPILL_MAX_BYTES;
+}
+
+bool spill_ckpt_sane(const spill_ckpt & c) {
+    return c.n_tgt < SPILL_MAX_BYTES && c.n_dft < SPILL_MAX_BYTES && c.n_spec < SPILL_MAX_BYTES;
 }
 
 // UTF-8 -> filesystem path. On Windows a narrow string is taken to be in the ANSI codepage, which
@@ -1845,6 +1869,8 @@ struct spill_layout {
     uint64_t off_prompt;
     uint64_t off_main;
     uint64_t off_drft;
+    uint64_t off_index;
+    uint64_t off_ckpt;
     uint64_t size;
 };
 
@@ -1853,7 +1879,9 @@ spill_layout spill_layout_of(const spill_header & h) {
     l.off_prompt = SPILL_ALIGN;
     l.off_main   = l.off_prompt + spill_align_up(h.n_prompt*sizeof(llama_token));
     l.off_drft   = l.off_main   + spill_align_up(h.n_main);
-    l.size       = l.off_drft   + spill_align_up(h.n_drft);
+    l.off_index  = l.off_drft   + spill_align_up(h.n_drft);
+    l.off_ckpt   = l.off_index  + spill_align_up(h.n_ckpt*sizeof(spill_ckpt));
+    l.size       = l.off_ckpt   + h.n_ckpt_bytes; // already a sum of padded sections
     return l;
 }
 
@@ -2341,6 +2369,7 @@ size_t server_prompt_cache::restore_spilled() {
         st.uid           = h.uid;
         st.prompt.n_used = h.n_used;
         st.on_disk       = true;
+        st.ckpt_on_disk  = h.n_ckpt;
         st.disk_bytes    = lay.size;
 
         next_uid = std::max(next_uid, h.uid + 1);
@@ -2411,6 +2440,32 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     h.n_main    = st.data.main.size();
     h.n_drft    = st.data.drft.size();
 
+    // the context checkpoints go out with the state: after a restart they are what lets a prompt
+    // that matches only a prefix roll back, instead of being processed from the start again
+    std::vector<spill_ckpt> index;
+    index.reserve(st.prompt.checkpoints.size());
+
+    for (const auto & cp : st.prompt.checkpoints) {
+        index.push_back({
+            cp.n_tokens, cp.id_task, cp.pos_min, cp.pos_max, cp.base_pos,
+            cp.data_tgt.size(), cp.data_dft.size(), cp.data_spec.size(),
+        });
+
+        h.n_ckpt_bytes += spill_align_up(cp.data_tgt.size())
+                        + spill_align_up(cp.data_dft.size())
+                        + spill_align_up(cp.data_spec.size());
+    }
+
+    h.n_ckpt = index.size();
+
+    // a checkpoint only saves recomputation, so when the disk budget cannot take both, the
+    // checkpoints go and the state is still written out
+    if (h.n_ckpt > 0 && spill_layout_of(h).size > disk_free) {
+        h.n_ckpt       = 0;
+        h.n_ckpt_bytes = 0;
+        index.clear();
+    }
+
     // what does not fit the disk budget is skipped rather than written and deleted again right after
     if (spill_layout_of(h).size > disk_free) {
         return false;
@@ -2433,12 +2488,25 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
 
     // sections are written in the order spill_layout_of() describes; an empty one writes nothing
     // and contributes no padding, so the offsets still line up
-    const bool ok =
+    bool ok =
         f.write_section(&h, sizeof(h)) &&
         (h.n_prompt == 0 || f.write_section(prompt.data(), prompt.size())) &&
         (h.n_main   == 0 || f.write_section(st.data.main.data(), h.n_main)) &&
         (h.n_drft   == 0 || f.write_section(st.data.drft.data(), h.n_drft)) &&
-        f.finish();
+        (h.n_ckpt   == 0 || f.write_section(index.data(), index.size()*sizeof(spill_ckpt)));
+
+    if (ok && h.n_ckpt > 0) {
+        for (const auto & cp : st.prompt.checkpoints) {
+            ok = (cp.data_tgt.empty()  || f.write_section(cp.data_tgt.data(),  cp.data_tgt.size())) &&
+                 (cp.data_dft.empty()  || f.write_section(cp.data_dft.data(),  cp.data_dft.size())) &&
+                 (cp.data_spec.empty() || f.write_section(cp.data_spec.data(), cp.data_spec.size()));
+            if (!ok) {
+                break;
+            }
+        }
+    }
+
+    ok = ok && f.finish();
 
     f.close();
 
@@ -2454,8 +2522,9 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
         return false;
     }
 
-    st.disk_bytes = spill_layout_of(h).size;
-    st.on_disk    = true;
+    st.disk_bytes   = spill_layout_of(h).size;
+    st.ckpt_on_disk = h.n_ckpt;
+    st.on_disk      = true;
     return true;
 }
 
@@ -2466,6 +2535,11 @@ void server_prompt_cache::evict_state(server_prompt_cache_state & st) {
 
     st.data.main.clear();  st.data.main.shrink_to_fit();
     st.data.drft.clear();  st.data.drft.shrink_to_fit();
+
+    // the checkpoints are in the file too, unless the disk budget refused them
+    if (st.ckpt_on_disk == st.prompt.checkpoints.size()) {
+        st.prompt.checkpoints.clear();
+    }
 }
 
 bool server_prompt_cache::spill_state(server_prompt_cache_state & st, size_t disk_free) {
@@ -2484,7 +2558,7 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
 
     // the file stays. It holds exactly the bytes the state is handing back, so taking it away only
     // buys a full rewrite at the next idle. enforce_disk_limit decides when a file goes
-    if (st.data.size() > 0) {
+    if (st.data.size() > 0 && st.prompt.checkpoints.size() >= st.ckpt_on_disk) {
         return true; // clean: already in RAM, no read needed
     }
 
@@ -2503,8 +2577,10 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
 
         st.data.main.clear(); st.data.main.shrink_to_fit();
         st.data.drft.clear(); st.data.drft.shrink_to_fit();
-        st.on_disk    = false;
-        st.disk_bytes = 0;
+        st.prompt.checkpoints.clear();
+        st.on_disk      = false;
+        st.disk_bytes   = 0;
+        st.ckpt_on_disk = 0;
 
         return false;
     };
@@ -2535,6 +2611,63 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
         SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
         return drop();
     }
+
+    if (h.n_ckpt > 0) {
+        // checkpoints the disk budget refused are only in RAM, so the list is replaced by the file
+        // only when the file actually holds one
+        st.prompt.checkpoints.clear();
+
+        std::vector<spill_ckpt> index(h.n_ckpt);
+
+        if (!f.read_at(lay.off_index, index.data(), index.size()*sizeof(spill_ckpt))) {
+            SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+            return drop();
+        }
+
+        // the index must describe exactly the bytes the header reserved, or the walk below would
+        // read past the sections it owns
+        uint64_t n_bytes = 0;
+        for (const auto & e : index) {
+            if (!spill_ckpt_sane(e)) {
+                n_bytes = h.n_ckpt_bytes + 1;
+                break;
+            }
+            n_bytes += spill_align_up(e.n_tgt) + spill_align_up(e.n_dft) + spill_align_up(e.n_spec);
+        }
+
+        if (n_bytes != h.n_ckpt_bytes) {
+            SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+            return drop();
+        }
+
+        uint64_t off = lay.off_ckpt;
+
+        const auto rd_ckpt = [&](std::vector<uint8_t> & v, uint64_t n) -> bool {
+            v.resize(n);
+            if (n > 0 && !f.read_at(off, v.data(), n)) {
+                return false;
+            }
+            off += spill_align_up(n);
+            return true;
+        };
+
+        for (const auto & e : index) {
+            common_prompt_checkpoint cp;
+            cp.n_tokens = e.n_tokens;
+            cp.id_task  = e.id_task;
+            cp.pos_min  = e.pos_min;
+            cp.pos_max  = e.pos_max;
+            cp.base_pos = e.base_pos;
+
+            if (!rd_ckpt(cp.data_tgt, e.n_tgt) || !rd_ckpt(cp.data_dft, e.n_dft) || !rd_ckpt(cp.data_spec, e.n_spec)) {
+                SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+                return drop();
+            }
+
+            st.prompt.checkpoints.push_back(std::move(cp));
+        }
+    }
+
     f.close();
 
     return true; // the state is clean now: same bytes in RAM and on disk
@@ -2612,9 +2745,9 @@ size_t server_prompt_cache::free_ram(size_t need) {
             if (!st.is_clean()) {
                 continue;
             }
-            const size_t big = st.data.size();
+            const size_t big = st.size();
             evict_state(st);
-            freed += big;
+            freed += big - st.size();
         }
 
         for (auto & st : states) {
@@ -2624,14 +2757,14 @@ size_t server_prompt_cache::free_ram(size_t need) {
             if (st.on_disk || st.data.size() == 0) {
                 continue;
             }
-            const size_t big = st.data.size();
+            const size_t big = st.size();
             if (spill_state(st, disk_free)) {
-                freed     += big;
+                freed     += big - st.size();
                 disk_free -= std::min(disk_free, st.disk_bytes);
             }
         }
 
-        // the context checkpoints are not spilled, so a state on disk still holds them in RAM.
+        // checkpoints the disk budget refused, or ones read back by a cache hit, are still in RAM.
         // they only save recomputation, so let them go when spilling did not cover the deficit
         for (auto & st : states) {
             if (freed >= need) {

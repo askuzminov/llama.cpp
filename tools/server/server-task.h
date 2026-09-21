@@ -640,6 +640,10 @@ struct server_prompt_cache_state {
     bool     on_disk    = false;
     size_t   disk_bytes = 0;
 
+    // context checkpoints the file holds. The RAM copy is complete only when the list matches it,
+    // and only then is dropping the list free
+    size_t   ckpt_on_disk = 0;
+
     // the disk copy is up to date and the blobs are still in RAM: dropping the RAM costs no I/O,
     // and a cache hit needs no read back
     bool is_clean() const { return on_disk && data.size() > 0; }
