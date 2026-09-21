@@ -193,6 +193,54 @@ def test_prompt_cache_write_behind_while_idle():
             pass
 
 
+def test_prompt_cache_spill_with_mmproj():
+    # An mmproj marks every prompt of the slot as multimodal, also a text-only one. The spill must
+    # still take such a prompt: only a prompt that really holds a media chunk stays in RAM.
+    spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-mtmd-")
+
+    server = ServerPreset.tinygemma3()
+    server.n_slots = 1
+    server.n_predict = 4
+    server.temperature = 0.0
+    server.server_slots = True
+    server.cache_ram = 100
+    server.cache_spill_dir = spill_dir
+    server.cache_disk = 512
+
+    try:
+        server.start()
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT, "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+
+        files = []
+        for _ in range(50):
+            files = [f for f in os.listdir(spill_dir) if os.path.getsize(os.path.join(spill_dir, f)) > 0]
+            if files:
+                break
+            time.sleep(0.1)
+
+        assert len(files) == 1, f"expected the text-only state on disk, got {files}"
+
+        # the server is still alive and the state is still usable
+        res = server.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT + " The knight finally reached the castle gates.",
+            "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["cache_n"] > 0
+    finally:
+        server.stop()
+        try:
+            for f in os.listdir(spill_dir):
+                os.remove(os.path.join(spill_dir, f))
+            os.rmdir(spill_dir)
+        except OSError:
+            pass
+
+
 def test_prompt_cache_hit_keeps_the_file():
     # A cache hit hands the state to the slot, but the file holds the very same bytes, so taking it
     # away would only buy a full rewrite at the next idle. The follow-up state grows by a few tokens

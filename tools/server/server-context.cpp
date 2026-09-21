@@ -328,6 +328,9 @@ struct server_slot {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
+        // a state read back from disk carries text tokens only, so restore what the slot must hold
+        prompt.tokens.has_mtmd = mctx != nullptr;
+
         return res;
     }
 

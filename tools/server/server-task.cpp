@@ -2336,12 +2336,13 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
         return false; // nothing big to write out
     }
 
-    // the tokens are stored alongside the state so the file can be picked up after a restart;
-    // media chunks are not serialized, so such prompts are kept in RAM only
-    const llama_tokens & tokens = st.prompt.tokens.get_tokens();
-    for (llama_token tok : tokens) {
-        if (tok == LLAMA_TOKEN_NULL) {
-            return false;
+    // the tokens are stored alongside the state so the file can be picked up after a restart. The
+    // list is copied because get_tokens() rejects an mtmd prompt, also when it holds no media
+    llama_tokens tokens(st.prompt.tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = st.prompt.tokens[i];
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            return false; // a media chunk is not serialized, so this prompt stays in RAM
         }
     }
 
