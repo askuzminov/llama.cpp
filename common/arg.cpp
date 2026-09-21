@@ -1737,7 +1737,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "pressure; loaded back on a cache hit. While the server is idle, resident states are copied out as well, "
         "so a later eviction frees the RAM with no I/O and a crash does not lose the cache. The files are kept on "
         "shutdown and picked up again on the next start (cold-start reuse) as long as the model and KV "
-        "configuration match. Best on fast NVMe. (default: disabled)",
+        "configuration match. Several models may share one directory: a file is named after the "
+        "configuration it belongs to, so a model only ever reads and drops its own. "
+        "Best on fast NVMe. (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.cache_spill_dir = value;
         }
@@ -1745,7 +1747,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-disk"}, "N",
         string_format("[experimental] disk budget in MiB for spilled prompt-cache states (see --cache-spill-dir); "
-            "the least frequently used states are dropped once exceeded (default: %d, 0 = unlimited)", params.cache_disk_mib),
+            "the least frequently used states are dropped once exceeded. The budget counts one model, so a "
+            "directory shared by several of them holds up to N MiB for each (default: %d, 0 = unlimited)", params.cache_disk_mib),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("cache-disk must be >= 0");

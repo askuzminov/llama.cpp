@@ -1,4 +1,7 @@
+import base64
 import os
+import requests
+import struct
 import tempfile
 import time
 
@@ -23,6 +26,8 @@ LONG_PROMPT = (
     "He met many creatures along the way including dragons and fairies "
     "and wizards who helped him on his noble quest to save the kingdom."
 )
+
+IMG_URL = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png"
 
 
 def test_prompt_cache_spill_enabled_reuse():
@@ -195,7 +200,7 @@ def test_prompt_cache_write_behind_while_idle():
 
 def test_prompt_cache_spill_with_mmproj():
     # An mmproj marks every prompt of the slot as multimodal, also a text-only one. The spill must
-    # still take such a prompt: only a prompt that really holds a media chunk stays in RAM.
+    # still take such a prompt. See test_prompt_cache_spill_with_image for one that holds media.
     spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-mtmd-")
 
     server = ServerPreset.tinygemma3()
@@ -233,6 +238,94 @@ def test_prompt_cache_spill_with_mmproj():
         assert res.body["timings"]["cache_n"] > 0
     finally:
         server.stop()
+        try:
+            for f in os.listdir(spill_dir):
+                os.remove(os.path.join(spill_dir, f))
+            os.rmdir(spill_dir)
+        except OSError:
+            pass
+
+
+def test_prompt_cache_spill_with_image():
+    # A prompt that really holds an image must reach the disk too. The image is already encoded into
+    # the state blob, so the file only carries the chunk id and its token count. A restart on the
+    # same directory has to match the same image again and reuse the state.
+    spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-img-")
+
+    img_res = requests.get(IMG_URL)
+    img_res.raise_for_status()
+    img = base64.b64encode(img_res.content).decode("utf-8")
+
+    # the marker is random per process unless it is pinned, and both servers must use the same one
+    marker_env = os.environ.get("LLAMA_MEDIA_MARKER")
+    os.environ["LLAMA_MEDIA_MARKER"] = "<__media__>"
+
+    prompt = {
+        "prompt_string": "What is this: <__media__>\nAnswer with one word and then explain yourself.",
+        "multimodal_data": [ img ],
+    }
+
+    def make_server():
+        server = ServerPreset.tinygemma3()
+        server.n_slots = 1
+        server.n_predict = 4
+        server.temperature = 0.0
+        server.server_slots = True
+        server.cache_ram = 100
+        server.cache_spill_dir = spill_dir
+        server.cache_disk = 512
+        # gemma3 is a SWA model: without the full KV a restored state starts past position 0 and the
+        # slot has to reprocess the prompt, which would hide what this test is after
+        server.swa_full = True
+        return server
+
+    server = make_server()
+
+    try:
+        server.start()
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "cache_prompt": True, "temperature": 0.0, "top_k": 1,
+        })
+        assert res.status_code == 200, res.body
+        cold_prompt_n = res.body["timings"]["prompt_n"]
+        assert cold_prompt_n > 1
+
+        files = []
+        for _ in range(50):
+            files = [f for f in os.listdir(spill_dir) if os.path.getsize(os.path.join(spill_dir, f)) > 0]
+            if files:
+                break
+            time.sleep(0.1)
+
+        assert len(files) == 1, f"expected the image prompt on disk, got {files}"
+
+        # the pixels must not be in there: the image is already encoded into the state blob, so the
+        # prompt section carries the token list plus a chunk of a few dozen bytes
+        with open(os.path.join(spill_dir, files[0]), "rb") as f:
+            magic, _, _, _, _, n_prompt, _, _ = struct.unpack("<8sIIQQQQQ", f.read(56))
+        assert magic == b"LCPCACHE"
+        assert n_prompt*4 < cold_prompt_n*4 + 1024, f"the prompt section holds {n_prompt*4} bytes"
+
+        server.stop()
+
+        # cold start on the same directory: the image hashes to the same chunk id, so the restored
+        # placeholder matches and the prompt is not encoded again
+        server = make_server()
+        server.start()
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "cache_prompt": True, "temperature": 0.0, "top_k": 1,
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["cache_n"] > 0, "expected reuse of the spilled image prompt after a restart"
+        assert res.body["timings"]["prompt_n"] < cold_prompt_n
+    finally:
+        server.stop()
+        if marker_env is None:
+            os.environ.pop("LLAMA_MEDIA_MARKER", None)
+        else:
+            os.environ["LLAMA_MEDIA_MARKER"] = marker_env
         try:
             for f in os.listdir(spill_dir):
                 os.remove(os.path.join(spill_dir, f))
@@ -337,6 +430,63 @@ def test_prompt_cache_min_tokens_skips_short_prompts():
 
         time.sleep(0.5)
         assert os.listdir(spill_dir) == [], "short prompts must not enter the cache"
+    finally:
+        server.stop()
+        try:
+            for f in os.listdir(spill_dir):
+                os.remove(os.path.join(spill_dir, f))
+            os.rmdir(spill_dir)
+        except OSError:
+            pass
+
+
+def test_prompt_cache_spill_dir_shared_by_two_models():
+    # Two models may point at one spill dir. The file name carries the signature of the
+    # configuration, so a model only ever reads and drops its own files, and it still finds them
+    # after the other model has run there.
+    spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-share-")
+
+    def setup(server):
+        server.n_slots = 1
+        server.n_predict = 4
+        server.temperature = 0.0
+        server.server_slots = True
+        server.cache_ram = 100
+        server.cache_spill_dir = spill_dir
+        server.cache_disk = 512
+        return server
+
+    def run(server):
+        server.start()
+        res = server.make_request("POST", "/completion", data={
+            "prompt": LONG_PROMPT, "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+        server.stop()
+        return res.body["timings"]
+
+    server = setup(ServerPreset.tinyllama2())
+
+    try:
+        cold = run(server)
+        assert cold["prompt_n"] > 1
+
+        mine = os.listdir(spill_dir)
+        assert len(mine) == 1, f"expected one spill file after a clean stop, got {mine}"
+
+        # the other model spills into the same directory
+        server = setup(ServerPreset.stories15m_moe())
+        run(server)
+
+        both = sorted(os.listdir(spill_dir))
+        assert len(both) == 2, f"each model must keep its own file, got {both}"
+        assert mine[0] in both, "the second model dropped the first one's file"
+
+        # back to the first model: its state survived and is still reusable
+        server = setup(ServerPreset.tinyllama2())
+        warm = run(server)
+        assert warm["cache_n"] > 0, "expected reuse after the other model ran on the same dir"
+        assert warm["prompt_n"] < cold["prompt_n"]
     finally:
         server.stop()
         try:

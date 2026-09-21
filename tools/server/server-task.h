@@ -662,7 +662,7 @@ struct server_prompt_cache {
     // caller, and --cache-ram 0 means the cache is never created
     server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes = 0,
                         const std::string & spill_dir = "", size_t spill_limit_bytes = 0,
-                        uint64_t signature = 0);
+                        uint64_t signature = 0, bool has_mtmd = false);
     ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
@@ -691,6 +691,9 @@ struct server_prompt_cache {
     // different signature are from another model or another KV layout and are discarded on load.
     uint64_t signature = 0;
 
+    // an mmproj is loaded, so a spilled prompt may hold media chunks and can be restored with them
+    bool has_mtmd = false;
+
     size_t size() const;      // RAM-resident bytes across all states
     size_t disk_size() const; // bytes currently spilled to disk
 
@@ -712,10 +715,11 @@ struct server_prompt_cache {
     std::filesystem::path spill_dir_path() const;
     std::filesystem::path spill_path(uint64_t uid) const;
     // RAM -> disk, keeps st.data (the state becomes clean). `cancel` is polled between device
-    // transfers: when it fires the partial file is removed and the state stays dirty
-    bool write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel = nullptr);
+    // transfers: when it fires the partial file is removed and the state stays dirty. A state whose
+    // file would not fit in `disk_free` bytes is skipped
+    bool write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel = nullptr, size_t disk_free = SIZE_MAX);
     void evict_state(server_prompt_cache_state & st);   // free st.data of a clean state, no I/O
-    bool spill_state(server_prompt_cache_state & st);   // write_state + evict_state, keeps st in the list
+    bool spill_state(server_prompt_cache_state & st, size_t disk_free = SIZE_MAX); // write_state + evict_state, keeps st in the list
     bool unspill_state(server_prompt_cache_state & st); // disk -> RAM (reads st.data back, keeps the file)
 
     // write-behind: copy dirty states to disk while nothing else runs, without freeing their RAM.

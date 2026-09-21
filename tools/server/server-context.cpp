@@ -328,7 +328,8 @@ struct server_slot {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
-        // a state read back from disk carries text tokens only, so restore what the slot must hold
+        // the cache builds its prompts from the slots and restores media with them, so the flag
+        // should already agree. Keep the slot consistent anyway: a mismatch aborts on the next use
         prompt.tokens.has_mtmd = mctx != nullptr;
 
         return res;
@@ -1424,7 +1425,7 @@ private:
             const size_t spill_limit = (size_t) std::max(0, params_base.cache_disk_mib) * 1024ull * 1024ull;
             prompt_cache = std::make_unique<server_prompt_cache>(
                     (size_t) cache_ram_mib_eff, n_ctx, cache_ram_reserve_bytes, params_base.cache_spill_dir, spill_limit,
-                    prompt_cache_signature());
+                    prompt_cache_signature(), mctx != nullptr);
             prompt_cache->min_tokens = (size_t) std::max(0, params_base.cache_min_tokens);
 
             if (params_base.cache_min_tokens > 0) {

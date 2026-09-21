@@ -1707,7 +1707,7 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
-// on-disk layout of a spilled prompt-cache state: header, then the prompt tokens, then the two
+// on-disk layout of a spilled prompt-cache state: header, then the serialized prompt, then the two
 // state blobs. Self-describing so that a spill dir can be picked up again after a restart.
 namespace {
 
@@ -1717,7 +1717,7 @@ struct spill_header {
     uint32_t n_used;
     uint64_t uid;
     uint64_t signature;
-    uint64_t n_tokens;
+    uint64_t n_prompt; // server_tokens::serialize() output, in llama_token units
     uint64_t n_main;
     uint64_t n_drft;
 };
@@ -1725,7 +1725,7 @@ struct spill_header {
 static_assert(sizeof(spill_header) == 56, "unexpected spill_header layout");
 
 constexpr char     SPILL_MAGIC[8] = { 'L', 'C', 'P', 'C', 'A', 'C', 'H', 'E' };
-constexpr uint32_t SPILL_VERSION  = 2;
+constexpr uint32_t SPILL_VERSION  = 3;
 
 // Spill files bypass the OS file cache. A spilled state is written once and read back at most
 // once, so caching it buys nothing and costs memory - on a host sized for a large model those
@@ -1751,7 +1751,7 @@ bool spill_is_aligned(const void * p) {
 // the sizes come from a file that may have been truncated or tampered with
 bool spill_header_sane(const spill_header & h) {
     constexpr uint64_t max_bytes = 1ull << 40; // far above any real state
-    return h.n_tokens < max_bytes/sizeof(llama_token) && h.n_main < max_bytes && h.n_drft < max_bytes;
+    return h.n_prompt < max_bytes/sizeof(llama_token) && h.n_main < max_bytes && h.n_drft < max_bytes;
 }
 
 // UTF-8 -> filesystem path. On Windows a narrow string is taken to be in the ANSI codepage, which
@@ -1798,9 +1798,51 @@ std::string spill_fs_utf8(const std::filesystem::path & path) {
 #endif
 }
 
+// file name of a spilled state. The signature keeps the caches of different models apart in a
+// shared spill dir: without it their uid counters collide and they overwrite each other's files
+std::string spill_name_of(uint64_t signature, uint64_t uid) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "state-%016llx-%llu.bin", (unsigned long long) signature, (unsigned long long) uid);
+    return buf;
+}
+
+enum spill_name_kind {
+    SPILL_NAME_OTHER, // another model's file, or not one of ours at all
+    SPILL_NAME_MINE,
+    SPILL_NAME_OLD,   // ours by shape, from a build that had no signature in the name
+};
+
+spill_name_kind spill_name_classify(const std::string & name, uint64_t signature) {
+    static const std::string pre = "state-";
+    static const std::string ext = ".bin";
+
+    if (name.size() <= pre.size() + ext.size() ||
+        name.compare(0, pre.size(), pre) != 0 ||
+        name.compare(name.size() - ext.size(), ext.size(), ext) != 0) {
+        return SPILL_NAME_OTHER;
+    }
+
+    const std::string mid = name.substr(pre.size(), name.size() - pre.size() - ext.size());
+
+    if (mid.find_first_not_of("0123456789") == std::string::npos) {
+        return SPILL_NAME_OLD; // "state-<uid>.bin"
+    }
+
+    const size_t sep = mid.find('-');
+    if (sep == std::string::npos || sep + 1 >= mid.size() ||
+        mid.find_first_not_of("0123456789", sep + 1) != std::string::npos) {
+        return SPILL_NAME_OTHER;
+    }
+
+    char expect[32];
+    snprintf(expect, sizeof(expect), "%016llx-", (unsigned long long) signature);
+
+    return mid.compare(0, sep + 1, expect) == 0 ? SPILL_NAME_MINE : SPILL_NAME_OTHER;
+}
+
 // section offsets implied by a header
 struct spill_layout {
-    uint64_t off_tokens;
+    uint64_t off_prompt;
     uint64_t off_main;
     uint64_t off_drft;
     uint64_t size;
@@ -1808,20 +1850,11 @@ struct spill_layout {
 
 spill_layout spill_layout_of(const spill_header & h) {
     spill_layout l = {};
-    l.off_tokens = SPILL_ALIGN;
-    l.off_main   = l.off_tokens + spill_align_up(h.n_tokens*sizeof(llama_token));
+    l.off_prompt = SPILL_ALIGN;
+    l.off_main   = l.off_prompt + spill_align_up(h.n_prompt*sizeof(llama_token));
     l.off_drft   = l.off_main   + spill_align_up(h.n_main);
     l.size       = l.off_drft   + spill_align_up(h.n_drft);
     return l;
-}
-
-// bytes a state would occupy on disk, from the same layout the writer uses
-uint64_t spill_size_of(uint64_t n_tokens, uint64_t n_main, uint64_t n_drft) {
-    spill_header h = {};
-    h.n_tokens = n_tokens;
-    h.n_main   = n_main;
-    h.n_drft   = n_drft;
-    return spill_layout_of(h).size;
 }
 
 // One spill file, read or written with the cache bypassed. An aligned buffer goes to the device as
@@ -2193,13 +2226,14 @@ private:
 
 server_prompt_cache::server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes,
                                          const std::string & spill_dir, size_t spill_limit_bytes,
-                                         uint64_t signature) {
+                                         uint64_t signature, bool has_mtmd) {
     this->limit_size   = 1024ull*1024ull*limit_size_mib;
     this->limit_tokens = limit_tokens;
     this->reserve_size = reserve_bytes;
     this->spill_dir    = spill_dir;
     this->spill_limit  = spill_limit_bytes;
     this->signature    = signature;
+    this->has_mtmd     = has_mtmd;
 
     if (!this->spill_dir.empty()) {
         std::error_code ec;
@@ -2234,7 +2268,7 @@ std::filesystem::path server_prompt_cache::spill_dir_path() const {
 }
 
 std::filesystem::path server_prompt_cache::spill_path(uint64_t uid) const {
-    return spill_dir_path() / ("state-" + std::to_string(uid) + ".bin");
+    return spill_dir_path() / spill_name_of(signature, uid);
 }
 
 size_t server_prompt_cache::restore_spilled() {
@@ -2254,6 +2288,11 @@ size_t server_prompt_cache::restore_spilled() {
 
         const std::filesystem::path path = entry.path();
 
+        const spill_name_kind kind = spill_name_classify(spill_fs_utf8(path.filename()), signature);
+        if (kind == SPILL_NAME_OTHER) {
+            continue; // another model spills here too - leave its files alone
+        }
+
         spill_file f;
         if (!f.open_read(path)) {
             continue;
@@ -2263,11 +2302,17 @@ size_t server_prompt_cache::restore_spilled() {
         if (!f.read_at(0, &h, sizeof(h))) {
             continue; // not one of ours
         }
-        if (memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) != 0 || h.version != SPILL_VERSION) {
+        if (memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) != 0) {
+            continue; // not one of ours - leave it alone
+        }
+        if (kind == SPILL_NAME_OLD || h.version != SPILL_VERSION) {
+            // our file, written by another build: the layout or the name is gone, so is the state
+            f.close();
+            std::filesystem::remove(path, ec);
             continue;
         }
 
-        // a different model or KV layout, or a truncated file - the state cannot be restored
+        // the header disagrees with the name, or the file is truncated - the state cannot be restored
         const spill_layout lay = spill_header_sane(h) ? spill_layout_of(h) : spill_layout{};
         if (h.signature != signature || lay.size == 0 || lay.size != f.size()) {
             f.close();
@@ -2275,8 +2320,8 @@ size_t server_prompt_cache::restore_spilled() {
             continue;
         }
 
-        llama_tokens tokens(h.n_tokens);
-        if (h.n_tokens && !f.read_at(lay.off_tokens, tokens.data(), h.n_tokens*sizeof(llama_token))) {
+        llama_tokens packed(h.n_prompt);
+        if (h.n_prompt && !f.read_at(lay.off_prompt, packed.data(), h.n_prompt*sizeof(llama_token))) {
             f.close();
             std::filesystem::remove(path, ec);
             continue;
@@ -2284,7 +2329,15 @@ size_t server_prompt_cache::restore_spilled() {
         f.close();
 
         server_prompt_cache_state st;
-        st.prompt.tokens = server_tokens(tokens, false);
+        try {
+            st.prompt.tokens = server_tokens::deserialize(packed, has_mtmd);
+        } catch (const std::exception & e) {
+            // the media chunks cannot be rebuilt: the server runs without an mmproj now, or the
+            // chunk format moved on. Either way the state is unusable
+            SRV_WRN(" - discarding prompt-cache spill file '%s': %s\n", spill_fs_utf8(path).c_str(), e.what());
+            std::filesystem::remove(path, ec);
+            continue;
+        }
         st.uid           = h.uid;
         st.prompt.n_used = h.n_used;
         st.on_disk       = true;
@@ -2328,7 +2381,7 @@ void server_prompt_cache::persist() {
             n_disk, states.size(), disk_size() / (1024.0 * 1024.0));
 }
 
-bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel) {
+bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel, size_t disk_free) {
     if (spill_dir.empty() || st.on_disk) {
         return false;
     }
@@ -2336,19 +2389,37 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
         return false; // nothing big to write out
     }
 
-    // the tokens are stored alongside the state so the file can be picked up after a restart. The
-    // list is copied because get_tokens() rejects an mtmd prompt, also when it holds no media
-    llama_tokens tokens(st.prompt.tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        tokens[i] = st.prompt.tokens[i];
-        if (tokens[i] == LLAMA_TOKEN_NULL) {
-            return false; // a media chunk is not serialized, so this prompt stays in RAM
-        }
+    // the prompt is stored alongside the state so the file can be picked up after a restart. Media
+    // chunks come with it, without their pixels: the image is already encoded into the state blob,
+    // and matching the prompt again only needs the chunk id and its token count
+    std::vector<char> prompt;
+    try {
+        prompt = st.prompt.tokens.serialize();
+    } catch (const std::exception & e) {
+        SRV_ERR(" - failed to serialize a prompt-cache state: %s\n", e.what());
+        return false;
+    }
+
+    GGML_ASSERT(prompt.size() % sizeof(llama_token) == 0);
+
+    spill_header h = {};
+    memcpy(h.magic, SPILL_MAGIC, sizeof(h.magic));
+    h.version   = SPILL_VERSION;
+    h.n_used    = st.prompt.n_used;
+    h.signature = signature;
+    h.n_prompt  = prompt.size()/sizeof(llama_token);
+    h.n_main    = st.data.main.size();
+    h.n_drft    = st.data.drft.size();
+
+    // what does not fit the disk budget is skipped rather than written and deleted again right after
+    if (spill_layout_of(h).size > disk_free) {
+        return false;
     }
 
     if (st.uid == 0) {
         st.uid = next_uid++;
     }
+    h.uid = st.uid;
 
     const std::filesystem::path path = spill_path(st.uid);
 
@@ -2360,21 +2431,11 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
         return false;
     }
 
-    spill_header h = {};
-    memcpy(h.magic, SPILL_MAGIC, sizeof(h.magic));
-    h.version   = SPILL_VERSION;
-    h.n_used    = st.prompt.n_used;
-    h.uid       = st.uid;
-    h.signature = signature;
-    h.n_tokens  = tokens.size();
-    h.n_main    = st.data.main.size();
-    h.n_drft    = st.data.drft.size();
-
     // sections are written in the order spill_layout_of() describes; an empty one writes nothing
     // and contributes no padding, so the offsets still line up
     const bool ok =
         f.write_section(&h, sizeof(h)) &&
-        (h.n_tokens == 0 || f.write_section(tokens.data(), h.n_tokens*sizeof(llama_token))) &&
+        (h.n_prompt == 0 || f.write_section(prompt.data(), prompt.size())) &&
         (h.n_main   == 0 || f.write_section(st.data.main.data(), h.n_main)) &&
         (h.n_drft   == 0 || f.write_section(st.data.drft.data(), h.n_drft)) &&
         f.finish();
@@ -2407,8 +2468,8 @@ void server_prompt_cache::evict_state(server_prompt_cache_state & st) {
     st.data.drft.clear();  st.data.drft.shrink_to_fit();
 }
 
-bool server_prompt_cache::spill_state(server_prompt_cache_state & st) {
-    if (!st.on_disk && !write_state(st)) {
+bool server_prompt_cache::spill_state(server_prompt_cache_state & st, size_t disk_free) {
+    if (!st.on_disk && !write_state(st, nullptr, disk_free)) {
         return false;
     }
 
@@ -2539,8 +2600,7 @@ size_t server_prompt_cache::free_ram(size_t need) {
         // spill oldest resident states to disk: this frees their RAM but keeps them restorable, so
         // we never drop a state just to satisfy a RAM deficit. Spilling the whole (bounded) cache
         // is the most we can do for host-RAM pressure; the disk budget alone decides what is
-        // dropped for good (enforce_disk_limit).
-        // what will not fit on disk is skipped rather than written and deleted again right after
+        // dropped for good (enforce_disk_limit)
         size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit - std::min(spill_limit, disk_size());
 
         // a clean state already has its copy on disk (write_behind put it there while idle), so
@@ -2564,11 +2624,8 @@ size_t server_prompt_cache::free_ram(size_t need) {
             if (st.on_disk || st.data.size() == 0) {
                 continue;
             }
-            if (spill_size_of(st.prompt.tokens.size(), st.data.main.size(), st.data.drft.size()) > disk_free) {
-                continue;
-            }
             const size_t big = st.data.size();
-            if (spill_state(st)) {
+            if (spill_state(st, disk_free)) {
                 freed     += big;
                 disk_free -= std::min(disk_free, st.disk_bytes);
             }
@@ -2631,7 +2688,6 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
         return 0;
     }
 
-    // what will not fit on disk is skipped rather than written and dropped again right after
     size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit - std::min(spill_limit, disk_size());
 
     size_t n_written = 0;
@@ -2645,9 +2701,6 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
         auto & st = *it;
 
         if (st.on_disk || st.data.size() == 0) {
-            continue;
-        }
-        if (spill_size_of(st.prompt.tokens.size(), st.data.main.size(), st.data.drft.size()) > disk_free) {
             continue;
         }
 
@@ -2666,7 +2719,7 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
             break;
         }
 
-        if (!write_state(st, &interrupted)) {
+        if (!write_state(st, &interrupted, disk_free)) {
             if (interrupted && interrupted()) {
                 break; // stopped part way through, the file is gone and the state is still in RAM
             }
