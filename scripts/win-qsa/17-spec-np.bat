@@ -13,14 +13,16 @@ rem   np2-free     two slots, two different prompts - the draft lengths diverge 
 rem                splits. the realistic case, and np2-lock minus np2-free is the cost of the split
 rem   np1-noreuse  one slot with LLAMA_GRAPH_REUSE_DISABLE=1 - the target rebuilds its graph on
 rem                every pass, which prices the rebuild that a varying draft length already forces
-rem the last four arms answer a different question: does ngram-mod pay off next to draft-mtp. the
+rem the last five arms answer a different question: does ngram-mod pay off next to draft-mtp. the
 rem priority list in common/speculative.cpp puts every ngram speculator above every model one, so
-rem ngram-mod drafts first and the mtp head only runs where ngram found nothing. all four run on
+rem ngram-mod drafts first and the mtp head only runs where ngram found nothing. all five run on
 rem one slot:
-rem   ngram-off    draft-mtp alone on a repeat-verbatim prompt - the baseline for the next two
+rem   ngram-off    draft-mtp alone on a repeat-verbatim prompt - the baseline for ngram-on
 rem   ngram-on     ngram-mod,draft-mtp on the same prompt - what a long verbatim repeat is worth
 rem   ngram-crlf   the same block with CRLF line ends - the model writes LF, so the tokens differ
-rem                and the pool never matches. ngram-on minus ngram-crlf is the cost of CRLF input
+rem                and the pool never matches
+rem   ngram-crlf-off  the CRLF block with draft-mtp alone - the baseline ngram-crlf needs, since
+rem                the CRLF block also changes what the model writes
 rem   ngram-miss   ngram-mod,draft-mtp on the plain prompt, which has nothing to repeat - what the
 rem                speculator costs when it never hits
 rem the two-slot arms send both prompts in one request, as a json array. the server turns an array
@@ -50,7 +52,7 @@ if not defined SPECTIMEOUT set "SPECTIMEOUT=1800"
 if not defined SPECVERB    set "SPECVERB=4"
 if not defined SPECREPGEN  set "SPECREPGEN=1024"
 if not defined SPECREPLINE set "SPECREPLINE=80"
-if not defined SPECARMS    set "SPECARMS=np1 np2-one np2-lock np2-free np1-noreuse ngram-off ngram-on ngram-crlf ngram-miss"
+if not defined SPECARMS    set "SPECARMS=np1 np2-one np2-lock np2-free np1-noreuse ngram-off ngram-on ngram-crlf ngram-crlf-off ngram-miss"
 if not defined SETTLE      set "SETTLE=30"
 
 rem the two prompts. length does not matter here, only the generated tokens do, so the built-in
@@ -206,10 +208,11 @@ rem logs still compare with the runs already written down in README.md
 if "%ARM%"=="ngram-off"   ( set "NP=1" & set "BODY=repeat"      & set "NREQ=1" & set "NGEN=%SPECREPGEN%" & set "LLAMA_TRACE=1" )
 if "%ARM%"=="ngram-on"    ( set "NP=1" & set "BODY=repeat"      & set "NREQ=1" & set "NGEN=%SPECREPGEN%" & set "LLAMA_TRACE=1" & set "STYPE=ngram-mod,draft-mtp" )
 if "%ARM%"=="ngram-crlf"  ( set "NP=1" & set "BODY=repeat-crlf" & set "NREQ=1" & set "NGEN=%SPECREPGEN%" & set "LLAMA_TRACE=1" & set "STYPE=ngram-mod,draft-mtp" )
+if "%ARM%"=="ngram-crlf-off" ( set "NP=1" & set "BODY=repeat-crlf" & set "NREQ=1" & set "NGEN=%SPECREPGEN%" & set "LLAMA_TRACE=1" )
 if "%ARM%"=="ngram-miss"  ( set "NP=1" & set "BODY=one"         & set "NREQ=1" & set "LLAMA_TRACE=1" & set "STYPE=ngram-mod,draft-mtp" )
 
 if not defined NP (
-    echo unknown arm %ARM%, known: np1 np1-noreuse np2-one np2-lock np2-free ngram-off ngram-on ngram-crlf ngram-miss
+    echo unknown arm %ARM%, known: np1 np1-noreuse np2-one np2-lock np2-free ngram-off ngram-on ngram-crlf ngram-crlf-off ngram-miss
     set "RC=1"
     goto :eof
 )

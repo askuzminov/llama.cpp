@@ -98,7 +98,7 @@ set "SPECVERB=4"
 rem arms, see the header of 17-spec-np.bat. np2-lock minus np2-free is the price of splitting
 rem one target pass into two ubatches, np1-noreuse is the price of rebuilding the target graph.
 rem the ngram-* arms answer a different question - what ngram-mod is worth next to draft-mtp
-set "SPECARMS=np1 np2-one np2-lock np2-free np1-noreuse ngram-off ngram-on ngram-crlf ngram-miss"
+set "SPECARMS=np1 np2-one np2-lock np2-free np1-noreuse ngram-off ngram-on ngram-crlf ngram-crlf-off ngram-miss"
 
 rem seconds to wait between two model loads in 07, 10 and 11. the model fills the gpu almost
 rem completely and the driver frees it lazily, so a run started right after the previous one
