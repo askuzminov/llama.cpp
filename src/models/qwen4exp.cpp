@@ -181,11 +181,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // LM head, but none of the trunk
     const bool mtp_only     = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
     const int  trunk_flags  = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    // a hand-made shared head carries neither, so the graph reads both out of the target
+    const bool borrows      = mtp_only && ml.get_weight("token_embd.weight") == nullptr;
+    const int  borrow_flags = borrows ? TENSOR_NOT_REQUIRED | TENSOR_BORROWED : trunk_flags;
     // MTP tensors sit in the trailing blocks; skip them entirely unless a draft head was asked for
     const int  mtp_flags    = !ml.load_mtp ? TENSOR_SKIP : 0;
 
     // a shared draft head has no table of its own, the graph borrows the target one
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, borrow_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -193,7 +196,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | borrow_flags);
     // never tie to a token_embd that a borrowing draft head does not have
     if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);

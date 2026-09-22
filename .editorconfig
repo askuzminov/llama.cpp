@@ -60,3 +60,7 @@ end_of_line = unset
 charset = unset
 trim_trailing_whitespace = unset
 insert_final_newline = unset
+
+# these are run by cmd.exe and are kept CRLF by scripts/win-qsa/.gitattributes
+[scripts/win-qsa/*.bat]
+end_of_line = crlf

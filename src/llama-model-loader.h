@@ -147,6 +147,7 @@ struct llama_model_loader {
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
     static const int TENSOR_READ_CACHE      = 1 << 6; // with TENSOR_READ_LAZY: the arch can gather the rows itself, see llama_row_cache
+    static const int TENSOR_BORROWED        = 1 << 7; // a draft head can read this out of the model it drafts for, see create_tensor
 
     int n_kv      = 0;
     int n_tensors = 0;

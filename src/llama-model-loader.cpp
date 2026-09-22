@@ -1178,6 +1178,25 @@ llama_model_loader::lazy_read::kind llama_model_loader::lazy_read::add(
     return MMAP;
 }
 
+// shape-only description of a tensor that is not read from a file: the graph needs the dimensions
+static void fill_tensor_meta(ggml_tensor & t_meta, const char * name, ggml_type type, const std::initializer_list<int64_t> & ne) {
+    memset(&t_meta, 0, sizeof(ggml_tensor));
+    t_meta.type = type;
+    for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+        t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+        GGML_ASSERT(t_meta.ne[dim] >= 1);
+        if (dim == 0) {
+            t_meta.nb[dim] = ggml_type_size(type);
+        } else if (dim == 1) {
+            t_meta.nb[dim] = ggml_row_size(type, t_meta.ne[dim-1]);
+        } else {
+            t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+        }
+        GGML_ASSERT(t_meta.nb[dim] >= 1);
+    }
+    ggml_set_name(&t_meta, name);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1374,21 +1393,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_tensor t_meta;
-        memset(&t_meta, 0, sizeof(ggml_tensor));
-        t_meta.type = type;
-        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
-            GGML_ASSERT(t_meta.ne[dim] >= 1);
-            if (dim == 0) {
-                t_meta.nb[dim] = ggml_type_size(type);
-            } else if (dim == 1) {
-                t_meta.nb[dim] = ggml_row_size(type, t_meta.ne[dim-1]);
-            } else {
-                t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
-            }
-            GGML_ASSERT(t_meta.nb[dim] >= 1);
-        }
-        ggml_set_name(&t_meta, tn.str().c_str());
+        fill_tensor_meta(t_meta, tn.str().c_str(), type, ne);
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
@@ -1401,6 +1406,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
+        // a draft head that borrows this tensor reads it out of the model it drafts for, when the graph
+        // is built. A memory fit opens the head alone, with no target, so stand the shape in and let the
+        // graph reserve. The bytes count here as well as in the target, so the fit budgets high, not short.
+        if ((flags & TENSOR_BORROWED) && no_alloc) {
+            ggml_tensor t_meta;
+            fill_tensor_meta(t_meta, tn.str().c_str(), GGML_TYPE_F32, ne);
+
+            ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+            GGML_ASSERT(buft != nullptr);
+            ggml_tensor * ret = ggml_dup_tensor(ctx_for_buft(buft), &t_meta);
+            ggml_set_name(ret, tn.str().c_str());
+            return ret;
+        }
         return NULL;
     }
 

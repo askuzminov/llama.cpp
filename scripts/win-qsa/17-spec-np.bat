@@ -13,6 +13,16 @@ rem   np2-free     two slots, two different prompts - the draft lengths diverge 
 rem                splits. the realistic case, and np2-lock minus np2-free is the cost of the split
 rem   np1-noreuse  one slot with LLAMA_GRAPH_REUSE_DISABLE=1 - the target rebuilds its graph on
 rem                every pass, which prices the rebuild that a varying draft length already forces
+rem the last four arms answer a different question: does ngram-mod pay off next to draft-mtp. the
+rem priority list in common/speculative.cpp puts every ngram speculator above every model one, so
+rem ngram-mod drafts first and the mtp head only runs where ngram found nothing. all four run on
+rem one slot:
+rem   ngram-off    draft-mtp alone on a repeat-verbatim prompt - the baseline for the next two
+rem   ngram-on     ngram-mod,draft-mtp on the same prompt - what a long verbatim repeat is worth
+rem   ngram-crlf   the same block with CRLF line ends - the model writes LF, so the tokens differ
+rem                and the pool never matches. ngram-on minus ngram-crlf is the cost of CRLF input
+rem   ngram-miss   ngram-mod,draft-mtp on the plain prompt, which has nothing to repeat - what the
+rem                speculator costs when it never hits
 rem the two-slot arms send both prompts in one request, as a json array. the server turns an array
 rem into one task per element and posts them together, so both slots start in the same batch. in
 rem np2-lock the two prompts are the same string, so they also hold the same token count and
@@ -38,7 +48,9 @@ if not defined SPECFIT     set "SPECFIT=-fit off"
 if not defined SPECWAIT    set "SPECWAIT=900"
 if not defined SPECTIMEOUT set "SPECTIMEOUT=1800"
 if not defined SPECVERB    set "SPECVERB=4"
-if not defined SPECARMS    set "SPECARMS=np1 np2-one np2-lock np2-free np1-noreuse"
+if not defined SPECREPGEN  set "SPECREPGEN=1024"
+if not defined SPECREPLINE set "SPECREPLINE=80"
+if not defined SPECARMS    set "SPECARMS=np1 np2-one np2-lock np2-free np1-noreuse ngram-off ngram-on ngram-crlf ngram-miss"
 if not defined SETTLE      set "SETTLE=30"
 
 rem the two prompts. length does not matter here, only the generated tokens do, so the built-in
@@ -107,18 +119,22 @@ echo ### 17-spec-np %TS% > "%SUM%"
 echo ### MODEL=%MODEL% >> "%SUM%"
 echo ### SPECDRAFT=%SPECDRAFT% >> "%SUM%"
 echo ### n-max=%SPECNMAX% p-min=%SPECPMIN% ctx=%SPECCTX% n_predict=%SPECNGEN% >> "%SUM%"
+echo ### repeat body: %SPECREPLINE% lines, n_predict=%SPECREPGEN% >> "%SUM%"
 echo ### LOADMODE=%LOADMODE% EXTRA=%EXTRA% %SPECFIT% >> "%SUM%"
 echo. >> "%SUM%"
 
 call :mkreq one
 call :mkreq lock
 call :mkreq free
+call :mkrep repeat      lf
+call :mkrep repeat-crlf crlf
 if not "%RC%"=="0" exit /b 1
 
 set "ABORT=0"
 for %%a in (%SPECARMS%) do call :arm %%a
 
 set "LLAMA_GRAPH_REUSE_DISABLE="
+set "LLAMA_TRACE="
 
 echo.
 echo summary in %SUM%
@@ -145,6 +161,26 @@ if not exist "%POUT%" (
 goto :eof
 
 rem ------------------------------------------------------------------
+rem %1 = body name, %2 = line ending: lf or crlf. builds a block of text and asks the model to
+rem write it back verbatim, which is the one shape ngram-mod is built for. the block is generated
+rem here so the arm needs no data file; point SPECREPFILE at your own text to use that instead.
+rem temperature 0 and ignore_eos keep every arm on the same token count, so the tail the model
+rem writes after the block is the same in all of them and does not skew the comparison
+:mkrep
+set "PMODE=%~1"
+set "PEOL=%~2"
+set "PFILE=%SPECREPFILE%"
+set "PLINES=%SPECREPLINE%"
+set "PN=%SPECREPGEN%"
+set "POUT=%WORK%\req-%PMODE%.json"
+powershell -NoProfile -Command "$eol = if ($env:PEOL -eq 'crlf') { [string][char]13 + [string][char]10 } else { [string][char]10 }; if ($env:PFILE -and (Test-Path -LiteralPath $env:PFILE)) { $body = (Get-Content -Raw -LiteralPath $env:PFILE) -replace '\r\n', [string][char]10 } else { $body = [string]::Join([string][char]10, (1..[int]$env:PLINES | ForEach-Object { '    const int row_{0:d3} = accumulate(buffer, stride * {0}, offset + {0}, mask_{0:d3});' -f $_ })) }; $block = $body -replace [string][char]10, $eol; $p = 'Write the following block of text back to me, exactly as it is. Output only the block, no commentary and no code fences.' + $eol + $eol + $block; $j = [ordered]@{ prompt = $p; n_predict = [int]$env:PN; temperature = 0; top_k = 1; ignore_eos = $true; cache_prompt = $false; stream = $false } | ConvertTo-Json -Compress -Depth 5; [System.IO.File]::WriteAllText($env:POUT, $j, (New-Object System.Text.UTF8Encoding($false)))"
+if not exist "%POUT%" (
+    echo failed to build the request body %POUT%
+    set "RC=1"
+)
+goto :eof
+
+rem ------------------------------------------------------------------
 rem %1 = arm name
 :arm
 rem one arm failing to start means the next four fail the same way, so stop instead
@@ -153,7 +189,10 @@ set "ARM=%~1"
 set "NP="
 set "BODY="
 set "NREQ="
+set "STYPE=draft-mtp"
+set "NGEN=%SPECNGEN%"
 set "LLAMA_GRAPH_REUSE_DISABLE="
+set "LLAMA_TRACE="
 
 if "%ARM%"=="np1"         ( set "NP=1" & set "BODY=one"  & set "NREQ=1" )
 if "%ARM%"=="np1-noreuse" ( set "NP=1" & set "BODY=one"  & set "NREQ=1" & set "LLAMA_GRAPH_REUSE_DISABLE=1" )
@@ -161,16 +200,24 @@ if "%ARM%"=="np2-one"     ( set "NP=2" & set "BODY=one"  & set "NREQ=1" )
 if "%ARM%"=="np2-lock"    ( set "NP=2" & set "BODY=lock" & set "NREQ=2" )
 if "%ARM%"=="np2-free"    ( set "NP=2" & set "BODY=free" & set "NREQ=2" )
 
+rem LLAMA_TRACE=1 adds the per-step accept count and marks the steps that had to restore a
+rem checkpoint, which is what makes these four readable. the np arms stay without it so their
+rem logs still compare with the runs already written down in README.md
+if "%ARM%"=="ngram-off"   ( set "NP=1" & set "BODY=repeat"      & set "NREQ=1" & set "NGEN=%SPECREPGEN%" & set "LLAMA_TRACE=1" )
+if "%ARM%"=="ngram-on"    ( set "NP=1" & set "BODY=repeat"      & set "NREQ=1" & set "NGEN=%SPECREPGEN%" & set "LLAMA_TRACE=1" & set "STYPE=ngram-mod,draft-mtp" )
+if "%ARM%"=="ngram-crlf"  ( set "NP=1" & set "BODY=repeat-crlf" & set "NREQ=1" & set "NGEN=%SPECREPGEN%" & set "LLAMA_TRACE=1" & set "STYPE=ngram-mod,draft-mtp" )
+if "%ARM%"=="ngram-miss"  ( set "NP=1" & set "BODY=one"         & set "NREQ=1" & set "LLAMA_TRACE=1" & set "STYPE=ngram-mod,draft-mtp" )
+
 if not defined NP (
-    echo unknown arm %ARM%, known: np1 np1-noreuse np2-one np2-lock np2-free
+    echo unknown arm %ARM%, known: np1 np1-noreuse np2-one np2-lock np2-free ngram-off ngram-on ngram-crlf ngram-miss
     set "RC=1"
     goto :eof
 )
 
 set "SRVLOG=%LOGS%\17-spec-np-%TS%-%ARM%.log"
-set "SPECARGS=-m "%MODEL%" -md "%SPECDRAFT%" --spec-type draft-mtp --spec-draft-n-min 0 --spec-draft-n-max %SPECNMAX% --spec-draft-p-min %SPECPMIN% -c %SPECCTX% -np %NP% -fa on %SPECFIT% %LOADMODE% %EXTRA% --host 127.0.0.1 --port %SPECPORT% -lv %SPECVERB%"
+set "SPECARGS=-m "%MODEL%" -md "%SPECDRAFT%" --spec-type "%STYPE%" --spec-draft-n-min 0 --spec-draft-n-max %SPECNMAX% --spec-draft-p-min %SPECPMIN% -c %SPECCTX% -np %NP% -fa on %SPECFIT% %LOADMODE% %EXTRA% --host 127.0.0.1 --port %SPECPORT% -lv %SPECVERB%"
 
-echo === %ARM%: -np %NP%, body %BODY% (%NREQ% prompts), graph_reuse_disable=%LLAMA_GRAPH_REUSE_DISABLE% -^> %SRVLOG%
+echo === %ARM%: -np %NP%, body %BODY% (%NREQ% prompts), spec-type %STYPE%, graph_reuse_disable=%LLAMA_GRAPH_REUSE_DISABLE% -^> %SRVLOG%
 set "SCMD=%WORK%\srv-%ARM%.cmd"
 > "%SCMD%" echo @echo off
 >>"%SCMD%" echo "%BIN%\llama-server.exe" %SPECARGS% ^> "%SRVLOG%" 2^>^&1
@@ -195,7 +242,7 @@ for /f %%t in ('powershell -NoProfile -Command "(Get-Date).Ticks"') do set "TSTA
 curl.exe -s -S --max-time %SPECTIMEOUT% -H "Content-Type: application/json" --data-binary @"%WORK%\req-%BODY%.json" -o "%WORK%\%ARM%-resp.json" "http://127.0.0.1:%SPECPORT%/completion" 2> "%WORK%\%ARM%-curl.txt"
 set "CURLRC=%ERRORLEVEL%"
 
-set /a "TOTTOK=NREQ*SPECNGEN"
+set /a "TOTTOK=NREQ*NGEN"
 rem both numbers come out of one call, formatted with InvariantCulture: a russian locale renders
 rem Round() as 16,842 and the next command line then reads that as two arguments
 for /f "tokens=1,2" %%x in ('powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $e = ((Get-Date).Ticks - %TSTART%) / 10000000.0; $r = %TOTTOK% / [math]::Max($e, 0.001); '{0} {1}' -f [math]::Round($e, 3).ToString($c), [math]::Round($r, 2).ToString($c)"') do (
@@ -213,10 +260,11 @@ powershell -NoProfile -Command "Start-Sleep -Seconds 2"
 call :teardown
 
 echo. >> "%SUM%"
-echo ### %ARM%: -np %NP%, %NREQ% concurrent prompts, graph_reuse_disable=%LLAMA_GRAPH_REUSE_DISABLE% >> "%SUM%"
+echo ### %ARM%: -np %NP%, %NREQ% concurrent prompts, body %BODY%, spec-type %STYPE%, graph_reuse_disable=%LLAMA_GRAPH_REUSE_DISABLE% >> "%SUM%"
 echo ### wall %ELAPSED%s for %TOTTOK% generated tokens = %AGGTPS% t/s aggregate, curl rc=%CURLRC% >> "%SUM%"
-findstr /c:"eval time" /c:"graphs reused" /c:"draft acceptance" /c:"acc per pos" "%SRVLOG%" >> "%SUM%"
+findstr /c:"eval time" /c:"graphs reused" /c:"draft acceptance" /c:"acc per pos" /c:"statistics " "%SRVLOG%" >> "%SUM%"
 findstr /c:"n_rs_seq" /c:"recurrent" /c:"KV self size" /c:"compute buffer size" "%SRVLOG%" >> "%SUM%"
+for /f %%c in ('findstr /c:"restore checkpoint" "%SRVLOG%" ^| find /c /v ""') do echo ### draft steps that restored a checkpoint: %%c >> "%SUM%"
 
 echo === %ARM%: %AGGTPS% t/s aggregate over %ELAPSED%s
 

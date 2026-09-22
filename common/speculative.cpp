@@ -1886,7 +1886,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.5)
+        // consecutive accept rounds with low acceptance fraction (< 0.25)
         int n_low = 0;
     };
 
@@ -1915,15 +1915,40 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfos.resize(n_seq);
     }
 
+    // the container is shared by every sequence, so a reset drops their ngrams too:
+    // they all have to index their prompt again and start a new streak
+    void reset_shared() {
+        mod.reset();
+
+        for (auto & si : sinfos) {
+            si.n_low  = 0;
+            si.i_last = 0;
+        }
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_low = 0;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
             return;
+        }
+
+        // check the occupancy before indexing - a reset after it would drop this prompt
+        // while i_last still claims that it is indexed
+        {
+            const double f = (double)mod.get_used() / (double)mod.size();
+
+            constexpr double f_thold = 0.25;
+            if (f > f_thold) {
+                SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
+
+                reset_shared();
+            }
         }
 
         for (size_t i = 0; i < prompt.size() - n; ++i) {
@@ -1932,15 +1957,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = prompt.size() - n;
 
-        const double f = (double)mod.get_used() / (double)mod.size();
-        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
-
-        constexpr double f_thold = 0.25;
-        if (f > f_thold) {
-            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
-
-            mod.reset();
-        }
+        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n",
+                mod.get_used(), mod.size(), (double)mod.get_used() / (double)mod.size());
     }
 
     void draft_one(
@@ -1995,8 +2013,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result.resize(result.size() - n);
 
-        // store length of drafted n-gram for later acceptance analysis
-        sinfo.n_draft_last = result.size();
+        // store length of drafted n-gram for later acceptance analysis. the caller truncates
+        // the draft to n_max, so measure that length and not the generated one
+        sinfo.n_draft_last = dparams.n_max > 0 ? std::min(result.size(), (size_t) dparams.n_max) : result.size();
     }
 
     bool process(const llama_batch & /*batch*/) override {
@@ -2034,9 +2053,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                         SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
                     }
 
-                    mod.reset();
-                    sinfo.n_low = 0;
-                    sinfo.i_last = 0;
+                    reset_shared();
                 }
             } else {
                 sinfo.n_low = 0;
@@ -2112,8 +2129,12 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        // the context cache belongs to the previous prompt. keep the static and dynamic ones
+        auto & sinfo = sinfos[seq_id];
+
+        sinfo.cache_size = 0;
+        sinfo.ngram_cache_context.clear();
     }
 
     void draft_one(
