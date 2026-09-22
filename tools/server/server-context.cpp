@@ -4302,6 +4302,12 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
+                        // the replay step that follows does not call the speculator, so tell it
+                        // about the rejection now, while the draft length is still known
+                        if (!slot.spec_is_replay) {
+                            common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                        }
+
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);

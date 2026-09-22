@@ -1879,6 +1879,17 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
+    // a draft that is almost all wrong costs a full target pass, so stop drafting for a few
+    // calls. the pause doubles while the drafts stay bad and is cleared by a good one
+    static constexpr int n_skip_base = 4;
+    static constexpr int n_skip_max  = 256;
+
+    // acceptance below f_acc_low is bad. below f_acc_bad one round is enough to pause,
+    // otherwise it takes n_low_max rounds in a row
+    static constexpr double f_acc_low = 0.25;
+    static constexpr double f_acc_bad = 0.10;
+    static constexpr int    n_low_max = 5;
+
     struct seq_info {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
@@ -1886,8 +1897,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.25)
+        // consecutive accept rounds with low acceptance fraction (< f_acc_low)
         int n_low = 0;
+
+        // calls left to skip, and the length of the next pause
+        int n_skip      = 0;
+        int n_skip_next = n_skip_base;
     };
 
     std::vector<seq_info> sinfos;
@@ -1932,6 +1947,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
         sinfo.n_low = 0;
+        sinfo.n_skip = 0;
+        sinfo.n_skip_next = n_skip_base;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -1985,6 +2002,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             }
 
             sinfo.i_last = cur_len - n;
+        }
+
+        // paused after a bad draft. keep indexing, but do not draft
+        if (sinfo.n_skip > 0) {
+            sinfo.n_skip--;
+            return;
         }
 
         result.resize(n + params.n_max);
@@ -2043,20 +2066,32 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
-        // compute acceptance fraction if we have a recorded draft length
+        // compute acceptance fraction if we have a recorded draft length. the length is consumed
+        // here: the server can report the same draft twice, once on a rollback and once on the
+        // replay of the accepted part
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
-            if (f_acc < 0.25) {
-                sinfo.n_low++;
-                if (sinfo.n_low >= 5) {
-                    if (verbose) {
-                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
-                    }
 
-                    reset_shared();
+            sinfo.n_draft_last = 0;
+
+            if (f_acc >= f_acc_low) {
+                sinfo.n_low       = 0;
+                sinfo.n_skip_next = n_skip_base;
+
+                return;
+            }
+
+            sinfo.n_low++;
+
+            // the pool is left alone: it is shared, and the other sequences still match in it
+            if (f_acc < f_acc_bad || sinfo.n_low >= n_low_max) {
+                sinfo.n_skip      = sinfo.n_skip_next;
+                sinfo.n_skip_next = std::min(2*sinfo.n_skip_next, n_skip_max);
+                sinfo.n_low       = 0;
+
+                if (verbose) {
+                    SPC_TRC("low acceptance (%.3f) - pausing ngram_mod for %d calls\n", f_acc, sinfo.n_skip);
                 }
-            } else {
-                sinfo.n_low = 0;
             }
         }
     }
