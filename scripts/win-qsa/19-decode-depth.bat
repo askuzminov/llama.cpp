@@ -66,9 +66,16 @@ type "%LOG%" >> "%SUM%"
 rem ---------------------------------------------------------------
 rem  фаза 2: разбор по операциям, одна загрузка модели на глубину
 rem ---------------------------------------------------------------
+rem фаза 1 идёт на любом бэкенде, фаза 2 это только таймингы vulkan
+if /i not "%BACKEND%"=="vulkan" (
+    echo backend is %BACKEND%, skipping phase 2
+    goto :phase2_done
+)
+
 set "GGML_VK_PERF_LOGGER=1"
 for %%d in (%DECPERFDEPTHS%) do call :perf %%d
 set "GGML_VK_PERF_LOGGER="
+:phase2_done
 
 echo.
 type "%SUM%"

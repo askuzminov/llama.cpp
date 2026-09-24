@@ -8,6 +8,12 @@ rem two tile shapes of the gather, see 04-fa-sparse.bat.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
+rem весь шаг это GGML_VK_PERF_LOGGER, на другом бэкенде он даст только загрузку модели
+if /i not "%BACKEND%"=="vulkan" (
+    echo backend is %BACKEND%, 07-perf-logger is vulkan only
+    exit /b 0
+)
+
 if not defined FAVARIANTS set "FAVARIANTS=1 0 g r"
 if not defined SETTLE set "SETTLE=30"
 rem depth of the measured graph. the sparsity of the indexer grows with it: the budget is a

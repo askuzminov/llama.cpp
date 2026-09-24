@@ -6,6 +6,10 @@ rem are derived, so overriding BUILD here works too.
 
 rem set "MODEL=D:\models\qwen3-next-Q4_K_M.gguf"
 
+rem the backend is detected from what is installed: nvcc or CUDA_PATH -> cuda, else the
+rem vulkan sdk -> vulkan. EXTRA follows it. set them here only to overrule that, or to
+rem give -ncmoe a value that fits this card
+
 rem strix halo / vulkan
 rem set "CMAKE_BACKEND=-DGGML_VULKAN=ON"
 rem set "EXTRA=-ngl 99"
@@ -17,7 +21,8 @@ rem set "EXTRA=-ngl 99 -ncmoe 30"
 rem source of the wikitext text for 05 and 06, if huggingface is unreachable
 rem set "PPLURL=http://.../wikitext-2-raw-v1.zip"
 
-rem arms of 04, 06 and 07: 1 = gather path, 0 = dense kernel
+rem arms of 04, 06 and 07: 1 = gather path, 0 = dense kernel. vulkan knobs, so off vulkan
+rem they all measure the same thing and only arm 1 runs
 rem set "FAVARIANTS=1 0"
 rem set "PERFDEPTH=122880"
 rem context and chunks of the quality runs, keep well above the ~513 block budget

@@ -4,6 +4,12 @@ rem mapMemory. заодно перебирает размер блока, на �
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
+rem обе ручки vulkan-овские, на другом бэкенде это четыре одинаковых загрузки
+if /i not "%BACKEND%"=="vulkan" (
+    echo backend is %BACKEND%, 09-alloc-timing is vulkan only
+    exit /b 0
+)
+
 if not exist "%BIN%\llama-bench.exe" (
     echo not built: %BIN%\llama-bench.exe
     echo run 00-build.bat first

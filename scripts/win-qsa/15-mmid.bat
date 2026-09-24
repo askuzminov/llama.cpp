@@ -9,6 +9,12 @@ rem bit-comparable against the cpu reference.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
+rem the epilogue is a vulkan pipeline, another backend has nothing to switch
+if /i not "%BACKEND%"=="vulkan" (
+    echo backend is %BACKEND%, 15-mmid is vulkan only
+    exit /b 0
+)
+
 rem arms: on default (epilogue), off disabled
 if not defined MMIDVARIANTS set "MMIDVARIANTS=on off"
 

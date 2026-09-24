@@ -19,15 +19,19 @@ set "PPLFILE=%~dp0wikitext-2-raw\wiki.test.raw"
 rem build directory, created by 00-build.bat
 set "BUILD=%~dp0..\..\build-win"
 
-rem backend selection for cmake.
+rem backend for cmake. auto picks from what the machine has: nvcc or CUDA_PATH -> cuda,
+rem else VULKAN_SDK or glslc -> vulkan, else a cpu only build. cuda wins when both are
+rem installed. pin it instead of auto to decide here:
 rem   strix halo / vulkan : -DGGML_VULKAN=ON
 rem   3090 / cuda         : -DGGML_CUDA=ON
-set "CMAKE_BACKEND=-DGGML_VULKAN=ON"
+set "CMAKE_BACKEND=auto"
 
-rem arguments added to every model run.
+rem arguments added to every model run. auto gives -ngl 99, and on cuda -ncmoe 30 as well,
+rem because the experts do not fit in 24 GB. -ncmoe depends on the card, so a different one
+rem needs its own value here.
 rem   strix halo, everything on the gpu : -ngl 99
 rem   3090 + i9, moe experts on the cpu : -ngl 99 -ncmoe 30
-set "EXTRA=-ngl 99"
+set "EXTRA=auto"
 
 rem how the weights are loaded. dio = unbuffered reads, none = read into memory without
 rem mmap, auto = let llama.cpp pick (mmap). -lzm dio gathers the rows of the PLE table
@@ -59,8 +63,9 @@ set "UBATCH=512,2048"
 rem arms swept by 04, 05, 06 and 07, one model load each. 1 is the build default, which
 rem walks the list of cells the tile can see instead of all of KV. 0 is the plain dense
 rem kernel. g and r are the two tile shapes of the gather, see 04-fa-sparse.bat. the
-rem selection is the same in all of them, so this only moves speed
-set "FAVARIANTS=1 0 g r"
+rem selection is the same in all of them, so this only moves speed. all four are vulkan
+rem knobs, so auto keeps only arm 1 on another backend
+set "FAVARIANTS=auto"
 
 rem context and chunk count of the quality runs. the budget is a fixed ~513 blocks, so at a
 rem short context it already covers most of the cache and the indexer is bypassed. keep the
@@ -166,8 +171,9 @@ rem           text; one model load per variant, so both are slow
 set "RUN_PLE=1"
 rem   13 - raw disk IOPS behind -lzm dio, needs diskspd (downloaded on first run)
 set "RUN_DISK=1"
-rem   15 - MUL_MAT_ID tuning, one model load per arm, so it is slow
-set "RUN_MMID=1"
+rem   15 - MUL_MAT_ID tuning, one model load per arm, so it is slow. vulkan only, auto
+rem        turns it off on another backend
+set "RUN_MMID=auto"
 rem   17 - does -np pay off under speculative decoding, one server start per arm. off by
 rem        default: it needs SPECDRAFT, which most setups do not have
 set "RUN_SPEC=0"
@@ -187,6 +193,40 @@ rem ===================================================================
 rem  derived, no need to touch
 rem ===================================================================
 for %%i in ("%BUILD%") do set "BUILD=%%~fi"
+
+rem resolve the backend. BACKEND is the short name the other scripts branch on
+if /i not "%CMAKE_BACKEND%"=="auto" goto :backend_set
+set "CMAKE_BACKEND="
+where nvcc >nul 2>&1
+if not errorlevel 1 set "CMAKE_BACKEND=-DGGML_CUDA=ON"
+if defined CMAKE_BACKEND goto :backend_set
+if defined CUDA_PATH set "CMAKE_BACKEND=-DGGML_CUDA=ON"
+if defined CMAKE_BACKEND goto :backend_set
+if defined VULKAN_SDK set "CMAKE_BACKEND=-DGGML_VULKAN=ON"
+if defined CMAKE_BACKEND goto :backend_set
+where glslc >nul 2>&1
+if not errorlevel 1 set "CMAKE_BACKEND=-DGGML_VULKAN=ON"
+:backend_set
+
+set "BACKEND=cpu"
+if not "%CMAKE_BACKEND:GGML_VULKAN=%"=="%CMAKE_BACKEND%" set "BACKEND=vulkan"
+if not "%CMAKE_BACKEND:GGML_CUDA=%"=="%CMAKE_BACKEND%" set "BACKEND=cuda"
+
+rem defaults that follow from the backend
+if /i not "%EXTRA%"=="auto" goto :extra_set
+set "EXTRA=-ngl 99"
+if /i "%BACKEND%"=="cuda" set "EXTRA=-ngl 99 -ncmoe 30"
+:extra_set
+
+if /i not "%FAVARIANTS%"=="auto" goto :fa_set
+set "FAVARIANTS=1 0 g r"
+if /i not "%BACKEND%"=="vulkan" set "FAVARIANTS=1"
+:fa_set
+
+if /i not "%RUN_MMID%"=="auto" goto :mmid_set
+set "RUN_MMID=1"
+if /i not "%BACKEND%"=="vulkan" set "RUN_MMID=0"
+:mmid_set
 
 rem multi-config generators (msvc) put the binaries in bin\Release, single-config in bin
 set "BIN=%BUILD%\bin\Release"

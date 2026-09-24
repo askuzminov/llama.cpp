@@ -36,7 +36,8 @@ set "SUM=%LOGS%\04-fa-sparse-%TS%-summary.txt"
 set "RC=0"
 
 for %%v in (%FAVARIANTS%) do call :run %%v
-for %%r in (%FARATIOS%) do call :run r %%r
+rem the ratio is a vulkan knob, another backend would just run the same arm again
+if /i "%BACKEND%"=="vulkan" for %%r in (%FARATIOS%) do call :run r %%r
 
 set "GGML_VK_FA_SPARSE_DISABLE="
 set "GGML_VK_FA_SPARSE_ROW_RATIO="

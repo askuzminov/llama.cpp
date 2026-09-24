@@ -29,6 +29,9 @@ rem the log holds all three. the union gives a per-token selection (sparse_grp=1
 rem and keeps the coopmat matmul, and only pays off if the rows of a tile overlap. the one-row
 rem tile gets an exact list and gives up the matmul
 if not defined FAGROUP set "FAGROUP=1"
+rem both arms and the scalar one below force a vulkan pipeline, another backend would just
+rem repeat the run above
+if /i not "%BACKEND%"=="vulkan" set "FAGROUP=0"
 if "%FAGROUP%"=="1" (
     call :arm 1 "one list per tile"
     call :arm 0 "one row per tile"
@@ -36,6 +39,7 @@ if "%FAGROUP%"=="1" (
 
 rem the same cases on the scalar path, where a query tile is 4 to 8 rows instead of 16
 if not defined FASCALAR set "FASCALAR=1"
+if /i not "%BACKEND%"=="vulkan" set "FASCALAR=0"
 if "%FASCALAR%"=="1" (
     echo. >> "%LOG%"
     echo ### GGML_VK_DISABLE_COOPMAT=1, scalar path >> "%LOG%"

@@ -58,7 +58,7 @@ set "QSA_UNATTENDED=1"
 set "SUM=%LOGS%\run-all-%TS%-summary.txt"
 echo ### run-all %TS% > "%SUM%"
 echo ### MODEL=%MODEL% >> "%SUM%"
-echo ### LOADMODE=%LOADMODE% EXTRA=%EXTRA% >> "%SUM%"
+echo ### BACKEND=%BACKEND% LOADMODE=%LOADMODE% EXTRA=%EXTRA% >> "%SUM%"
 echo. >> "%SUM%"
 
 set "RC=0"

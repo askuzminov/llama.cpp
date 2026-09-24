@@ -14,6 +14,12 @@ rem   32768 x 1 x 151936 x 2 = about 10 GB
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
+rem гатер есть только в vulkan, на другом бэкенде плечо и база это один и тот же код
+if /i not "%BACKEND%"=="vulkan" (
+    echo backend is %BACKEND%, 06-kl-divergence is vulkan only
+    exit /b 0
+)
+
 if not defined FAVARIANTS set "FAVARIANTS=1 0 g r"
 
 if not exist "%BIN%\llama-perplexity.exe" (
