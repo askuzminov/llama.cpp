@@ -17,6 +17,7 @@
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
+#include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
@@ -2322,6 +2323,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CONV_2D:
             ggml_cuda_op_conv2d(ctx, dst);
             break;
+        case GGML_OP_CONV_3D:
+            ggml_cuda_op_conv3d(ctx, dst);
+            break;
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
             break;
@@ -3470,6 +3474,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
+        ops.reserve(13);  // max ops; avoids gcc -Wstringop-overflow false positive
 
         if (can_fuse) {
             const ggml_tensor * logits  = node->src[0];
@@ -4539,6 +4544,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 ggml_cuda_topk_moe_args args;
                 const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
                 std::vector<ggml_op>    ops;
+                ops.reserve(13);  // max ops; avoids gcc -Wstringop-overflow false positive
 
                 const ggml_tensor * node = cgraph->nodes[i];
 
@@ -5510,8 +5516,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+        case GGML_OP_CONV_3D:
+            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_CONV_2D_DW:
-            return op->src[0]->type == GGML_TYPE_F32;
+            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_1D:
         case GGML_OP_POOL_2D:
