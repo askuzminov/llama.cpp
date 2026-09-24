@@ -26,6 +26,11 @@ rem   strix halo / vulkan : -DGGML_VULKAN=ON
 rem   3090 / cuda         : -DGGML_CUDA=ON
 set "CMAKE_BACKEND=auto"
 
+rem cmake generator. auto keeps the cmake default, which on windows is visual studio, and
+rem switches to ninja when cuda is picked but its msbuild integration is not installed.
+rem pin a name to decide here, e.g. Ninja (needs cl and ninja on PATH)
+set "GENERATOR=auto"
+
 rem arguments added to every model run. auto gives -ngl 99, and on cuda -ncmoe 30 as well,
 rem because the experts do not fit in 24 GB. -ncmoe depends on the card, so a different one
 rem needs its own value here.

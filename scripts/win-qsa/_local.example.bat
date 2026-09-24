@@ -18,6 +18,10 @@ rem 3090 + i9, moe experts on the cpu
 rem set "CMAKE_BACKEND=-DGGML_CUDA=ON"
 rem set "EXTRA=-ngl 99 -ncmoe 30"
 
+rem the cmake generator. auto keeps the cmake default and falls back to ninja when cuda is
+rem built without its msbuild integration. pin it when that guess is wrong
+rem set "GENERATOR=Ninja"
+
 rem source of the wikitext text for 05 and 06, if huggingface is unreachable
 rem set "PPLURL=http://.../wikitext-2-raw-v1.zip"
 
