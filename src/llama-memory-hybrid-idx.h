@@ -125,7 +125,7 @@ public:
     ggml_tensor * get_pool(int32_t il) const;
 
     // the pool holds derived data, so nothing restores it: every cell move drops it
-    void qsa_pool_drop();
+    void qsa_pool_drop() const;
 
     // a new ubatch invalidates what qsa_prepare cached
     void qsa_step() const;
@@ -250,6 +250,9 @@ private:
 
     // a full-cache context groups nothing, so it cannot say what is dirty
     bool is_full = false;
+
+    // an update context shifts or copies cells, so applying it drops the pool
+    bool is_update = false;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact

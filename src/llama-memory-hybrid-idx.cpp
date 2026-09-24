@@ -228,9 +228,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
-    // an update shifts positions or copies streams, both of which move cells under the blocks
-    qsa_pool_drop();
-
+    // note: the pool is dropped when the context is applied, not here: llama_context::decode asks
+    //       for an update on every call and most of them turn out to be no-ops
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
 
@@ -459,7 +458,7 @@ ggml_tensor * llama_memory_hybrid_idx::get_pool(int32_t il) const {
     return it == pool_tensors.end() ? nullptr : it->second;
 }
 
-void llama_memory_hybrid_idx::qsa_pool_drop() {
+void llama_memory_hybrid_idx::qsa_pool_drop() const {
     // only the bookkeeping is dropped. the rows keep their numbers, which is all the blocks past
     // the last pooled one need: their bias decides them, not their score
     qsa_pool.clear();
@@ -1057,7 +1056,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     mem(mem),
     // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        mem->get_mem_idx()->init_update(lctx, optimize)) {}
+        mem->get_mem_idx()->init_update(lctx, optimize)) {
+    is_update = true;
+}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -1089,6 +1090,11 @@ bool llama_memory_hybrid_idx_context::apply() {
     }
 
     if (mem) {
+        // a shift or a stream copy moves cells under the blocks
+        if (is_update) {
+            mem->qsa_pool_drop();
+        }
+
         // the cells moved, so the grouping qsa_prepare cached no longer describes them
         mem->qsa_step();
     }

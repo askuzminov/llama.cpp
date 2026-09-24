@@ -979,14 +979,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_dirty, n_stream);
 
     // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows.
-    // the slices stay views: add takes its own strides on every backend, and vulkan folds the
-    // chain into one multi_add that reads all r of them once. materializing them instead costs
-    // a read and a write of the whole gather per slice
-    ggml_tensor * vals = nullptr;
+    // the slices stay views: add takes its own strides on every backend, while materializing them
+    // costs a read and a write of the whole gather per slice
+    std::vector<ggml_tensor *> slices(r);
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_dirty, n_stream,
+        slices[i] = ggml_view_3d(ctx0, members, idx_dim, n_dirty, n_stream,
                 members->nb[2], members->nb[3], i*members->nb[1]);
-        vals = vals ? ggml_add(ctx0, vals, slice) : slice;
+
+        // the views go into the graph first, so the adds below end up next to each other.
+        // vulkan folds a run of adds into one multi_add, and a view in between cuts the run
+        ggml_build_forward_expand(gf, slices[i]);
+    }
+
+    ggml_tensor * vals = slices[0];
+    for (int64_t i = 1; i < r; ++i) {
+        vals = ggml_add(ctx0, vals, slices[i]);
     }
 
     // a one-member block leaves vals a view, and scale wants a contiguous source
