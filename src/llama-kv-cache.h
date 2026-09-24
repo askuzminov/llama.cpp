@@ -417,6 +417,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // first cache stream of the current slot info, the `s0` get_k/get_v offset their views by
+    uint32_t get_s0() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

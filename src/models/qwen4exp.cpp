@@ -790,7 +790,8 @@ public:
             return;
         }
 
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa_dirty(dirty_cells, dirty_pos, dirty_rows, ubatch, ratio);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -826,10 +827,17 @@ public:
             res &= cell_blk->ne[1] == n_stream;
         }
 
-        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
-        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        if (blk_cells) {
+            res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+            res &= blk_cells->ne[1] == n_stream;
+        }
+
+        res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
+        res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
+
+        // how many block keys this pass has to rebuild decides the shape of the dirty list
+        res &= dirty_rows->ne[0] == (int64_t) mctx->qsa_prepare(&params.ubatch, ratio, blk_bias).n_dirty;
+        res &= dirty_rows->ne[1] == n_stream;
 
         return res;
     }
@@ -837,9 +845,13 @@ public:
     // per stream: a cell index names a different token in each stream
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream], only without blk_bias
-    ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
-    ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
+    ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream], only with blk_bias
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+
+    // the blocks whose pooled key this pass rebuilds, padded to a size that holds still
+    ggml_tensor * dirty_cells = nullptr; // I32 [ratio*n_dirty, n_stream]
+    ggml_tensor * dirty_pos   = nullptr; // I32 [4*n_dirty*n_stream]
+    ggml_tensor * dirty_rows  = nullptr; // I32 [n_dirty, n_stream], rows of the pool view
 
     // when the budget covers the cache the indexer is skipped and only k_idxs is built
     bool    bypass = false;
@@ -907,21 +919,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->budget = (int64_t) hparams.indexer_top_k + r - 1;
 
         if (!bypass) {
-            // the per-block selection scores blocks directly and never expands them to cells, so
-            // cell_blk stays unbuilt there: an input no node reads is never allocated
-            if (!blk_bias) {
+            // only one of the two is ever read: the per-block selection turns chosen blocks back
+            // into cells, the per-cell one spreads a block score over its cells. an input no node
+            // reads is never allocated, so building both would leave set_input writing into null
+            if (blk_bias) {
+                qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+
+                ggml_set_input(qsa->blk_cells);
+            } else {
                 qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
 
                 ggml_set_input(qsa->cell_blk);
             }
 
-            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-            qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-            ggml_set_input(qsa->blk_cells);
-            ggml_set_input(qsa->blk_pos);
             ggml_set_input(qsa->bias);
+
+            // the pooled block keys are kept across passes, so only the moved ones are rebuilt
+            const int64_t n_dirty = mctx_hyb->qsa_prepare(&ubatch, (uint32_t) r, blk_bias).n_dirty;
+
+            qsa->dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_dirty, n_stream);
+            qsa->dirty_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_dirty*n_stream);
+            qsa->dirty_rows  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_dirty, n_stream);
+
+            ggml_set_input(qsa->dirty_cells);
+            ggml_set_input(qsa->dirty_pos);
+            ggml_set_input(qsa->dirty_rows);
         }
 
         inp = qsa.get();
@@ -945,32 +969,59 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    // gathers per stream: blk_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+    // the pooled keys of a block only change where its cells do, so the whole set is kept in the
+    // memory module and this pass rebuilds the dirty ones. set_input pads the list to a size that
+    // holds still, so the graph stays reusable
+    const int64_t n_dirty = inp->dirty_rows->ne[0];
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
-    ggml_tensor * pooled = nullptr;
+    // gathers per stream: dirty_cells row s indexes stream s's own cells
+    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->dirty_cells);
+    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_dirty, n_stream);
+
+    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows.
+    // the slices stay views: add takes its own strides on every backend, and vulkan folds the
+    // chain into one multi_add that reads all r of them once. materializing them instead costs
+    // a read and a write of the whole gather per slice
+    ggml_tensor * vals = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_dirty, n_stream,
+                members->nb[2], members->nb[3], i*members->nb[1]);
+        vals = vals ? ggml_add(ctx0, vals, slice) : slice;
     }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    cb(pooled, "indexer_k_pooled", il);
+
+    // a one-member block leaves vals a view, and scale wants a contiguous source
+    if (!ggml_is_contiguous(vals)) {
+        vals = ggml_cont(ctx0, vals);
+    }
+
+    vals = ggml_scale(ctx0, vals, 1.0f/(float) r);
+    cb(vals, "indexer_k_pooled", il);
 
     // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+    vals = ggml_reshape_3d(ctx0, vals, idx_dim, n_dirty*n_stream, 1);
+    vals = build_norm(vals, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
+    vals = ggml_reshape_3d(ctx0, vals, idx_dim, 1, n_dirty*n_stream);
+    vals = ggml_rope_multi(ctx0, vals, inp->dirty_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
-    cb(pooled, "indexer_k", il);
+
+    // store the rebuilt keys, then read the whole range back through the store: the read is a
+    // view of it, so nothing below can be scheduled before the write
+    ggml_tensor * pool = mctx_hyb->get_pool(ctx0, il);
+    GGML_ASSERT(pool != nullptr);
+
+    const int64_t n_pool = pool->ne[1];
+
+    pool = ggml_set_rows(ctx0,
+            ggml_reshape_2d(ctx0, pool, idx_dim, n_pool*n_stream),
+            ggml_reshape_2d(ctx0, vals, idx_dim, n_dirty*n_stream),
+            ggml_reshape_1d(ctx0, inp->dirty_rows, n_dirty*n_stream));
+
+    // blocks past the live ones keep an old key. they are never picked on their score: the bias
+    // hides a block with no cells, and always takes one whose cells no block pools
+    cb(pool, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -980,10 +1031,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
-    // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+    q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
+
+    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer.
+    // one stream at a time: a stream reads only the live part of its pool, so the step from one
+    // stream to the next is larger than that part, and mul_mat carries one step for all of them
+    ggml_tensor * score = nullptr;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        ggml_tensor * ks = ggml_view_2d(ctx0, pool, idx_dim, n_blocks, pool->nb[1], s*n_pool*pool->nb[1]);
+        ggml_tensor * qs = ggml_view_2d(ctx0, q,    idx_dim, n_idx_h*n_tps, q->nb[1], s*q->nb[2]);
+
+        ggml_tensor * sc = ggml_mul_mat(ctx0, ks, qs);
+
+        if (n_stream > 1) {
+            sc = ggml_reshape_3d(ctx0, sc, n_blocks, n_idx_h*n_tps, 1);
+        }
+
+        score = score ? ggml_concat(ctx0, score, sc, 2) : sc;
+    }
 
     // rectify before the reshape: the allocator runs relu in place only on a real parent, and a
     // reshape in between makes it allocate a second n_blocks*n_idx_h*n_tokens buffer
