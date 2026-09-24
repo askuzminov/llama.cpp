@@ -76,6 +76,20 @@ set "CTXVARIANTS="262144 2048" "262144 1024" "262144 512" "131072 2048" "131072 
 rem the depth 07-perf-logger.bat measures at
 set "PERFDEPTH=64000"
 
+rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
+rem the attention itself is capped by the indexer budget, but the block keys of the indexer
+rem are rebuilt from the whole cache on every pass, so the decode is expected to grow with
+rem n_kv. depth 0 is below the budget, where the indexer is bypassed entirely, so the first
+rem point after it has to be well above ~2052 cells or the step would be read as depth.
+rem the last depth plus DECNGEN must stay at or below 262144, the trained context
+set "DECDEPTHS=0,4096,16384,32768,65536,131072,262080"
+set "DECNGEN=64"
+rem the batch only fills the depth, the measured pass generates one token
+set "DECB=4096"
+set "DECUB=2048"
+rem depths at which 19 also takes the per-op breakdown, one model load each
+set "DECPERFDEPTHS=16384 131072"
+
 rem context llama-server is started with by 14-server.bat. the sweeps above stay shallow to
 rem keep a research run cheap, the server does not have that reason: 262144 is the trained
 rem context of qwen4exp, 0 takes it from the model
@@ -157,6 +171,9 @@ set "RUN_MMID=1"
 rem   17 - does -np pay off under speculative decoding, one server start per arm. off by
 rem        default: it needs SPECDRAFT, which most setups do not have
 set "RUN_SPEC=0"
+rem   19 - generation speed against the depth of the context, plus the per-op breakdown.
+rem        off by default: the sweep spends about an hour filling the deep contexts
+set "RUN_DECODE=0"
 
 rem ===================================================================
 rem  machine-specific overrides. _local.bat is not tracked by git, so

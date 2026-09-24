@@ -1,7 +1,7 @@
 @echo off
-rem every step of this folder, in order, one log each. 14-server is the only one left out:
-rem it runs until stopped. which steps run is set by RUN_* in _config.bat, all of them are
-rem 1 by default; the exit code of each is collected into one summary at the end.
+rem every step of this folder, in order, one log each. 14-server and 18-serve are left out:
+rem they run until stopped. which steps run is set by RUN_* in _config.bat, most of them
+rem are 1 by default; the exit code of each is collected into one summary at the end.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -16,6 +16,7 @@ if not defined RUN_PLE     set "RUN_PLE=1"
 if not defined RUN_DISK    set "RUN_DISK=1"
 if not defined RUN_MMID    set "RUN_MMID=1"
 if not defined RUN_SPEC    set "RUN_SPEC=0"
+if not defined RUN_DECODE  set "RUN_DECODE=0"
 
 set "STEPS="
 if "%RUN_BUILD%"=="1"   set "STEPS=%STEPS% 00-build"
@@ -30,6 +31,7 @@ if "%RUN_DISK%"=="1"    set "STEPS=%STEPS% 13-disk-iops"
 if "%RUN_MMID%"=="1"    set "STEPS=%STEPS% 15-mmid"
 if "%RUN_DIAG%"=="1"    set "STEPS=%STEPS% 16-ctx"
 if "%RUN_SPEC%"=="1"    set "STEPS=%STEPS% 17-spec-np"
+if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 19-decode-depth"
 
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do
