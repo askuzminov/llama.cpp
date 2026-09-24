@@ -11,21 +11,26 @@ if /i not "%GENERATOR%"=="auto" goto :gen_pin
 if /i not "%BACKEND%"=="cuda" goto :gen_done
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" goto :gen_done
+rem vswhere sits under "program files (x86)", and for /f hands its command to cmd /c, which
+rem strips the quotes when the path holds ( or ). so every call here goes through a file
+set "VSTMP=%~dp0vswhere.tmp"
 set "VSNEW="
 set "VSCUDA="
 set "VSHOST="
-for /f "usebackq delims=" %%i in (`"%VSWHERE%" -products * -sort -property installationPath`) do call :gen_scan "%%i"
+"%VSWHERE%" -products * -sort -property installationPath > "%VSTMP%" 2>nul
+for /f "usebackq delims=" %%i in ("%VSTMP%") do call :gen_scan "%%i"
 if not defined VSCUDA goto :gen_ninja
 rem cmake already takes the newest studio, name one only when the files are in another
-if /i "%VSCUDA%"=="%VSNEW%" goto :gen_done
+if /i "%VSCUDA%"=="%VSNEW%" goto :gen_nopin
 set "VSMAJ="
 set "VSYEAR="
-for /f "usebackq tokens=1 delims=." %%v in (`"%VSWHERE%" -path "%VSCUDA%" -property installationVersion`) do set "VSMAJ=%%v"
-for /f "usebackq delims=" %%v in (`"%VSWHERE%" -path "%VSCUDA%" -property catalog_productLineVersion`) do set "VSYEAR=%%v"
-if not defined VSYEAR if "%VSMAJ%"=="17" set "VSYEAR=2022"
-if not defined VSYEAR if "%VSMAJ%"=="16" set "VSYEAR=2019"
-if not defined VSMAJ goto :gen_done
-if not defined VSYEAR goto :gen_done
+"%VSWHERE%" -path "%VSCUDA%" -property installationVersion > "%VSTMP%" 2>nul
+set /p VSMAJ=<"%VSTMP%"
+"%VSWHERE%" -path "%VSCUDA%" -property catalog_productLineVersion > "%VSTMP%" 2>nul
+set /p VSYEAR=<"%VSTMP%"
+for /f "tokens=1 delims=." %%v in ("%VSMAJ%") do set "VSMAJ=%%v"
+if not defined VSMAJ goto :gen_nopin
+if not defined VSYEAR goto :gen_nopin
 echo cuda integration for msbuild is only in %VSCUDA%
 set "GENERATOR=Visual Studio %VSMAJ% %VSYEAR%"
 goto :gen_pin
@@ -36,7 +41,10 @@ where ninja >nul 2>&1
 if errorlevel 1 goto :gen_nomsbuild
 where cl >nul 2>&1
 if not errorlevel 1 goto :gen_ninja_ok
-rem ninja calls cl itself, so it has to be on PATH. take it from the studio, as the ci does
+rem ninja calls cl itself, so it has to be on PATH. take it from the studio, as the ci does.
+rem a toolkit without integration for the newest studio refuses its cl too, so prefer 2022
+"%VSWHERE%" -products * -sort -version "[17.0,18.0)" -property installationPath > "%VSTMP%" 2>nul
+set /p VSHOST=<"%VSTMP%"
 if not defined VSHOST set "VSHOST=%VSNEW%"
 if not defined VSHOST goto :gen_nomsbuild
 if not exist "%VSHOST%\VC\Auxiliary\Build\vcvarsall.bat" goto :gen_nomsbuild
@@ -56,9 +64,15 @@ echo   1. install cuda 13.4, it knows visual studio 2026 and is what upstream ci
 echo   2. copy the files in, as administrator:
 echo      copy "%CUDA_PATH%\extras\visual_studio_integration\MSBuildExtensions\*" "%VSNEW%\MSBuild\Microsoft\VC\v170\BuildCustomizations\"
 echo   3. run the cuda installer again and select visual studio integration
+if defined VSTMP del "%VSTMP%" >nul 2>&1
 exit /b 1
 
+:gen_nopin
+if defined VSTMP del "%VSTMP%" >nul 2>&1
+goto :gen_done
+
 :gen_pin
+if defined VSTMP del "%VSTMP%" >nul 2>&1
 if not defined GENERATOR goto :gen_done
 if /i "%GENERATOR%"=="auto" goto :gen_done
 set "GENARG=-G "%GENERATOR%""
@@ -124,16 +138,8 @@ exit /b 0
 rem %1 = one visual studio install, newest first
 :gen_scan
 if not defined VSNEW set "VSNEW=%~1"
-if not defined VSHOST call :gen_host "%~1"
 if defined VSCUDA goto :eof
 dir /b /s "%~1\MSBuild\Microsoft\VC\CUDA *.props" >nul 2>&1
 if errorlevel 1 goto :eof
 set "VSCUDA=%~1"
-goto :eof
-
-rem ninja needs a compiler the toolkit accepts. a toolkit with no integration for the newest
-rem studio usually refuses its cl too, so prefer 2022
-:gen_host
-for /f "usebackq tokens=1 delims=." %%v in (`"%VSWHERE%" -path "%~1" -property installationVersion`) do set "VSMAJ=%%v"
-if "%VSMAJ%"=="17" set "VSHOST=%~1"
 goto :eof
