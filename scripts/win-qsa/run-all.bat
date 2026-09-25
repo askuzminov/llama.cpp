@@ -17,6 +17,7 @@ if not defined RUN_DISK    set "RUN_DISK=1"
 if not defined RUN_MMID    set "RUN_MMID=1"
 if not defined RUN_SPEC    set "RUN_SPEC=0"
 if not defined RUN_DECODE  set "RUN_DECODE=0"
+if not defined RUN_MOECACHE set "RUN_MOECACHE=0"
 
 set "STEPS="
 if "%RUN_BUILD%"=="1"   set "STEPS=%STEPS% 00-build"
@@ -32,6 +33,7 @@ if "%RUN_MMID%"=="1"    set "STEPS=%STEPS% 15-mmid"
 if "%RUN_DIAG%"=="1"    set "STEPS=%STEPS% 16-ctx"
 if "%RUN_SPEC%"=="1"    set "STEPS=%STEPS% 17-spec-np"
 if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 19-decode-depth"
+if "%RUN_MOECACHE%"=="1" set "STEPS=%STEPS% 20-moecache"
 
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do

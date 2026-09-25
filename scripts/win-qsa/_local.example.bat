@@ -66,3 +66,12 @@ rem diskspd for 13-disk-iops.bat: path to the exe if it cannot be downloaded her
 rem set "DISKSPD=C:\tools\diskspd\amd64\diskspd.exe"
 rem set "DISKVARIANTS="4 32 4" "256 32 4""
 rem set "RUN_DISK=0"
+
+rem 20-moecache.bat: arms "ctx np", tokens generated per arm, and the prompt text. a saved agent
+rem session in MOEPROMPTFILE measures the routing of that kind of text. the -ub of models.ini
+rem goes into MOEARGS
+rem set "MOEARMS="262144 1" "131072 2""
+rem set "MOENGEN=4096"
+rem set "MOEPROMPTFILE=%~dp0agent-session.txt"
+rem set "MOEARGS=-fit off -ub 2048"
+rem set "RUN_MOECACHE=1"

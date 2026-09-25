@@ -100,6 +100,16 @@ set "DECUB=2048"
 rem depths at which 19 also takes the per-op breakdown, one model load each
 set "DECPERFDEPTHS=16384 131072"
 
+rem 20-moecache.bat: what a VRAM cache of the hot MoE experts would give, one llama-completion run
+rem per arm. an arm is "ctx np": the context decides how much VRAM is left for the cache, and a
+rem slot gets ctx/np of it. the prompt is the head of MOEPROMPTFILE, the wikitext text unless
+rem _local.bat points it at something else. MOEARGS goes into every arm: -fit off keeps -ncmoe
+rem from EXTRA, and the -ub of models.ini belongs there too
+set "MOEARMS="262144 1" "131072 2""
+set "MOENGEN=2048"
+set "MOECHARS=65536"
+set "MOEARGS=-fit off"
+
 rem context llama-server is started with by 14-server.bat. the sweeps above stay shallow to
 rem keep a research run cheap, the server does not have that reason: 262144 is the trained
 rem context of qwen4exp, 0 takes it from the model
@@ -185,6 +195,10 @@ set "RUN_SPEC=0"
 rem   19 - generation speed against the depth of the context, plus the per-op breakdown.
 rem        off by default: the sweep spends about an hour filling the deep contexts
 set "RUN_DECODE=0"
+rem   20 - what a VRAM cache of the hot MoE experts would give, from the routing of a real text.
+rem        auto runs it on cuda only: there -ncmoe keeps the experts of the first layers in host
+rem        memory, on the strix halo every expert is in VRAM already and the report is one line
+set "RUN_MOECACHE=auto"
 
 rem ===================================================================
 rem  machine-specific overrides. _local.bat is not tracked by git, so
@@ -232,6 +246,11 @@ if /i not "%RUN_MMID%"=="auto" goto :mmid_set
 set "RUN_MMID=1"
 if /i not "%BACKEND%"=="vulkan" set "RUN_MMID=0"
 :mmid_set
+
+if /i not "%RUN_MOECACHE%"=="auto" goto :moecache_set
+set "RUN_MOECACHE=1"
+if /i not "%BACKEND%"=="cuda" set "RUN_MOECACHE=0"
+:moecache_set
 
 rem multi-config generators (msvc) put the binaries in bin\Release, single-config in bin
 set "BIN=%BUILD%\bin\Release"
