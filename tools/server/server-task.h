@@ -705,6 +705,9 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // the cached state that load() restores for tokens_new: it keeps more of itself and of tokens_new than tokens_cur does. states.end() when there is none
+    std::list<server_prompt_cache_state>::iterator find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new);
+
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();

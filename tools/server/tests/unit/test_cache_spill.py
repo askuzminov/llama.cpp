@@ -629,3 +629,47 @@ def test_prompt_cache_spill_carries_checkpoints():
             os.rmdir(spill_dir)
         except OSError:
             pass
+
+
+def test_prompt_cache_returning_prompt_beats_slot():
+    # One slot, two conversations with a shared prefix. When the first one comes back, the slot
+    # still keeps most of the second one, but the cache holds all of the first one: it must come
+    # from the cache, not be processed again from the end of the shared prefix.
+    server = ServerPreset.tinyllama2()
+    server.n_slots = 1
+    server.n_predict = 4
+    server.temperature = 0.0
+    server.cache_ram = 100
+
+    shared = "Once upon a time in a land far away, there lived a brave knight who traveled across mountains and rivers."
+    prompt_a = shared + (
+        " He found the legendary golden sword hidden deep within the enchanted forest of whispers."
+        " He met many creatures along the way including dragons and fairies and wizards who helped"
+        " him on his noble quest to save the kingdom."
+    )
+    prompt_b = shared + " She liked cats."
+
+    try:
+        server.start()
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt_a, "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+        n_prompt_a = res.body["timings"]["prompt_n"]
+
+        # the second conversation takes the slot, the first one goes to the cache
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt_b, "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt_a + " The knight finally reached the castle gates.",
+            "cache_prompt": True, "temperature": 0.0,
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["cache_n"] >= n_prompt_a, \
+            f"expected all {n_prompt_a} tokens of the first prompt from the cache, got {res.body['timings']}"
+    finally:
+        server.stop()

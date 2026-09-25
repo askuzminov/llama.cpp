@@ -1752,6 +1752,9 @@ private:
         }
 
         if (ret) {
+            // the slot keeps most of its prompt, but a conversation that comes back can find more of itself in the cache
+            update_cache = update_cache || (prompt_cache && prompt_cache->find_best(ret->prompt.tokens, task.tokens) != prompt_cache->states.end());
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks

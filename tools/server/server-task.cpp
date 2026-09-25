@@ -3029,10 +3029,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new) {
+    const int lcp_best = tokens_cur.get_common_prefix(tokens_new);
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_keep_best = tokens_cur.size() > 0 ? float(lcp_best) / tokens_cur.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
@@ -3063,7 +3063,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    }
 
+    return it_best;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    auto it_best = find_best(prompt.tokens, tokens_new);
+
+    if (it_best != states.end()) {
         // pull the state back from disk if it was spilled
         if (it_best->on_disk && !unspill_state(*it_best)) {
             SRV_ERR("%s", "failed to load spilled prompt-cache state\n");
