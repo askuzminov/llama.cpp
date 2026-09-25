@@ -468,6 +468,10 @@ llama_context::llama_context(
         }
     }
 
+    if (llama_moe_stats_enabled()) {
+        moe_stats = std::make_unique<llama_moe_stats>(model);
+    }
+
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
@@ -482,6 +486,10 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (moe_stats) {
+        moe_stats->report();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2002,6 +2010,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+
+        if (moe_stats) {
+            moe_stats->add_ubatch(res, sched.get(), ubatch.n_tokens);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.

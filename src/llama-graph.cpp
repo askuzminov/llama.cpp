@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-moecache.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -1335,6 +1336,9 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
+    t_moe_topk.clear();
+    t_moe_topk_il.clear();
+
     params = {};
 
     inputs.clear();
@@ -1400,6 +1404,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);
         }
+    }
+    for (auto * tensor : t_moe_topk) {
+        ggml_set_output(tensor);
     }
 }
 
@@ -2118,6 +2125,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    }
+
+    if (llama_moe_stats_enabled()) {
+        // the top-k node is a view into a buffer that gets reused, so keep a small copy of the ids
+        ggml_tensor * topk = ggml_cont(ctx0, selected_experts);
+        ggml_build_forward_expand(gf, topk);
+        res->t_moe_topk.push_back(topk);
+        res->t_moe_topk_il.push_back(il);
     }
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]

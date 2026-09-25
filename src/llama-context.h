@@ -7,12 +7,14 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moecache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <array>
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -316,6 +318,9 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // MoE expert cache measurement, created only for LLAMA_MOE_CACHE_STATS
+    std::unique_ptr<llama_moe_stats> moe_stats;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

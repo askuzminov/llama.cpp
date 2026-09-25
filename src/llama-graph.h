@@ -944,6 +944,10 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // routing ids of every MoE layer, recorded only for LLAMA_MOE_CACHE_STATS
+    std::vector<ggml_tensor *> t_moe_topk;
+    std::vector<int>           t_moe_topk_il;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
