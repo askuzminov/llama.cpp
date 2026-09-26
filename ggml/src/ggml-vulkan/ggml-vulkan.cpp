@@ -3373,6 +3373,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_16, "concat_transpose_16", concat_transpose_16_len, concat_transpose_16_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_32, "concat_transpose_32", concat_transpose_32_len, concat_transpose_32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
@@ -8090,18 +8092,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
-        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
-        // grouped query attention - make the N dimension equal to gqa_ratio, reduce
-        // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
-        // and change addressing calculations to index Q's dimension 2.
-        gqa_ratio = qk_ratio;
-        N = gqa_ratio;
-        workgroups_y /= gqa_ratio;
-    }
-
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
-
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
@@ -8117,14 +8107,41 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Sparse mask hint (op_params[4]): compact the <= n_kv_max finite positions and gather only those.
     const int32_t n_kv_max = mask ? ggml_get_op_params_i32(dst, 4) : 0;
     static const bool disable_sparse = getenv("GGML_VK_FA_SPARSE_DISABLE") != nullptr;
-    // cm2 dense is fast, so it needs a larger reduction to win.
-    const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : 2;
-    const bool sparse_shape_ok = !disable_sparse && n_kv_max > 0 && mask &&
-                            max_bias == 0.0f && logit_softcap == 0.0f &&
-                            k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 &&
-                            nem0 == KV &&
-                            (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max);
+    auto sparse_ok = [&](FaCodePath path) {
+        // cm2 dense is fast, so it needs a larger reduction to win.
+        const int64_t min_ratio = path == FA_COOPMAT2 ? 4 : 2;
+        return !disable_sparse && n_kv_max > 0 && mask &&
+               max_bias == 0.0f && logit_softcap == 0.0f &&
+               k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 &&
+               nem0 == KV &&
+               (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max);
+    };
 
+    // Prefill folds the heads too when the sparse list applies: the tile is then one query row
+    // over the heads of a group, and all of them walk the exact list of that row.
+    // GGML_VK_FA_SPARSE_GQA=0 keeps one head per tile on prefill, see scripts/win-qsa/04-fa-sparse.bat.
+    static const bool sparse_gqa = [] {
+        const char * val = getenv("GGML_VK_FA_SPARSE_GQA");
+        return val == nullptr || atoi(val) != 0;
+    }();
+
+    if ((N <= 8 || (sparse_gqa && sparse_ok(tuning_params.path))) &&
+        qk_ratio > 1 && qk_ratio <= max_gqa &&
+        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+        // grouped query attention - make the N dimension equal to gqa_ratio, reduce
+        // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
+        // and change addressing calculations to index Q's dimension 2.
+        gqa_ratio = qk_ratio;
+        N = gqa_ratio;
+        workgroups_y /= gqa_ratio;
+    }
+
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+
+    // the fold keeps the code path (N >= 2), so the check above and this one agree
+    const bool sparse_shape_ok = sparse_ok(tuning_params.path);
+
+    // The rest is for a tile without the fold.
     // A tile of several query rows cannot share one exact list, because each row selects its own
     // cells. Two ways out. The pre-pass can union the rows of the tile: the coopmat matmul stays,
     // but the list grows to at most block_rows * n_kv_max cells. Else prefill re-tunes to a
@@ -8703,6 +8720,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_CONCAT: {
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
+        }
+        // a source with dim 1 innermost (a transposed view) goes through tiles, so its reads are contiguous
+        auto transposed = [](const ggml_tensor * t) { return t->ne[0] > 1 && t->ne[1] > 1 && t->nb[1] < t->nb[0]; };
+        if (!ggml_is_quantized(src0->type) && (transposed(src0) || transposed(src1))) {
+            if (ggml_type_size(src0->type) == 4) {
+                return ctx->device->pipeline_concat_transpose_32;
+            }
+            if (ggml_type_size(src0->type) == 2) {
+                return ctx->device->pipeline_concat_transpose_16;
+            }
         }
         switch (ggml_vk_concat_unit_size(src0->type)) {
         case 1:
@@ -9666,7 +9693,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
                 elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
             } else if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
-                pipeline == ctx->device->pipeline_cpy_transpose_16) {
+                pipeline == ctx->device->pipeline_cpy_transpose_16 ||
+                pipeline == ctx->device->pipeline_concat_transpose_32 ||
+                pipeline == ctx->device->pipeline_concat_transpose_16) {
                 // 32x32 tiles
                 elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
                 elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], 32);

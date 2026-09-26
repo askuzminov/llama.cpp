@@ -2416,7 +2416,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        // a kernel fault reaches this check at its own node only with CUDA_LAUNCH_BLOCKING=1, GGML_CUDA_DISABLE_GRAPHS=1 and GGML_CUDA_DISABLE_FUSION=1
+        GGML_LOG_ERROR("%s: %s failed, node '%s' %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n", __func__, ggml_op_desc(dst),
+                dst->name, ggml_type_name(dst->type), dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * src = dst->src[i];
+            if (src != nullptr) {
+                GGML_LOG_ERROR("%s:   src%d '%s' %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n", __func__, i,
+                        src->name, ggml_type_name(src->type), src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+            }
+        }
         CUDA_CHECK(err);
     }
 

@@ -42,6 +42,10 @@ extern char **environ;
 
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
 
+// the driver can release the memory of an exited child some time after the process ended.
+// a child spawned in this time after an exit first waits for that memory, see mem_wait_env
+#define MEM_WAIT_MS 120000
+
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
 #define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
 
@@ -1144,6 +1148,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
     inst.meta.status      = SERVER_MODEL_STATUS_LOADING;
     inst.meta.loaded_info = json{};
     inst.meta.last_used   = ggml_time_ms();
+    inst.alone            = opts.mode == SERVER_CHILD_MODE_NORMAL;
+    for (const auto & m : mapping) {
+        inst.alone = inst.alone && !m.second.meta.is_running();
+    }
 
     if (inst.meta.port <= 0) {
         throw std::runtime_error("failed to get a port number");
@@ -1163,6 +1171,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
             child_env.push_back("LLAMA_ARG_HF_REPO=" + name);
+        }
+
+        const std::string mem_wait = inst.alone ? mem_wait_env() : "";
+        if (!mem_wait.empty()) {
+            SRV_INF("previous instance exited recently, the new one waits for its memory: %s\n", mem_wait.c_str());
+            child_env.push_back("LLAMA_SERVER_MEM_WAIT=" + mem_wait);
         }
 
         SRV_INF("%s", "spawning server instance with args:\n");
@@ -1199,6 +1213,29 @@ void server_models::load(const std::string & name, const load_options & opts) {
     cv.notify_all();
 }
 
+std::string server_models::mem_wait_env() const {
+    const int64_t left = t_last_exit + MEM_WAIT_MS - ggml_time_ms();
+    if (t_last_exit == 0 || left <= 0) {
+        return "";
+    }
+    json need = json::object();
+    for (const auto & [dev, m] : mem_last.items()) {
+        const int64_t free  = json_value(m, "free",  (int64_t) 0);
+        const int64_t used  = json_value(m, "used",  (int64_t) 0);
+        const int64_t total = json_value(m, "total", (int64_t) 0);
+        // other programs also change the free memory, so only a device the last child filled noticeably is waited for
+        const int64_t slack = std::max<int64_t>(1ll << 30, total / 20);
+        if (used >= slack) {
+            // room for the same load, but not more than was free before it
+            need[dev] = std::min(free - slack, used + slack);
+        }
+    }
+    if (need.empty()) {
+        return "";
+    }
+    return safe_json_to_str({{"ms", left}, {"need", need}});
+}
+
 void server_models::request_stop(const std::string & name, bool send_exit) {
     auto it = mapping.find(name);
     if (it == mapping.end() || stopping_models.count(name)) {
@@ -1211,6 +1248,9 @@ void server_models::request_stop(const std::string & name, bool send_exit) {
 void server_models::on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code) {
     {
         std::lock_guard<std::mutex> lk(mutex);
+        if (mode == SERVER_CHILD_MODE_NORMAL) {
+            t_last_exit = ggml_time_ms();
+        }
         auto it = mapping.find(name);
         if (it == mapping.end() || it->second.subproc != proc) {
             stopping_models.erase(name);
@@ -1651,6 +1691,14 @@ void server_models::handle_child_state(const std::string & name, const std::stri
             } break;
         case SERVER_STATE_READY:
             {
+                if (payload.is_object() && payload.contains("mem")) {
+                    std::lock_guard<std::mutex> lk(mutex);
+                    auto it = mapping.find(name);
+                    if (it != mapping.end() && it->second.alone && payload["mem"].is_object()) {
+                        mem_last = payload["mem"];
+                    }
+                    payload.erase("mem");
+                }
                 update_status(name, {
                     SERVER_MODEL_STATUS_LOADED,
                     0,
@@ -1803,6 +1851,120 @@ void server_child::notify_to_router(const std::string & state, const json & payl
     fprintf(stdout, "\n%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
     fflush(stdout);
     common_log_resume(common_log_main());
+}
+
+// devices the model is loaded on by default: the --device list, else the discrete gpus, else the integrated ones
+static std::vector<ggml_backend_dev_t> mem_devices(const common_params & params) {
+    std::vector<ggml_backend_dev_t> res;
+    if (!params.devices.empty()) {
+        for (auto * dev : params.devices) {
+            if (dev != nullptr) {
+                res.push_back(dev);
+            }
+        }
+        return res;
+    }
+    for (auto type : { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU }) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == type) {
+                res.push_back(dev);
+            }
+        }
+        if (!res.empty()) {
+            break;
+        }
+    }
+    return res;
+}
+
+// device name -> free and total bytes, "host" is the system memory
+static std::map<std::string, std::pair<size_t, size_t>> mem_query(const std::vector<ggml_backend_dev_t> & devs) {
+    std::map<std::string, std::pair<size_t, size_t>> res;
+    for (auto * dev : devs) {
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        res[ggml_backend_dev_name(dev)] = { free, total };
+    }
+    size_t free  = 0;
+    size_t total = 0;
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu != nullptr) {
+        ggml_backend_dev_memory(cpu, &free, &total);
+    }
+    // outside windows the cpu device reports all memory as free
+    const size_t avail = common_host_mem_available();
+    res["host"] = { avail > 0 ? avail : free, total };
+    return res;
+}
+
+void server_child::wait_mem(const common_params & params) {
+    mem_devs  = mem_devices(params);
+    mem_start = mem_query(mem_devs);
+
+    const char * env = std::getenv("LLAMA_SERVER_MEM_WAIT");
+    if (env == nullptr) {
+        return;
+    }
+    int64_t wait_ms = 0;
+    std::map<std::string, size_t> need;
+    try {
+        const json cfg = json::parse(env);
+        wait_ms = cfg.at("ms").get<int64_t>();
+        for (const auto & [dev, n] : cfg.at("need").items()) {
+            need[dev] = n.get<size_t>();
+        }
+    } catch (const std::exception & e) {
+        SRV_WRN("ignoring LLAMA_SERVER_MEM_WAIT: %s\n", e.what());
+        return;
+    }
+
+    const int64_t t_start = ggml_time_ms();
+    bool waited = false;
+    while (true) {
+        std::string lack;
+        for (const auto & [dev, n] : need) {
+            auto it = mem_start.find(dev);
+            if (it != mem_start.end() && it->second.first < n) {
+                lack += string_format(" %s %zu/%zu MiB", dev.c_str(), it->second.first / (1024 * 1024), n / (1024 * 1024));
+            }
+        }
+        const int64_t t = ggml_time_ms() - t_start;
+        if (lack.empty()) {
+            if (waited) {
+                SRV_INF("previous instance released its memory after %.1f s\n", t / 1000.0);
+            }
+            return;
+        }
+        if (t >= wait_ms) {
+            SRV_WRN("previous instance still holds memory after %.1f s, loading anyway, free/needed:%s\n", t / 1000.0, lack.c_str());
+            return;
+        }
+        if (!waited) {
+            SRV_INF("waiting up to %.1f s until the previous instance releases its memory, free/needed:%s\n", wait_ms / 1000.0, lack.c_str());
+            waited = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        mem_start = mem_query(mem_devs);
+    }
+}
+
+json server_child::mem_report() {
+    json res = json::object();
+    for (const auto & [dev, cur] : mem_query(mem_devs)) {
+        auto it = mem_start.find(dev);
+        if (it == mem_start.end()) {
+            continue;
+        }
+        const size_t free = it->second.first;
+        res[dev] = {
+            {"free",  free},
+            {"used",  free > cur.first ? free - cur.first : 0},
+            {"total", cur.second},
+        };
+    }
+    return res;
 }
 
 

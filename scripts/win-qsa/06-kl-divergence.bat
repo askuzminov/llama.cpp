@@ -4,9 +4,10 @@ rem kernel. every arm walks the same cells, so the answer should be near zero an
 rem check of the gather, not of the selection. the base runs with the gather off, and every
 rem value of FAVARIANTS is then measured against it - 0 included, which repeats the base and
 rem gives the noise floor of two runs of the same code. a KLD of an arm that is not far above
-rem that floor is rounding, one that is above it is a defect. g and r are the two tile shapes
-rem of the gather, see 04-fa-sparse.bat: they differ in how long a list the kernel walks, so
-rem only the summation order changes and both have to land on the floor.
+rem that floor is rounding, one that is above it is a defect. arm 1 folds the heads on
+rem prefill, g and r are the two older tile shapes of the gather with the fold off, see
+rem 04-fa-sparse.bat: they differ in how long a list the kernel walks, so only the summation
+rem order changes and all three have to land on the floor.
 rem run 05 first if you only want a cheap number: this one writes a logits file of about
 rem 300 KB per token.
 rem   KLCTX x KLCHUNKS tokens x n_vocab x 2 bytes
@@ -72,6 +73,7 @@ for %%v in (%FAVARIANTS%) do call :run %%v
 
 set "GGML_VK_FA_SPARSE_DISABLE="
 set "GGML_VK_FA_SPARSE_GROUP="
+set "GGML_VK_FA_SPARSE_GQA="
 
 del "%BASEFILE%"
 
@@ -85,9 +87,12 @@ rem 0 повторяет базовый прогон и даёт уровень 
 set "LOG=%LOGS%\06-kl-%TS%-s%~1.log"
 set "GGML_VK_FA_SPARSE_DISABLE="
 set "GGML_VK_FA_SPARSE_GROUP="
+set "GGML_VK_FA_SPARSE_GQA="
 if "%~1"=="0" set "GGML_VK_FA_SPARSE_DISABLE=1"
 if "%~1"=="g" set "GGML_VK_FA_SPARSE_GROUP=1"
 if "%~1"=="r" set "GGML_VK_FA_SPARSE_GROUP=0"
+if "%~1"=="g" set "GGML_VK_FA_SPARSE_GQA=0"
+if "%~1"=="r" set "GGML_VK_FA_SPARSE_GQA=0"
 echo === sparse=%~1 -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %KLCTX% --chunks %KLCHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"

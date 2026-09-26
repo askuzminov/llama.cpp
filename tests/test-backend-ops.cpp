@@ -6590,7 +6590,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim))
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: transposed a, 1 << 5: transposed b)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -6620,6 +6620,12 @@ struct test_concat : public test_case {
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
+        } else if (v & 16) {
+            a = ggml_new_tensor_4d(ctx, type, ne_a[1], ne_a[0], ne_a[2], ne_a[3]);
+            ggml_set_name(a, "a");
+
+            a = ggml_transpose(ctx, a);
+            ggml_set_name(a, "transpose_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_name(a, "a");
@@ -6639,6 +6645,12 @@ struct test_concat : public test_case {
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(b, "view_of_b");
+        } else if (v & 32) {
+            b = ggml_new_tensor_4d(ctx, type, ne_b[1], ne_b[0], ne_b[2], ne_b[3]);
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transpose_of_b");
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
@@ -10685,6 +10697,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // transposed sources; no i64, the CPU concat of it needs contiguous rows
+    for (int v : { 16, 32, 48 }) {
+        for (int dim : { 0, 1, 2, 3, }) {
+            for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_I8, GGML_TYPE_I16, GGML_TYPE_I32 }) {
+                test_cases.emplace_back(new test_concat(type, {11, 12, 13, 14}, 7, dim, v));
+            }
+        }
+    }
+
+    // conv state + transposed tokens, as before ssm_conv: many tiles, with partial tiles at the edges
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_concat(type, {3, 1100, 2, 1}, 67, 0, 32));
+        test_cases.emplace_back(new test_concat(type, {45, 70, 3, 1}, 37, 1, 16));
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {
@@ -11043,6 +11070,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4, 64));
+
+    // sparse prefill with few query rows: the heads of a group share the exact list of each row,
+    // and the device is not full, so the list is also split over several workgroups
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 8192, 12, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2052, 4));
 
     // sparse mask where the rows of a tile pick different cells, so a tile cannot share one list
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024, 4,  8));
@@ -11741,6 +11773,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3,  3328, 1, 1},  512, 0, 32)); // prefill conv input: state + transposed x
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 32)); // same, qwen4exp with a 2048 ubatch
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill

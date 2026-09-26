@@ -487,6 +487,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         // setup communication child --> router if necessary
         if (child.is_child()) {
+            child.wait_mem(params);
             ctx_server.set_state_callback([&](server_state state, json payload) {
                 child.notify_to_router(server_state_to_str(state), payload);
             });
@@ -581,7 +582,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         std::thread monitor_thread;
         if (child.is_child()) {
             monitor_thread = child.setup(shutdown_handler);
-            child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
+            json info = routes.get_model_info();
+            info["mem"] = child.mem_report();
+            child.notify_to_router(server_state_to_str(SERVER_STATE_READY), info);
         }
 
         // this call blocks the main thread until queue_tasks.terminate() is called

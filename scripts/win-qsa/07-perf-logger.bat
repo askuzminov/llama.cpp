@@ -3,8 +3,9 @@ rem per-op timings from the vulkan backend at a deep context, one run per arm of
 rem produces a lot of output, keep the run short. cuda ignores GGML_VK_PERF_LOGGER.
 rem the point of the sweep: the gather path walks the list of cells a query tile can see, the
 rem dense path walks all of KV. the FLASH_ATTN_EXT line says which one wins on the real
-rem per-token mask, and the lines around it say what the pre-pass costs. arms g and r are the
-rem two tile shapes of the gather, see 04-fa-sparse.bat.
+rem per-token mask, and the lines around it say what the pre-pass costs. arm 1 folds the
+rem heads on prefill, arms g and r are the two older tile shapes with the fold off, see
+rem 04-fa-sparse.bat. the CONCAT line is the conv input of the recurrent layers.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -44,6 +45,7 @@ for %%v in (%FAVARIANTS%) do call :run %%v
 set "GGML_VK_PERF_LOGGER="
 set "GGML_VK_FA_SPARSE_DISABLE="
 set "GGML_VK_FA_SPARSE_GROUP="
+set "GGML_VK_FA_SPARSE_GQA="
 
 echo.
 type "%SUM%"
@@ -60,9 +62,12 @@ if "%FIRST%"=="1" (set "FIRST=0") else (
 set "LOG=%LOGS%\07-perf-%TS%-s%~1.log"
 set "GGML_VK_FA_SPARSE_DISABLE="
 set "GGML_VK_FA_SPARSE_GROUP="
+set "GGML_VK_FA_SPARSE_GQA="
 if "%~1"=="0" set "GGML_VK_FA_SPARSE_DISABLE=1"
 if "%~1"=="g" set "GGML_VK_FA_SPARSE_GROUP=1"
 if "%~1"=="r" set "GGML_VK_FA_SPARSE_GROUP=0"
+if "%~1"=="g" set "GGML_VK_FA_SPARSE_GQA=0"
+if "%~1"=="r" set "GGML_VK_FA_SPARSE_GQA=0"
 echo === sparse=%~1
 "%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p 512 -n 0 -b 4096 -ub 2048 -d %PERFDEPTH% %LOADMODE% -r 1 --no-warmup %EXTRA% > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"

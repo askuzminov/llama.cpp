@@ -11,11 +11,13 @@
 #include <condition_variable>
 #include <thread>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 /**
  * state diagram:
@@ -121,6 +123,7 @@ private:
         std::shared_ptr<server_subproc> subproc; // shared with the monitor thread
         server_model_meta meta;
         int req_count = 0; // number of active proxy requests
+        bool alone = false; // no other instance was running when this one was spawned
 
         // ask the child to exit (it handles the command on its stdin, see server_child::setup)
         void request_exit() const;
@@ -210,6 +213,15 @@ private:
 
     // if true, add some delay to simulate works (useful for testing)
     bool debug_fake_timing = false;
+
+    // memory per device reported by the last child that was spawned alone, see server_child::mem_report
+    json mem_last = json::object();
+    // time of the last child exit, the driver can release the memory of that child some time later
+    int64_t t_last_exit = 0;
+
+    // LLAMA_SERVER_MEM_WAIT value for a child spawned alone, empty if it has nothing to wait for
+    // not thread-safe, caller must hold mutex
+    std::string mem_wait_env() const;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
@@ -306,7 +318,7 @@ public:
     // called from the monitor thread
     // payload per state:
     //     state = loading     -> payload = {} (TODO: add progress info)
-    //     state = ready       -> payload = model_info (json), or {} if wakeup from sleeping
+    //     state = ready       -> payload = model_info (json) with "mem" from server_child::mem_report, or {} if wakeup from sleeping
     //     state = sleeping    -> payload = {}
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
@@ -332,6 +344,17 @@ struct server_child {
     // notify router server for status changes (e.g. loading, downloading, sleeping, etc.)
     // message will be handled by server_models::handle_child_state() on the router side
     void notify_to_router(const std::string & state_name, const json & payload);
+
+    // call before the model is loaded: if the router set LLAMA_SERVER_MEM_WAIT, wait until the previous
+    // instance released its memory, then record the free memory per device
+    void wait_mem(const common_params & params);
+
+    // free memory per device before the load and how much the load took
+    json mem_report();
+
+private:
+    std::vector<ggml_backend_dev_t> mem_devs;
+    std::map<std::string, std::pair<size_t, size_t>> mem_start; // device name -> free, total
 };
 
 struct server_models_routes {

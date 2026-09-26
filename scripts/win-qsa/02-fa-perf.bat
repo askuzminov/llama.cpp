@@ -24,10 +24,12 @@ echo writing %LOG%
 set "RC=%ERRORLEVEL%"
 echo exit=%RC% >> "%LOG%"
 
-rem the run above takes whichever tile shape the build picks. these two force each of them, so
-rem the log holds all three. the union gives a per-token selection (sparse_grp=1) a shared list
-rem and keeps the coopmat matmul, and only pays off if the rows of a tile overlap. the one-row
-rem tile gets an exact list and gives up the matmul
+rem the run above takes whichever tile shape the build picks: on this shape (12 q heads per kv
+rem head) that is the head fold, one query row over the heads of a group with an exact list.
+rem these two turn the fold off and force each of the older shapes, so the log holds all
+rem three. the union gives a per-token selection (sparse_grp=1) a shared list and keeps the
+rem coopmat matmul, and only pays off if the rows of a tile overlap. the one-row tile gets an
+rem exact list and gives up the matmul
 if not defined FAGROUP set "FAGROUP=1"
 rem both arms and the scalar one below force a vulkan pipeline, another backend would just
 rem repeat the run above
@@ -57,11 +59,13 @@ exit /b %RC%
 rem %1 = value of GGML_VK_FA_SPARSE_GROUP, %2 = what it means in the log
 :arm
 echo. >> "%LOG%"
-echo ### GGML_VK_FA_SPARSE_GROUP=%~1, %~2 >> "%LOG%"
+echo ### GGML_VK_FA_SPARSE_GQA=0 GGML_VK_FA_SPARSE_GROUP=%~1, %~2 >> "%LOG%"
+set "GGML_VK_FA_SPARSE_GQA=0"
 set "GGML_VK_FA_SPARSE_GROUP=%~1"
 "%BIN%\test-backend-ops.exe" perf -o FLASH_ATTN_EXT -p "kv=32768" >> "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 set "GGML_VK_FA_SPARSE_GROUP="
+set "GGML_VK_FA_SPARSE_GQA="
 echo exit=%EC% >> "%LOG%"
 if not "%EC%"=="0" set "RC=%EC%"
 goto :eof
