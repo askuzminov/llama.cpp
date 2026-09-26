@@ -18,6 +18,7 @@ struct llama_cparams {
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+    int32_t  n_moe_cache;     // slots per layer of the device cache of host experts, 0 = off, -1 = auto
 
     int32_t  nextn_layer_offset = 0;
 

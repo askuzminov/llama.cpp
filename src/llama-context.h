@@ -322,6 +322,9 @@ private:
     // MoE expert cache measurement, created only for LLAMA_MOE_CACHE_STATS
     std::unique_ptr<llama_moe_stats> moe_stats;
 
+    // device cache of host MoE experts, created only for n_moe_cache != 0
+    std::unique_ptr<llama_moe_cache> moe_cache;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;

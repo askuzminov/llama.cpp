@@ -1596,14 +1596,6 @@ bool llama_model_loader::load_all_data(
         llama_progress_callback progress_callback,
         void * progress_callback_user_data,
         llama_tensor_range_queue * ranges) {
-    if (files.empty()) {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            set_tensor_data(t, set_tensor_data_ud);
-        }
-        return true;
-    }
-    GGML_ASSERT(size_data != 0 && "call init_mappings() first");
-
     // tells the allocating thread when the tensors it handed over are no longer in use
     struct range_guard {
         llama_tensor_range_queue * q;
@@ -1613,6 +1605,18 @@ bool llama_model_loader::load_all_data(
     if (ranges) {
         ranges->enter();
     }
+
+    if (files.empty()) {
+        // a tensor has a buffer only after the allocating thread hands over its range
+        llama_tensor_range range = { ggml_get_first_tensor(ctx), nullptr };
+        for (bool have = ranges ? ranges->pop(range) : range.first != nullptr; have; have = ranges && ranges->pop(range)) {
+            for (ggml_tensor * t = range.first; t != range.last; t = ggml_get_next_tensor(ctx, t)) {
+                set_tensor_data(t, set_tensor_data_ud);
+            }
+        }
+        return true;
+    }
+    GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 

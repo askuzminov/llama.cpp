@@ -58,10 +58,14 @@ echo   1. run the cuda installer again and select visual studio integration
 echo   2. install ninja, then run this again
 exit /b 1
 :gen_done
+rem for ninja cmake takes the first nvcc on PATH, and it can be from another toolkit. give it
+rem the one in CUDA_PATH, as -T does for msbuild. when it changes, cmake makes a new cache
+set "NVCCARG="
+if /i "%BACKEND%"=="cuda" if not defined TOOLSET if defined CP if exist "%CP%\bin\nvcc.exe" set "NVCCARG="-DCMAKE_CUDA_COMPILER=%CP:\=/%/bin/nvcc.exe""
 
 rem the backend flags only turn a backend on, so a cache made for another one would keep
-rem it, and its dlls would stay in bin. a cache also remembers its generator, its toolset
-rem and its nvcc. start over when any of them changed
+rem it, and its dlls would stay in bin. a cache also remembers its generator and its
+rem toolset. start over when any of them changed
 if not exist "%BUILD%\CMakeCache.txt" goto :configure
 set "HAVE=cpu"
 findstr /b /i /c:"GGML_VULKAN:BOOL=ON" "%BUILD%\CMakeCache.txt" >nul
@@ -69,15 +73,10 @@ if not errorlevel 1 set "HAVE=vulkan"
 findstr /b /i /c:"GGML_CUDA:BOOL=ON" "%BUILD%\CMakeCache.txt" >nul
 if not errorlevel 1 set "HAVE=cuda"
 if /i not "%HAVE%"=="%BACKEND%" goto :wipe_backend
-rem a new toolkit does not replace the nvcc in the cache, and a configure that died on a
-rem missing toolset leaves a cache with no nvcc at all. the cache stores the path with /
-if /i not "%BACKEND%"=="cuda" goto :check_gen
-if not defined CP goto :check_gen
-findstr /b /i /c:"CMAKE_CUDA_COMPILER:FILEPATH=%CP:\=/%/bin/nvcc.exe" "%BUILD%\CMakeCache.txt" >nul
-if errorlevel 1 goto :wipe_toolkit
-rem cmake refuses to change the toolset of a cache it already made
+rem msbuild gets nvcc from the -T toolset. cmake refuses to change the toolset of a cache it
+rem made, and compares the text as it is: match case too. /l keeps the \ in the path literal
 if not defined TOOLSET goto :check_gen
-findstr /b /i /c:"CMAKE_GENERATOR_TOOLSET:INTERNAL=cuda=" "%BUILD%\CMakeCache.txt" >nul
+findstr /b /l /c:"CMAKE_GENERATOR_TOOLSET:INTERNAL=cuda=%CP%" "%BUILD%\CMakeCache.txt" >nul
 if errorlevel 1 goto :wipe_toolkit
 
 :check_gen
@@ -98,9 +97,9 @@ echo %BUILD% was configured for %HAVE%, wanted %BACKEND%: removing it
 rmdir /s /q "%BUILD%"
 
 :configure
-echo building into %BUILD%, backend %BACKEND% %CMAKE_BACKEND% %GENARG% %TOOLSET%
+echo building into %BUILD%, backend %BACKEND% %CMAKE_BACKEND% %GENARG% %TOOLSET% %NVCCARG%
 if /i "%BACKEND%"=="cpu" echo   no cuda toolkit and no vulkan sdk found, this is a cpu only build
-cmake -S "%~dp0..\.." -B "%BUILD%" %GENARG% %TOOLSET% %CMAKE_BACKEND% -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake -S "%~dp0..\.." -B "%BUILD%" %GENARG% %TOOLSET% %NVCCARG% %CMAKE_BACKEND% -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
 if not "%ERRORLEVEL%"=="0" exit /b 1
 
 cmake --build "%BUILD%" --config Release -j %NUMBER_OF_PROCESSORS%

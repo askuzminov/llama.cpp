@@ -768,6 +768,7 @@ public:
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
 class llm_graph_result;
+class llama_moe_cache;
 
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -809,6 +810,8 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    const llama_moe_cache * moe_cache; // nullptr when the graph does not use the MoE expert cache
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -880,7 +883,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            moe_cache == other.moe_cache;
     }
 };
 
@@ -947,6 +951,11 @@ public:
     // routing ids of every MoE layer, recorded only for LLAMA_MOE_CACHE_STATS
     std::vector<ggml_tensor *> t_moe_topk;
     std::vector<int>           t_moe_topk_il;
+
+    // MoE layers that use the expert cache and the routing ids they copy to the cache
+    std::vector<int>     moe_cache_il;
+    std::vector<int64_t> moe_cache_n_used;
+    int64_t              moe_cache_n_tokens = 0;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1036,6 +1045,8 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    const llama_moe_cache * moe_cache;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1160,6 +1171,26 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
+
+    // activation between the up/gate and the down projections of the experts
+    ggml_tensor * build_moe_ffn_act(
+             ggml_tensor * cur,
+             ggml_tensor * up,
+         llm_ffn_op_type   type_op,
+                    bool   has_gate,
+                    bool   has_gate_exps,
+                     int   il) const;
+
+    // computes the cached experts of the host mul_mat_id nodes on the device and makes the host nodes skip them
+    // returns the device result of the down projection, or nullptr when the layer does not use the cache
+    ggml_tensor * build_moe_cache(
+             ggml_tensor * mm_up,
+             ggml_tensor * mm_gate,
+             ggml_tensor * mm_down,
+         llm_ffn_op_type   type_op,
+                    bool   has_gate,
+                    bool   has_gate_exps,
+                     int   il) const;
 
     //
     // inputs

@@ -12,12 +12,21 @@ rem sampled with a fixed seed, not greedy: a greedy run can fall into a loop, a 
 rem experts again and again, and the hit rate comes out too high. the arms differ in context and
 rem slots, because those decide how much VRAM is left for the cache: the last line of each report
 rem is the free VRAM and how many slots fit in it.
+rem
+rem an arm can also run the real cache (--moe-cache, llama_moe_cache in the same source file):
+rem the words after "ctx np" go to llama-completion for that arm only. the cache writes lines that
+rem start with "moe_cache: " and they go to the summary: the slots it took, then the hit rate and
+rem the uploads.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem arms, "ctx np": the two server setups in question. a slot gets ctx/np of the context, and the
-rem prompt plus MOENGEN has to fit into it
-if not defined MOEARMS       set "MOEARMS="262144 1" "131072 2""
+rem arms, "ctx np [args]". a slot gets ctx/np of the context, and the prompt plus MOENGEN has to
+rem fit into it. -ncmoe in args adds its layers to the -ncmoe of EXTRA, so an arm can only move
+rem more layers to the host. the default compares the server setup of EXTRA with the real cache:
+rem all 48 MoE layers of the model on the host and the free VRAM in slots. -cmoe would also move
+rem the MTP layer, which the cache does not serve. the arms of the first measurement were
+rem "262144 1" "131072 2"
+if not defined MOEARMS       set "MOEARMS="262144 1" "262144 1 -ncmoe 48 --moe-cache auto""
 rem an LRU of 256 slots that takes one expert per step needs 256 steps to fill, so the run has to
 rem be several times longer than that
 if not defined MOENGEN       set "MOENGEN=2048"
@@ -78,9 +87,10 @@ echo ### prompt=%MOEPROMPTFILE% chars=%MOECHARS% n_gen=%MOENGEN% seed=%MOESEED% 
 set "LLAMA_MOE_CACHE_STATS=%MOEPERIOD%"
 set "RC=0"
 set "FIRST=1"
+set "ARM=0"
 
 for %%v in (%MOEARMS%) do (
-    for /f "tokens=1,2" %%a in (%%v) do call :arm %%a %%b
+    for /f "tokens=1,2,*" %%a in (%%v) do call :arm %%a %%b "%%c"
 )
 
 set "LLAMA_MOE_CACHE_STATS="
@@ -92,8 +102,9 @@ echo.
 echo done, %SUM%
 exit /b %RC%
 
-rem %1 = context, %2 = slots
+rem %1 = context, %2 = slots, %3 = args of the arm in quotes
 :arm
+set /a ARM+=1
 if "%FIRST%"=="1" (
     set "FIRST=0"
 ) else (
@@ -101,15 +112,15 @@ if "%FIRST%"=="1" (
     powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"
 )
 
-set "LOG=%LOGS%\20-moecache-%TS%-c%~1-np%~2.log"
-echo === -c %~1 -np %~2 -^> %LOG%
-"%BIN%\llama-completion.exe" -m "%MODEL%" -f "%PFILE%" -c %~1 -np %~2 -fa on %LOADMODE% %EXTRA% %MOEARGS% -no-cnv --no-display-prompt -n %MOENGEN% --ignore-eos --seed %MOESEED% > "%LOG%" 2>&1
+set "LOG=%LOGS%\20-moecache-%TS%-arm%ARM%-c%~1-np%~2.log"
+echo === arm %ARM%: -c %~1 -np %~2 %~3 -^> %LOG%
+"%BIN%\llama-completion.exe" -m "%MODEL%" -f "%PFILE%" -c %~1 -np %~2 -fa on %LOADMODE% %EXTRA% %MOEARGS% %~3 -no-cnv --no-display-prompt -n %MOENGEN% --ignore-eos --seed %MOESEED% > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"
 
 echo. >> "%SUM%"
-echo ### -c %~1 -np %~2 exit=%EC% >> "%SUM%"
-findstr /c:"eval time =" /c:"failed to" /c:"out of memory" "%LOG%" >> "%SUM%"
+echo ### arm %ARM%: -c %~1 -np %~2 %~3 exit=%EC% >> "%SUM%"
+findstr /c:"eval time =" /c:"failed to" /c:"out of memory" /c:"moe_cache: " "%LOG%" >> "%SUM%"
 
 rem the last report covers the whole arm. with every expert in VRAM there is no table, only one line
 powershell -NoProfile -Command "$t = Get-Content -LiteralPath '%LOG%'; $m = $t | Select-String -SimpleMatch 'MoE expert cache potential' | Select-Object -Last 1; if ($m) { $t[($m.LineNumber - 1)..($t.Count - 1)] | Where-Object { $_ -like '*moe_cache_stats:*' } } else { $t | Where-Object { $_ -like '*moe_cache_stats:*' } | Select-Object -Last 1 }" >> "%SUM%"

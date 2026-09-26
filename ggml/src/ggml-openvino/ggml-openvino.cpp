@@ -1328,6 +1328,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_MUL_MAT_ID: {
+        if (op->src[3] != nullptr) {
+            return {false, "MUL_MAT_ID with a skip input is not supported"};
+        }
         // Single-expert (or empty) MUL_MAT_ID is a degenerate shape that stresses GatherMatmul edge
         // cases and never occurs in real MoE; let it fall back to CPU.
         if (op->src[0] != nullptr && op->src[0]->ne[2] <= 1) {

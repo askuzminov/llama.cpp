@@ -3415,6 +3415,23 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_add_skip(
+        struct ggml_tensor * a,
+        struct ggml_tensor * skip) {
+    if (!skip) {
+        a->src[3] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(a->src[3] == NULL);
+    GGML_ASSERT(skip->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(skip));
+    GGML_ASSERT(ggml_nelements(skip) == a->src[0]->ne[2]);
+
+    a->src[3] = skip;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

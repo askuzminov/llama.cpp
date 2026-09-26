@@ -2828,6 +2828,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--moe-cache"}, "N",
+        "keep the most recently used MoE experts of the CPU layers in a device cache: N slots per layer, 'auto' to use free device memory, 0 = off (default: 0) [EXPERIMENTAL]",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.n_moe_cache = -1;
+            } else {
+                params.n_moe_cache = std::stoi(value);
+                if (params.n_moe_cache < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

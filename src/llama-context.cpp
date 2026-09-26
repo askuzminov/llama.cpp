@@ -111,6 +111,7 @@ llama_context::llama_context(
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
+    cparams.n_moe_cache             = params.n_moe_cache;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -472,6 +473,10 @@ llama_context::llama_context(
         moe_stats = std::make_unique<llama_moe_stats>(model);
     }
 
+    if (cparams.n_moe_cache != 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.hparams.no_alloc) {
+        moe_cache = std::make_unique<llama_moe_cache>(model, cparams.n_moe_cache);
+    }
+
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
@@ -489,6 +494,10 @@ llama_context::~llama_context() {
 
     if (moe_stats) {
         moe_stats->report();
+    }
+
+    if (moe_cache) {
+        moe_cache->report();
     }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
@@ -1464,6 +1473,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (moe_cache) {
+        // allocate after the first real batch, so that the compute buffers are already in the free memory count
+        if (!moe_cache->is_init()) {
+            if (!cparams.warmup) {
+                moe_cache->init(sched.get());
+            }
+        } else {
+            moe_cache->update(res);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2571,6 +2591,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_cache   =*/ moe_cache && moe_cache->ready() && !cparams.warmup && !opt_ctx ? moe_cache.get() : nullptr,
     };
 }
 
@@ -3765,6 +3786,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.n_moe_cache                 =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

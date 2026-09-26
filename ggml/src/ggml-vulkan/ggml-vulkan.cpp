@@ -15406,6 +15406,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                         return false;
                     }
+                    if (op->src[3]) {
+                        return false;
+                    }
                 }
                 switch (src0_type) {
                     case GGML_TYPE_F32:
