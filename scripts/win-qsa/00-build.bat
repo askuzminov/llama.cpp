@@ -10,7 +10,10 @@ rem msbuild to the toolkit's own copy, and then it does not matter which studio 
 set "GENARG="
 set "TOOLSET="
 set "CP=%CUDA_PATH%"
-if defined CP if "%CP:~-1%"=="\" set "CP=%CP:~0,-1%"
+rem cmd expands a line before its if runs, and a substring of an undefined CP breaks that line
+if not defined CP goto :cp_done
+if "%CP:~-1%"=="\" set "CP=%CP:~0,-1%"
+:cp_done
 if not defined GENERATOR set "GENERATOR=auto"
 if /i not "%GENERATOR%"=="auto" set "GENARG=-G "%GENERATOR%""
 if /i not "%BACKEND%"=="cuda" goto :gen_done
@@ -61,7 +64,11 @@ exit /b 1
 rem for ninja cmake takes the first nvcc on PATH, and it can be from another toolkit. give it
 rem the one in CUDA_PATH, as -T does for msbuild. when it changes, cmake makes a new cache
 set "NVCCARG="
-if /i "%BACKEND%"=="cuda" if not defined TOOLSET if defined CP if exist "%CP%\bin\nvcc.exe" set "NVCCARG="-DCMAKE_CUDA_COMPILER=%CP:\=/%/bin/nvcc.exe""
+if /i not "%BACKEND%"=="cuda" goto :nvcc_done
+if defined TOOLSET goto :nvcc_done
+if not defined CP goto :nvcc_done
+if exist "%CP%\bin\nvcc.exe" set "NVCCARG="-DCMAKE_CUDA_COMPILER=%CP:\=/%/bin/nvcc.exe""
+:nvcc_done
 
 rem the backend flags only turn a backend on, so a cache made for another one would keep
 rem it, and its dlls would stay in bin. a cache also remembers its generator and its

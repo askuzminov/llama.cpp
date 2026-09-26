@@ -230,8 +230,11 @@ if not errorlevel 1 set "CMAKE_BACKEND=-DGGML_VULKAN=ON"
 :backend_set
 
 set "BACKEND=cpu"
+rem as in 00-build.bat: a replace in an undefined CMAKE_BACKEND breaks the line before its if runs
+if not defined CMAKE_BACKEND goto :backend_named
 if not "%CMAKE_BACKEND:GGML_VULKAN=%"=="%CMAKE_BACKEND%" set "BACKEND=vulkan"
 if not "%CMAKE_BACKEND:GGML_CUDA=%"=="%CMAKE_BACKEND%" set "BACKEND=cuda"
+:backend_named
 
 rem defaults that follow from the backend
 if /i not "%EXTRA%"=="auto" goto :extra_set
