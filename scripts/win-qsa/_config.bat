@@ -101,11 +101,13 @@ rem depths at which 19 also takes the per-op breakdown, one model load each
 set "DECPERFDEPTHS=16384 131072"
 
 rem 20-moecache.bat: what a VRAM cache of the hot MoE experts would give, one llama-completion run
-rem per arm. an arm is "ctx np": the context decides how much VRAM is left for the cache, and a
-rem slot gets ctx/np of it. the prompt is the head of MOEPROMPTFILE, the wikitext text unless
-rem _local.bat points it at something else. MOEARGS goes into every arm: -fit off keeps -ncmoe
-rem from EXTRA, and the -ub of models.ini belongs there too
-set "MOEARMS="262144 1" "131072 2""
+rem per arm. an arm is "ctx np [args]": the context decides how much VRAM is left for the cache, and
+rem each sequence gets ctx/np of the context. the args go to that arm only: the second arm runs the
+rem real cache (--moe-cache) with all 48 MoE layers on the host and the free VRAM in slots. the
+rem prompt is the head of MOEPROMPTFILE, the wikitext text unless _local.bat points it at something
+rem else. MOEARGS goes into every arm: -fit off keeps -ncmoe from EXTRA, and the -ub of models.ini
+rem belongs there too
+set "MOEARMS="262144 1" "262144 1 -ncmoe 48 --moe-cache auto""
 set "MOENGEN=2048"
 set "MOECHARS=65536"
 set "MOEARGS=-fit off"
