@@ -56,6 +56,9 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    uint32_t get_n_kv_used() const override;
+    void     set_n_kv_full(uint32_t n_kv) override;
+
     bool get_can_shift() const override;
 
     void clear(bool data) override;

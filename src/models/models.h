@@ -3,6 +3,7 @@
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
+#include "llama-row-cache.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
@@ -2381,15 +2382,26 @@ struct llama_model_qwen35 : public llama_model_base {
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    ~llama_model_qwen4exp() override;
 
     class llm_graph_input_qsa;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // under -lzm dio the PLE table is never loaded: per_layer_tok_embd stays null and the rows
+    // are read from the file on demand instead
+    bool                             ple_cached = false;
+    std::unique_ptr<llama_row_cache> ple_cache;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        // tag-dispatched ctor for graph_mtp: binds the members without building the trunk
+        struct no_build_t {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
+            llm_build_delta_net_base(params), model(model) {}
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2427,6 +2439,9 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+
+        // row view of the KQ mask input, shared by the QSA layers - see build_attn_qsa
+        ggml_tensor * qsa_kq_mask_rows = nullptr;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
@@ -2479,6 +2494,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    // LLM_GRAPH_TYPE_DECODER_MTP draft head: one HC-wrapped dense-attention + MoE block
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

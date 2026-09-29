@@ -1693,12 +1693,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
-        string_format("max number of context checkpoints to create per slot (default: %d)"
+        string_format("explicit count cap on context checkpoints per slot (default: %d; -1 = no count limit, 0 = disabled).\n"
+            "The footprint is bounded in bytes by the host RAM free at the moment a checkpoint is made, "
+            "less --cache-ram-reserve, so a count cap is normally unnecessary and does not help when RAM is short. "
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
         [](common_params & params, int value) {
             params.n_ctx_checkpoints = value;
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-crr", "--cache-ram-reserve"}, "N",
+        string_format("keep at least N MiB of host RAM free by evicting context checkpoints under memory pressure\n"
+            "(default: %d, -1 = auto (fraction of total RAM), 0 = disabled). Checked on every checkpoint creation,\n"
+            "so it also covers memory taken by other processes after startup.", params.cache_ram_reserve_mib),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-ram-reserve must be >= -1");
+            }
+            params.cache_ram_reserve_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM_RESERVE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
@@ -1711,12 +1725,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
+        string_format("set the maximum prompt cache size in MiB (default: %d, -1 - auto (fraction of total RAM), 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-spill-dir"}, "PATH",
+        "[experimental] spill cold prompt-cache states to PATH (on disk) instead of dropping them under memory "
+        "pressure; loaded back on a cache hit, which leaves the file in place. While the server is idle, resident "
+        "states are copied out as well, so a later eviction frees the RAM with no I/O and a crash does not lose the "
+        "cache. The files are kept on shutdown and picked up again on the next start (cold-start reuse) as long as "
+        "the model and KV configuration match. The context checkpoints go out with the state, so a prompt that "
+        "matches only a prefix can still roll back after a restart. Several models may share one directory: a file "
+        "is named after the configuration it belongs to, so a model only ever reads and drops its own. "
+        "Best on fast NVMe. (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.cache_spill_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SPILL_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk"}, "N",
+        string_format("[experimental] disk budget in MiB for spilled prompt-cache states (see --cache-spill-dir). "
+            "This budget is the only thing that deletes them: once it is exceeded the least valuable states go "
+            "first, ranked by how often each was reused times how much work it saves. The budget counts one model, "
+            "so a directory shared by several of them holds up to N MiB for each (default: %d, 0 = unlimited)", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk must be >= 0");
+            }
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-min-tokens"}, "N",
+        string_format("smallest piece of work worth a prompt-cache disk write, in tokens (default: %d, 0 = no minimum). "
+            "Prompts shorter than N are not cached at all: they are cheap to recompute, while a hybrid model stores the "
+            "same fixed recurrent state for any length, so caching one mostly takes room from the long prompts that pay "
+            "off. A state whose front is already on disk is also not written again until it grows N tokens past it, "
+            "which keeps a chat that gains a few hundred tokens per turn from rewriting gigabytes every turn. A crash "
+            "then costs up to N tokens of recompute", params.cache_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-min-tokens must be >= 0");
+            }
+            params.cache_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -2707,12 +2763,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- auto: on, but only for tensors larger than 4 GiB\n"
+        "- auto: on, but only for tensors larger than 4 GiB; falls back to dio without mmap\n"
+        "- dio: on, but gather the rows one at a time from the file, no mmap needed\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
             else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
+            else if (value == "dio")  { params.lazy_mode = LLAMA_LAZY_MODE_DIO;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
@@ -2770,6 +2828,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache"}, "N",
+        "keep the most recently used MoE experts of the CPU layers in a device cache: N slots per layer, 'auto' to use free device memory, 0 = off (default: 0) [EXPERIMENTAL]",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.n_moe_cache = -1;
+            } else {
+                params.n_moe_cache = std::stoi(value);
+                if (params.n_moe_cache < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--phase-mem"},
+        "with one sequence, size the compute buffers per phase: a prompt batch gets the largest ubatch that fits the free device memory "
+        "at its KV depth (up to -ub), and a generation batch gives the free memory to --moe-cache (default: off) [EXPERIMENTAL]",
+        [](common_params & params) {
+            params.phase_mem = true;
+        }
+    ).set_env("LLAMA_ARG_PHASE_MEM"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

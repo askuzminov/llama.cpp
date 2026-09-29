@@ -1854,7 +1854,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
         case GGML_OP_MUL_MAT_ID:
-            return ggml_metal_supports_mul_mat_op(
+            // kernel_mul_mm_id_map0 assumes that a token uses each expert at most once
+            if (ggml_get_op_params_i32(op, 1) == GGML_HINT_IDS_REPEAT && ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm)) {
+                return false;
+            }
+            return op->src[3] == NULL && ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, false,
                     ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
         case GGML_OP_SET:

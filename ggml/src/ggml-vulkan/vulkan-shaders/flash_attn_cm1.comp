@@ -152,6 +152,9 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        if (fa_sparse_tail(j * Bc)) {
+            break;
+        }
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
@@ -181,10 +184,17 @@ void main() {
                         if (kv_active) {
                             f16vec4 m;
                             if (USE_SPARSE) {
-                                // sparse is gqa-gated (m_stride == 0): all four rows share the value
-                                FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);
-                                m = f16vec4(mv);
-                                max_mask = max(max_mask, float(mv));
+                                // the tile covers Br mask rows and the sparse list is their union, so each
+                                // row masks itself. grouped query attention puts the tile on one row
+                                // (m_stride == 0) and the row term drops out, sharing the value as before
+                                m = f16vec4(0.0);
+                                [[unroll]] for (uint32_t rr = 0; rr < 4; ++rr) {
+                                    uint32_t mrow = i * Br + r * 4 + rr;
+                                    if (!nem1_bounds_check || mrow < p.nem1) {
+                                        m[rr] = data_m[m_offset + mrow * m_stride + kcol];
+                                        max_mask = max(max_mask, float(m[rr]));
+                                    }
+                                }
                             } else if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],

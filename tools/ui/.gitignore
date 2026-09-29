@@ -9,7 +9,6 @@ node_modules
 /.svelte-kit
 /build
 dev-dist
-dist
 
 # OS
 .DS_Store
@@ -40,3 +39,6 @@ storybook-static
 # Vitest browser mode failure artifacts
 .vitest-attachments/
 tests/**/__screenshots__/
+
+# the built UI is kept in git, so that the build does not download it
+!/dist/**

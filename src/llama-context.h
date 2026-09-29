@@ -7,12 +7,14 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moecache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <array>
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -163,6 +165,12 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    // serialize only the cells added after base_pos (0 = the memory cannot produce a delta)
+    size_t state_seq_get_delta(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
+
+    // apply a delta on top of an already loaded BASE state
+    int32_t state_seq_apply_delta(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -263,6 +271,23 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // max tokens per ubatch, smaller than n_ubatch in the phases of phase_mem
+    uint32_t n_ubatch_split() const;
+
+    // phase_mem: switch the layout for a batch of n_tokens tokens
+    void phase_update(uint32_t n_tokens);
+    void phase_gen();
+    void phase_prompt(uint32_t n_tokens);
+
+    // KV cells used after n_tokens more tokens
+    uint32_t phase_kv_end(uint32_t n_tokens) const;
+
+    // add the compute buffer size of each device for ubatches of n_ub tokens after n_tokens more tokens, return the graph splits
+    int  phase_size(uint32_t n_ub, uint32_t n_tokens, std::map<ggml_backend_dev_t, size_t> & sizes);
+
+    // replace the scheduler with one that has no compute buffers
+    void sched_free();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -312,6 +337,30 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // MoE expert cache measurement, created only for LLAMA_MOE_CACHE_STATS
+    std::unique_ptr<llama_moe_stats> moe_stats;
+
+    // device cache of host MoE experts, created only for n_moe_cache != 0
+    std::unique_ptr<llama_moe_cache> moe_cache;
+
+    // phase_mem: the compute buffers and the moe-cache slots follow the phase of the batches
+    enum llama_phase {
+        LLAMA_PHASE_NONE,
+        LLAMA_PHASE_GEN,    // small batches: small compute buffers, the free memory goes to the moe-cache
+        LLAMA_PHASE_PROMPT, // large batches: no moe-cache slots, the largest ubatch that fits at the KV depth
+    };
+
+    llama_phase phase = LLAMA_PHASE_NONE;
+
+    uint32_t phase_n_gen    = 0; // batches of at most this many tokens are generation
+    uint32_t phase_n_tokens = 0; // max tokens per ubatch of the reserved graphs, 0 = n_ubatch
+    uint32_t phase_n_kv     = 0; // KV cells of the reserved graphs, 0 = all
+    bool     phase_cache    = false; // the moe-cache slots were allocated in this generation phase
+
+    // a draft context follows the phase switches of its target
+    llama_context *              phase_owner = nullptr;
+    std::vector<llama_context *> phase_followers;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

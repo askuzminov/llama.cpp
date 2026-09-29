@@ -81,6 +81,16 @@ GGML_API size_t                       ggml_backend_alloc_ctx_tensors_from_buft_s
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend);
 
+// reports the tensors [first, last) that a freshly created buffer holds, so that a caller can start
+// using them while the next buffer is still being allocated. last == NULL means the end of the context.
+// called with first == NULL when allocation failed and every buffer handed over so far is about to be
+// freed: the callback must not return before the tensors are no longer in use
+typedef void (*ggml_backend_alloc_range_cb)(struct ggml_tensor * first, struct ggml_tensor * last, void * user_data);
+
+GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors_from_buft_cb(
+        struct ggml_context * ctx, ggml_backend_buffer_type_t buft,
+        ggml_backend_alloc_range_cb cb, void * user_data);
+
 #ifdef  __cplusplus
 }
 #endif

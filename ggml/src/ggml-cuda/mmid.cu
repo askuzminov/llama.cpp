@@ -103,17 +103,36 @@ static __global__ void mm_ids_helper(
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
     ggml_cuda_syncwarp();
 
-    for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
-        const mm_ids_helper_store store_it = store[itc];
-        const int it       = store_it.it();
-        const int iex_used = store_it.iex_used();
-        ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
-        // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
-        if (write_inverse) {
-            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
-        } else {
-            ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
+    // A token can use the same expert more than once (e.g. the zero slot of the MoE cache), nex_prev counts every use.
+    // Read the ids of each token again and write one row per use.
+    int nrows = 0;
+    for (int itc0 = 0; itc0 < it_compact; itc0 += warp_size) {
+        const int itc = itc0 + threadIdx.x;
+        const int it  = itc < it_compact ? int(store[itc].it()) : 0;
+
+        int n = 0;
+        for (int iex = 0; iex < n_expert_used && itc < it_compact; ++iex) {
+            n += ids[it*si1 + iex] == expert;
         }
+        const int n_incl = warp_prefix_inclusive_sum<int, warp_size>(n);
+
+        int irow = nex_prev + nrows + n_incl - n;
+        for (int iex = 0; iex < n_expert_used && n > 0; ++iex) {
+            if (ids[it*si1 + iex] != expert) {
+                continue;
+            }
+            ids_dst[irow] = it*n_expert_used + iex;
+            // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
+            if (write_inverse) {
+                ids_src1[it*n_expert_used + iex] = irow;
+            } else {
+                ids_src1[irow] = it*sis1 + iex % nchannels_y;
+            }
+            irow++;
+            n--;
+        }
+
+        nrows += __shfl_sync(0xFFFFFFFF, n_incl, warp_size - 1, warp_size);
     }
 
     if (threadIdx.x != 0) {
@@ -126,7 +145,7 @@ static __global__ void mm_ids_helper(
         return;
     }
 
-    expert_bounds[gridDim.x] = nex_prev + it_compact;
+    expert_bounds[gridDim.x] = nex_prev + nrows;
 }
 
 template <int n_expert_used_template>

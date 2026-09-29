@@ -454,6 +454,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_IDS_REPEAT       = 2, // mul_mat_id: a row of ids can use the same expert more than once
     };
 
     // model file types
@@ -1502,6 +1503,11 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // skip: I32 [n_as], rows with skip[ids[i]] != 0 are not computed and are set to zero
+    GGML_API void ggml_mul_mat_id_add_skip(
+            struct ggml_tensor * a,
+            struct ggml_tensor * skip);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

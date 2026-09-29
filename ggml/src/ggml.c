@@ -3368,7 +3368,7 @@ void ggml_mul_mat_set_prec(
 void ggml_mul_mat_set_hint(
         struct ggml_tensor * a,
         enum ggml_op_hint    hint) {
-    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+    GGML_ASSERT(a->op == (hint == GGML_HINT_IDS_REPEAT ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT));
 
     const int32_t hint_i32 = (int32_t) hint;
 
@@ -3413,6 +3413,23 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[2] = ids;
 
     return result;
+}
+
+void ggml_mul_mat_id_add_skip(
+        struct ggml_tensor * a,
+        struct ggml_tensor * skip) {
+    if (!skip) {
+        a->src[3] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(a->src[3] == NULL);
+    GGML_ASSERT(skip->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(skip));
+    GGML_ASSERT(ggml_nelements(skip) == a->src[0]->ne[2]);
+
+    a->src[3] = skip;
 }
 
 // ggml_out_prod

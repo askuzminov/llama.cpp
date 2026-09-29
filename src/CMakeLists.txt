@@ -36,7 +36,9 @@ set(LLAMA_CORE_SOURCES
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
+    llama-moecache.cpp
     llama-quant.cpp
+    llama-row-cache.cpp
     llama-sampler.cpp
     llama-vocab.cpp
     unicode-data.cpp

@@ -219,6 +219,7 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_DIO  = 3, // same, but rows are gathered through an own row cache, no mmap needed
     };
 
     enum llama_context_type {
@@ -338,6 +339,8 @@ extern "C" {
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.
+        // Called from a loader thread, not from the thread that called llama_model_load_from_file,
+        // and never from more than one thread at a time.
         llama_progress_callback progress_callback;
 
         // context pointer passed to the progress callback
@@ -372,6 +375,7 @@ extern "C" {
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
+        int32_t  n_moe_cache;           // device cache of host MoE experts: slots per layer, 0 = off, -1 = auto [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -412,6 +416,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool phase_mem;   // n_seq_max == 1: size the compute buffers per phase, prompt batches get a larger ubatch and
+                          // generation gives the free memory to the MoE expert cache [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -646,6 +652,12 @@ extern "C" {
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
+
+    // Returns the bytes of the model files that a mapping can fault in, 0 if nothing is mapped.
+    // The OS counts these pages as available RAM, so a caller that budgets host memory must not
+    // claim them. The load mode does not answer this: a lazy tensor maps its file on any load
+    // mode, and then only its own rows are read through the mapping.
+    LLAMA_API uint64_t llama_model_mapped_size(const struct llama_model * model);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
@@ -948,6 +960,28 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Saves append-only sequence state after base_pos. Returns the required size when dst is NULL.
+    // Returns 0 when the memory implementation does not support delta state.
+    LLAMA_API size_t llama_state_seq_get_delta_ext(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                     llama_pos   base_pos);
+
+    /// @details Apply a delta checkpoint on top of already loaded BASE state.
+    /// The BASE state must be loaded first via llama_state_seq_set_data_ext().
+    /// This function reads the delta data and updates only the cells with pos > base_pos.
+    /// @returns 0 on success, negative value on error
+    LLAMA_API int32_t llama_state_seq_apply_delta(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                     llama_pos   base_pos);
 
     //
     // Decoding

@@ -2459,6 +2459,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 }
             }
         case GGML_OP_MUL_MAT_ID:
+            if (op->src[3]) {
+                return false;
+            }
             switch (op->src[0]->type) {
                 case GGML_TYPE_F16:
                 case GGML_TYPE_F32:

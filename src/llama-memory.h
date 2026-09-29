@@ -93,6 +93,16 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // highest used attention cell + 1, 0 if the module does not report it
+    virtual uint32_t get_n_kv_used() const { return 0; }
+
+    // n_kv of the attention caches in the next init_full() contexts, 0 = full size
+    virtual void set_n_kv_full(uint32_t n_kv) { (void) n_kv; }
+
+    // the last ubatch failed or was aborted: drop what the module derived from its compute
+    // its positions are then removed with seq_rm
+    virtual void ubatch_failed() {}
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
@@ -124,6 +134,22 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // delta state write/read (for checkpoint compression)
+    // write the delta (difference) from a previous state at base_pos
+    virtual size_t state_write_delta(
+            llama_io_write_i & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) const;
+
+    // Apply delta on top of already loaded state (delta only)
+    virtual bool state_read_delta(
+            llama_io_read_i  & io_delta,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos);
+
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

@@ -1417,7 +1417,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // ctx_other links two kinds of draft: one with no trunk of its own, which runs on the target
+        // memory (gemma4), and one that only borrows weights and keeps its own memory (a shared head)
+        const bool has_trunk = llama_model_n_layer(llama_get_model(ctx_dft)) > 0;
+
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && !has_trunk;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -1855,6 +1859,17 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
+    // a draft that is almost all wrong costs a full target pass, so stop drafting for a few
+    // calls. the pause doubles while the drafts stay bad and is cleared by a good one
+    static constexpr int n_skip_base = 4;
+    static constexpr int n_skip_max  = 256;
+
+    // acceptance below f_acc_low is bad. below f_acc_bad one round is enough to pause,
+    // otherwise it takes n_low_max rounds in a row
+    static constexpr double f_acc_low = 0.25;
+    static constexpr double f_acc_bad = 0.10;
+    static constexpr int    n_low_max = 5;
+
     struct seq_info {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
@@ -1862,8 +1877,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.5)
+        // consecutive accept rounds with low acceptance fraction (< f_acc_low)
         int n_low = 0;
+
+        // calls left to skip, and the length of the next pause
+        int n_skip      = 0;
+        int n_skip_next = n_skip_base;
     };
 
     std::vector<seq_info> sinfos;
@@ -1891,15 +1910,42 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfos.resize(n_seq);
     }
 
+    // the container is shared by every sequence, so a reset drops their ngrams too:
+    // they all have to index their prompt again and start a new streak
+    void reset_shared() {
+        mod.reset();
+
+        for (auto & si : sinfos) {
+            si.n_low  = 0;
+            si.i_last = 0;
+        }
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_low = 0;
+        sinfo.n_skip = 0;
+        sinfo.n_skip_next = n_skip_base;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
             return;
+        }
+
+        // check the occupancy before indexing - a reset after it would drop this prompt
+        // while i_last still claims that it is indexed
+        {
+            const double f = (double)mod.get_used() / (double)mod.size();
+
+            constexpr double f_thold = 0.25;
+            if (f > f_thold) {
+                SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
+
+                reset_shared();
+            }
         }
 
         for (size_t i = 0; i < prompt.size() - n; ++i) {
@@ -1908,15 +1954,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = prompt.size() - n;
 
-        const double f = (double)mod.get_used() / (double)mod.size();
-        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
-
-        constexpr double f_thold = 0.25;
-        if (f > f_thold) {
-            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
-
-            mod.reset();
-        }
+        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n",
+                mod.get_used(), mod.size(), (double)mod.get_used() / (double)mod.size());
     }
 
     void draft_one(
@@ -1945,6 +1984,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
+        // paused after a bad draft. keep indexing, but do not draft
+        if (sinfo.n_skip > 0) {
+            sinfo.n_skip--;
+            return;
+        }
+
         result.resize(n + params.n_max);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
@@ -1971,8 +2016,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result.resize(result.size() - n);
 
-        // store length of drafted n-gram for later acceptance analysis
-        sinfo.n_draft_last = result.size();
+        // store length of drafted n-gram for later acceptance analysis. the caller truncates
+        // the draft to n_max, so measure that length and not the generated one
+        sinfo.n_draft_last = dparams.n_max > 0 ? std::min(result.size(), (size_t) dparams.n_max) : result.size();
     }
 
     bool process(const common_batch & /*batch*/) override {
@@ -2000,22 +2046,32 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
-        // compute acceptance fraction if we have a recorded draft length
+        // compute acceptance fraction if we have a recorded draft length. the length is consumed
+        // here: the server can report the same draft twice, once on a rollback and once on the
+        // replay of the accepted part
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
-            if (f_acc < 0.25) {
-                sinfo.n_low++;
-                if (sinfo.n_low >= 5) {
-                    if (verbose) {
-                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
-                    }
 
-                    mod.reset();
-                    sinfo.n_low = 0;
-                    sinfo.i_last = 0;
+            sinfo.n_draft_last = 0;
+
+            if (f_acc >= f_acc_low) {
+                sinfo.n_low       = 0;
+                sinfo.n_skip_next = n_skip_base;
+
+                return;
+            }
+
+            sinfo.n_low++;
+
+            // the pool is left alone: it is shared, and the other sequences still match in it
+            if (f_acc < f_acc_bad || sinfo.n_low >= n_low_max) {
+                sinfo.n_skip      = sinfo.n_skip_next;
+                sinfo.n_skip_next = std::min(2*sinfo.n_skip_next, n_skip_max);
+                sinfo.n_low       = 0;
+
+                if (verbose) {
+                    SPC_TRC("low acceptance (%.3f) - pausing ngram_mod for %d calls\n", f_acc, sinfo.n_skip);
                 }
-            } else {
-                sinfo.n_low = 0;
             }
         }
     }
@@ -2088,8 +2144,12 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        // the context cache belongs to the previous prompt. keep the static and dynamic ones
+        auto & sinfo = sinfos[seq_id];
+
+        sinfo.cache_size = 0;
+        sinfo.ngram_cache_context.clear();
     }
 
     void draft_one(
@@ -2542,7 +2602,7 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;

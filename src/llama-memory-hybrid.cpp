@@ -126,6 +126,14 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
     return std::make_unique<llama_memory_hybrid_context>(this);
 }
 
+uint32_t llama_memory_hybrid::get_n_kv_used() const {
+    return mem_attn->get_n_kv_used();
+}
+
+void llama_memory_hybrid::set_n_kv_full(uint32_t n_kv) {
+    mem_attn->set_n_kv_full(n_kv);
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }

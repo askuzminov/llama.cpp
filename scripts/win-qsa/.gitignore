@@ -1,0 +1,7 @@
+!*.bat
+logs/
+wikitext-2-raw/
+*.zip
+*.ZIP
+diskspd/
+_local.bat
