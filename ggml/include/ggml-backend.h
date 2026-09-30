@@ -353,6 +353,17 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Snapshot of the splits of the allocated graph, to compute this graph again after other graphs without a new split and allocation
+    // The graph and its tensors must not change while the snapshot is in use
+    // After the save, the graph nodes use the input copies of the snapshot: free the snapshot only together with the graph
+    typedef struct ggml_backend_sched_snapshot * ggml_backend_sched_snapshot_t;
+
+    // Call after ggml_backend_sched_alloc_graph. Returns NULL if the scheduler cannot restore graphs (pipeline parallelism, compute buffers that reset the tensors)
+    GGML_API ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_save(ggml_backend_sched_t sched);
+    // Makes the graph of the snapshot the allocated graph. Returns false if the compute buffers were reallocated after the save, then allocate the graph again
+    GGML_API bool                          ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snapshot);
+    GGML_API void                          ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snapshot);
+
     //
     // Meta backend
     //

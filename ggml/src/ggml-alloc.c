@@ -496,6 +496,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    size_t n_realloc; // buffer reallocations
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -936,6 +938,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->n_realloc++;
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -1116,6 +1119,10 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+size_t ggml_gallocr_get_n_realloc(ggml_gallocr_t galloc) {
+    return galloc->n_realloc;
 }
 
 // utils

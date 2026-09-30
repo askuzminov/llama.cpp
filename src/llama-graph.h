@@ -966,7 +966,8 @@ public:
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    // not zeroed, so the pages that the graph does not use are not in memory
+    std::unique_ptr<uint8_t[]> buf_compute_meta;
 
     ggml_cgraph * gf;
 

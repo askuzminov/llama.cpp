@@ -824,6 +824,9 @@ struct ggml_backend_sched {
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
 
+    // snapshot of the allocated graph after ggml_backend_sched_snapshot_restore, NULL after a split
+    struct ggml_backend_sched_snapshot * snapshot;
+
     // graph splits
     struct ggml_backend_sched_split * splits;
     int n_splits;
@@ -1093,6 +1096,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+    sched->snapshot = NULL;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -2109,6 +2113,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->snapshot = NULL;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2247,13 +2252,210 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     sched->is_reset = false;
 }
 
+// graph state after the split and the allocation of a graph
+struct ggml_backend_sched_snapshot {
+    ggml_backend_sched_t sched;
+    size_t n_realloc; // buffer reallocations of the scheduler at the save
+
+    std::vector<ggml_backend_sched_split> splits; // the inputs of each split point into inputs
+    std::vector<ggml_tensor *> inputs;            // inputs of all splits
+    std::vector<ggml_tensor>   copies;            // copy of each input in the backend of its split, the nodes use these copies
+
+    // backends of the graph tensors
+    struct ggml_hash_set hash_set;
+    std::vector<int>     backend_ids; // [hash_set.size]
+};
+
+static int ggml_backend_sched_snapshot_backend_id(const ggml_backend_sched_snapshot * snapshot, const struct ggml_tensor * tensor) {
+    const size_t id = ggml_hash_find(&snapshot->hash_set, tensor);
+    if (id == GGML_HASHSET_FULL || !ggml_bitset_get(snapshot->hash_set.used, id)) {
+        return -1;
+    }
+    return snapshot->backend_ids[id];
+}
+
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
     GGML_ASSERT(sched);
-    int backend_index = tensor_backend_id(node);
+    int backend_index = sched->snapshot ? ggml_backend_sched_snapshot_backend_id(sched->snapshot, node) : tensor_backend_id(node);
     if (backend_index == -1) {
         return NULL;
     }
     return sched->backends[backend_index];
+}
+
+ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_save(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(sched->is_alloc);
+
+    // pipeline parallelism uses more than one copy of each input
+    if (sched->n_copies > 1) {
+        return NULL;
+    }
+
+    // a buffer reset releases the tensor extras, so the allocation of the next graph makes the tensors of this graph not valid
+    auto has_reset = [](const struct ggml_tensor * t) {
+        return t->buffer != NULL && t->buffer->usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && t->buffer->iface.reset != NULL;
+    };
+
+    int n_inputs  = 0;
+    int n_tensors = sched->graph.n_leafs;
+    for (int i = 0; i < sched->graph.n_leafs; i++) {
+        if (has_reset(sched->graph.leafs[i])) {
+            return NULL;
+        }
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            if (has_reset(split->graph.nodes[j])) {
+                return NULL;
+            }
+        }
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (has_reset(tensor_copy(split->inputs[j], split->backend_id, 0))) {
+                return NULL;
+            }
+        }
+        n_inputs  += split->n_inputs;
+        n_tensors += split->graph.n_nodes + split->n_inputs;
+    }
+
+    ggml_backend_sched_snapshot * snapshot = new ggml_backend_sched_snapshot;
+    snapshot->sched     = sched;
+    snapshot->n_realloc = ggml_gallocr_get_n_realloc(sched->galloc);
+    snapshot->hash_set  = ggml_hash_set_new(2*n_tensors);
+    snapshot->backend_ids.assign(snapshot->hash_set.size, -1);
+
+    auto add = [&](struct ggml_tensor * t) {
+        snapshot->backend_ids[ggml_hash_find_or_insert(&snapshot->hash_set, t)] = tensor_backend_id(t);
+    };
+
+    // with one copy, the leafs of the graph copy are the leafs of the graph
+    for (int i = 0; i < sched->graph.n_leafs; i++) {
+        add(sched->graph.leafs[i]);
+    }
+
+    snapshot->splits.assign(sched->splits, sched->splits + sched->n_splits);
+    snapshot->inputs.resize(n_inputs);
+    snapshot->copies.resize(n_inputs);
+
+    // the copies of the scheduler are in its context, the next split reuses that memory
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> copies;
+    copies.reserve(n_inputs);
+
+    int k = 0;
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        struct ggml_backend_sched_split * split_dst = &snapshot->splits[i];
+
+        split_dst->inputs          = snapshot->inputs.data() + k;
+        split_dst->inputs_capacity = split->n_inputs;
+
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            add(split->graph.nodes[j]);
+        }
+        for (int j = 0; j < split->n_inputs; j++, k++) {
+            struct ggml_tensor * input = split->inputs[j];
+            add(input);
+
+            struct ggml_tensor ** cpy = &tensor_copy(input, split->backend_id, 0);
+            snapshot->inputs[k] = input;
+            snapshot->copies[k] = **cpy;
+            copies[*cpy] = &snapshot->copies[k];
+            *cpy = &snapshot->copies[k];
+        }
+    }
+
+    // a copy can be the source of nodes in later splits of the same backend
+    const uintptr_t ctx_begin = (uintptr_t) sched->context_buffer;
+    const uintptr_t ctx_end   = ctx_begin + sched->context_buffer_size;
+    auto remap = [&](struct ggml_tensor ** t) {
+        if ((uintptr_t) *t >= ctx_begin && (uintptr_t) *t < ctx_end) {
+            auto it = copies.find(*t);
+            GGML_ASSERT(it != copies.end());
+            *t = it->second;
+        }
+    };
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            struct ggml_tensor * node = split->graph.nodes[j];
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                remap(&node->src[s]);
+            }
+            remap(&node->view_src);
+        }
+    }
+
+    return snapshot;
+}
+
+bool ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snapshot) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(snapshot && snapshot->sched == sched);
+
+    if (ggml_gallocr_get_n_realloc(sched->galloc) != snapshot->n_realloc) {
+        return false;
+    }
+
+    const int n_splits = (int) snapshot->splits.size();
+    if (n_splits > sched->splits_capacity) {
+        const int old_cap = sched->splits_capacity;
+        sched->splits_capacity = n_splits;
+        sched->splits = (ggml_backend_sched_split *) realloc(sched->splits, sched->splits_capacity * sizeof(struct ggml_backend_sched_split));
+        GGML_ASSERT(sched->splits != NULL);
+        memset(&sched->splits[old_cap], 0, (sched->splits_capacity - old_cap) * sizeof(struct ggml_backend_sched_split));
+    }
+
+    // compute_splits finds the input copies in the hash set
+    ggml_hash_set_reset(&sched->hash_set);
+
+    int k = 0;
+    for (int i = 0; i < n_splits; i++) {
+        const struct ggml_backend_sched_split * src = &snapshot->splits[i];
+        struct ggml_backend_sched_split * dst = &sched->splits[i];
+
+        while (dst->inputs_capacity < src->n_inputs) {
+            ggml_backend_sched_split_inputs_grow(dst);
+        }
+        for (int j = 0; j < src->n_inputs; j++, k++) {
+            struct ggml_tensor * input = src->inputs[j];
+            dst->inputs[j] = input;
+
+            size_t id = ggml_hash_insert(&sched->hash_set, input);
+            if (id == GGML_HASHSET_ALREADY_EXISTS) {
+                id = ggml_hash_find(&sched->hash_set, input);
+            } else {
+                sched->hv_tensor_backend_ids[id] = ggml_backend_sched_snapshot_backend_id(snapshot, input);
+                memset(&tensor_id_copy(id, 0, 0), 0, sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+            }
+            tensor_id_copy(id, src->backend_id, 0) = &snapshot->copies[k];
+        }
+        dst->backend_id = src->backend_id;
+        dst->i_start    = src->i_start;
+        dst->i_end      = src->i_end;
+        dst->n_inputs   = src->n_inputs;
+        dst->graph      = src->graph;
+    }
+
+    sched->n_splits       = n_splits;
+    sched->n_graph_inputs = 0;
+    sched->snapshot       = snapshot;
+    sched->is_reset       = false;
+    sched->is_alloc       = true;
+
+    return true;
+}
+
+void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snapshot) {
+    if (snapshot == NULL) {
+        return;
+    }
+    if (snapshot->sched->snapshot == snapshot) {
+        snapshot->sched->snapshot = NULL;
+    }
+    ggml_hash_set_free(&snapshot->hash_set);
+    delete snapshot;
 }
 
 // utils

@@ -269,7 +269,14 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    // an entry for a new graph, moved to the front
     llm_graph_result * get_gf_res_prev();
+
+    // the graph of an entry that can compute the ubatch of gparams, moved to the front, nullptr if there is none
+    llm_graph_result * get_gf_res_reuse(const llm_graph_params & gparams);
+
+    // drop the graphs, keep the entries
+    void gf_res_prev_reset();
 
     // max tokens per ubatch, smaller than n_ubatch in the phases of phase_mem
     uint32_t n_ubatch_split() const;
@@ -423,8 +430,14 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // graphs of recent ubatch shapes, the most recently used first
+    // a graph with a scheduler snapshot is computed again without a new build, split and allocation
+    // separate arenas also give batches with and without outputs distinct CUDA graph cache keys
+    struct graph_entry {
+        llm_graph_result_ptr            res;
+        ggml_backend_sched_snapshot_ptr snapshot; // the graph uses the memory of the snapshot, free the snapshot only with the graph
+    };
+    std::vector<graph_entry> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
@@ -439,6 +452,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // env: LLAMA_GRAPH_CACHE, max graphs in gf_res_prev, 0 disables the scheduler snapshots
+    uint32_t graph_cache_size = 8;
 
     // perf
     mutable int64_t t_start_us  = 0;
