@@ -270,7 +270,8 @@ struct common_speculative_auto {
     }
 
     // prior 0.9 worth two observations: an ngram draft needs a long match to exist at all.
-    // positions past the observed ones take the last estimate, a matched ngram tends to keep matching
+    // positions 3+ share one estimate, as the MTP calibration rows: a matched ngram tends to keep matching.
+    // with one estimate per position, the far positions get few observations and the draft grows by only 1-2 tokens per cycle
     double acc_pos(common_speculative_type type, int j) const {
         const auto & a = pos_acc[type];
         const auto & n = pos_n[type];
@@ -415,13 +416,15 @@ struct common_speculative_auto {
         } else if (s.type != COMMON_SPECULATIVE_TYPE_NONE) {
             auto & a = pos_acc[s.type];
             auto & n = pos_n  [s.type];
-            if ((int) a.size() < n_test) {
-                a.resize(n_test, 0.0);
-                n.resize(n_test, 0.0);
+            const int n_row = std::min(n_test, n_depth);
+            if ((int) a.size() < n_row) {
+                a.resize(n_row, 0.0);
+                n.resize(n_row, 0.0);
             }
             for (int j = 0; j < n_test; ++j) {
-                a[j] = a[j] * f_cal + (j < n_accepted ? 1.0 : 0.0);
-                n[j] = n[j] * f_cal + 1.0;
+                const int d = std::min(j, n_depth - 1);
+                a[d] = a[d] * f_cal + (j < n_accepted ? 1.0 : 0.0);
+                n[d] = n[d] * f_cal + 1.0;
             }
         }
     }
@@ -615,10 +618,10 @@ struct common_speculative_auto {
                 continue;
             }
             str.clear();
-            for (size_t j = 0; j < pos_n[t].size() && j < 16; ++j) {
+            for (size_t j = 0; j < pos_n[t].size(); ++j) {
                 str += string_format(" %.2f", acc_pos((common_speculative_type) t, (int) j));
             }
-            SPC_INF("auto: acceptance by position, %s:%s\n", common_speculative_type_to_str((common_speculative_type) t).c_str(), str.c_str());
+            SPC_INF("auto: acceptance by position (0, 1, 2, 3+), %s:%s\n", common_speculative_type_to_str((common_speculative_type) t).c_str(), str.c_str());
         }
     }
 };
