@@ -245,6 +245,7 @@ struct common_speculative_auto {
                 SPC_WRN("cannot open the trace file '%s'\n", path_trace);
             } else {
                 fprintf(trace, "cycle,mode,valid,seq,impl,n_draft,n_acc,t_cycle_us,t_draft_us,n_verify,rate_tps,t0_us,t1_us,t_step_us,thr_keep,thr_step,hp,pt,pm,ov\n");
+                fflush(trace);
             }
         }
     }
@@ -582,6 +583,8 @@ struct common_speculative_auto {
                     rate() * 1e6, t0, t1, t_step, thr_keep, thr_step,
                     join(s.hp).c_str(), join(s.pt).c_str(), join(s.pm).c_str(), join(s.ov).c_str());
         }
+        // the process can be killed without exit, so do not keep lines in the buffer
+        fflush(trace);
     }
 
     void print() const {

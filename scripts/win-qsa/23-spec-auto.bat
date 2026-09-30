@@ -184,8 +184,15 @@ if not "%UP%"=="1" (
     goto :eof
 )
 
-rem the warmup also covers the first 64 cycles of --spec-auto, which probe draft lengths
+rem the warmup also covers the first 64 cycles of --spec-auto, which probe draft lengths. a request
+rem error here is the same for every arm, so the run stops
 call :req warmup 0 256
+if "%RERR%"=="1" (
+    echo the warmup request failed, the next arms are skipped
+    set "ABORT=1"
+    call :teardown
+    goto :eof
+)
 for %%p in (%SPECAUTOPROMPTS%) do (
     for %%s in (%SPECAUTOSEEDS%) do call :req %%p %%s %SPECAUTONGEN%
 )
@@ -200,7 +207,7 @@ set "AWORK=%WORK%"
 set "AARM=%ARM%"
 echo. >> "%SUM%"
 echo ### %ARM%: types %STYPE% %AARGS% >> "%SUM%"
-powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $n = 0; $ms = 0; $dn = 0; $da = 0; $rows = @(); Get-ChildItem -LiteralPath $env:AWORK -Filter ($env:AARM + '-*-resp.json') | Where-Object { $_.Name -notlike '*-warmup-*' } | Sort-Object Name | ForEach-Object { try { $t = (Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json).timings; $n += $t.predicted_n; $ms += $t.predicted_ms; $dn += $t.draft_n; $da += $t.draft_n_accepted; $rows += ('    {0}: {1} tokens, {2} t/s, draft {3}/{4}' -f $_.Name, $t.predicted_n, [math]::Round($t.predicted_per_second, 2).ToString($c), $t.draft_n_accepted, $t.draft_n) } catch { $rows += ('    {0}: no timings' -f $_.Name) } }; $rows | ForEach-Object { $_ }; $tps = if ($ms -gt 0) { 1000.0 * $n / $ms } else { 0 }; $acc = if ($dn -gt 0) { $da / $dn } else { 0 }; '### total {0} tokens in {1} ms = {2} t/s, draft acceptance {3} ({4} / {5})' -f $n, [math]::Round($ms, 1).ToString($c), [math]::Round($tps, 2).ToString($c), [math]::Round($acc, 4).ToString($c), $da, $dn" >> "%SUM%"
+powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $n = 0; $ms = 0; $dn = 0; $da = 0; $rows = @(); Get-ChildItem -LiteralPath $env:AWORK -Filter ($env:AARM + '-*-resp.json') | Where-Object { $_.Name -notlike '*-warmup-*' } | Sort-Object Name | ForEach-Object { $f = $_.Name; try { $r = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json; $t = $r.timings; if ($null -eq $t) { throw [string]$r.error.message }; $n += $t.predicted_n; $ms += $t.predicted_ms; $dn += $t.draft_n; $da += $t.draft_n_accepted; $rows += ('    {0}: {1} tokens, {2} t/s, draft {3}/{4}' -f $_.Name, $t.predicted_n, [math]::Round($t.predicted_per_second, 2).ToString($c), $t.draft_n_accepted, $t.draft_n) } catch { $rows += ('    {0}: no timings: {1}' -f $f, $_.Exception.Message) } }; $rows | ForEach-Object { $_ }; $tps = if ($ms -gt 0) { 1000.0 * $n / $ms } else { 0 }; $acc = if ($dn -gt 0) { $da / $dn } else { 0 }; '### total {0} tokens in {1} ms = {2} t/s, draft acceptance {3} ({4} / {5})' -f $n, [math]::Round($ms, 1).ToString($c), [math]::Round($tps, 2).ToString($c), [math]::Round($acc, 4).ToString($c), $da, $dn" >> "%SUM%"
 findstr /c:"auto:" /c:"statistics " "%SRVLOG%" >> "%SUM%"
 
 echo === waiting %SETTLE%s for the gpu to be released
@@ -213,18 +220,29 @@ rem %1 = prompt name, %2 = seed, %3 = max tokens
 set "RNAME=%~1"
 set "RSEED=%~2"
 set "RN=%~3"
+set "RERR=0"
 set "RPROMPT=%WORK%\prompt-%RNAME%.txt"
 set "RBODY=%WORK%\%ARM%-%RNAME%-s%RSEED%-req.json"
 set "RRESP=%WORK%\%ARM%-%RNAME%-s%RSEED%-resp.json"
 set "RTEMP=%STEMP%"
 set "RTOPK=%STOPK%"
 set "RTOPP=%STOPP%"
-powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $p = Get-Content -Raw -LiteralPath $env:RPROMPT; $j = [ordered]@{ messages = @(@{ role = 'user'; content = $p }); max_tokens = [int]$env:RN; temperature = [double]::Parse($env:RTEMP, $c); top_k = [int]$env:RTOPK; top_p = [double]::Parse($env:RTOPP, $c); seed = [int]$env:RSEED; cache_prompt = $false; stream = $false } | ConvertTo-Json -Compress -Depth 5; [System.IO.File]::WriteAllText($env:RBODY, $j, (New-Object System.Text.UTF8Encoding($false)))"
+powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $p = [IO.File]::ReadAllText($env:RPROMPT); $j = [ordered]@{ messages = @(@{ role = 'user'; content = $p }); max_tokens = [int]$env:RN; temperature = [double]::Parse($env:RTEMP, $c); top_k = [int]$env:RTOPK; top_p = [double]::Parse($env:RTOPP, $c); seed = [int]$env:RSEED; cache_prompt = $false; stream = $false } | ConvertTo-Json -Compress -Depth 5; [System.IO.File]::WriteAllText($env:RBODY, $j, (New-Object System.Text.UTF8Encoding($false)))"
 echo     %RNAME% seed %RSEED%
 curl.exe -s -S --max-time %SPECAUTOTIMEOUT% -H "Content-Type: application/json" --data-binary @"%RBODY%" -o "%RRESP%" "http://127.0.0.1:%SPECAUTOPORT%/v1/chat/completions" 2> "%WORK%\%ARM%-%RNAME%-s%RSEED%-curl.txt"
 if errorlevel 1 (
     echo curl failed on %ARM% %RNAME% seed %RSEED%, see %WORK%\%ARM%-%RNAME%-s%RSEED%-curl.txt
     set "RC=1"
+    set "RERR=1"
+    goto :eof
+)
+findstr /c:"predicted_per_second" "%RRESP%" >nul 2>&1
+if errorlevel 1 (
+    echo no timings in the answer to %ARM% %RNAME% seed %RSEED%:
+    type "%RRESP%"
+    echo.
+    set "RC=1"
+    set "RERR=1"
 )
 goto :eof
 
