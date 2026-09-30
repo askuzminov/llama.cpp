@@ -173,11 +173,14 @@ start "23-spec-auto-%ARM%" /min cmd /c "%SCMD%"
 call :waitup
 if not "%UP%"=="1" (
     if "%GONE%"=="1" (
-        echo llama-server.exe exited after %WAITED%s, last lines of %SRVLOG%:
+        set "FMSG=llama-server.exe exited after %WAITED%s"
     ) else (
-        echo no 200 from /health after %WAITED%s, last lines of %SRVLOG%:
+        set "FMSG=no 200 from /health after %WAITED%s"
     )
+    echo !FMSG!, last lines of %SRVLOG%:
     powershell -NoProfile -Command "Get-Content -Tail 20 -LiteralPath $env:SRVLOG"
+    echo. >> "%SUM%"
+    echo ### %ARM%: !FMSG!, the next arms are skipped, see %SRVLOG% >> "%SUM%"
     set "RC=1"
     set "ABORT=1"
     call :teardown
@@ -189,6 +192,8 @@ rem error here is the same for every arm, so the run stops
 call :req warmup 0 256
 if "%RERR%"=="1" (
     echo the warmup request failed, the next arms are skipped
+    echo. >> "%SUM%"
+    echo ### %ARM%: the warmup request failed, the next arms are skipped, see %RRESP% >> "%SUM%"
     set "ABORT=1"
     call :teardown
     goto :eof
