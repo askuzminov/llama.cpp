@@ -213,7 +213,8 @@ set "AARM=%ARM%"
 echo. >> "%SUM%"
 echo ### %ARM%: types %STYPE% %AARGS% >> "%SUM%"
 powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $n = 0; $ms = 0; $dn = 0; $da = 0; $rows = @(); Get-ChildItem -LiteralPath $env:AWORK -Filter ($env:AARM + '-*-resp.json') | Where-Object { $_.Name -notlike '*-warmup-*' } | Sort-Object Name | ForEach-Object { $f = $_.Name; try { $r = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json; $t = $r.timings; if ($null -eq $t) { throw [string]$r.error.message }; $n += $t.predicted_n; $ms += $t.predicted_ms; $dn += $t.draft_n; $da += $t.draft_n_accepted; $rows += ('    {0}: {1} tokens, {2} t/s, draft {3}/{4}' -f $_.Name, $t.predicted_n, [math]::Round($t.predicted_per_second, 2).ToString($c), $t.draft_n_accepted, $t.draft_n) } catch { $rows += ('    {0}: no timings: {1}' -f $f, $_.Exception.Message) } }; $rows | ForEach-Object { $_ }; $tps = if ($ms -gt 0) { 1000.0 * $n / $ms } else { 0 }; $acc = if ($dn -gt 0) { $da / $dn } else { 0 }; '### total {0} tokens in {1} ms = {2} t/s, draft acceptance {3} ({4} / {5})' -f $n, [math]::Round($ms, 1).ToString($c), [math]::Round($tps, 2).ToString($c), [math]::Round($acc, 4).ToString($c), $da, $dn" >> "%SUM%"
-findstr /c:"auto:" /c:"statistics " "%SRVLOG%" >> "%SUM%"
+rem the spec prints are cumulative and come after each request, keep the last one
+powershell -NoProfile -Command "$l = @(Select-String -LiteralPath $env:SRVLOG -SimpleMatch -Pattern 'auto:', 'statistics ' | ForEach-Object { $_.Line }); $i = -1; for ($k = 0; $k -lt $l.Count; $k++) { if ($l[$k] -match 'print: auto: (on|trace only),') { $i = $k } }; if ($i -ge 0) { $l[$i..($l.Count - 1)] }" >> "%SUM%"
 
 echo === waiting %SETTLE%s for the gpu to be released
 powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"

@@ -14793,35 +14793,129 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
     };
 
-    auto const &is_src_of = [&is_empty](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
-        auto const &base = [](const ggml_tensor * tensor) {
-            return tensor->view_src ? tensor->view_src : tensor;
-        };
+    auto const &base = [](const ggml_tensor * tensor) {
+        return tensor->view_src ? tensor->view_src : tensor;
+    };
+
+    // the dependency test runs for many node pairs, so read the sources of each node once
+    struct node_srcs {
+        const ggml_tensor * base;
+        bool                empty;
+        int                 n_src;
+        const ggml_tensor * src     [GGML_MAX_SRC];
+        const ggml_tensor * src_base[GGML_MAX_SRC];
+    };
+    std::vector<node_srcs> srcs(graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        node_srcs & ns = srcs[i];
+        ns.base  = base(node);
+        ns.empty = is_empty(node);
+        ns.n_src = 0;
         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
-            if (dst->src[s] == src) {
+            if (node->src[s]) {
+                ns.src     [ns.n_src] = node->src[s];
+                ns.src_base[ns.n_src] = base(node->src[s]);
+                ns.n_src++;
+            }
+        }
+    }
+
+    // true if node dst_idx must stay after node src_idx
+    auto const &is_src_of = [&](int dst_idx, int src_idx) -> bool {
+        const node_srcs & d = srcs[dst_idx];
+        const node_srcs & s = srcs[src_idx];
+        const ggml_tensor * src = graph->nodes[src_idx];
+        for (int k = 0; k < d.n_src; ++k) {
+            if (d.src[k] == src) {
                 return true;
             }
-            if (is_empty(dst) || is_empty(src)) {
-                continue;
-            }
+        }
+        if (!d.empty && !s.empty) {
             // A source view of dst may read storage written through a different view by src.
-            if (dst->src[s] && base(dst->src[s]) == base(src)) {
-                return true;
+            for (int k = 0; k < d.n_src; ++k) {
+                if (d.src_base[k] == s.base) {
+                    return true;
+                }
             }
             // Moving dst forward may overwrite storage still read through a view by src.
-            if (src->src[s] && base(dst) == base(src->src[s])) {
-                return true;
+            for (int k = 0; k < s.n_src; ++k) {
+                if (s.src_base[k] == d.base) {
+                    return true;
+                }
             }
         }
         // implicit dependency if they view the same tensor
-        if (base(dst) == base(src)) {
-            return true;
-        }
-        return false;
+        return d.base == s.base;
     };
 
+    // how far ahead of the first unused node the search goes, a dependency is at most NUM_TO_CHECK - 1 nodes back
+    const int NUM_TO_CHECK = 20;
+
+    // the dependencies do not change while the window moves, so find them once for each node
+    std::vector<int> dep_begin(graph->n_nodes + 1);
+    std::vector<int> dep_list;
+    for (int j = 0; j < graph->n_nodes; ++j) {
+        dep_begin[j] = (int) dep_list.size();
+        for (int c = std::max(0, j - NUM_TO_CHECK + 1); c < j; ++c) {
+            if (is_src_of(j, c)) {
+                dep_list.push_back(c);
+            }
+        }
+    }
+    dep_begin[graph->n_nodes] = (int) dep_list.size();
+
+    std::vector<ggml_op> ops(graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ops[i] = graph->nodes[i]->op;
+    }
+
+    // a node in the window that starts one of these patterns is not pulled forward
+    const std::initializer_list<ggml_op> * window_patterns[] = {
+        &topk_moe_early_softmax_norm,
+        &topk_moe_sigmoid_norm_bias,
+        &topk_moe_sqrt_softplus_norm_bias,
+        &topk_moe_early_softmax,
+        &topk_moe_late_softmax,
+        &snake_pattern,
+        &rms_norm_mul_add_mul_pattern,
+        &rms_norm_mul_add_pattern,
+        &rms_norm_mul_rope_view_set_rows_pattern,
+        &rms_norm_view_set_rows_pattern,
+        &rope_view_set_rows_pattern,
+        &hc_post_gate_pattern,
+    };
+
+    auto const &ops_match = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
+        if (start + (int)pattern.size() > graph->n_nodes) {
+            return false;
+        }
+        for (size_t j = 0; j < pattern.size(); ++j) {
+            if (ops[start + j] != pattern.begin()[j]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // the nodes where a window pattern can match by op alone, the exact checks are skipped at the other nodes
+    std::vector<uint8_t> may_match(graph->n_nodes, false);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        for (const auto * pattern : window_patterns) {
+            if (ops_match(*pattern, i)) {
+                may_match[i] = true;
+                break;
+            }
+        }
+        // every interior QSA node is protected
+        if (ops_match(topk_qsa_pattern, i)) {
+            for (int o = 0; o < (int) topk_qsa_pattern.size(); ++o) {
+                may_match[i + o] = true;
+            }
+        }
+    }
+
     std::vector<ggml_tensor *> new_order;
-    std::vector<bool> used(graph->n_nodes, false);
+    std::vector<uint8_t> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
 
     int first_unused = 0;
@@ -14835,21 +14929,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return true;
     };
+    std::vector<int> current_set;
     while (first_unused < graph->n_nodes) {
-        std::vector<int> current_set;
+        current_set.clear();
 
         // Check for fusion patterns and avoid reordering them
         auto const &match_pattern = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
-            if (start + (int)pattern.size() <= graph->n_nodes) {
-                bool is_pattern = true;
-                for (size_t j = 0; j < pattern.size(); ++j) {
-                    if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
-                        is_pattern = false;
-                    }
-                }
-                return is_pattern;
+            if (start + (int)pattern.size() > graph->n_nodes) {
+                return false;
             }
-            return false;
+            for (size_t j = 0; j < pattern.size(); ++j) {
+                if (ops[start + j] != pattern.begin()[j] || used[start + j]) {
+                    return false;
+                }
+            }
+            return true;
         };
 
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
@@ -14950,7 +15044,6 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
@@ -14968,25 +15061,22 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
-            if (match_pattern(topk_moe_early_softmax_norm, j) ||
-                match_pattern(topk_moe_sigmoid_norm_bias, j) ||
-                match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
-                match_pattern(topk_moe_early_softmax, j) ||
-                match_pattern(topk_moe_late_softmax, j) ||
-                match_pattern(snake_pattern, j) ||
-                in_qsa_pattern(j) ||
-                match_pattern(rms_norm_mul_add_mul_pattern, j) ||
-                match_pattern(rms_norm_mul_add_pattern, j) ||
-                match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
-                match_pattern(rms_norm_view_set_rows_pattern, j) ||
-                match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
-                continue;
+            if (may_match[j]) {
+                bool in_pattern = in_qsa_pattern(j);
+                for (const auto * pattern : window_patterns) {
+                    in_pattern = in_pattern || match_pattern(*pattern, j);
+                }
+                if (in_pattern) {
+                    continue;
+                }
             }
             bool ok = true;
-            for (int c = first_unused; c < j; ++c) {
+            for (int d = dep_begin[j]; d < dep_begin[j + 1]; ++d) {
+                const int c = dep_list[d];
+                if (c < first_unused) {
+                    continue;
+                }
                 if (!used[c] &&
-                    is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
@@ -15045,7 +15135,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
                         for (int c = rope_idx + 1; can_pull && c < set_rows_idx; ++c) {
                             if (!used[c] && c != view_idx && !is_empty(graph->nodes[c]) &&
-                                is_src_of(graph->nodes[set_rows_idx], graph->nodes[c])) {
+                                is_src_of(set_rows_idx, c)) {
                                 can_pull = false;
                             }
                         }
@@ -15135,12 +15225,14 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     continue;
                 }
                 bool ok = true;
-                for (int c = first_unused; c < j; ++c) {
-                    bool c_in_current_set = std::find(current_set.begin(), current_set.end(), c) != current_set.end();
+                for (int d = dep_begin[j]; d < dep_begin[j + 1]; ++d) {
+                    const int c = dep_list[d];
+                    if (c < first_unused) {
+                        continue;
+                    }
                     // skip views whose srcs haven't been processed.
                     if (!used[c] &&
-                        is_src_of(graph->nodes[j], graph->nodes[c]) &&
-                        !c_in_current_set) {
+                        std::find(current_set.begin(), current_set.end(), c) == current_set.end()) {
                         ok = false;
                         break;
                     }
