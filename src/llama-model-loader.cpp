@@ -538,6 +538,7 @@ struct llama_gguf_window {
     std::vector<uint8_t> buf;
     uint64_t             begin = 0;  // file offset of buf[0]
     size_t               len   = 0;  // valid bytes in buf
+    std::string          error;      // a failed read, raised again once gguf has freed its context
 
     llama_gguf_window(llama_file * file) : file(file), buf(4*MiB) {}
 
@@ -554,10 +555,17 @@ struct llama_gguf_window {
             const uint64_t pos = offset + done;
 
             if (pos < w.begin || pos >= w.begin + w.len) {
-                w.begin = pos;
-                w.len   = std::min<uint64_t>(w.buf.size(), size - pos);
-                w.file->seek(w.begin, SEEK_SET);
-                w.file->read_raw(w.buf.data(), w.len);
+                // an exception must not pass through gguf: it would skip the free of the context
+                try {
+                    w.begin = pos;
+                    w.len   = std::min<uint64_t>(w.buf.size(), size - pos);
+                    w.file->seek(w.begin, SEEK_SET);
+                    w.file->read_raw(w.buf.data(), w.len);
+                } catch (const std::exception & e) {
+                    w.len   = 0;
+                    w.error = e.what();
+                    return done;
+                }
             }
 
             const size_t from = (size_t) (pos - w.begin);
@@ -573,7 +581,11 @@ struct llama_gguf_window {
 
 static struct gguf_context * llama_gguf_init_from_file(llama_file * file, struct gguf_init_params params) {
     llama_gguf_window window(file);
-    return gguf_init_from_callback(llama_gguf_window::read, &window, 0, file->size(), params);
+    struct gguf_context * ctx = gguf_init_from_callback(llama_gguf_window::read, &window, 0, file->size(), params);
+    if (!ctx && !window.error.empty()) {
+        throw std::runtime_error(window.error);
+    }
+    return ctx;
 }
 
 llama_model_loader::llama_model_loader(
@@ -1732,6 +1744,30 @@ bool llama_model_loader::load_all_data(
         return backend;
     }(__func__);
 
+    // frees the async upload resources also on a cancel or a read error
+    // declared after range_guard, so the uploads land before the allocating thread can free their buffers
+    struct upload_guard {
+        std::vector<ggml_backend_event_t>  & events;
+        std::vector<ggml_backend_buffer_t> & host_buffers;
+        ggml_backend_t                     & backend;
+
+        void release() {
+            for (auto * event : events) {
+                ggml_backend_event_synchronize(event);
+                ggml_backend_event_free(event);
+            }
+            events.clear();
+            for (auto * buf : host_buffers) {
+                ggml_backend_buffer_free(buf);
+            }
+            host_buffers.clear();
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
+
+        ~upload_guard() { release(); }
+    } uploads { events, host_buffers, upload_backend };
+
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
@@ -1912,14 +1948,7 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
-    }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_backend_free(upload_backend);
+    uploads.release();
 
     // check validation results
     bool validation_failed = false;

@@ -666,7 +666,7 @@ struct server_prompt_cache {
     // caller, and --cache-ram 0 means the cache is never created
     server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes = 0,
                         const std::string & spill_dir = "", size_t spill_limit_bytes = 0,
-                        uint64_t signature = 0, bool has_mtmd = false);
+                        uint64_t signature = 0, uint64_t owner = 0, bool has_mtmd = false);
     ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
@@ -691,9 +691,13 @@ struct server_prompt_cache {
     size_t      spill_limit = 0;
     uint64_t    next_uid    = 1;
 
-    // identifies the model / context configuration the spilled states belong to. Files carrying a
-    // different signature are from another model or another KV layout and are discarded on load.
+    // identifies the model / context configuration the spilled states belong to. Only files with
+    // this signature can be restored.
     uint64_t signature = 0;
+
+    // identifies the model file. A file of this owner with another signature is this model under an
+    // old configuration and is removed on load; files of other owners are left alone
+    uint64_t owner = 0;
 
     // an mmproj is loaded, so a spilled prompt may hold media chunks and can be restored with them
     bool has_mtmd = false;

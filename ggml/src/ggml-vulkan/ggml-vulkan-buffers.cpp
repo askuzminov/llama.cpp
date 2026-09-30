@@ -157,15 +157,22 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     buf->ptr = nullptr;
 
-    if (import_ptr) {
-        buf->ptr = import_ptr;
-    } else {
-        if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
-            buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
+    try {
+        if (import_ptr) {
+            buf->ptr = import_ptr;
+        } else {
+            if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+                buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
+            }
         }
-    }
 
-    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+        device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    } catch (const vk::SystemError & e) {
+        // buf->size is still 0, so the destructor frees neither the memory nor the buffer
+        device->device.freeMemory(buf->device_memory);
+        device->device.destroyBuffer(buf->buffer);
+        throw;
+    }
 
     buf->device = device;
     buf->size = size;

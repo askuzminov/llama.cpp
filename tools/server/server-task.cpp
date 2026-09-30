@@ -1821,31 +1821,43 @@ std::string spill_fs_utf8(const std::filesystem::path & path) {
 #endif
 }
 
-// file name of a spilled state. The signature keeps the caches of different models apart in a
-// shared spill dir: without it their uid counters collide and they overwrite each other's files
-std::string spill_name_of(uint64_t signature, uint64_t uid) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "state-%016llx-%llu.bin", (unsigned long long) signature, (unsigned long long) uid);
+// file name of a spilled state. The owner (the model file) keeps the caches of different models apart
+// in a shared spill dir, the signature tells a model's current configuration from an old one
+std::string spill_name_of(uint64_t owner, uint64_t signature, uint64_t uid) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "state-%016llx-%016llx-%llu.bin", (unsigned long long) owner, (unsigned long long) signature, (unsigned long long) uid);
     return buf;
 }
 
 enum spill_name_kind {
-    SPILL_NAME_OTHER, // another model's file, or not one of ours at all
+    SPILL_NAME_OTHER,      // another model's file, or not one of ours at all
     SPILL_NAME_MINE,
-    SPILL_NAME_TMP,   // ours, from a write that did not get to the rename
+    SPILL_NAME_TMP,        // ours, from a write that did not get to the rename
+    SPILL_NAME_STALE,      // this model under an old configuration: it cannot be restored
+    SPILL_NAME_LEGACY,     // the name had no owner yet, this configuration
+    SPILL_NAME_LEGACY_OLD, // the name had no owner yet, another configuration or model, or unfinished
 };
 
 // a state is written under its name plus this suffix and renamed when complete
 constexpr char SPILL_TMP_EXT[] = ".tmp";
 
-spill_name_kind spill_name_classify(const std::string & name, uint64_t signature) {
+static bool spill_is_hex16(const std::string & s, size_t pos) {
+    return s.size() >= pos + 16 && s.find_first_not_of("0123456789abcdef", pos) >= pos + 16;
+}
+
+spill_name_kind spill_name_classify(const std::string & name, uint64_t owner, uint64_t signature) {
     static const std::string pre = "state-";
     static const std::string ext = ".bin";
     static const std::string tmp = SPILL_TMP_EXT;
 
     if (name.size() > tmp.size() && name.compare(name.size() - tmp.size(), tmp.size(), tmp) == 0) {
-        const std::string base = name.substr(0, name.size() - tmp.size());
-        return spill_name_classify(base, signature) == SPILL_NAME_MINE ? SPILL_NAME_TMP : SPILL_NAME_OTHER;
+        switch (spill_name_classify(name.substr(0, name.size() - tmp.size()), owner, signature)) {
+            case SPILL_NAME_MINE:       return SPILL_NAME_TMP;
+            case SPILL_NAME_STALE:      return SPILL_NAME_STALE;
+            case SPILL_NAME_LEGACY:
+            case SPILL_NAME_LEGACY_OLD: return SPILL_NAME_LEGACY_OLD;
+            default:                    return SPILL_NAME_OTHER;
+        }
     }
 
     if (name.size() <= pre.size() + ext.size() ||
@@ -1854,18 +1866,31 @@ spill_name_kind spill_name_classify(const std::string & name, uint64_t signature
         return SPILL_NAME_OTHER;
     }
 
+    // <owner>-<signature>-<uid>, or <signature>-<uid> as written before the owner was added
     const std::string mid = name.substr(pre.size(), name.size() - pre.size() - ext.size());
 
-    const size_t sep = mid.find('-');
+    const size_t sep = mid.rfind('-');
     if (sep == std::string::npos || sep + 1 >= mid.size() ||
         mid.find_first_not_of("0123456789", sep + 1) != std::string::npos) {
         return SPILL_NAME_OTHER;
     }
 
-    char expect[32];
-    snprintf(expect, sizeof(expect), "%016llx-", (unsigned long long) signature);
+    char hex[20];
+    if (sep == 16 && spill_is_hex16(mid, 0)) {
+        snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) signature);
+        return mid.compare(0, 16, hex) == 0 ? SPILL_NAME_LEGACY : SPILL_NAME_LEGACY_OLD;
+    }
+    if (sep != 33 || mid[16] != '-' || !spill_is_hex16(mid, 0) || !spill_is_hex16(mid, 17)) {
+        return SPILL_NAME_OTHER;
+    }
 
-    return mid.compare(0, sep + 1, expect) == 0 ? SPILL_NAME_MINE : SPILL_NAME_OTHER;
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) owner);
+    if (mid.compare(0, 16, hex) != 0) {
+        return SPILL_NAME_OTHER;
+    }
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) signature);
+
+    return mid.compare(17, 16, hex) == 0 ? SPILL_NAME_MINE : SPILL_NAME_STALE;
 }
 
 // section offsets implied by a header
@@ -2272,13 +2297,14 @@ private:
 
 server_prompt_cache::server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes,
                                          const std::string & spill_dir, size_t spill_limit_bytes,
-                                         uint64_t signature, bool has_mtmd) {
+                                         uint64_t signature, uint64_t owner, bool has_mtmd) {
     this->limit_size   = 1024ull*1024ull*limit_size_mib;
     this->limit_tokens = limit_tokens;
     this->reserve_size = reserve_bytes;
     this->spill_dir    = spill_dir;
     this->spill_limit  = spill_limit_bytes;
     this->signature    = signature;
+    this->owner        = owner;
     this->has_mtmd     = has_mtmd;
 
     if (!this->spill_dir.empty()) {
@@ -2314,7 +2340,7 @@ std::filesystem::path server_prompt_cache::spill_dir_path() const {
 }
 
 std::filesystem::path server_prompt_cache::spill_path(uint64_t uid) const {
-    return spill_dir_path() / spill_name_of(signature, uid);
+    return spill_dir_path() / spill_name_of(owner, signature, uid);
 }
 
 size_t server_prompt_cache::restore_spilled() {
@@ -2327,14 +2353,19 @@ size_t server_prompt_cache::restore_spilled() {
     // adopt in a stable order so that the list stays oldest-first by uid
     std::vector<server_prompt_cache_state> found;
 
+    // list first: a renamed legacy file must not show up again later in the same walk
+    std::vector<std::filesystem::path> paths;
     for (const auto & entry : it) {
-        if (!entry.is_regular_file(ec) || ec) {
-            continue;
+        if (entry.is_regular_file(ec) && !ec) {
+            paths.push_back(entry.path());
         }
+    }
 
-        const std::filesystem::path path = entry.path();
+    size_t n_stale = 0;
+    size_t n_stale_bytes = 0;
 
-        const spill_name_kind kind = spill_name_classify(spill_fs_utf8(path.filename()), signature);
+    for (std::filesystem::path path : paths) {
+        const spill_name_kind kind = spill_name_classify(spill_fs_utf8(path.filename()), owner, signature);
         if (kind == SPILL_NAME_OTHER) {
             continue; // another model spills here too - leave its files alone
         }
@@ -2342,6 +2373,34 @@ size_t server_prompt_cache::restore_spilled() {
             SRV_WRN(" - removing unfinished prompt-cache spill file '%s'\n", spill_fs_utf8(path).c_str());
             std::filesystem::remove(path, ec);
             continue;
+        }
+        if (kind == SPILL_NAME_STALE || kind == SPILL_NAME_LEGACY_OLD) {
+            // nothing can restore it: this model under an old configuration, or a name without owner
+            // that is not this configuration's. Left in place, it would take disk space forever
+            const uintmax_t n = std::filesystem::file_size(path, ec);
+            if (std::filesystem::remove(path, ec)) {
+                n_stale++;
+                n_stale_bytes += ec ? 0 : (size_t) n;
+            }
+            continue;
+        }
+        if (kind == SPILL_NAME_LEGACY) {
+            // this configuration's state under the old name: give it the owner and keep it
+            spill_file f;
+            spill_header h = {};
+            const bool ok = f.open_read(path) && f.read_at(0, &h, sizeof(h)) && memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) == 0;
+            f.close();
+            const std::filesystem::path to = spill_path(h.uid);
+            if (!ok || std::filesystem::exists(to, ec)) {
+                std::filesystem::remove(path, ec);
+                continue;
+            }
+            std::filesystem::rename(path, to, ec);
+            if (ec) {
+                std::filesystem::remove(path, ec);
+                continue;
+            }
+            path = to;
         }
 
         spill_file f;
@@ -2407,6 +2466,11 @@ size_t server_prompt_cache::restore_spilled() {
 
     for (auto & st : found) {
         states.push_back(std::move(st));
+    }
+
+    if (n_stale > 0) {
+        SRV_INF(" - removed %zu prompt-cache spill file(s) that cannot be restored (%.3f MiB)\n",
+                n_stale, n_stale_bytes / (1024.0 * 1024.0));
     }
 
     enforce_disk_limit();

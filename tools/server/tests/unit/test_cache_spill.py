@@ -202,7 +202,8 @@ def test_prompt_cache_write_behind_while_idle():
 def test_prompt_cache_spill_kill_mid_write():
     # A state is written under a temporary name and renamed when it is complete. A process killed in
     # the middle of a write leaves only the temporary file, and the next start removes it, together
-    # with a state file without a header from a build that wrote in place. Other models' files stay.
+    # with a state file without a header from a build that wrote in place, the files of this model
+    # under another configuration and the files named before the owner was added. Other models' files stay.
     # tinygemma3 is used because its state is tens of MiB, so the write lasts long enough to catch.
     spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-kill-")
 
@@ -239,13 +240,20 @@ def test_prompt_cache_spill_kill_mid_write():
 
         assert os.listdir(spill_dir) == tmp, "the killed write left a file under a state name"
 
-        sig = re.fullmatch(r"state-([0-9a-f]{16})-\d+\.bin\.tmp", tmp[0]).group(1)
-        other = "1" * 16 if sig == "0" * 16 else "0" * 16
+        m = re.fullmatch(r"state-([0-9a-f]{16})-([0-9a-f]{16})-\d+\.bin\.tmp", tmp[0])
+        owner, sig = m.group(1), m.group(2)
+        other_owner = "1" * 16 if owner == "0" * 16 else "0" * 16
+        other_sig   = "1" * 16 if sig   == "0" * 16 else "0" * 16
 
         # an unfinished write of a build that wrote in place: the name is there, the header is not
-        open(os.path.join(spill_dir, f"state-{sig}-900.bin"), "wb").close()
+        open(os.path.join(spill_dir, f"state-{owner}-{sig}-900.bin"), "wb").close()
 
-        keep = [f"state-{other}-900.bin.tmp", "state-900.bin"]
+        # this model under another configuration, and names without owner: nothing restores them
+        for name in [f"state-{owner}-{other_sig}-901.bin", f"state-{other_sig}-902.bin", f"state-{sig}-903.bin.tmp"]:
+            with open(os.path.join(spill_dir, name), "wb") as f:
+                f.write(b"x" * 100)
+
+        keep = [f"state-{other_owner}-{sig}-900.bin.tmp", f"state-{other_owner}-{other_sig}-901.bin", "state-900.bin"]
         for name in keep:
             with open(os.path.join(spill_dir, name), "wb") as f:
                 f.write(b"x" * 100)

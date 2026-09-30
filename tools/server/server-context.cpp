@@ -1408,7 +1408,7 @@ private:
             const size_t spill_limit = (size_t) std::max(0, params_base.cache_disk_mib) * 1024ull * 1024ull;
             prompt_cache = std::make_unique<server_prompt_cache>(
                     (size_t) cache_ram_mib_eff, n_ctx, cache_ram_reserve_bytes, params_base.cache_spill_dir, spill_limit,
-                    prompt_cache_signature(), mctx != nullptr);
+                    prompt_cache_signature(), (uint64_t) std::hash<std::string>{}(params_base.model.path), mctx != nullptr);
             prompt_cache->min_tokens = (size_t) std::max(0, params_base.cache_min_tokens);
 
             if (params_base.cache_min_tokens > 0) {
@@ -2869,7 +2869,7 @@ private:
     }
 
     // Identifies the model and context configuration that the cached states belong to. Spill files
-    // written under a different signature cannot be restored and are discarded on startup.
+    // of this model written under a different signature cannot be restored and are removed on startup.
     uint64_t prompt_cache_signature() {
         char desc[256] = {};
         llama_model_desc(model_tgt, desc, sizeof(desc));

@@ -4,7 +4,7 @@
 // payload sizes live in the file header. These tests drive server_prompt_cache directly - no model
 // is involved - over payload sizes that are deliberately awkward for an aligned layout (empty,
 // one byte, exactly one block, one below a block, one block past the direct-transfer threshold),
-// plus the cold-start adoption, signature mismatch and truncation paths.
+// plus the cold-start adoption, signature mismatch, legacy names and truncation paths.
 
 #include "server-task.h"
 
@@ -328,28 +328,94 @@ static void test_cold_start(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
-// a run with a different model / KV layout must not restore the files. It must not delete them
-// either: the signature is in the file name, so from here they are indistinguishable from the
-// files of another model that spills into the same directory
+// a run of the same model with another KV layout cannot restore the files, so it removes them.
+// A run of another model spilling into the same directory leaves them alone
 static void test_signature_mismatch(const std::string & dir) {
+    const uint64_t owner_a = 0x1111111111111111ull;
+    const uint64_t owner_b = 0x2222222222222222ull;
+
     {
-        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG, owner_a);
         fill(cache);
     }
     assert(!dir_empty(dir));
 
     {
-        server_prompt_cache cache(0, 0, 0, dir, 0, SIG ^ 1ull);
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG, owner_b);
         assert(cache.states.empty());
     }
     assert(!dir_empty(dir));
 
-    // the run they belong to still finds them
     {
-        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
-        assert(!cache.states.empty());
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG ^ 1ull, owner_a);
+        assert(cache.states.empty());
+    }
+    assert(dir_empty(dir));
+}
+
+// files named before the owner was added: this configuration's ones are renamed and kept, the
+// others cannot be told apart by model any more and are removed
+static void test_legacy_names(const std::string & dir) {
+    const uint64_t owner = 0x3333333333333333ull;
+
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG, owner);
+        fill(cache);
+    }
+
+    // the uids are given when the files are written, so take the names from the directory
+    const std::filesystem::path root = fs_path(dir);
+    const std::string           pre  = "state-3333333333333333-";
+
+    std::vector<std::filesystem::path> files;
+    for (const auto & entry : std::filesystem::directory_iterator(root)) {
+        files.push_back(entry.path());
+    }
+    assert(files.size() == sizeof(CASES)/sizeof(CASES[0]));
+    for (const auto & path : files) {
+        const std::string n = fs_utf8(path.filename());
+        assert(n.compare(0, pre.size(), pre) == 0);
+        std::filesystem::rename(path, root / fs_path("state-" + n.substr(pre.size())));
+    }
+
+    char name[96];
+
+    const auto touch = [&](const char * n) {
+        FILE * f = fopen(fs_utf8(root / n).c_str(), "wb");
+        assert(f);
+        fputs("x", f);
+        fclose(f);
+    };
+
+    snprintf(name, sizeof(name), "state-%016llx-7.bin", (unsigned long long) (SIG ^ 1ull));
+    const std::string legacy_other = name;
+    snprintf(name, sizeof(name), "state-%016llx-8.bin.tmp", (unsigned long long) SIG);
+    const std::string legacy_tmp = name;
+    snprintf(name, sizeof(name), "state-4444444444444444-%016llx-9.bin", (unsigned long long) SIG);
+    const std::string other_owner = name;
+
+    touch(legacy_other.c_str());
+    touch(legacy_tmp.c_str());
+    touch(other_owner.c_str());
+    touch("notes.txt");
+
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG, owner);
+        assert(cache.states.size() == files.size());
+        for (auto & st : cache.states) {
+            assert(std::filesystem::exists(cache.spill_path(st.uid)));
+            assert(cache.unspill_state(st));
+        }
         clear_cache(cache);
     }
+
+    assert(!std::filesystem::exists(root / legacy_other));
+    assert(!std::filesystem::exists(root / legacy_tmp));
+    assert( std::filesystem::exists(root / other_owner));
+    assert( std::filesystem::exists(root / "notes.txt"));
+
+    std::filesystem::remove(root / other_owner);
+    std::filesystem::remove(root / "notes.txt");
     assert(dir_empty(dir));
 }
 
@@ -390,6 +456,7 @@ int main() {
         { "rewrite-step",       test_rewrite_step       },
         { "cold-start",         test_cold_start         },
         { "signature-mismatch", test_signature_mismatch },
+        { "legacy-names",       test_legacy_names       },
         { "truncated",          test_truncated          },
     };
 
