@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -83,7 +84,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+// optional: called after the target samples draft position i, with the candidates of that position
+using common_sampler_verify_cb = std::function<void(size_t i, const llama_token_data_array * cur_p)>;
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false, const common_sampler_verify_cb & on_pos = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);

@@ -4263,8 +4263,16 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+
+                common_sampler_verify_cb on_pos = nullptr;
+                if (common_speculative_need_verify(spec.get())) {
+                    on_pos = [&](size_t i, const llama_token_data_array * cur_p) {
+                        common_speculative_verify(spec.get(), slot.id, i, cur_p, slot.spec_draft[i], slot.task->params.sampling.temp);
+                    };
+                }
+
                 auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_pos)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);

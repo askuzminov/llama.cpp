@@ -19,6 +19,7 @@ if not defined RUN_SPEC    set "RUN_SPEC=0"
 if not defined RUN_DECODE  set "RUN_DECODE=0"
 if not defined RUN_MOECACHE set "RUN_MOECACHE=0"
 if not defined RUN_UBMEM   set "RUN_UBMEM=0"
+if not defined RUN_SPECAUTO set "RUN_SPECAUTO=0"
 
 set "STEPS="
 if "%RUN_BUILD%"=="1"   set "STEPS=%STEPS% 00-build"
@@ -36,6 +37,7 @@ if "%RUN_SPEC%"=="1"    set "STEPS=%STEPS% 17-spec-np"
 if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 19-decode-depth"
 if "%RUN_MOECACHE%"=="1" set "STEPS=%STEPS% 20-moecache"
 if "%RUN_UBMEM%"=="1"   set "STEPS=%STEPS% 22-ubmem"
+if "%RUN_SPECAUTO%"=="1" set "STEPS=%STEPS% 23-spec-auto"
 
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do

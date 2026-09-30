@@ -92,6 +92,10 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+// (optional) report the target candidates at draft position i, for the trace (LLAMA_SPEC_TRACE)
+bool common_speculative_need_verify(const common_speculative * spec);
+void common_speculative_verify(common_speculative * spec, llama_seq_id seq_id, size_t i, const llama_token_data_array * cur_p, llama_token id_draft, float temp);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

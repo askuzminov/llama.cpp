@@ -170,6 +170,26 @@ rem seconds until /health answers after the start, and for one request
 set "UBMEMWAIT=900"
 set "UBMEMTIMEOUT=1800"
 
+rem 23-spec-auto.bat: no speculation, ngram-mod, draft-mtp and both, fixed and with --spec-auto, see
+rem the header of the script. an arm is "name types [args]", one server start each. every arm runs SPECAUTOPROMPTS x SPECAUTOSEEDS
+rem chat requests of up to SPECAUTONGEN tokens with sampling on (SPECAUTOSAMP = temperature top-k
+rem top-p, as in models.ini) and writes a per-cycle trace. SPECAUTOCTX auto is SRVCTX, SPECAUTOARGS
+rem auto is the setup of models.ini, as UBMEMARGS. n6 is the arm the offline comparison uses: p-min
+rem 0 drafts every position, so its trace holds the head probabilities of all six. auto is the fully
+rem automatic setup: the type comes from the draft gguf, no n-max, so the cap is 6, and --spec-auto
+rem adds ngram-mod itself. ng-n3 is its baseline with the same speculators. add
+rem "n6p06 draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.6" to check the old setting
+set "SPECAUTOARMS="none none" "ng ngram-mod" "ng-auto ngram-mod --spec-auto" "n2 draft-mtp --spec-draft-n-max 2" "n3 draft-mtp --spec-draft-n-max 3" "n6 draft-mtp --spec-draft-n-max 6" "mtp-auto draft-mtp --spec-auto" "ng-n3 ngram-mod,draft-mtp --spec-draft-n-max 3" "auto infer --spec-auto""
+set "SPECAUTOPROMPTS=os db code repeat"
+set "SPECAUTOSEEDS=1 2"
+set "SPECAUTONGEN=1024"
+set "SPECAUTOCTX=auto"
+set "SPECAUTOARGS=auto"
+set "SPECAUTOSAMP=1.0 20 0.95"
+set "SPECAUTOPORT=8097"
+set "SPECAUTOWAIT=900"
+set "SPECAUTOTIMEOUT=1800"
+
 rem seconds to wait between two model loads in 07, 10 and 11. the model fills the gpu almost
 rem completely and the driver frees it lazily, so a run started right after the previous one
 rem dies in vkAllocateMemory
@@ -236,6 +256,9 @@ set "RUN_MOECACHE=auto"
 rem   22 - does the server survive a prefill and a decode in turn at a large -ub. off by
 rem        default: one server start at the full context per arm
 set "RUN_UBMEM=0"
+rem   23 - fixed draft lengths against --spec-auto. off by default: it needs SPECDRAFT, and it is
+rem        one server start at the full context per arm
+set "RUN_SPECAUTO=0"
 
 rem ===================================================================
 rem  machine-specific overrides. _local.bat is not tracked by git, so

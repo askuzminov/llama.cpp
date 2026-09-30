@@ -540,6 +540,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         plan_spec.dspark = {};
     }
 
+    const bool spec_types_given = !spec_types_is_default(params);
+
     // infer the speculative type from the sidecar shipped by the draft repo when none is requested
     if (spec_types_is_default(params)) {
         if (!plan_spec.mtp.local_path.empty()) {
@@ -566,6 +568,20 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         const auto types_gguf = common_speculative_types_from_gguf(params.speculative.draft.mparams.path);
         if (!types_gguf.empty()) {
             params.speculative.types = types_gguf;
+        }
+    }
+
+    // --spec-auto without an explicit --spec-draft-n-max raises the cap. without an explicit --spec-type,
+    // ngram-mod joins the inferred model draft: it drafts only on a long match and costs nearly nothing when it finds none
+    if (params.speculative.auto_n) {
+        auto & spec = params.speculative;
+
+        if (!spec.draft.n_max_set) {
+            spec.draft.n_max = std::max(spec.draft.n_max, COMMON_SPECULATIVE_AUTO_N_MAX);
+        }
+
+        if (!spec_types_given && !spec_types_is_default(params)) {
+            spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         }
     }
 
@@ -4221,6 +4237,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4263,6 +4280,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
 
+    add_opt(common_arg(
+        {"--spec-auto"},
+        {"--no-spec-auto"},
+        string_format("pick the draft length per cycle from the measured verify cost and the calibrated draft acceptance. --spec-draft-n-max is the cap, %d when not given; "
+                      "without --spec-type, ngram-mod is added next to the inferred draft type (default: %s)",
+                      COMMON_SPECULATIVE_AUTO_N_MAX, params.speculative.auto_n ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.auto_n = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_AUTO"));
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),

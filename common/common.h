@@ -328,9 +328,13 @@ struct common_params_model {
     }
 };
 
+// draft length cap of --spec-auto when --spec-draft-n-max is not given
+#define COMMON_SPECULATIVE_AUTO_N_MAX 6
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    bool    n_max_set = false; // n_max was given explicitly, --spec-auto then keeps it as the cap
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
@@ -379,6 +383,8 @@ struct common_params_speculative {
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;
+
+    bool auto_n = false; // pick the draft length per cycle from the measured cost and acceptance, n_max is the cap
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
