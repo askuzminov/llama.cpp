@@ -11653,6 +11653,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 2048, 10240, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  640, 2048,  2560, {1, 1}, {1, 1}));
 
+    // qwen4exp prefill at -ub 4096: the other q8_0 projections of the graph by time (attention and GDN in and out,
+    // the shared expert, the hyper-connection up projection), for tile sweeps
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {2560, 6144}, {6144, 2560}, {12288, 2560}, {10240, 320}, {640, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 4096, k, {1, 1}, {1, 1}));
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
@@ -11676,8 +11682,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp: 512 experts, 10 per token. gate/up is q4_K [640, 2560] and down is q5_1 [2560, 640],
     // and at prefill q4_K reads its weights at about half the rate of q5_1. q4_0 runs the same shape
     // at the same 0.5625 bytes per weight, so it tells the k-quant path apart from the bit width.
-    // n = 2048 and 8192 are prefill at those -ub, about 40 and 160 rows per expert
-    for (int bs : {512, 2048, 8192}) {
+    // n = 2048, 4096 and 8192 are prefill at those -ub, about 40, 80 and 160 rows per expert
+    for (int bs : {512, 2048, 4096, 8192}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
         }

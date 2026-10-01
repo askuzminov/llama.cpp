@@ -1875,6 +1875,33 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
 
+        // GGML_VK_MMQ_TILE: the medium tile of the quant matmuls and matmul_id, 11 comma separated warptile values:
+        // BLOCK_SIZE,BM,BN,BK,WM,WN,WMITER,TM,TN,TK,WARP. for tile sweeps: on some drivers the medium tile is the
+        // largest one left, so it runs every large matmul. matmul_id takes the same tile, as coopmat1 does anyway
+        const char * mmq_tile = getenv("GGML_VK_MMQ_TILE");
+        if (mmq_tile && mmq_tile[0]) {
+            std::vector<uint32_t> wt;
+            std::stringstream ss(mmq_tile);
+            for (std::string v; std::getline(ss, v, ',');) {
+                wt.push_back((uint32_t) std::stoul(v));
+            }
+            if (wt.size() == 11 && wt[0] > 0 && wt[10] > 0 && wt[0] % wt[10] == 0 && wt[4] > 0 && wt[5] > 0 &&
+                wt[1] % wt[4] == 0 && wt[2] % wt[5] == 0 && (wt[1] / wt[4]) * (wt[2] / wt[5]) == wt[0] / wt[10] &&
+                wt[3] == 32) {
+                m_warptile_mmq   = wt;
+                m_warptile_mmqid = wt;
+                m_mmq_wg_denoms  = { wt[1], wt[2], 1 };
+                GGML_LOG_INFO("ggml_vulkan: medium quant tile %s, shared memory %s\n", mmq_tile,
+                    ggml_vk_matmul_shmem_support(device, wt, false, GGML_TYPE_Q8_0) &&
+                    ggml_vk_matmul_shmem_support(device, wt, true,  GGML_TYPE_Q8_0) ? "fits" : "does not fit, the medium tile is off");
+            } else {
+                // the loads of the quant blocks assume a K step of 32 (q5_1 and the tail of a K that is not a multiple
+                // of the step break with 64)
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_TILE=%s ignored: needs 11 values, (BM/WM)*(BN/WN) == BLOCK_SIZE/WARP and BK 32\n",
+                    mmq_tile);
+            }
+        }
+
         const bool use_cm1_int = device->coopmat_int_support &&
                                  (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
 
