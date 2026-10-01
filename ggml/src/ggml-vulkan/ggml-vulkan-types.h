@@ -1026,6 +1026,8 @@ struct vk_device_struct {
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
+    // matmuls split their columns so that the part of B each one reads stays in this many bytes of cache, 0 = off
+    uint64_t mm_chunk_bytes;
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
     bool disable_host_visible_vidmem;

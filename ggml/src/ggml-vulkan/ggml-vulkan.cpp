@@ -4900,6 +4900,15 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
 
+        // every strip of M re-reads B, so a B larger than the last level cache comes from memory once per strip.
+        // AMD APUs have a 32 MB MALL, keep each part of B to half of it. GGML_VK_MM_CHUNK_MB=0 turns this off
+        const char * mm_chunk_mb = getenv("GGML_VK_MM_CHUNK_MB");
+        if (mm_chunk_mb) {
+            device->mm_chunk_bytes = (uint64_t) (std::max(0.0, atof(mm_chunk_mb)) * 1024.0 * 1024.0);
+        } else {
+            device->mm_chunk_bytes = device->vendor_id == VK_VENDOR_ID_AMD && device->uma ? 16ull*1024*1024 : 0;
+        }
+
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
         device->add_rms_fusion = !device->disable_fusion &&
@@ -6526,15 +6535,36 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
+    // every strip of M re-reads B: when B is larger than the cache budget, run the columns in parts whose B fits
+    uint32_t n_part = (uint32_t) ne11;
+    const uint64_t y_col_bytes = (uint64_t) ne10 * (y_f32_kernel ? sizeof(float) : sizeof(ggml_fp16_t));
+    if (ctx->device->mm_chunk_bytes > 0 && !quantize_y && split_k == 1 && ne12*ne13 == 1 &&
+        CEIL_DIV(ne01, pipeline->wg_denoms[0]) > 1) {
+        const uint32_t bn   = pipeline->wg_denoms[1];
+        const uint64_t cols = ctx->device->mm_chunk_bytes / y_col_bytes / bn * bn;
+        const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+        if (cols >= bn && cols < ne11 &&
+            (cols * y_col_bytes) % align == 0 && (cols * stride_d * sizeof(float)) % align == 0) {
+            n_part = (uint32_t) cols;
+        }
+    }
+
     // compute
-    ggml_vk_matmul(
-        ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
-        ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-        ne01, ne11, ne10,
-        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
-    );  // NOLINT
+    for (uint32_t n0 = 0; n0 < ne11; n0 += n_part) {
+        const uint32_t n1     = std::min<uint32_t>((uint32_t) ne11 - n0, n_part);
+        const uint64_t y_off  = (uint64_t) n0 * y_col_bytes;
+        const uint64_t d_off  = (uint64_t) n0 * stride_d * sizeof(float);
+        // the staged B is padded to whole tiles, a part ends on a tile boundary or at the padded end
+        const uint32_t n1_pad = n_part == ne11 ? padded_n : (qy_needs_dequant ? ROUNDUP_POW2(n1, pipeline->wg_denoms[1]) : n1);
+        ggml_vk_matmul(
+            ctx, subctx, pipeline,
+            { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset + y_off, y_range - y_off },
+            ggml_vk_subbuffer(ctx, d_D, d_buf_offset + d_off), { ctx->prealloc_split_k, 0, d_sz * split_k },
+            ne01, n1, ne10,
+            ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+            split_k, ne12*ne13, ne02, ne12, r2, r3, n1_pad
+        );  // NOLINT
+    }
 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;

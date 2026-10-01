@@ -11643,9 +11643,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // qwen4exp prefill: the hyper-connection down projection [hc*n_embd] -> [hc_lr] (m 320, k 10240) at three
+    // qwen4exp prefill: the hyper-connection down projection [hc*n_embd] -> [hc_lr] (m 320, k 10240) at four
     // ubatch sizes, and q8_0 neighbours of the same graph to tell which of m, k and n makes it slow
-    for (int64_t n : {512, 1024, 2048}) {
+    for (int64_t n : {512, 1024, 2048, 4096}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, n, 10240, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  320, 2048,  2560, {1, 1}, {1, 1}));
