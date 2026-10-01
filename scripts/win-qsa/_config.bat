@@ -83,11 +83,12 @@ rem n_tokens = min(n_ctx, n_ubatch), so both axes are swept. no weights are read
 rem takes about a second
 set "CTXVARIANTS="262144 2048" "262144 1024" "262144 512" "131072 2048" "131072 512" "65536 512" "32768 512""
 
-rem the depth 07-perf-logger.bat measures at, and the prompt length of the measured graph.
-rem PERFPP=2048 PERFDEPTH=0 FAVARIANTS=1 gives one ubatch of 2048 at depth 0, the point gufo
+rem the depth 07-perf-logger.bat measures at, the prompt length of the measured graph and its
+rem ubatch. PERFPP=2048 PERFDEPTH=0 FAVARIANTS=1 gives one ubatch of 2048 at depth 0, the point gufo
 rem reports its prefill split at (the sparse arms do not engage below the indexer budget)
 set "PERFDEPTH=64000"
 set "PERFPP=512"
+set "PERFUB=2048"
 
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
 rem the attention itself is capped by the indexer budget, but the block keys of the indexer

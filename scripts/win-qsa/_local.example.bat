@@ -30,6 +30,7 @@ rem they all measure the same thing and only arm 1 runs
 rem set "FAVARIANTS=1 0"
 rem set "PERFDEPTH=122880"
 rem set "PERFPP=2048"
+rem set "PERFUB=1024"
 rem context and chunks of the quality runs, keep well above the ~513 block budget
 rem set "QCTX=65536"
 rem set "QCHUNKS=2"

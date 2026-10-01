@@ -21,8 +21,9 @@ if not defined SETTLE set "SETTLE=30"
 rem depth of the measured graph. the sparsity of the indexer grows with it: the budget is a
 rem fixed number of blocks, so the deeper the context the larger the share of skippable tiles
 if not defined PERFDEPTH set "PERFDEPTH=64000"
-rem prompt length of the measured graph, -ub is 2048, so up to 2048 it is one ubatch
+rem prompt length of the measured graph and the ubatch it is split into
 if not defined PERFPP set "PERFPP=512"
+if not defined PERFUB set "PERFUB=2048"
 
 if not exist "%BIN%\llama-bench.exe" (
     echo not built: %BIN%\llama-bench.exe
@@ -71,13 +72,13 @@ if "%~1"=="g" set "GGML_VK_FA_SPARSE_GROUP=1"
 if "%~1"=="r" set "GGML_VK_FA_SPARSE_GROUP=0"
 if "%~1"=="g" set "GGML_VK_FA_SPARSE_GQA=0"
 if "%~1"=="r" set "GGML_VK_FA_SPARSE_GQA=0"
-echo === sparse=%~1 pp%PERFPP% d%PERFDEPTH%
-"%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p %PERFPP% -n 0 -b 4096 -ub 2048 -d %PERFDEPTH% %LOADMODE% -r 1 --no-warmup %EXTRA% > "%LOG%" 2>&1
+echo === sparse=%~1 pp%PERFPP% ub%PERFUB% d%PERFDEPTH%
+"%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p %PERFPP% -n 0 -b 4096 -ub %PERFUB% -d %PERFDEPTH% %LOADMODE% -r 1 --no-warmup %EXTRA% > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"
 
 echo. >> "%SUM%"
-echo ### sparse=%~1 pp%PERFPP% d%PERFDEPTH% exit=%EC% >> "%SUM%"
+echo ### sparse=%~1 pp%PERFPP% ub%PERFUB% d%PERFDEPTH% exit=%EC% >> "%SUM%"
 findstr /C:"| qwen4exp" /C:"failed to load model" /C:"allocation of size" "%LOG%" >> "%SUM%"
 
 rem only the last graph is measured at the requested depth, the ones before it build the context
