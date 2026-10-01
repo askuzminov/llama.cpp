@@ -6536,9 +6536,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // every strip of M re-reads B: when B is larger than the cache budget, run the columns in parts whose B fits
+    // a quantized B is packed in q8_1_x4 blocks of 128 values, a column starts on a block when ne10 is a multiple of 128
     uint32_t n_part = (uint32_t) ne11;
-    const uint64_t y_col_bytes = (uint64_t) ne10 * (y_f32_kernel ? sizeof(float) : sizeof(ggml_fp16_t));
-    if (ctx->device->mm_chunk_bytes > 0 && !quantize_y && split_k == 1 && ne12*ne13 == 1 &&
+    const uint64_t y_col_bytes = quantize_y ? (uint64_t) ne10 / ggml_blck_size(GGML_TYPE_Q8_1) * ggml_type_size(GGML_TYPE_Q8_1) :
+                                              (uint64_t) ne10 * (y_f32_kernel ? sizeof(float) : sizeof(ggml_fp16_t));
+    if (ctx->device->mm_chunk_bytes > 0 && (!quantize_y || ne10 % 128 == 0) && split_k == 1 && ne12*ne13 == 1 &&
         CEIL_DIV(ne01, pipeline->wg_denoms[0]) > 1) {
         const uint32_t bn   = pipeline->wg_denoms[1];
         const uint64_t cols = ctx->device->mm_chunk_bytes / y_col_bytes / bn * bn;
