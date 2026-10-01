@@ -1304,6 +1304,8 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    // gated_delta_net + the cpy of its state into the recurrent cache: the cache view the op writes to
+    const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

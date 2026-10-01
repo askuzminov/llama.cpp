@@ -704,6 +704,9 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    // state output (binding 7): offset of slot 0 and the stride between slots, in elements
+    uint32_t sout_off;
+    uint32_t sout_slot_stride;
 };
 
 struct vk_op_ssm_scan_push_constants {
