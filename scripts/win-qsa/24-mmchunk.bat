@@ -1,10 +1,10 @@
 @echo off
-rem column parts of big-B matmuls (GGML_VK_MM_CHUNK_MB): a matmul whose staged B is larger than the cache
-rem budget runs its columns in parts, so the strips of M do not read B from memory again for every strip.
-rem the shape it is for is the qwen4exp hyper-connection down projection, q8_0 m 320 k 10240. first the
-rem correctness with a 0.25 MB budget, so that small shapes are split too, on the int8 path (B quantized to
-rem q8_1, the default on strix halo) and on the coopmat f16 path (int dot off). then the throughput grid:
-rem both paths, with the default budget (16 MB on an AMD APU) and with the parts off. no model needed.
+rem column parts of matmuls with a small A and a large K (GGML_VK_MM_CHUNK_MB): when A and B do not fit the
+rem cache budget, the columns run in parts one after another, so that A and the part of B in use stay in the
+rem cache. the shape it is for is the qwen4exp hyper-connection down projection, q8_0 m 320 k 10240. on strix
+rem halo with coopmat the q8_0 matmul takes B as f16 (there is no int8 pipeline next to coopmat), so int dot
+rem changes nothing here. first the correctness with a 0.5 MB budget, so that small shapes are split too, then
+rem the throughput grid over the budget: off, 16, 24 (the default on an AMD APU) and 32 MB. no model needed.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -25,17 +25,19 @@ set "MMP=type_a=q8_0,type_b=f32,m=(320|640|2560),n=(512|1024|2048|4096),k=(2560|
 set "RC=0"
 echo writing %SUM%
 
-rem arm name, int dot off (1) or on (0)
-call :test mmq 0
-call :test cm 1
+set "LOG=%LOGS%\24-mmchunk-%TS%-test.log"
+set "GGML_VK_MM_CHUNK_MB=0.5"
+echo === test, budget 0.5 MB -^> %LOG%
+"%BIN%\test-backend-ops.exe" test -b Vulkan0 -o MUL_MAT > "%LOG%" 2>&1
+set "EC=%ERRORLEVEL%"
+if not "%EC%"=="0" set "RC=%EC%"
+echo ### test, budget 0.5 MB, exit=%EC% >> "%SUM%"
+findstr /C:"tests passed" /C:"FAIL" "%LOG%" >> "%SUM%"
+echo. >> "%SUM%"
 
-rem arm name, int dot off (1) or on (0), budget in MB (empty = the default)
-call :perf mmq-16 0 ""
-call :perf mmq-0 0 0
-call :perf cm-16 1 ""
-call :perf cm-0 1 0
+rem budget in MB, 0 = off
+for %%b in (0 16 24 32) do call :perf %%b
 
-set "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT="
 set "GGML_VK_MM_CHUNK_MB="
 
 echo.
@@ -44,30 +46,14 @@ echo.
 echo done, %SUM%
 exit /b %RC%
 
-:test
-set "LOG=%LOGS%\24-mmchunk-%TS%-test-%~1.log"
-set "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT="
-if "%~2"=="1" set "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1"
-set "GGML_VK_MM_CHUNK_MB=0.25"
-echo === test %~1 -^> %LOG%
-"%BIN%\test-backend-ops.exe" test -b Vulkan0 -o MUL_MAT > "%LOG%" 2>&1
-set "EC=%ERRORLEVEL%"
-if not "%EC%"=="0" set "RC=%EC%"
-echo ### test %~1, budget 0.25 MB, exit=%EC% >> "%SUM%"
-findstr /C:"tests passed" /C:"FAIL" "%LOG%" >> "%SUM%"
-echo. >> "%SUM%"
-goto :eof
-
 :perf
 set "LOG=%LOGS%\24-mmchunk-%TS%-perf-%~1.log"
-set "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT="
-if "%~2"=="1" set "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1"
-set "GGML_VK_MM_CHUNK_MB=%~3"
-echo === perf %~1 -^> %LOG%
+set "GGML_VK_MM_CHUNK_MB=%~1"
+echo === perf, budget %~1 MB -^> %LOG%
 "%BIN%\test-backend-ops.exe" perf -b Vulkan0 -o MUL_MAT -p "%MMP%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" set "RC=%EC%"
-echo ### perf %~1, exit=%EC% >> "%SUM%"
+echo ### perf, budget %~1 MB, exit=%EC% >> "%SUM%"
 findstr /C:"MUL_MAT(" "%LOG%" >> "%SUM%"
 echo. >> "%SUM%"
 goto :eof

@@ -4900,13 +4900,13 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
 
-        // every strip of M re-reads B, so a B larger than the last level cache comes from memory once per strip.
-        // AMD APUs have a 32 MB MALL, keep each part of B to half of it. GGML_VK_MM_CHUNK_MB=0 turns this off
+        // a matmul whose A and B do not fit the last level cache reads them from memory once per tile. AMD APUs
+        // have a 32 MB MALL: keep A and the part of B that is in use to 24 MB. GGML_VK_MM_CHUNK_MB=0 turns this off
         const char * mm_chunk_mb = getenv("GGML_VK_MM_CHUNK_MB");
         if (mm_chunk_mb) {
             device->mm_chunk_bytes = (uint64_t) (std::max(0.0, atof(mm_chunk_mb)) * 1024.0 * 1024.0);
         } else {
-            device->mm_chunk_bytes = device->vendor_id == VK_VENDOR_ID_AMD && device->uma ? 16ull*1024*1024 : 0;
+            device->mm_chunk_bytes = device->vendor_id == VK_VENDOR_ID_AMD && device->uma ? 24ull*1024*1024 : 0;
         }
 
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
@@ -6535,15 +6535,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
-    // every strip of M re-reads B: when B is larger than the cache budget, run the columns in parts whose B fits
-    // a quantized B is packed in q8_1_x4 blocks of 128 values, a column starts on a block when ne10 is a multiple of 128
+    // the tiles of a column read the whole of A and a column strip of B. when A and B do not fit the cache budget
+    // and A is small (few strips of M, a large K), run the columns in parts, one after another, so that A and the
+    // part of B in use stay in the cache. a quantized B is packed in q8_1_x4 blocks of 128 values, a column starts
+    // on a block when ne10 is a multiple of 128
     uint32_t n_part = (uint32_t) ne11;
     const uint64_t y_col_bytes = quantize_y ? (uint64_t) ne10 / ggml_blck_size(GGML_TYPE_Q8_1) * ggml_type_size(GGML_TYPE_Q8_1) :
                                               (uint64_t) ne10 * (y_f32_kernel ? sizeof(float) : sizeof(ggml_fp16_t));
-    if (ctx->device->mm_chunk_bytes > 0 && (!quantize_y || ne10 % 128 == 0) && split_k == 1 && ne12*ne13 == 1 &&
-        CEIL_DIV(ne01, pipeline->wg_denoms[0]) > 1) {
-        const uint32_t bn   = pipeline->wg_denoms[1];
-        const uint64_t cols = ctx->device->mm_chunk_bytes / y_col_bytes / bn * bn;
+    const uint64_t a_bytes = qx_needs_dequant ? x_sz : ggml_nbytes(src0);
+    if (ctx->device->mm_chunk_bytes > 0 && a_bytes <= ctx->device->mm_chunk_bytes / 2 &&
+        (!quantize_y || ne10 % 128 == 0) && split_k == 1 && ne12*ne13 == 1 && CEIL_DIV(ne01, pipeline->wg_denoms[0]) > 1) {
+        const uint32_t bn    = pipeline->wg_denoms[1];
+        const uint64_t cols  = (ctx->device->mm_chunk_bytes - a_bytes) / y_col_bytes / bn * bn;
         const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
         if (cols >= bn && cols < ne11 &&
             (cols * y_col_bytes) % align == 0 && (cols * stride_d * sizeof(float)) % align == 0) {
@@ -6553,6 +6556,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // compute
     for (uint32_t n0 = 0; n0 < ne11; n0 += n_part) {
+        // parts that overlap in time would share the cache again
+        if (n0 > 0) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
         const uint32_t n1     = std::min<uint32_t>((uint32_t) ne11 - n0, n_part);
         const uint64_t y_off  = (uint64_t) n0 * y_col_bytes;
         const uint64_t d_off  = (uint64_t) n0 * stride_d * sizeof(float);
