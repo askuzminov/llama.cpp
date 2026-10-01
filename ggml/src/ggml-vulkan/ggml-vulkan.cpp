@@ -1887,17 +1887,28 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             if (wt.size() == 11 && wt[0] > 0 && wt[10] > 0 && wt[0] % wt[10] == 0 && wt[4] > 0 && wt[5] > 0 &&
                 wt[1] % wt[4] == 0 && wt[2] % wt[5] == 0 && (wt[1] / wt[4]) * (wt[2] / wt[5]) == wt[0] / wt[10] &&
-                wt[3] == 32) {
-                m_warptile_mmq   = wt;
-                m_warptile_mmqid = wt;
-                m_mmq_wg_denoms  = { wt[1], wt[2], 1 };
-                GGML_LOG_INFO("ggml_vulkan: medium quant tile %s, shared memory %s\n", mmq_tile,
-                    ggml_vk_matmul_shmem_support(device, wt, false, GGML_TYPE_Q8_0) &&
-                    ggml_vk_matmul_shmem_support(device, wt, true,  GGML_TYPE_Q8_0) ? "fits" : "does not fit, the medium tile is off");
+                wt[3] == 32 && (wt[1] & (wt[1] - 1)) == 0 && (wt[2] & (wt[2] - 1)) == 0) {
+                // shared memory as mul_mm.comp declares it: the A and B stages, the row ids of matmul_id, the coopmat
+                // stage of TM*TN accumulators per wave (f32 at worst) and the ballots
+                const uint32_t warps = wt[0] / wt[10];
+                const uint32_t shmem = (wt[1] + wt[2]) * (wt[3] + (device->coopmat_support ? 8 : 1)) * sizeof(ggml_fp16_t) +
+                                       wt[2] * 2 * sizeof(uint16_t) +
+                                       (device->coopmat_support ? wt[7] * wt[8] * warps * sizeof(float) : 0) + warps * 4 * sizeof(uint32_t);
+                if (shmem <= device->properties.limits.maxComputeSharedMemorySize) {
+                    m_warptile_mmq   = wt;
+                    m_warptile_mmqid = wt;
+                    m_mmq_wg_denoms  = { wt[1], wt[2], 1 };
+                    GGML_LOG_INFO("ggml_vulkan: medium quant tile %s, shared memory %u of %u\n", mmq_tile, shmem,
+                        device->properties.limits.maxComputeSharedMemorySize);
+                } else {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_TILE=%s ignored: needs %u bytes of shared memory, the device has %u\n",
+                        mmq_tile, shmem, device->properties.limits.maxComputeSharedMemorySize);
+                }
             } else {
                 // the loads of the quant blocks assume a K step of 32 (q5_1 and the tail of a K that is not a multiple
                 // of the step break with 64)
-                GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_TILE=%s ignored: needs 11 values, (BM/WM)*(BN/WN) == BLOCK_SIZE/WARP and BK 32\n",
+                // the tile edges are rounded with power of two masks (BM 192 fails the tests)
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_TILE=%s ignored: needs 11 values, (BM/WM)*(BN/WN) == BLOCK_SIZE/WARP, BK 32 and BM, BN powers of two\n",
                     mmq_tile);
             }
         }

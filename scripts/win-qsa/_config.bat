@@ -93,8 +93,9 @@ set "PERFUB=2048"
 rem 25-tile-sweep.bat: the medium quant tiles to try, each "BLOCK_SIZE,BM,BN,BK,WM,WN,WMITER,TM,TN,TK,WARP" in
 rem quotes. (BM/WM)*(BN/WN) must be BLOCK_SIZE/WARP, BK 32, WARP the subgroup size (64 on strix halo) and TM,TN,TK
 rem the coopmat shape (16). a wave holds (WM/16)*(WN/16) accumulators, that is what spills the large tile 128x128
-rem on 128 threads (32 of them); on 512 threads the same tile keeps 8. at most 512 threads: the coopmat stage of
-rem the shader grows with the waves. the build default 128,64,64,32,64,32,2,16,16,16,64 always runs first
+rem on 128 threads (32 of them); on 512 threads the same tile keeps 8. the windows driver gives 32 KB of shared
+rem memory: 256x64 and 256x128 do not fit. BM and BN are powers of two. the build default
+rem 128,64,64,32,64,32,2,16,16,16,64 always runs first
 set "TILES="128,64,64,32,32,64,2,16,16,16,64" "256,64,64,32,32,32,2,16,16,16,64" "256,128,64,32,64,32,2,16,16,16,64" "256,128,64,32,32,64,2,16,16,16,64" "256,64,128,32,64,32,2,16,16,16,64" "256,64,128,32,32,64,2,16,16,16,64" "256,128,128,32,64,64,2,16,16,16,64" "512,128,128,32,64,32,2,16,16,16,64" "512,128,128,32,32,64,2,16,16,16,64" "512,128,64,32,32,32,2,16,16,16,64" "512,64,128,32,32,32,2,16,16,16,64" "128,128,32,32,64,32,2,16,16,16,64" "128,32,128,32,32,64,2,16,16,16,64""
 
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
