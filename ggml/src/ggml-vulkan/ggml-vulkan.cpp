@@ -4827,6 +4827,13 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
             }
 
+            if (getenv("GGML_VK_DISABLE_F16ACC") != nullptr) {
+                // diagnostics: f32 accumulators only, a reference for the precision of the default matmuls
+                GGML_LOG_INFO("ggml_vulkan: f16 accumulators off (GGML_VK_DISABLE_F16ACC), the device %s them\n",
+                    device->coopmat_acc_f16_support ? "has" : "does not have");
+                device->coopmat_acc_f16_support = false;
+            }
+
             if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
                 // No suitable matmul mode found
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
