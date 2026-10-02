@@ -9,7 +9,9 @@ rem the quants with an int8 pipeline; a FAIL ends the run before the model is lo
 rem throughput of the qwen4exp shapes at 4096 tokens, int8 off and on. then, when the model is there:
 rem llama-bench pp4096 (ub 2048 and 4096) and tg64, and the KLD against the f16 path on wikitext, for
 rem every value of GGML_VK_INT_COOPMAT: 0 off (the KLD floor), 1 MUL_MAT and MUL_MAT_ID, 2 MUL_MAT only,
-rem 3 MUL_MAT_ID only. "26-int8.bat kld" runs the KLD step only
+rem 3 MUL_MAT_ID only. "26-int8.bat kld" runs the KLD step only. "26-int8.bat bisect" runs only the
+rem KLD of single weight groups on int8 (GGML_VK_INT_COOPMAT_FILTER, parts of the weight names): which
+rem matmuls move the output
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -32,8 +34,16 @@ set "MMP=type_a=q8_0,type_b=f32,m=(320|640|2560|6144|10240|12288),n=4096,k=(320|
 set "IDP=n_mats=512,n_used=10,b=0,m=(640|2560),n=4096"
 set "RC=0"
 set "TESTRC=0"
+set "KN=0"
+set "GGML_VK_INT_COOPMAT_FILTER="
 echo writing %SUM%
 
+rem the KLD arms, each "GGML_VK_INT_COOPMAT GGML_VK_INT_COOPMAT_FILTER". bisect: all but the hc mixers,
+rem then one group at a time - hc mixers, shared expert, attention and GDN projections, PLE and indexer,
+rem expert down, expert gate and up. "attn_" also matches hc_attn_*, hence the -hc_
+set "KLARMS="0" "1" "2" "3""
+if /i "%~1"=="bisect" set "KLARMS="1 -hc_" "2 hc_" "2 shexp" "2 attn_,ssm_,-hc_" "2 ple_,indexer" "3 down_exps" "3 gate_exps,up_exps""
+if /i "%~1"=="bisect" goto :kldonly
 if /i "%~1"=="kld" goto :kldonly
 
 call :test MUL_MAT
@@ -147,6 +157,7 @@ echo === waiting %SETTLE%s for the gpu to be released
 powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"
 set "LOG=%LOGS%\26-int8-%TS%-kl-base.log"
 set "GGML_VK_INT_COOPMAT=0"
+set "GGML_VK_INT_COOPMAT_FILTER="
 echo === kl base, int8 off, c=%INT8CTX% chunks=%INT8CHUNKS%, try %TRY% -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %INT8CTX% --chunks %INT8CHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
@@ -157,7 +168,7 @@ rem a crash leaves a truncated .dat; the base run prints "Final estimate" as its
 findstr /c:"Final estimate" "%LOG%" >nul
 if not "%ERRORLEVEL%"=="0" set "EC=1"
 if not "%EC%"=="0" goto :klbasefail
-for %%i in (0 1 2 3) do call :klarm %%i
+for %%i in (%KLARMS%) do call :klarm %%i
 del "%BASEFILE%"
 goto :eof
 
@@ -167,25 +178,36 @@ echo ### kl base run failed, see %LOG% >> "%SUM%"
 if exist "%BASEFILE%" del "%BASEFILE%"
 goto :eof
 
+rem %1 = "GGML_VK_INT_COOPMAT GGML_VK_INT_COOPMAT_FILTER", the filter may be missing
 :klarm
+set "ARM=%~1"
+set "M="
+set "F="
+for /f "tokens=1,2" %%a in ("%ARM%") do (
+    set "M=%%a"
+    set "F=%%b"
+)
+set /a KN+=1
 set "TRY=0"
 :klarm_try
 set /a TRY+=1
 echo === waiting %SETTLE%s for the gpu to be released
 powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"
-set "LOG=%LOGS%\26-int8-%TS%-kl-%~1.log"
-set "GGML_VK_INT_COOPMAT=%~1"
-echo === kl, int8 %~1 against the f16 base, try %TRY% -^> %LOG%
+set "LOG=%LOGS%\26-int8-%TS%-kl-%KN%.log"
+set "GGML_VK_INT_COOPMAT=%M%"
+set "GGML_VK_INT_COOPMAT_FILTER=%F%"
+echo === kl %KN%, int8 %M% filter "%F%" against the f16 base, try %TRY% -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %INT8CTX% --chunks %INT8CHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 set "GGML_VK_INT_COOPMAT="
+set "GGML_VK_INT_COOPMAT_FILTER="
 findstr /C:"failed to allocate" /C:"Device memory allocation" "%LOG%" >nul
 if "%ERRORLEVEL%"=="0" if %TRY% LSS 2 goto :klarm_try
 rem llama-perplexity returns 0 even when kl_divergence gives up, so check the numbers are there
 findstr /c:"Mean    KLD" "%LOG%" >nul
 if not "%ERRORLEVEL%"=="0" set "EC=1"
 if not "%EC%"=="0" set "RC=%EC%"
-echo ### kl, int8 %~1 against the f16 base, try %TRY%, exit=%EC% >> "%SUM%"
-findstr /c:"Same top" /c:"Mean PPL(Q)/PPL(base)" /c:"Mean    KLD" /c:"RMS" /c:"failed" "%LOG%" >> "%SUM%"
+echo ### kl %KN%, int8 %M% filter "%F%" against the f16 base, try %TRY%, exit=%EC% >> "%SUM%"
+findstr /c:"Same top" /c:"Mean PPL(Q)/PPL(base)" /c:"Mean    KLD" /c:"RMS" /c:"failed" /c:"int8 coopmat filter" "%LOG%" >> "%SUM%"
 echo. >> "%SUM%"
 goto :eof

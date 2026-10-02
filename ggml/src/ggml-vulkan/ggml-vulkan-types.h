@@ -764,6 +764,9 @@ struct vk_device_struct {
     uint32_t coopmat_int_k;
     // the ops that take the int8 coopmat path: bit 0 MUL_MAT, bit 1 MUL_MAT_ID
     uint32_t coopmat_int_ops;
+    // GGML_VK_INT_COOPMAT_FILTER (diagnostics): weight name parts that take (include) or skip (exclude) int8
+    std::vector<std::string> coopmat_int_include;
+    std::vector<std::string> coopmat_int_exclude;
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
