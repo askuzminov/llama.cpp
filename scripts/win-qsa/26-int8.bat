@@ -7,7 +7,9 @@ rem int8 pipeline (a FAIL ends the run before the model is loaded), then the thr
 rem at 4096 tokens, then with the model llama-bench pp4096 (ub 2048 and 4096) and tg64, and the KLD on
 rem wikitext against the most exact base: the f16 path with f32 accumulators. arms of the KLD: the default,
 rem the old default, and the base with -ub 256 (only the order of the sums changes, the noise floor of this
-rem model). "26-int8.bat kld" runs the KLD step only
+rem model). "26-int8.bat kld" runs the KLD step only. "26-int8.bat kldlong" runs it on INT8LONGCHUNKS
+rem chunks instead of INT8CHUNKS (32 by default: 8 times the tokens, a base logits file of about 16 GB),
+rem with the same arms: per-chunk values in the logs allow a paired comparison of the arms
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -41,6 +43,8 @@ set "BENCHARMS="default" "0" "0 acc16""
 set "KLARMS="default" "0 acc16" "0 acc32ub256""
 set "BASEARM=0 acc32"
 if /i "%~1"=="kld" goto :kldonly
+if /i "%~1"=="kldlong" set "INT8CHUNKS=%INT8LONGCHUNKS%"
+if /i "%~1"=="kldlong" goto :kldonly
 
 call :test MUL_MAT
 call :test MUL_MAT_ID

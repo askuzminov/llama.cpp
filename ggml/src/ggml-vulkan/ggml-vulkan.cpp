@@ -4218,6 +4218,19 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
 
+        // GGML_VK_SHMEM_LIMIT (experiment): the shared memory in bytes that the shaders may declare. above the limit
+        // the driver reports, a shader is outside the Vulkan spec: the driver may refuse it, run it, compute garbage
+        // or hang the device. the AMD driver on Windows reports 32 KB where RDNA has 64 KB per workgroup
+        if (const char * shmem_limit = getenv("GGML_VK_SHMEM_LIMIT")) {
+            const int v = atoi(shmem_limit);
+            if (v > 0) {
+                const uint32_t reported = device->properties.limits.maxComputeSharedMemorySize;
+                GGML_LOG_WARN("ggml_vulkan: shared memory limit %u -> %d (GGML_VK_SHMEM_LIMIT)%s\n", reported, v,
+                    (uint32_t) v > reported ? ", outside the Vulkan spec" : "");
+                device->properties.limits.maxComputeSharedMemorySize = (uint32_t) v;
+            }
+        }
+
         if (device->driver_id == vk::DriverId::eMoltenvk) {
             // Disable external_memory_host until https://github.com/KhronosGroup/MoltenVK/pull/2622
             // is available in the Vulkan SDK.
@@ -4849,6 +4862,13 @@ vk_device ggml_vk_get_device(size_t idx) {
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
 
+        // GGML_VK_INT_LARGE_TILE=1 (experiment): the large int8 coopmat tiles even where the large f16 tile is off,
+        // as on the AMD driver, where the f16 one spills (28.09). the shared memory check below still applies
+        const bool int_large_tile = getenv("GGML_VK_INT_LARGE_TILE") != nullptr && atoi(getenv("GGML_VK_INT_LARGE_TILE")) != 0;
+        if (int_large_tile) {
+            GGML_LOG_INFO("ggml_vulkan: large int8 coopmat tiles on (GGML_VK_INT_LARGE_TILE)\n");
+        }
+
         // Shaders
         // Disable matmul tile sizes early if performance low or not supported
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
@@ -4914,10 +4934,10 @@ vk_device ggml_vk_get_device(size_t idx) {
             }
 #endif
 
-            device->mul_mat_l_int[i]    = device->mul_mat_l[i];
+            device->mul_mat_l_int[i]    = device->mul_mat_l[i] || int_large_tile;
             device->mul_mat_m_int[i]    = device->mul_mat_m[i];
             device->mul_mat_s_int[i]    = device->mul_mat_s[i];
-            device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i];
+            device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i] || int_large_tile;
             device->mul_mat_id_m_int[i] = device->mul_mat_id_m[i];
             device->mul_mat_id_s_int[i] = device->mul_mat_id_s[i];
         }

@@ -104,6 +104,8 @@ rem path. the base logits file takes about INT8CTX x INT8CHUNKS x n_vocab x 2 by
 rem 2048 x 4 x 248320 x 2 = about 4 GB, deleted at the end
 set "INT8CTX=2048"
 set "INT8CHUNKS=4"
+rem chunks of "26-int8.bat kldlong": about 0.5 GB of base logits per chunk of 2048 (half of it is scored)
+set "INT8LONGCHUNKS=32"
 
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
 rem the attention itself is capped by the indexer budget, but the block keys of the indexer
