@@ -22,6 +22,9 @@ rem                       is nearer to the exact sums. arms: the default, int8 e
 rem                       hc mixers, the base with -ub 256 (the noise floor of a reordering at the same
 rem                       precision) and f32 everywhere (GGML_VK_DISABLE_F16); plus llama-bench of the
 rem                       default, of f32 accumulators and of int8 with f32 accumulators
+rem   26-int8.bat hc      the same base as ref; int8 with f32 accumulators everywhere but the hc up
+rem                       projections (K 320), but the hc down projections (M 320), but both; plus
+rem                       llama-bench of the default and of the first and the last of those
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -65,6 +68,10 @@ if /i "%~1"=="ref" set "BENCHARMS="0" "0 - acc32" "1 - acc32""
 if /i "%~1"=="ref" set "KLARMS="0" "1 - acc32" "1 -hc_ acc32" "0 - acc32ub256" "0 - f32""
 if /i "%~1"=="ref" set "BASEARM=0 - acc32"
 if /i "%~1"=="ref" goto :benchonly
+if /i "%~1"=="hc" set "BENCHARMS="0" "1 -hc_attn_up,-hc_ffn_up,-hc_head_up acc32" "1 -hc_ acc32""
+if /i "%~1"=="hc" set "KLARMS="1 -hc_attn_up,-hc_ffn_up,-hc_head_up acc32" "1 -hc_attn_down,-hc_ffn_down,-hc_head_down acc32" "1 -hc_ acc32""
+if /i "%~1"=="hc" set "BASEARM=0 - acc32"
+if /i "%~1"=="hc" goto :benchonly
 if /i "%~1"=="bisect" goto :kldonly
 if /i "%~1"=="kld" goto :kldonly
 if /i "%~1"=="floor" goto :benchonly
