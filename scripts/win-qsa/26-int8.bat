@@ -115,7 +115,7 @@ goto :eof
 
 rem the driver frees the memory of the previous process lazily, and a model load right after it
 rem can fail to allocate even after SETTLE (README, traps). every model run below gets one more
-rem try after another wait when its log says "failed to allocate"
+rem try after another wait when its log says "failed to allocate" or "Device memory allocation"
 :bench
 set "TRY=0"
 :bench_try
@@ -128,7 +128,7 @@ echo === llama-bench pp4096 tg64, int8 %~1, try %TRY% -^> %LOG%
 "%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p 4096 -n 64 -b 4096 -ub 2048,4096 -d 0 %LOADMODE% -r 2 %EXTRA% -o md > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 set "GGML_VK_INT_COOPMAT="
-findstr /C:"failed to allocate" "%LOG%" >nul
+findstr /C:"failed to allocate" /C:"Device memory allocation" "%LOG%" >nul
 if "%ERRORLEVEL%"=="0" if %TRY% LSS 2 goto :bench_try
 if not "%EC%"=="0" set "RC=%EC%"
 echo ### llama-bench pp4096 tg64, int8 %~1, try %TRY%, exit=%EC% >> "%SUM%"
@@ -151,7 +151,7 @@ echo === kl base, int8 off, c=%INT8CTX% chunks=%INT8CHUNKS%, try %TRY% -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %INT8CTX% --chunks %INT8CHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 set "GGML_VK_INT_COOPMAT="
-findstr /C:"failed to allocate" "%LOG%" >nul
+findstr /C:"failed to allocate" /C:"Device memory allocation" "%LOG%" >nul
 if "%ERRORLEVEL%"=="0" if %TRY% LSS 2 goto :kld_try
 rem a crash leaves a truncated .dat; the base run prints "Final estimate" as its last line
 findstr /c:"Final estimate" "%LOG%" >nul
@@ -179,7 +179,7 @@ echo === kl, int8 %~1 against the f16 base, try %TRY% -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %INT8CTX% --chunks %INT8CHUNKS% -fa on %LOADMODE% %EXTRA% --kl-divergence --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 set "GGML_VK_INT_COOPMAT="
-findstr /C:"failed to allocate" "%LOG%" >nul
+findstr /C:"failed to allocate" /C:"Device memory allocation" "%LOG%" >nul
 if "%ERRORLEVEL%"=="0" if %TRY% LSS 2 goto :klarm_try
 rem llama-perplexity returns 0 even when kl_divergence gives up, so check the numbers are there
 findstr /c:"Mean    KLD" "%LOG%" >nul

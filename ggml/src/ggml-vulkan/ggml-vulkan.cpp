@@ -6387,8 +6387,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // quants), in which case coopmat1 falls back to the f16 B-type quant matmul below.
     bool quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
                       src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
-    if (ctx->device->coopmat_int_support && !(ctx->device->coopmat_int_ops & 1u)) {
-        // GGML_VK_INT_COOPMAT=3: int8 for MUL_MAT_ID only; with coopmat the q8_1 pipelines are the int8 coopmat ones
+    if (ctx->device->coopmat_int_support && (!(ctx->device->coopmat_int_ops & 1u) || (dst->flags & GGML_TENSOR_FLAG_OUTPUT))) {
+        // GGML_VK_INT_COOPMAT=3: int8 for MUL_MAT_ID only; with coopmat the q8_1 pipelines are the int8 coopmat ones.
+        // a graph output (the logits) stays off int8 too: the error of the q8_1 activations goes straight into the
+        // result. it is a matmul only when many rows need logits (perplexity), a prompt or a decode step reads one row
         quantize_y = false;
     }
 
