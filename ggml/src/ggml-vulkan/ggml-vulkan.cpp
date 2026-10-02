@@ -1589,6 +1589,7 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
     if (src0_type == GGML_TYPE_NVFP4 && !device->ocp_fp4) {
         total += 128u * (uint32_t)sizeof(float);         // ue4m3_fp32_lut[128]
     }
+    total += warptile[7] * warptile[8] * (BLOCK_SIZE / std::max(WARP, 1u)) * (uint32_t)sizeof(float); // cm1_stage, TM x TN per warp
     if (mul_mat_id) {
         total += BN * 2u * (uint32_t)sizeof(uint16_t);   // row_ids[BN] (u16vec2)
         const uint32_t num_warps = BLOCK_SIZE / std::max(WARP, 1u);
@@ -13796,12 +13797,10 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
             return false;
         }
         // The tile shader applies the scale as it writes out, which removes a full write and read
-        // back of the matmul result at prefill. The coopmat2 shader has the binding but not the
-        // epilogue, and the integer coopmat shader (mul_mmq_cm1, quantized experts on RADV) has
-        // neither, so both stay on the old path.
+        // back of the matmul result at prefill. The integer coopmat shader (mul_mmq_cm1) does the
+        // same. The coopmat2 shader has the binding but not the epilogue, so it stays on the old path.
         if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
-            if (ctx->device->coopmat2 ||
-                (ctx->device->coopmat_int_support && ggml_is_quantized(mmid->src[0]->type))) {
+            if (ctx->device->coopmat2) {
                 return false;
             }
             // The shader indexes the scale as [token * nei0 + expert_slot].
