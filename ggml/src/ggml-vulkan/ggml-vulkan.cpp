@@ -4102,7 +4102,7 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
     const uint32_t n_wg = 512;
     const vk::DeviceSize size = n_wg * sizeof(uint32_t);
 
-    vk::ShaderModule module;
+    vk::ShaderModule shader;
     vk::DescriptorSetLayout dsl;
     vk::PipelineLayout layout;
     vk::Pipeline pipeline;
@@ -4114,13 +4114,13 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
     bool ok = false;
 
     try {
-        module = d.createShaderModule({ {}, shmem_probe_len, reinterpret_cast<const uint32_t *>(shmem_probe_data) });
+        shader = d.createShaderModule({ {}, shmem_probe_len, reinterpret_cast<const uint32_t *>(shmem_probe_data) });
         const vk::DescriptorSetLayoutBinding binding { 0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute };
         dsl = d.createDescriptorSetLayout({ {}, binding });
         layout = d.createPipelineLayout({ {}, dsl });
         const vk::SpecializationMapEntry entry { 0, 0, sizeof(uint32_t) };
         const vk::SpecializationInfo spec { 1, &entry, sizeof(uint32_t), &words };
-        const vk::PipelineShaderStageCreateInfo stage { {}, vk::ShaderStageFlagBits::eCompute, module, "main", &spec };
+        const vk::PipelineShaderStageCreateInfo stage { {}, vk::ShaderStageFlagBits::eCompute, shader, "main", &spec };
         pipeline = d.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo { {}, stage, layout }).value;
 
         buffer = d.createBuffer({ {}, size, vk::BufferUsageFlagBits::eStorageBuffer, vk::SharingMode::eExclusive });
@@ -4153,8 +4153,10 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, layout, 0, set, {});
         cmd.dispatch(n_wg, 1, 1);
-        const vk::MemoryBarrier to_host { vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead };
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, to_host, {}, {});
+        // the shader writes become visible to the host read. the barrier type stays unnamed: windows.h defines
+        // MemoryBarrier as a macro
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {},
+                            { { { vk::AccessFlagBits::eShaderWrite }, { vk::AccessFlagBits::eHostRead } } }, {}, {});
         cmd.end();
 
         fence = d.createFence({});
@@ -4186,7 +4188,7 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
     if (pipeline) d.destroyPipeline(pipeline);
     if (layout) d.destroyPipelineLayout(layout);
     if (dsl) d.destroyDescriptorSetLayout(dsl);
-    if (module) d.destroyShaderModule(module);
+    if (shader) d.destroyShaderModule(shader);
     return ok;
 }
 
