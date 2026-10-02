@@ -6,7 +6,8 @@ rem the driver may refuse a shader, run it, compute garbage or hang the gpu - th
 rem what the larger limit opens: the large int8 coopmat tile for the dense matmuls (512 threads, 128x128,
 rem about 41 KB; GGML_VK_INT_LARGE_TILE=1 turns the large int8 tiles on, at 32 KB only matmul_id takes
 rem them), larger flash attention tiles where their size follows the shared memory, more rows per pass in
-rem solve_tri. arms: default (32 KB), 64k (the limit only), 64k-large (the limit and the large int8 tiles).
+rem solve_tri. arms: 32k (the reported limit), 64k (the limit only), 64k-large (the limit and the large int8
+rem tiles). since 02.10 the RDNA3 iGPU on the AMD driver takes 64 KB by default, so 32k sets it back
 rem   1 64k-large against the CPU: MUL_MAT, MUL_MAT_ID, MUL_MAT_ID_FUSION, FLASH_ATTN_EXT (head size 128,
 rem     and the sparse cases of 01), SOLVE_TRI; a FAIL or a crash stops before the model is loaded
 rem   2 perf of the qwen4exp matmul shapes at 4096 tokens, every arm
@@ -54,12 +55,12 @@ call :test FLASH_ATTN_EXT "n_kv_max=[1-9]"
 call :test SOLVE_TRI ""
 if not "%TESTRC%"=="0" goto :failed
 
-for %%a in (default 64k 64k-large) do call :perf %%a
+for %%a in (32k 64k 64k-large) do call :perf %%a
 
 rem paths stay out of parenthesized blocks, a ")" in one would end the block
 if not exist "%MODEL%" goto :nomodel
 if not exist "%BIN%\llama-bench.exe" goto :nobench
-for %%a in (default 64k 64k-large) do call :bench %%a
+for %%a in (32k 64k 64k-large) do call :bench %%a
 goto :end
 
 :failed
@@ -82,9 +83,10 @@ echo.
 echo done, %SUM%
 exit /b %RC%
 
-rem %1 = default, 64k or 64k-large
+rem %1 = 32k, 64k or 64k-large
 :armenv
 call :armclear
+if /i "%~1"=="32k" set "GGML_VK_SHMEM_LIMIT=32768"
 if /i "%~1"=="64k" set "GGML_VK_SHMEM_LIMIT=65536"
 if /i "%~1"=="64k-large" set "GGML_VK_SHMEM_LIMIT=65536"
 if /i "%~1"=="64k-large" set "GGML_VK_INT_LARGE_TILE=1"

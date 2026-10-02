@@ -1543,7 +1543,8 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
     return supported;
 }
 
-static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+// glu: the fused gate/up shader (FUSED_GLU) keeps a second A side in shared memory
+static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type, bool glu = false) {
 
     bool kscales2 = false;    // two scale sets per block
     bool has_dm   = false;    // d+m as vec2 + b-side sum
@@ -1575,10 +1576,11 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
     const uint32_t KSCALES = kscales2 ? 2u : 1u;
 
     uint32_t total = 0;
-    total += BM * QPITCH * (uint32_t)sizeof(uint32_t);   // buf_a_qs
+    const uint32_t a_side = BM * QPITCH * (uint32_t)sizeof(uint32_t) +       // buf_a_qs
+                            (has_dm ? (BM * BK_STEP * 2u * (uint32_t)sizeof(float))   // buf_a_dm (vec2)
+                                    : (BM * BK_STEP * KSCALES * (uint32_t)sizeof(float))); // buf_a_d
+    total += glu ? 2 * a_side : a_side;
     total += BN * QPITCH * (uint32_t)sizeof(uint32_t);   // buf_b_qs
-    total += has_dm ? (BM * BK_STEP * 2u * (uint32_t)sizeof(float))   // buf_a_dm (vec2)
-                    : (BM * BK_STEP * KSCALES * (uint32_t)sizeof(float)); // buf_a_d
     total += BN * BK_STEP * (uint32_t)sizeof(float);     // buf_b_d
     if (has_dm) {
         total += BN * BK_STEP * (uint32_t)sizeof(float); // buf_b_s
@@ -1718,6 +1720,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
                             l_mmq_cm1_wg_denoms_k, m_mmq_cm1_wg_denoms_k, s_mmq_cm1_wg_denoms_k,
                             l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
+    // GGML_VK_MMQ_INT_TILE: the large int8 coopmat tile with its own workgroup size
+    bool mmq_int_tile_set = false;
+    std::array<uint32_t, 3> l_mmq_int_wg_denoms {};
 
     uint32_t l_align, m_align, s_align;
 
@@ -1917,6 +1922,36 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // the tile edges are rounded with power of two masks (BM 192 fails the tests)
                 GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_TILE=%s ignored: needs 11 values, (BM/WM)*(BN/WN) == BLOCK_SIZE/WARP, BK 32, BM and BN powers of two and >= BLOCK_SIZE*8/BK\n",
                     mmq_tile);
+            }
+        }
+
+        // GGML_VK_MMQ_INT_TILE (experiment): the large int8 coopmat tile as "BM,BN,WM,WN". a wave of cm1_sg lanes
+        // computes WM x WN, (BM/WM)*(BN/WN) waves make the workgroup. the loads of mul_mmq_cm1 guard the tile
+        // edges, so any multiple of 16 works; the shared memory is checked per type below. it takes effect where
+        // the large int8 tile is on (RADV, or GGML_VK_INT_LARGE_TILE=1)
+        const char * mmq_int_tile = getenv("GGML_VK_MMQ_INT_TILE");
+        if (mmq_int_tile && mmq_int_tile[0] && device->coopmat_int_support) {
+            std::vector<uint32_t> v;
+            std::stringstream ss(mmq_int_tile);
+            for (std::string part; std::getline(ss, part, ',');) {
+                v.push_back((uint32_t) std::stoul(part));
+            }
+            const bool shape_ok = v.size() == 4 && v[2] > 0 && v[3] > 0 && v[2] % 16 == 0 && v[3] % 16 == 0 &&
+                                  v[0] % v[2] == 0 && v[1] % v[3] == 0;
+            const uint32_t block = shape_ok ? cm1_sg * (v[0] / v[2]) * (v[1] / v[3]) : 0;
+            if (shape_ok && block > 0 && block <= device->properties.limits.maxComputeWorkGroupInvocations) {
+                l_warptile_mmq_cm1_int = { block, v[0], v[1], 32, v[2], v[3], 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
+                l_mmq_int_wg_denoms = { v[0], v[1], 1 };
+                mmq_int_tile_set = true;
+                if (!requested) {
+                    GGML_LOG_INFO("ggml_vulkan: large int8 tile %s: %u threads, q4_K fits in shared memory: matmul %s, matmul_id %s\n",
+                        mmq_int_tile, block,
+                        ggml_vk_matmul_cm1_int_shmem_support(device, l_warptile_mmq_cm1_int, false, GGML_TYPE_Q4_K) ? "yes" : "no",
+                        ggml_vk_matmul_cm1_int_shmem_support(device, l_warptile_mmq_cm1_int, true, GGML_TYPE_Q4_K) ? "yes" : "no");
+                }
+            } else if (!requested) {
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMQ_INT_TILE=%s ignored: needs BM,BN,WM,WN with WM, WN multiples of 16 that divide BM, BN and at most %u threads\n",
+                    mmq_int_tile, device->properties.limits.maxComputeWorkGroupInvocations);
             }
         }
 
@@ -2452,11 +2487,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id, true);
             if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, identity, false, false, 0, false, true);
         };
+        // the fused gate/up matmul_id (FUSED_GLU): one binding more (the up projection), and only the tiles whose
+        // two A sides fit in shared memory
+        auto cm1_create_mmq_glu = [&](ggml_type type, const std::vector<vk_tile_config>& tc_base,
+                                      const std::string& name, size_t len, const void* data) {
+            spec_fn_t identity = [](const std::vector<uint32_t>& wt, bool) { return wt; };
+            std::vector<vk_tile_config> tc;
+            for (const auto & c : filter_tc(tc_base, type, true, true)) {
+                if (ggml_vk_matmul_cm1_int_shmem_support(device, c.warptile, true, type, true)) {
+                    tc.push_back(c);
+                }
+            }
+            if (!tc.empty()) create_mm_pipelines({type, GGML_TYPE_Q8_1, true, false, true}, tc, name, len, data,
+                                                 sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count + 1, identity, false, false, 0, false, true);
+        };
 
         std::vector<vk_tile_config> tc_mmq_cm1_int = {
             {s_warptile_mmq_cm1_int, s_mmq_wg_denoms, s_align},
             {m_warptile_mmq_cm1_int, m_mmq_wg_denoms, m_align},
-            {l_warptile_mmq_cm1_int, l_mmq_wg_denoms, l_align},
+            {l_warptile_mmq_cm1_int, mmq_int_tile_set ? l_mmq_int_wg_denoms : l_mmq_wg_denoms, l_align},
         };
         std::vector<vk_tile_config> tc_mmq_cm1_int_k = {
             {s_warptile_mmq_cm1_int_k, s_mmq_cm1_wg_denoms_k, s_align},
@@ -2611,6 +2660,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create_mmq({GGML_TYPE_Q5_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_k_q8_1",   matmul_id_subgroup_q5_k_q8_1_cm1_len,   matmul_id_subgroup_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); }
+#define CM1_GLU(TYPE, tstr) cm1_create_mmq_glu(TYPE, tc_mmq_cm1_int, "matmul_id_subgroup_glu_" #tstr "_q8_1", matmul_id_subgroup_glu_##tstr##_q8_1_cm1_len, matmul_id_subgroup_glu_##tstr##_q8_1_cm1_data)
+            CM1_GLU(GGML_TYPE_Q4_0,   q4_0);
+            CM1_GLU(GGML_TYPE_Q4_1,   q4_1);
+            CM1_GLU(GGML_TYPE_Q5_0,   q5_0);
+            CM1_GLU(GGML_TYPE_Q5_1,   q5_1);
+            CM1_GLU(GGML_TYPE_Q8_0,   q8_0);
+            CM1_GLU(GGML_TYPE_IQ4_NL, iq4_nl);
+            CM1_GLU(GGML_TYPE_IQ4_XS, iq4_xs);
+            CM1_GLU(GGML_TYPE_MXFP4,  mxfp4);
+            CM1_GLU(GGML_TYPE_Q4_K,   q4_k);
+            CM1_GLU(GGML_TYPE_Q5_K,   q5_k);
+#undef CM1_GLU
         }
     } else
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -4033,6 +4094,102 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 }
 
+// runs shmem_probe.comp with `bytes` of shared memory per workgroup. true when the driver takes the shader and
+// every workgroup reads back its own data. plain Vulkan calls: it runs before the device has its pipelines
+static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
+    vk::Device d = device->device;
+    const uint32_t words = bytes / (uint32_t) sizeof(uint32_t);
+    const uint32_t n_wg = 512;
+    const vk::DeviceSize size = n_wg * sizeof(uint32_t);
+
+    vk::ShaderModule module;
+    vk::DescriptorSetLayout dsl;
+    vk::PipelineLayout layout;
+    vk::Pipeline pipeline;
+    vk::Buffer buffer;
+    vk::DeviceMemory memory;
+    vk::DescriptorPool pool;
+    vk::CommandPool cmd_pool;
+    vk::Fence fence;
+    bool ok = false;
+
+    try {
+        module = d.createShaderModule({ {}, shmem_probe_len, reinterpret_cast<const uint32_t *>(shmem_probe_data) });
+        const vk::DescriptorSetLayoutBinding binding { 0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute };
+        dsl = d.createDescriptorSetLayout({ {}, binding });
+        layout = d.createPipelineLayout({ {}, dsl });
+        const vk::SpecializationMapEntry entry { 0, 0, sizeof(uint32_t) };
+        const vk::SpecializationInfo spec { 1, &entry, sizeof(uint32_t), &words };
+        const vk::PipelineShaderStageCreateInfo stage { {}, vk::ShaderStageFlagBits::eCompute, module, "main", &spec };
+        pipeline = d.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo { {}, stage, layout }).value;
+
+        buffer = d.createBuffer({ {}, size, vk::BufferUsageFlagBits::eStorageBuffer, vk::SharingMode::eExclusive });
+        const vk::MemoryRequirements req = d.getBufferMemoryRequirements(buffer);
+        const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+        const vk::MemoryPropertyFlags host = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+        uint32_t type_idx = UINT32_MAX;
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount && type_idx == UINT32_MAX; i++) {
+            if ((req.memoryTypeBits & (1u << i)) && (mem_props.memoryTypes[i].propertyFlags & host) == host) {
+                type_idx = i;
+            }
+        }
+        if (type_idx == UINT32_MAX) {
+            throw std::runtime_error("no host visible memory type");
+        }
+        memory = d.allocateMemory({ req.size, type_idx });
+        d.bindBufferMemory(buffer, memory, 0);
+        uint32_t * errors = static_cast<uint32_t *>(d.mapMemory(memory, 0, size));
+        memset(errors, 0, size);
+
+        const vk::DescriptorPoolSize pool_size { vk::DescriptorType::eStorageBuffer, 1 };
+        pool = d.createDescriptorPool({ {}, 1, pool_size });
+        const vk::DescriptorSet set = d.allocateDescriptorSets({ pool, dsl })[0];
+        const vk::DescriptorBufferInfo buf_info { buffer, 0, size };
+        d.updateDescriptorSets(vk::WriteDescriptorSet { set, 0, 0, vk::DescriptorType::eStorageBuffer, {}, buf_info }, {});
+
+        cmd_pool = d.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, device->compute_queue->queue_family_index });
+        const vk::CommandBuffer cmd = d.allocateCommandBuffers({ cmd_pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+        cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, layout, 0, set, {});
+        cmd.dispatch(n_wg, 1, 1);
+        const vk::MemoryBarrier to_host { vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, to_host, {}, {});
+        cmd.end();
+
+        fence = d.createFence({});
+        device->compute_queue->handle->submit(vk::SubmitInfo { {}, {}, cmd }, fence);
+        if (d.waitForFences(fence, true, 10ull * 1000 * 1000 * 1000) != vk::Result::eSuccess) {
+            throw std::runtime_error("no answer in 10 s");
+        }
+
+        uint64_t bad = 0;
+        for (uint32_t i = 0; i < n_wg; i++) {
+            bad += errors[i];
+        }
+        d.unmapMemory(memory);
+        ok = bad == 0;
+        if (!ok) {
+            GGML_LOG_WARN("ggml_vulkan: shared memory probe of %u bytes: %llu words of %llu read back wrong\n", bytes,
+                (unsigned long long) bad, (unsigned long long) 4 * n_wg * words);
+        }
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("ggml_vulkan: shared memory probe of %u bytes failed: %s\n", bytes, e.what());
+        ok = false;
+    }
+
+    if (fence) d.destroyFence(fence);
+    if (cmd_pool) d.destroyCommandPool(cmd_pool);
+    if (pool) d.destroyDescriptorPool(pool);
+    if (memory) d.freeMemory(memory);
+    if (buffer) d.destroyBuffer(buffer);
+    if (pipeline) d.destroyPipeline(pipeline);
+    if (layout) d.destroyPipelineLayout(layout);
+    if (dsl) d.destroyDescriptorSetLayout(dsl);
+    if (module) d.destroyShaderModule(module);
+    return ok;
+}
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -4218,16 +4375,23 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
 
-        // GGML_VK_SHMEM_LIMIT (experiment): the shared memory in bytes that the shaders may declare. above the limit
-        // the driver reports, a shader is outside the Vulkan spec: the driver may refuse it, run it, compute garbage
-        // or hang the device. the AMD driver on Windows reports 32 KB where RDNA has 64 KB per workgroup
-        if (const char * shmem_limit = getenv("GGML_VK_SHMEM_LIMIT")) {
-            const int v = atoi(shmem_limit);
-            if (v > 0) {
-                const uint32_t reported = device->properties.limits.maxComputeSharedMemorySize;
-                GGML_LOG_WARN("ggml_vulkan: shared memory limit %u -> %d (GGML_VK_SHMEM_LIMIT)%s\n", reported, v,
-                    (uint32_t) v > reported ? ", outside the Vulkan spec" : "");
-                device->properties.limits.maxComputeSharedMemorySize = (uint32_t) v;
+        // the shared memory in bytes that the shaders may declare. above the limit the driver reports, a shader is
+        // outside the Vulkan spec: the driver may refuse it, run it, compute garbage or hang the device. the AMD
+        // driver on Windows reports 32 KB where RDNA has 64 KB per workgroup; on the RDNA3.5 iGPU of Strix Halo
+        // every test passed with 64 KB (matmul, matmul_id, flash attention, solve_tri; 02.10.2026), so the RDNA3
+        // iGPUs on that driver ask for 64 KB. GGML_VK_SHMEM_LIMIT (bytes) overrides, 32768 keeps the reported
+        // limit. a raised limit is applied below, once the queues exist and shmem_probe.comp has passed with it
+        uint32_t shmem_limit = device->properties.limits.maxComputeSharedMemorySize;
+        const char * shmem_why = nullptr;
+        if (device->driver_id == vk::DriverId::eAmdProprietary && device->architecture == AMD_RDNA3 &&
+            device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu && shmem_limit < 65536) {
+            shmem_limit = 65536;
+            shmem_why = "RDNA3 iGPU on the AMD driver";
+        }
+        if (const char * shmem_env = getenv("GGML_VK_SHMEM_LIMIT")) {
+            if (atoi(shmem_env) > 0) {
+                shmem_limit = (uint32_t) atoi(shmem_env);
+                shmem_why = "GGML_VK_SHMEM_LIMIT";
             }
         }
 
@@ -4861,6 +5025,30 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+
+        // the shared memory limit chosen above: a lower one is taken as it is, a raised one only after the probe
+        {
+            const uint32_t reported = device->properties.limits.maxComputeSharedMemorySize;
+            if (shmem_limit < reported) {
+                GGML_LOG_WARN("ggml_vulkan: shared memory limit %u -> %u (%s)\n", reported, shmem_limit, shmem_why);
+                device->properties.limits.maxComputeSharedMemorySize = shmem_limit;
+            } else if (shmem_limit > reported) {
+                if (ggml_vk_shmem_probe(device, shmem_limit)) {
+                    GGML_LOG_WARN("ggml_vulkan: shared memory limit %u -> %u (%s), outside the Vulkan spec, the probe passed\n",
+                        reported, shmem_limit, shmem_why);
+                    device->properties.limits.maxComputeSharedMemorySize = shmem_limit;
+                } else {
+                    GGML_LOG_WARN("ggml_vulkan: shared memory limit stays %u: %u bytes (%s) failed the probe\n",
+                        reported, shmem_limit, shmem_why);
+                }
+            }
+            // GGML_VK_SHMEM_PROBE=1 (diagnostics): run the probe on the limit in use as well
+            if (getenv("GGML_VK_SHMEM_PROBE") != nullptr) {
+                const uint32_t limit = device->properties.limits.maxComputeSharedMemorySize;
+                GGML_LOG_INFO("ggml_vulkan: shared memory probe of %u bytes: %s\n", limit,
+                    ggml_vk_shmem_probe(device, limit) ? "passed" : "failed");
+            }
+        }
 
         // GGML_VK_INT_LARGE_TILE=1 (experiment): the large int8 coopmat tiles even where the large f16 tile is off,
         // as on the AMD driver, where the f16 one spills (28.09). the shared memory check below still applies
@@ -6062,9 +6250,9 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 }
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
-        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
+        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false, bool glu = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
-    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc};
+    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, glu};
     auto it = ctx->device->pipeline_matmul.find(key);
     if (it == ctx->device->pipeline_matmul.end() || it->second.empty()) {
         // Try without f16acc
@@ -6102,14 +6290,19 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11, uint32_t ncols_max,
-        bool hoist_row_ids, const vk_subbuffer & fused_scale, uint32_t fusion_flags) {
+        bool hoist_row_ids, const vk_subbuffer & fused_scale, uint32_t fusion_flags, const vk_subbuffer * a2 = nullptr) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
                                               nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids), fusion_flags };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, { m, ncols_max, n_as });
+    if (a2) {
+        // FUSED_GLU: binding 6 is the up projection of the experts
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale, *a2 }, pc, { m, ncols_max, n_as });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, { m, ncols_max, n_as });
+    }
 }
 
 bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -7433,7 +7626,10 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     }
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr) {
+// glu_up, glu_dst: src0 is the gate projection of the experts, glu_up the up projection, and glu_dst (a GLU node)
+// takes silu(gate) * up from the fused int8 shader (FUSED_GLU); see ggml_vk_can_fuse_mmid_glu
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr,
+                                     const ggml_tensor * glu_up = nullptr, ggml_tensor * glu_dst = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -7474,7 +7670,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
     // With the following MUL fused in, the scaled result goes straight to the MUL destination.
-    const ggml_tensor * out_dst = fused_dst ? fused_dst : dst;
+    const ggml_tensor * out_dst = glu_dst ? glu_dst : fused_dst ? fused_dst : dst;
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)out_dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
@@ -7539,7 +7735,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     // Check for mmq first
-    const std::vector<vk_matmul_pipeline_pair>* mmp_map = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0], true) : nullptr;
+    const std::vector<vk_matmul_pipeline_pair>* mmp_map = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0], true, glu_up != nullptr) : nullptr;
+    // the fused gate/up shader exists on the int8 path only; ggml_vk_can_fuse_mmid_glu made sure it is taken
+    GGML_ASSERT(glu_up == nullptr || mmp_map != nullptr);
 
     if (mmp_map == nullptr) {
         // Fall back to f16 dequant mul mat
@@ -7797,6 +7995,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // if a token can use the same expert more than once, an expert can get up to nei0*nei1 rows
     const uint32_t ncols_max = ggml_get_op_params_i32(dst, 1) == GGML_HINT_IDS_REPEAT ? nei0*nei1 : nei1;
 
+    vk_subbuffer a2_buf {};
+    if (glu_up) {
+        a2_buf = ggml_vk_tensor_subbuffer(ctx, glu_up);
+    }
+
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
@@ -7806,7 +8009,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         stride_batch_x, stride_batch_y, ne20*ne21,
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, ncols_max, hoist_row_ids,
         fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
-        fused_scale ? 1u : 0u
+        fused_scale ? 1u : 0u,
+        glu_up ? &a2_buf : nullptr
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -8062,6 +8266,51 @@ bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx)
     return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
+// MUL_MAT_ID, MUL_MAT_ID, GLU: the experts' up and gate projections (either first) and swiglu over both, run as
+// one int8 coopmat matmul_id with two A matrices and silu(gate) * up as its output (FUSED_GLU in mul_mmq_cm1.comp).
+// it needs the int8 path of the experts, the same input and ids for both, weights of one type and layout, and a
+// batch that goes to matmul_id (decode takes mat-vec)
+static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    // GGML_VK_DISABLE_MMID_GLU: off, for comparisons
+    static const bool disabled = getenv("GGML_VK_DISABLE_MMID_GLU") != nullptr;
+    if (disabled || !ctx->device->coopmat_int_support || !(ctx->device->coopmat_int_ops & 2u) || !ctx->device->integer_dot_product) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { node_idx + 2 })) {
+        return false;
+    }
+    const ggml_tensor * a   = cgraph->nodes[node_idx];
+    const ggml_tensor * b   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr ||
+        !((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a))) {
+        return false;
+    }
+    if (a->src[1] != b->src[1] || a->src[2] != b->src[2] ||
+        ggml_get_op_params_i32(a, 1) != ggml_get_op_params_i32(b, 1)) {
+        return false;
+    }
+    const ggml_tensor * w0 = a->src[0];
+    const ggml_tensor * w1 = b->src[0];
+    if (w0->type != w1->type || !ggml_are_same_shape(w0, w1) || !ggml_are_same_stride(w0, w1) ||
+        !ggml_is_contiguous(w0) || !ggml_is_contiguous(w1) ||
+        ggml_nbytes(w0) > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    const ggml_tensor * x = a->src[1];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || (x->ne[0] * x->ne[1]) % 4 != 0) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(glu) || !ggml_are_same_shape(glu, a)) {
+        return false;
+    }
+    if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+        return false;
+    }
+    return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, w0->type, GGML_TYPE_Q8_1, (ggml_prec) a->op_params[0], true, true) != nullptr;
+}
+
 void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -8075,6 +8324,15 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // result goes straight to the MUL destination.
         const ggml_tensor * fused_scale = nullptr;
         ggml_tensor * fused_dst = nullptr;
+        if (ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 2]->op == GGML_OP_GLU) {
+            // FUSED_GLU, see ggml_vk_can_fuse_mmid_glu: silu() goes to src[0] of the GLU, or to src[1] when swapped
+            ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
+            const bool swapped = ggml_get_op_params_i32(glu, 1) != 0;
+            ggml_tensor * gate = swapped ? glu->src[1] : glu->src[0];
+            ggml_tensor * up   = swapped ? glu->src[0] : glu->src[1];
+            ggml_vk_mul_mat_id_q_f16(ctx, subctx, gate->src[0], src1, src2, gate, nullptr, nullptr, up->src[0], glu);
+            return;
+        }
         if (ctx->num_additional_fused_ops == 1) {
             ggml_tensor * mul = cgraph->nodes[node_idx + 1];
             fused_scale = (mul->src[0] == dst) ? mul->src[1] : mul->src[0];
@@ -14667,6 +14925,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mmid_glu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "MUL_MAT_ID_MUL_MAT_ID_GLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
@@ -15293,6 +15557,36 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         used[k] = true;
                     }
                 }
+            }
+        }
+
+        // MUL_MAT_ID that feeds a swiglu GLU whose other source is a MUL_MAT_ID on the same input and ids (the
+        // experts' up and gate projections): pull the other matmul and the GLU right after it, so the three run as one
+        // (FUSED_GLU, ggml_vk_can_fuse_mmid_glu). the other matmul reads only what this one reads, and the GLU only the
+        // two matmuls, so the move keeps the order valid
+        if (ctx->device->coopmat_int_support && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT_ID) {
+            const ggml_tensor * mm = graph->nodes[first_unused];
+            for (int k = first_unused + 1; k < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++k) {
+                const ggml_tensor * n = graph->nodes[k];
+                if (used[k] || n->op != GGML_OP_GLU || ggml_get_glu_op(n) != GGML_GLU_OP_SWIGLU || n->src[1] == nullptr) {
+                    continue;
+                }
+                const ggml_tensor * other = n->src[0] == mm ? n->src[1] : n->src[1] == mm ? n->src[0] : nullptr;
+                if (other == nullptr) {
+                    continue;
+                }
+                if (other->op == GGML_OP_MUL_MAT_ID && other->src[1] == mm->src[1] && other->src[2] == mm->src[2]) {
+                    for (int q = first_unused + 1; q < k; ++q) {
+                        if (graph->nodes[q] == other && !used[q]) {
+                            current_set.push_back(q);
+                            used[q] = true;
+                            current_set.push_back(k);
+                            used[k] = true;
+                            break;
+                        }
+                    }
+                }
+                break;
             }
         }
 

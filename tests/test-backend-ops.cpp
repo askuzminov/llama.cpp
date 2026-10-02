@@ -11320,6 +11320,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // prefill-sized batches go to matmul_id; on the Vulkan int8 coopmat path the experts' gate and up projections
+    // and the swiglu run as one shader there (FUSED_GLU). q6_K has no fused shader and checks the plain path
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+                           GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (bool b : {false, true}) {
+            for (int64_t m_batch : {16, 64, 200}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 96, 256,
+                    true, 16, 8, b, false, true, false, {1, 1}));
+            }
+        }
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {

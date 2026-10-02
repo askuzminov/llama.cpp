@@ -506,6 +506,10 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
 
 #endif
 
+// CM1_A_SIDE_ONLY: a second include for the up projection of the fused gate/up shader takes only the A side
+// above, with its names mapped to the second set of buffers
+#ifndef CM1_A_SIDE_ONLY
+
 // ===== B-side: load and store =====
 
 struct block_b_prefetch {
@@ -592,3 +596,5 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             }                                                                                   \
         }                                                                                       \
     }
+
+#endif // CM1_A_SIDE_ONLY

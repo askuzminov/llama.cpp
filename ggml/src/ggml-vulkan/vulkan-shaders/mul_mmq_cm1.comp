@@ -41,6 +41,17 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
 layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
+#ifdef FUSED_GLU
+// FUSED_GLU: the experts' gate projection is A (binding 0), the up projection is A2, and the result is
+// silu(gate) * up. both share the B tile, the row ids and one launch
+layout (binding = 6) readonly buffer A2 {A_TYPE data_a2[];};
+#if defined(A_TYPE_PACKED16)
+layout (binding = 6) readonly buffer A2_PACKED16 {A_TYPE_PACKED16 data_a2_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 6) readonly buffer A2_PACKED32 {A_TYPE_PACKED32 data_a2_packed32[];};
+#endif
+#endif
 #endif
 
 layout (push_constant) uniform parameter
@@ -112,6 +123,15 @@ shared vec2 buf_a_dm[BM * BK_STEP];   // .x = d, .y = m
 shared float buf_a_d[BM * BK_STEP * KSCALES];
 #endif
 
+#ifdef FUSED_GLU
+shared uint32_t buf_a2_qs[BM * QPITCH];
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+shared vec2 buf_a2_dm[BM * BK_STEP];
+#else
+shared float buf_a2_d[BM * BK_STEP * KSCALES];
+#endif
+#endif
+
 shared uint32_t buf_b_qs[BN * QPITCH];
 shared float buf_b_d[BN * BK_STEP];
 
@@ -156,6 +176,56 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 #endif
 
 #include "mul_mmq_cm1_funcs.glsl"
+
+#ifdef FUSED_GLU
+// the A side once more for the up projection: the same helpers on the second set of buffers
+#define CM1_A_SIDE_ONLY
+#define block_a_prefetch block_a2_prefetch
+#define block_a_load     block_a2_load
+#define block_a_to_shmem block_a2_to_shmem
+#define data_a           data_a2
+#define data_a_packed16  data_a2_packed16
+#define data_a_packed32  data_a2_packed32
+#define buf_a_qs         buf_a2_qs
+#define buf_a_d          buf_a2_d
+#define buf_a_dm         buf_a2_dm
+#include "mul_mmq_cm1_funcs.glsl"
+#undef CM1_A_SIDE_ONLY
+#undef block_a_prefetch
+#undef block_a_load
+#undef block_a_to_shmem
+#undef data_a
+#undef data_a_packed16
+#undef data_a_packed32
+#undef buf_a_qs
+#undef buf_a_d
+#undef buf_a_dm
+
+// the A part of PREFETCH_BLOCK and STORE_BLOCK_TO_LDS for the up projection
+#define PREFETCH_A2(blk)                                                                        \
+    [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
+        const uint buf_ib = loadc_a + li * loadstride_a;                                        \
+        if (buf_ib < BM) {                                                                      \
+            const uint ib = pos_a_ib + buf_ib * p.stride_a / BK;                                \
+            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
+                pre_a2[li * BK_STEP + ks] = block_a2_load(ib + ks, loadr_a);                    \
+            }                                                                                   \
+        }                                                                                       \
+    }
+
+#define STORE_A2_TO_LDS(blk)                                                                    \
+    [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
+        const uint buf_ib = loadc_a + li * loadstride_a;                                        \
+        if (buf_ib < BM) {                                                                      \
+            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
+                block_a2_to_shmem(pre_a2[li * BK_STEP + ks], buf_ib, ks, loadr_a);              \
+            }                                                                                   \
+        }                                                                                       \
+    }
+#else
+#define PREFETCH_A2(blk)
+#define STORE_A2_TO_LDS(blk)
+#endif
 
 void main() {
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
@@ -294,6 +364,13 @@ void main() {
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col * CM_ELEMS; i++) {
         sums[i] = ACC_TYPE(0.0);
     }
+#ifdef FUSED_GLU
+    // the up projection; sums holds the gate projection
+    ACC_TYPE sums2[cms_per_row * cms_per_col * CM_ELEMS];
+    [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col * CM_ELEMS; i++) {
+        sums2[i] = ACC_TYPE(0.0);
+    }
+#endif
 
     // Double-buffering: prefetch registers
     const uint A_LOADS = (BM + loadstride_a - 1) / loadstride_a;
@@ -301,9 +378,13 @@ void main() {
 
     block_a_prefetch pre_a[A_LOADS * BK_STEP];
     block_b_prefetch pre_b[B_LOADS * BK_STEP];
+#ifdef FUSED_GLU
+    block_a2_prefetch pre_a2[A_LOADS * BK_STEP];
+#endif
 
     if (start_k < end_k) {
         PREFETCH_BLOCK(start_k)
+        PREFETCH_A2(start_k)
     }
 
     const uint a_row0 = warp_r * WM;
@@ -318,6 +399,7 @@ void main() {
 
     for (uint block = start_k; block < end_k; block += BK * BK_STEP) {
         STORE_BLOCK_TO_LDS(block)
+        STORE_A2_TO_LDS(block)
 
         barrier();
 
@@ -327,6 +409,7 @@ void main() {
         const uint next_block = block + BK * BK_STEP;
         if (next_block < end_k) {
             PREFETCH_BLOCK(next_block)
+            PREFETCH_A2(next_block)
         }
 
         if (active_col_tile) {
@@ -334,6 +417,9 @@ void main() {
             const uint K_SUB = BK / TK;
 
 #if KSCALES == 2
+#ifdef FUSED_GLU
+#error FUSED_GLU has no two-scale (q3_K, q6_K, nvfp4) path
+#endif
             [[unroll]] for (uint h = 0; h < K_SUB; h++) {
                 [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
                     coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
@@ -372,6 +458,14 @@ void main() {
             // Preload all A/B fragments up front (ILP).
             coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[cms_per_row * K_SUB];
             coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[cms_per_col * K_SUB];
+#ifdef FUSED_GLU
+            coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a2[cms_per_row * K_SUB];
+            [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+                [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                    coopMatLoad(cache_a2[r * K_SUB + h], buf_a2_qs, (a_row0 + r * TM) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+#endif
 
             [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
                 [[unroll]] for (uint h = 0; h < K_SUB; h++) {
@@ -403,6 +497,19 @@ void main() {
                     }
                     ma[e] = dm.y;
                 }
+#ifdef FUSED_GLU
+                float scale_a2[CM_ELEMS];
+                float nbias_a2[CM_ELEMS];
+                float ma2[CM_ELEMS];
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                    vec2 dm2 = buf_a2_dm[ks * BM + a_row0 + r * TM + cm_elem_row(e)];
+                    scale_a2[e] = dm2.x;
+                    if (USE_MAGIC_BIAS) {
+                        nbias_a2[e] = -ACC_BIAS_F * scale_a2[e];
+                    }
+                    ma2[e] = dm2.y;
+                }
+#endif
 
                 [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
                     coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
@@ -419,12 +526,33 @@ void main() {
                             sums[tile_idx * CM_ELEMS + e], int(acc[e]),
                             scale_a[e], nbias_a[e], scale_b[c], ma[e] * bs[c]);
                     }
+#ifdef FUSED_GLU
+                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc2 =
+                        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(
+                            USE_MAGIC_BIAS ? ACC_BIAS_BITS : 0);
+                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                        acc2 = coopMatMulAdd(cache_a2[r * K_SUB + h], cache_b[c * K_SUB + h], acc2);
+                    }
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                        sums2[tile_idx * CM_ELEMS + e] = cm1_accumulate(
+                            sums2[tile_idx * CM_ELEMS + e], int(acc2[e]),
+                            scale_a2[e], nbias_a2[e], scale_b[c], ma2[e] * bs[c]);
+                    }
+#endif
                 }
             }
 #else
             // Preload all A/B fragments up front (ILP).
             coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[cms_per_row * K_SUB];
             coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[cms_per_col * K_SUB];
+#ifdef FUSED_GLU
+            coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a2[cms_per_row * K_SUB];
+            [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+                [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                    coopMatLoad(cache_a2[r * K_SUB + h], buf_a2_qs, (a_row0 + r * TM) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+#endif
 
             [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
                 [[unroll]] for (uint h = 0; h < K_SUB; h++) {
@@ -451,6 +579,16 @@ void main() {
                         nbias_a[e] = -ACC_BIAS_F * scale_a[e];
                     }
                 }
+#ifdef FUSED_GLU
+                float scale_a2[CM_ELEMS];
+                float nbias_a2[CM_ELEMS];
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                    scale_a2[e] = buf_a2_d[ks * BM + a_row0 + r * TM + cm_elem_row(e)];
+                    if (USE_MAGIC_BIAS) {
+                        nbias_a2[e] = -ACC_BIAS_F * scale_a2[e];
+                    }
+                }
+#endif
 
                 [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
                     coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
@@ -467,6 +605,19 @@ void main() {
                             sums[tile_idx * CM_ELEMS + e], int(acc[e]),
                             scale_a[e], nbias_a[e], scale_b[c], 0.0);
                     }
+#ifdef FUSED_GLU
+                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc2 =
+                        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(
+                            USE_MAGIC_BIAS ? ACC_BIAS_BITS : 0);
+                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                        acc2 = coopMatMulAdd(cache_a2[r * K_SUB + h], cache_b[c * K_SUB + h], acc2);
+                    }
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                        sums2[tile_idx * CM_ELEMS + e] = cm1_accumulate(
+                            sums2[tile_idx * CM_ELEMS + e], int(acc2[e]),
+                            scale_a2[e], nbias_a2[e], scale_b[c], 0.0);
+                    }
+#endif
                 }
             }
 #endif // KSCALES
@@ -478,6 +629,8 @@ void main() {
 
 #undef PREFETCH_BLOCK
 #undef STORE_BLOCK_TO_LDS
+#undef PREFETCH_A2
+#undef STORE_A2_TO_LDS
 #undef B_IB_CALC
 
     const uint dr = ir * BM + a_row0;
@@ -496,7 +649,14 @@ void main() {
 
                 const u16vec2 row_idx = row_ids[col_i - ic * BN];
                 const uint store_offset = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
+#ifdef FUSED_GLU
+                // swiglu: silu(gate) * up, as ggml_swiglu_split computes it
+                const float g = float(sums[tile_idx * CM_ELEMS + e]);
+                const float u = float(sums2[tile_idx * CM_ELEMS + e]);
+                data_d[store_offset] = D_TYPE(g / (1.0f + exp(-g)) * u);
+#else
                 data_d[store_offset] = D_TYPE(float(sums[tile_idx * CM_ELEMS + e]) * get_fused_scale(row_idx));
+#endif
             }
         }
     }

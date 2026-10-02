@@ -107,6 +107,13 @@ set "INT8CHUNKS=4"
 rem chunks of "26-int8.bat kldlong": about 0.5 GB of base logits per chunk of 2048 (half of it is scored)
 set "INT8LONGCHUNKS=32"
 
+rem 29-int8-tiles.bat: the large int8 coopmat tiles to try, each "BM,BN,WM,WN" in quotes. a wave of 32
+rem lanes computes WM x WN ((WM/16)*(WN/16) accumulators), (BM/WM)*(BN/WN) waves make the workgroup, at most
+rem 1024 threads. shared memory: the dense matmul needs about (BM+BN)*144 bytes plus the scales, matmul_id
+rem (BM+BN)*80; a tile over the limit (64 KB on the RDNA3 iGPU) is dropped for that type, see "fits" in
+rem the log. 128,128,32,32 is the large tile of the build
+set "INT8TILES="128,128,32,32" "128,128,64,32" "128,128,32,64" "128,128,64,64" "256,128,64,32" "256,128,32,32" "128,256,32,64" "256,64,64,32" "64,256,32,64" "128,64,32,32" "64,128,32,32""
+
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
 rem the attention itself is capped by the indexer budget, but the block keys of the indexer
 rem are rebuilt from the whole cache on every pass, so the decode is expected to grow with

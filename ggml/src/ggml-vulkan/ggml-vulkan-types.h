@@ -278,10 +278,12 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    // matmul_id of the experts' gate and up projections in one pass, silu(gate) * up out (FUSED_GLU)
+    bool glu = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, glu)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.glu);
     }
 };
 
