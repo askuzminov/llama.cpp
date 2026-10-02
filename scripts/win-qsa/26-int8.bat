@@ -1,30 +1,13 @@
 @echo off
-rem the int8 coopmat matmuls of the prefill (mul_mmq_cm1: activations quantized to q8_1, int8 WMMA) on
-rem the AMD driver under windows. GGML_VK_INT_COOPMAT=1 turns them on, by default they run on RADV only.
-rem the fork turned them off after upstream #29392 (garbage with the AMD driver on windows), but that
-rem issue was an old driver that hid shader_float8, so RDNA4 ran with the RDNA3 accumulator layout; it is
-rem closed. int8 WMMA is the route gufo takes for its dense q8_0 and expert matmuls.
-rem   26-int8.bat         MUL_MAT, MUL_MAT_ID and MUL_MAT_ID_FUSION against the CPU for the quants with an
-rem                       int8 pipeline (a FAIL ends the run before the model is loaded), the throughput of
-rem                       the qwen4exp shapes at 4096 tokens, then with the model llama-bench pp4096 (ub 2048
-rem                       and 4096) and tg64 and the KLD against the f16 path on wikitext for every value of
-rem                       GGML_VK_INT_COOPMAT: 0 off (the KLD floor of the same code), 1 MUL_MAT and
-rem                       MUL_MAT_ID, 2 MUL_MAT only, 3 MUL_MAT_ID only
-rem   26-int8.bat kld     the KLD step only
-rem   26-int8.bat bisect  the KLD of single weight groups on int8 (GGML_VK_INT_COOPMAT_FILTER)
-rem   26-int8.bat floor   how far the f16 path itself moves when only the order of the sums changes
-rem                       (-ub 256, fusion off, the scalar path: no coopmat, no integer dot), next to int8
-rem                       without the hc mixers and int8 everywhere; plus llama-bench of those int8 arms
-rem   26-int8.bat ref     the KLD against a more exact base: the f16 path with f32 accumulators
-rem                       (GGML_VK_DISABLE_F16ACC). the default f16 path sums quantized matmuls in f16
-rem                       accumulators when the device has them, the int8 path in int32 and f32: which one
-rem                       is nearer to the exact sums. arms: the default, int8 everywhere, int8 without the
-rem                       hc mixers, the base with -ub 256 (the noise floor of a reordering at the same
-rem                       precision) and f32 everywhere (GGML_VK_DISABLE_F16); plus llama-bench of the
-rem                       default, of f32 accumulators and of int8 with f32 accumulators
-rem   26-int8.bat hc      the same base as ref; int8 with f32 accumulators everywhere but the hc up
-rem                       projections (K 320), but the hc down projections (M 320), but both; plus
-rem                       llama-bench of the default and of the first and the last of those
+rem the int8 coopmat matmuls of the prefill (mul_mmq_cm1: activations quantized to q8_1, int8 WMMA) and the
+rem f32 accumulators of the f16 path, the default on the AMD driver for RDNA3 since 02.10.2026, against the
+rem f16 path (GGML_VK_INT_COOPMAT=0) and the old default (f16 path with f16 accumulators, GGML_VK_F16ACC=1).
+rem first MUL_MAT, MUL_MAT_ID and MUL_MAT_ID_FUSION with the default against the CPU for the quants with an
+rem int8 pipeline (a FAIL ends the run before the model is loaded), then the throughput of the qwen4exp shapes
+rem at 4096 tokens, then with the model llama-bench pp4096 (ub 2048 and 4096) and tg64, and the KLD on
+rem wikitext against the most exact base: the f16 path with f32 accumulators. arms of the KLD: the default,
+rem the old default, and the base with -ub 256 (only the order of the sums changes, the noise floor of this
+rem model). "26-int8.bat kld" runs the KLD step only
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -52,38 +35,20 @@ set "BN=0"
 call :armclear
 echo writing %SUM%
 
-rem an arm is "MODE FILTER EXTRA": MODE is GGML_VK_INT_COOPMAT, FILTER is GGML_VK_INT_COOPMAT_FILTER
-rem (parts of weight names, -x excludes, "-" alone or nothing is no filter), EXTRA is empty or ub256,
-rem nofuse, scalar, acc32, acc32ub256, f32, see :armenv. BASEARM is the arm of the KLD base.
-rem bisect: all but the hc mixers, then one group at a time - hc mixers, shared expert, attention and
-rem GDN projections, PLE and indexer, expert down, expert gate and up ("attn_" also matches hc_attn_*,
-rem hence the -hc_)
-set "BENCHARMS="0" "1" "2" "3""
-set "KLARMS="0" "1" "2" "3""
-set "BASEARM=0"
-if /i "%~1"=="bisect" set "KLARMS="1 -hc_" "2 hc_" "2 shexp" "2 attn_,ssm_,-hc_" "2 ple_,indexer" "3 down_exps" "3 gate_exps,up_exps""
-if /i "%~1"=="floor" set "BENCHARMS="0" "1" "1 -hc_""
-if /i "%~1"=="floor" set "KLARMS="0 - ub256" "0 - nofuse" "0 - scalar" "1 -hc_" "1""
-if /i "%~1"=="ref" set "BENCHARMS="0" "0 - acc32" "1 - acc32""
-if /i "%~1"=="ref" set "KLARMS="0" "1 - acc32" "1 -hc_ acc32" "0 - acc32ub256" "0 - f32""
-if /i "%~1"=="ref" set "BASEARM=0 - acc32"
-if /i "%~1"=="ref" goto :benchonly
-if /i "%~1"=="hc" set "BENCHARMS="0" "1 -hc_attn_up,-hc_ffn_up,-hc_head_up acc32" "1 -hc_ acc32""
-if /i "%~1"=="hc" set "KLARMS="1 -hc_attn_up,-hc_ffn_up,-hc_head_up acc32" "1 -hc_attn_down,-hc_ffn_down,-hc_head_down acc32" "1 -hc_ acc32""
-if /i "%~1"=="hc" set "BASEARM=0 - acc32"
-if /i "%~1"=="hc" goto :benchonly
-if /i "%~1"=="bisect" goto :kldonly
+rem an arm is "MODE EXTRA": MODE is default (no knob) or the value of GGML_VK_INT_COOPMAT (0 off, 1 on,
+rem 2 MUL_MAT only, 3 MUL_MAT_ID only), EXTRA is empty or acc16, acc32, ub256, acc32ub256, see :armenv
+set "BENCHARMS="default" "0" "0 acc16""
+set "KLARMS="default" "0 acc16" "0 acc32ub256""
+set "BASEARM=0 acc32"
 if /i "%~1"=="kld" goto :kldonly
-if /i "%~1"=="floor" goto :benchonly
 
 call :test MUL_MAT
 call :test MUL_MAT_ID
 call :test MUL_MAT_ID_FUSION
 if not "%TESTRC%"=="0" goto :failed
 
-for %%i in (0 1) do call :perf %%i
+for %%i in (0 default) do call :perf %%i
 
-:benchonly
 rem paths stay out of parenthesized blocks, a ")" in one would end the block
 if not exist "%MODEL%" goto :nomodel
 if not exist "%BIN%\llama-bench.exe" goto :nobench
@@ -120,72 +85,59 @@ echo.
 echo done, %SUM%
 exit /b %RC%
 
-rem %1 = an arm, see above. sets the knobs and ARGS (extra arguments) and ARMLABEL
+rem %1 = an arm, see above. sets the knobs, ARGS (extra arguments) and ARMLABEL
 :armenv
 set "M="
-set "F="
 set "X="
-for /f "tokens=1,2,3" %%a in ("%~1") do (
+for /f "tokens=1,2" %%a in ("%~1") do (
     set "M=%%a"
-    set "F=%%b"
-    set "X=%%c"
+    set "X=%%b"
 )
-if "%F%"=="-" set "F="
 call :armclear
 set "ARGS="
-set "GGML_VK_INT_COOPMAT=%M%"
-set "GGML_VK_INT_COOPMAT_FILTER=%F%"
+if not "%M%"=="default" set "GGML_VK_INT_COOPMAT=%M%"
+if "%X%"=="acc16" set "GGML_VK_F16ACC=1"
+if "%X%"=="acc32" set "GGML_VK_F16ACC=0"
 if "%X%"=="ub256" set "ARGS=-ub 256"
-if "%X%"=="nofuse" set "GGML_VK_DISABLE_FUSION=1"
-if "%X%"=="scalar" set "GGML_VK_DISABLE_COOPMAT=1"
-if "%X%"=="scalar" set "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1"
-if "%X%"=="acc32" set "GGML_VK_DISABLE_F16ACC=1"
-if "%X%"=="acc32ub256" set "GGML_VK_DISABLE_F16ACC=1"
+if "%X%"=="acc32ub256" set "GGML_VK_F16ACC=0"
 if "%X%"=="acc32ub256" set "ARGS=-ub 256"
-if "%X%"=="f32" set "GGML_VK_DISABLE_F16=1"
-set "ARMLABEL=int8 %M% filter "%F%" %X%"
+set "ARMLABEL=int8 %M% %X%"
 goto :eof
 
 :armclear
 set "GGML_VK_INT_COOPMAT="
-set "GGML_VK_INT_COOPMAT_FILTER="
-set "GGML_VK_DISABLE_FUSION="
-set "GGML_VK_DISABLE_COOPMAT="
-set "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT="
-set "GGML_VK_DISABLE_F16ACC="
-set "GGML_VK_DISABLE_F16="
+set "GGML_VK_F16ACC="
 goto :eof
 
-rem %1 = the op to test, always with int8 on
+rem %1 = the op to test, with the default
 :test
 set "LOG=%LOGS%\26-int8-%TS%-test-%~1.log"
-set "GGML_VK_INT_COOPMAT=1"
-echo === test %~1, int8 on -^> %LOG%
+call :armclear
+echo === test %~1, default -^> %LOG%
 "%BIN%\test-backend-ops.exe" test -b Vulkan0 -o %~1 -p "%TQP%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
-set "GGML_VK_INT_COOPMAT="
 findstr /C:"tests passed" "%LOG%" >nul
 if not "%ERRORLEVEL%"=="0" set "EC=1"
 if not "%EC%"=="0" set "RC=%EC%"
 if not "%EC%"=="0" set "TESTRC=%EC%"
-echo ### test %~1, int8 on, exit=%EC% >> "%SUM%"
+echo ### test %~1, default, exit=%EC% >> "%SUM%"
 findstr /C:"int8 coopmat" /C:"tests passed" /C:"FAIL" "%LOG%" >> "%SUM%"
 echo. >> "%SUM%"
 goto :eof
 
-rem %1 = 0 int8 off (the f16 path), 1 int8 on
+rem %1 = an arm
 :perf
 set "LOG=%LOGS%\26-int8-%TS%-perf-%~1.log"
-set "GGML_VK_INT_COOPMAT=%~1"
-echo === perf, int8 %~1 -^> %LOG%
+call :armenv %1
+echo === perf, %ARMLABEL% -^> %LOG%
 "%BIN%\test-backend-ops.exe" perf -b Vulkan0 -o MUL_MAT -p "%MMP%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 "%BIN%\test-backend-ops.exe" perf -b Vulkan0 -o MUL_MAT_ID -p "%IDP%" >> "%LOG%" 2>&1
 set "EC2=%ERRORLEVEL%"
-set "GGML_VK_INT_COOPMAT="
+call :armclear
 if not "%EC%"=="0" set "RC=%EC%"
 if not "%EC2%"=="0" set "RC=%EC2%"
-echo ### perf, int8 %~1, exit=%EC% %EC2% >> "%SUM%"
+echo ### perf, %ARMLABEL%, exit=%EC% %EC2% >> "%SUM%"
 findstr /C:"MUL_MAT(" /C:"MUL_MAT_ID(" "%LOG%" >> "%SUM%"
 echo. >> "%SUM%"
 goto :eof
@@ -210,11 +162,11 @@ findstr /C:"failed to allocate" /C:"Device memory allocation" "%LOG%" >nul
 if "%ERRORLEVEL%"=="0" if %TRY% LSS 2 goto :bench_try
 if not "%EC%"=="0" set "RC=%EC%"
 echo ### llama-bench pp4096 tg64 %BN%, %ARMLABEL%, try %TRY%, exit=%EC% >> "%SUM%"
-findstr /C:" pp4096 " /C:" tg64 " /C:"int8 coopmat" /C:"failed" "%LOG%" >> "%SUM%"
+findstr /C:" pp4096 " /C:" tg64 " /C:"failed" "%LOG%" >> "%SUM%"
 echo. >> "%SUM%"
 goto :eof
 
-rem the base logits come from BASEARM: the f16 path, or with f32 accumulators in the ref mode
+rem the base logits come from BASEARM: the f16 path with f32 accumulators
 :kld
 set "BASEFILE=%LOGS%\26-int8-kl-base-%TS%.dat"
 set "TRY=0"
@@ -235,7 +187,7 @@ findstr /c:"Final estimate" "%LOG%" >nul
 if not "%ERRORLEVEL%"=="0" set "EC=1"
 if not "%EC%"=="0" goto :klbasefail
 echo ### kl base: %ARMLABEL% >> "%SUM%"
-findstr /c:"f16 accumulators" /c:"Final estimate" "%LOG%" >> "%SUM%"
+findstr /c:"Final estimate" "%LOG%" >> "%SUM%"
 echo. >> "%SUM%"
 for %%i in (%KLARMS%) do call :klarm %%i
 del "%BASEFILE%"
@@ -256,7 +208,7 @@ echo === waiting %SETTLE%s for the gpu to be released
 powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"
 set "LOG=%LOGS%\26-int8-%TS%-kl-%KN%.log"
 call :armenv %1
-echo === kl %KN%, %ARMLABEL% against the f16 base, try %TRY% -^> %LOG%
+echo === kl %KN%, %ARMLABEL% against the base, try %TRY% -^> %LOG%
 "%BIN%\llama-perplexity.exe" -m "%MODEL%" -f "%PPLFILE%" -c %INT8CTX% --chunks %INT8CHUNKS% -fa on %LOADMODE% %EXTRA% %ARGS% --kl-divergence --kl-divergence-base "%BASEFILE%" > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
 call :armclear
@@ -266,7 +218,7 @@ rem llama-perplexity returns 0 even when kl_divergence gives up, so check the nu
 findstr /c:"Mean    KLD" "%LOG%" >nul
 if not "%ERRORLEVEL%"=="0" set "EC=1"
 if not "%EC%"=="0" set "RC=%EC%"
-echo ### kl %KN%, %ARMLABEL% against the f16 base, try %TRY%, exit=%EC% >> "%SUM%"
-findstr /c:"Same top" /c:"Mean PPL(Q)/PPL(base)" /c:"Mean    KLD" /c:"RMS" /c:"failed" /c:"int8 coopmat filter" /c:"f16 accumulators" "%LOG%" >> "%SUM%"
+echo ### kl %KN%, %ARMLABEL% against the base, try %TRY%, exit=%EC% >> "%SUM%"
+findstr /c:"Same top" /c:"Mean PPL(Q)/PPL(base)" /c:"Mean    KLD" /c:"RMS" /c:"failed" "%LOG%" >> "%SUM%"
 echo. >> "%SUM%"
 goto :eof

@@ -4720,28 +4720,14 @@ vk_device ggml_vk_get_device(size_t idx) {
 
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
 
-            // GGML_VK_INT_COOPMAT: 1 int8 coopmat for MUL_MAT and MUL_MAT_ID, 2 for MUL_MAT only, 3 for
-            // MUL_MAT_ID only, on any driver (see below); unset or 0 keeps the default
+            // GGML_VK_INT_COOPMAT: 0 int8 coopmat off, 1 on for MUL_MAT and MUL_MAT_ID, 2 for MUL_MAT only, 3 for
+            // MUL_MAT_ID only, on any driver (see below); unset keeps the default
             const char * int_coopmat_env = getenv("GGML_VK_INT_COOPMAT");
-            const int int_coopmat_mode = int_coopmat_env ? atoi(int_coopmat_env) : 0;
-            const bool int_coopmat_any_driver = int_coopmat_mode >= 1 && int_coopmat_mode <= 3;
+            const int int_coopmat_mode = int_coopmat_env ? atoi(int_coopmat_env) : -1;
+            const bool int_coopmat_default = device->driver_id == vk::DriverId::eMesaRadv ||
+                                             (device->driver_id == vk::DriverId::eAmdProprietary && device->architecture == AMD_RDNA3);
+            const bool int_coopmat_on = int_coopmat_mode < 0 ? int_coopmat_default : int_coopmat_mode >= 1 && int_coopmat_mode <= 3;
             device->coopmat_int_ops = int_coopmat_mode == 2 ? 1u : int_coopmat_mode == 3 ? 2u : 3u;
-
-            // GGML_VK_INT_COOPMAT_FILTER (diagnostics): comma separated parts of weight names. "-x" keeps the
-            // weights with x in the name off int8; with any other part only the weights that contain one take it
-            const char * int_coopmat_filter = getenv("GGML_VK_INT_COOPMAT_FILTER");
-            if (int_coopmat_filter && int_coopmat_filter[0]) {
-                std::stringstream ss(int_coopmat_filter);
-                for (std::string part; std::getline(ss, part, ',');) {
-                    if (part.size() > 1 && part[0] == '-') {
-                        device->coopmat_int_exclude.push_back(part.substr(1));
-                    } else if (!part.empty()) {
-                        device->coopmat_int_include.push_back(part[0] == '+' ? part.substr(1) : part);
-                    }
-                }
-                GGML_LOG_INFO("ggml_vulkan: int8 coopmat filter %s: %zu include, %zu exclude\n", int_coopmat_filter,
-                    device->coopmat_int_include.size(), device->coopmat_int_exclude.size());
-            }
 
             for (auto& prop : cm_props) {
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
@@ -4787,18 +4773,18 @@ vk_device ggml_vk_get_device(size_t idx) {
                            (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup &&
                            device->coopmat_int_m == 0 &&
-                           // mul_mmq_cm1 hardcodes the RDNA3 and RDNA4 accumulator layouts that RADV gives. #29392 (wrong
-                           // results with the AMD driver on Windows) came from an old driver without shader_float8, so RDNA4
-                           // got the RDNA3 layout; driver 26.10.44 fixed it. other drivers are not verified,
-                           // GGML_VK_INT_COOPMAT=1 allows them
-                           (device->driver_id == vk::DriverId::eMesaRadv || int_coopmat_any_driver)
+                           // mul_mmq_cm1 hardcodes the RDNA3 and RDNA4 accumulator layouts. RADV gives both; the AMD driver
+                           // gives the RDNA3 one (Strix Halo, test-backend-ops and KLD, 02.10.2026). #29392 (wrong results
+                           // with the AMD driver on Windows) came from an old driver without shader_float8, so RDNA4 got the
+                           // RDNA3 layout; driver 26.10.44 fixed it, RDNA4 on the AMD driver is not verified here
+                           int_coopmat_on
                 ) {
                     device->coopmat_int_support = true;
                     device->coopmat_int_m = prop.MSize;
                     device->coopmat_int_n = prop.NSize;
                     device->coopmat_int_k = prop.KSize;
                     if (device->driver_id != vk::DriverId::eMesaRadv || int_coopmat_mode > 1) {
-                        GGML_LOG_INFO("ggml_vulkan: int8 coopmat %ux%ux%u on (GGML_VK_INT_COOPMAT) for %s, architecture %s, subgroup %u-%u\n",
+                        GGML_LOG_INFO("ggml_vulkan: int8 coopmat %ux%ux%u on for %s, architecture %s, subgroup %u-%u\n",
                             prop.MSize, prop.NSize, prop.KSize,
                             device->coopmat_int_ops == 1 ? "MUL_MAT" : device->coopmat_int_ops == 2 ? "MUL_MAT_ID" : "MUL_MAT and MUL_MAT_ID",
                             device->architecture == AMD_RDNA3 ? "RDNA3" : device->architecture == AMD_RDNA4 ? "RDNA4" : "other, no int8 pipelines",
@@ -4827,10 +4813,11 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
             }
 
-            if (getenv("GGML_VK_DISABLE_F16ACC") != nullptr) {
-                // diagnostics: f32 accumulators only, a reference for the precision of the default matmuls
-                GGML_LOG_INFO("ggml_vulkan: f16 accumulators off (GGML_VK_DISABLE_F16ACC), the device %s them\n",
-                    device->coopmat_acc_f16_support ? "has" : "does not have");
+            // f16 accumulators of the coopmat matmuls, off by default on the AMD driver. Strix Halo, qwen4exp, KLD against
+            // f32 accumulators: 0.019, twice what a mere reordering of the sums gives (0.010), for 1% of the prefill.
+            // GGML_VK_F16ACC=0 or 1 overrides
+            const char * f16acc_env = getenv("GGML_VK_F16ACC");
+            if (f16acc_env ? atoi(f16acc_env) == 0 : device->driver_id == vk::DriverId::eAmdProprietary) {
                 device->coopmat_acc_f16_support = false;
             }
 
@@ -6354,24 +6341,6 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
     return pipeline;
 }
 
-// GGML_VK_INT_COOPMAT_FILTER: may this weight take the int8 coopmat path
-static bool ggml_vk_int_coopmat_weight_ok(const vk_device & device, const ggml_tensor * w) {
-    for (const auto & part : device->coopmat_int_exclude) {
-        if (strstr(w->name, part.c_str()) != nullptr) {
-            return false;
-        }
-    }
-    if (device->coopmat_int_include.empty()) {
-        return true;
-    }
-    for (const auto & part : device->coopmat_int_include) {
-        if (strstr(w->name, part.c_str()) != nullptr) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -6428,11 +6397,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // quants), in which case coopmat1 falls back to the f16 B-type quant matmul below.
     bool quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
                       src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
-    if (ctx->device->coopmat_int_support && (!(ctx->device->coopmat_int_ops & 1u) || (dst->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-                                             !ggml_vk_int_coopmat_weight_ok(ctx->device, src0))) {
+    if (ctx->device->coopmat_int_support && (!(ctx->device->coopmat_int_ops & 1u) || (dst->flags & GGML_TENSOR_FLAG_OUTPUT) || ne10 < 512)) {
         // GGML_VK_INT_COOPMAT=3: int8 for MUL_MAT_ID only; with coopmat the q8_1 pipelines are the int8 coopmat ones.
         // a graph output (the logits) stays off int8 too: the error of the q8_1 activations goes straight into the
-        // result. it is a matmul only when many rows need logits (perplexity), a prompt or a decode step reads one row
+        // result. it is a matmul only when many rows need logits (perplexity), a prompt or a decode step reads one row.
+        // so does K under 512: on Strix Halo the qwen4exp hc up projection (K 320) is 41% slower on int8 and takes
+        // the KLD against exact sums from 0.020 to 0.044
         quantize_y = false;
     }
 
@@ -7543,7 +7513,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
-    if (ctx->device->coopmat_int_support && (!(ctx->device->coopmat_int_ops & 2u) || !ggml_vk_int_coopmat_weight_ok(ctx->device, src0))) {
+    if (ctx->device->coopmat_int_support && !(ctx->device->coopmat_int_ops & 2u)) {
         // GGML_VK_INT_COOPMAT=2: int8 for MUL_MAT only
         quantize_y = false;
     }
