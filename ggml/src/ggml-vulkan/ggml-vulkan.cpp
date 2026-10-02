@@ -1589,7 +1589,6 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
     if (src0_type == GGML_TYPE_NVFP4 && !device->ocp_fp4) {
         total += 128u * (uint32_t)sizeof(float);         // ue4m3_fp32_lut[128]
     }
-    total += warptile[7] * warptile[8] * (BLOCK_SIZE / std::max(WARP, 1u)) * (uint32_t)sizeof(float); // cm1_stage, TM x TN per warp
     if (mul_mat_id) {
         total += BN * 2u * (uint32_t)sizeof(uint16_t);   // row_ids[BN] (u16vec2)
         const uint32_t num_warps = BLOCK_SIZE / std::max(WARP, 1u);
@@ -4721,8 +4720,12 @@ vk_device ggml_vk_get_device(size_t idx) {
 
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
 
+            // GGML_VK_INT_COOPMAT: 1 int8 coopmat for MUL_MAT and MUL_MAT_ID, 2 for MUL_MAT only, 3 for
+            // MUL_MAT_ID only, on any driver (see below); unset or 0 keeps the default
             const char * int_coopmat_env = getenv("GGML_VK_INT_COOPMAT");
-            const bool int_coopmat_any_driver = int_coopmat_env && atoi(int_coopmat_env) != 0;
+            const int int_coopmat_mode = int_coopmat_env ? atoi(int_coopmat_env) : 0;
+            const bool int_coopmat_any_driver = int_coopmat_mode >= 1 && int_coopmat_mode <= 3;
+            device->coopmat_int_ops = int_coopmat_mode == 2 ? 1u : int_coopmat_mode == 3 ? 2u : 3u;
 
             for (auto& prop : cm_props) {
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
@@ -4778,9 +4781,10 @@ vk_device ggml_vk_get_device(size_t idx) {
                     device->coopmat_int_m = prop.MSize;
                     device->coopmat_int_n = prop.NSize;
                     device->coopmat_int_k = prop.KSize;
-                    if (device->driver_id != vk::DriverId::eMesaRadv) {
-                        GGML_LOG_INFO("ggml_vulkan: int8 coopmat %ux%ux%u on (GGML_VK_INT_COOPMAT), architecture %s, subgroup %u-%u\n",
+                    if (device->driver_id != vk::DriverId::eMesaRadv || int_coopmat_mode > 1) {
+                        GGML_LOG_INFO("ggml_vulkan: int8 coopmat %ux%ux%u on (GGML_VK_INT_COOPMAT) for %s, architecture %s, subgroup %u-%u\n",
                             prop.MSize, prop.NSize, prop.KSize,
+                            device->coopmat_int_ops == 1 ? "MUL_MAT" : device->coopmat_int_ops == 2 ? "MUL_MAT_ID" : "MUL_MAT and MUL_MAT_ID",
                             device->architecture == AMD_RDNA3 ? "RDNA3" : device->architecture == AMD_RDNA4 ? "RDNA4" : "other, no int8 pipelines",
                             device->subgroup_min_size, device->subgroup_max_size);
                     }
@@ -6383,6 +6387,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // quants), in which case coopmat1 falls back to the f16 B-type quant matmul below.
     bool quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
                       src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+    if (ctx->device->coopmat_int_support && !(ctx->device->coopmat_int_ops & 1u)) {
+        // GGML_VK_INT_COOPMAT=3: int8 for MUL_MAT_ID only; with coopmat the q8_1 pipelines are the int8 coopmat ones
+        quantize_y = false;
+    }
 
     // Check for mmq first
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -7491,6 +7499,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    if (ctx->device->coopmat_int_support && !(ctx->device->coopmat_int_ops & 2u)) {
+        // GGML_VK_INT_COOPMAT=2: int8 for MUL_MAT only
+        quantize_y = false;
+    }
 
     // Check for mmq first
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0], true) : nullptr;

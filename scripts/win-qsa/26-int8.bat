@@ -7,8 +7,9 @@ rem closed. int8 WMMA is the route gufo takes for its dense q8_0 and expert matm
 rem MUL_MAT_ID and MUL_MAT_ID_FUSION (the router weight applied as the matmul writes) against the CPU for
 rem the quants with an int8 pipeline; a FAIL ends the run before the model is loaded. then the
 rem throughput of the qwen4exp shapes at 4096 tokens, int8 off and on. then, when the model is there:
-rem llama-bench pp4096 (ub 2048 and 4096) and tg64 off and on, and the KLD of the int8 path against the
-rem f16 path on wikitext, plus an off arm for the noise floor. "26-int8.bat kld" runs the KLD step only
+rem llama-bench pp4096 (ub 2048 and 4096) and tg64, and the KLD against the f16 path on wikitext, for
+rem every value of GGML_VK_INT_COOPMAT: 0 off (the KLD floor), 1 MUL_MAT and MUL_MAT_ID, 2 MUL_MAT only,
+rem 3 MUL_MAT_ID only. "26-int8.bat kld" runs the KLD step only
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -45,7 +46,7 @@ for %%i in (0 1) do call :perf %%i
 rem paths stay out of parenthesized blocks, a ")" in one would end the block
 if not exist "%MODEL%" goto :nomodel
 if not exist "%BIN%\llama-bench.exe" goto :nobench
-for %%i in (0 1) do call :bench %%i
+for %%i in (0 1 2 3) do call :bench %%i
 
 :kldonly
 if not exist "%MODEL%" goto :nomodel
@@ -136,7 +137,7 @@ echo. >> "%SUM%"
 goto :eof
 
 rem the base logits come from the f16 path (int8 off). arm 0 repeats the base and gives the noise
-rem floor, arm 1 is the int8 path
+rem floor, arms 1-3 are the int8 scopes
 :kld
 set "BASEFILE=%LOGS%\26-int8-kl-base-%TS%.dat"
 set "TRY=0"
@@ -156,7 +157,7 @@ rem a crash leaves a truncated .dat; the base run prints "Final estimate" as its
 findstr /c:"Final estimate" "%LOG%" >nul
 if not "%ERRORLEVEL%"=="0" set "EC=1"
 if not "%EC%"=="0" goto :klbasefail
-for %%i in (0 1) do call :klarm %%i
+for %%i in (0 1 2 3) do call :klarm %%i
 del "%BASEFILE%"
 goto :eof
 

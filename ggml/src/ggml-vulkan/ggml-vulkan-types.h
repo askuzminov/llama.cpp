@@ -762,6 +762,8 @@ struct vk_device_struct {
     uint32_t coopmat_int_m;
     uint32_t coopmat_int_n;
     uint32_t coopmat_int_k;
+    // the ops that take the int8 coopmat path: bit 0 MUL_MAT, bit 1 MUL_MAT_ID
+    uint32_t coopmat_int_ops;
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
