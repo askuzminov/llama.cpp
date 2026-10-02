@@ -340,6 +340,7 @@ struct cmd_params {
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
     bool                             offline;
+    int                              n_ctx;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
     std::vector<std::pair<int, int>> n_pg;
@@ -386,6 +387,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_file              */ {},
     /* hf_token             */ "",
     /* offline              */ false,
+    /* n_ctx                */ 0,
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -466,6 +468,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  -c, --ctx-size <n>                                smallest context of every test, the compute buffers are reserved\n");
+    printf("                                                    for it as llama-server does for its -c (default: %d = the test size)\n", cmd_params_defaults.n_ctx);
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -541,6 +545,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.n_ctx                = cmd_params_defaults.n_ctx;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -627,6 +632,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_batch.insert(params.n_batch.end(), p.begin(), p.end());
+            } else if (arg == "-c" || arg == "--ctx-size") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.n_ctx = std::stoi(argv[i]);
             } else if (arg == "-ub" || arg == "--ubatch-size") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2368,6 +2379,10 @@ int llama_bench(int argc, char ** argv) {
                 return 1;
             }
             prev_inst = &inst;
+        }
+
+        if (params.n_ctx > 0) {
+            cparams.n_ctx = std::max<uint32_t>(cparams.n_ctx, (uint32_t) params.n_ctx);
         }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);

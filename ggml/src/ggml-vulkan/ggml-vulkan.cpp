@@ -3242,7 +3242,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_IQ4_NL],  "get_rows_iq4_nl",  get_rows_iq4_nl_len,  get_rows_iq4_nl_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_MXFP4],   "get_rows_mxfp4",   get_rows_mxfp4_len,   get_rows_mxfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_NVFP4],   "get_rows_nvfp4",   get_rows_nvfp4_len,   get_rows_nvfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_I32],     "get_rows_i32",     get_rows_i32_len,     get_rows_i32_data,     "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_I32],     "get_rows_i32",     get_rows_i32_len,     get_rows_i32_data,     "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_F32 ], "get_rows_f32_f32",  get_rows_f32_f32_len,  get_rows_f32_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_F16 ], "get_rows_f16_f32",  get_rows_f16_f32_len,  get_rows_f16_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -3272,6 +3272,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_IQ4_NL],  "get_rows_iq4_nl_f32",  get_rows_iq4_nl_f32_len,  get_rows_iq4_nl_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_MXFP4],   "get_rows_mxfp4_f32",   get_rows_mxfp4_f32_len,   get_rows_mxfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_NVFP4],   "get_rows_nvfp4_f32",   get_rows_nvfp4_f32_len,   get_rows_nvfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+
+    // spec constants: norepeat (unused), FLAT_ROWS
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_F32 ],     "get_rows_flat_f32",      get_rows_f32_len,      get_rows_f32_data,      "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_F16 ],     "get_rows_flat_f16",      get_rows_f16_len,      get_rows_f16_data,      "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_BF16],     "get_rows_flat_bf16",     get_rows_bf16_len,     get_rows_bf16_data,     "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat[GGML_TYPE_I32],      "get_rows_flat_i32",      get_rows_i32_len,      get_rows_i32_data,      "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat_f32[GGML_TYPE_F32 ], "get_rows_flat_f32_f32",  get_rows_f32_f32_len,  get_rows_f32_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat_f32[GGML_TYPE_F16 ], "get_rows_flat_f16_f32",  get_rows_f16_f32_len,  get_rows_f16_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_flat_f32[GGML_TYPE_BF16], "get_rows_flat_bf16_f32", get_rows_bf16_f32_len, get_rows_bf16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
@@ -9062,22 +9071,35 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+// GET_ROWS: rows shorter than the 512-wide workgroup take the flat pipeline, which spreads the elements of
+// all rows over the workgroup; one row per workgroup leaves it mostly idle (one-element rows: 1 of 512)
+static bool ggml_vk_get_rows_flat(const ggml_tensor * src0, const ggml_tensor * src1) {
+    // GGML_VK_DISABLE_GET_ROWS_FLAT (experiment): the old dispatch, for the comparison
+    static const bool disabled = getenv("GGML_VK_DISABLE_GET_ROWS_FLAT") != nullptr;
+    return !disabled &&
+           (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_I32) &&
+           src0->ne[0] < 512 && (uint64_t)src0->ne[0] * src1->ne[0] <= UINT32_MAX / 2;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
+        {
         GGML_ASSERT(src1->type == GGML_TYPE_I32);
+        const bool flat = ggml_vk_get_rows_flat(src0, src1);
         if (src0->type == GGML_TYPE_I32) {
             // i32 src only supports i32 result
             GGML_ASSERT(dst->type == GGML_TYPE_I32);
-            return ctx->device->pipeline_get_rows[src0->type];
+            return flat ? ctx->device->pipeline_get_rows_flat[src0->type] : ctx->device->pipeline_get_rows[src0->type];
         }
         if (dst->type == GGML_TYPE_F16) {
-            return ctx->device->pipeline_get_rows[src0->type];
+            return flat ? ctx->device->pipeline_get_rows_flat[src0->type] : ctx->device->pipeline_get_rows[src0->type];
         }
         if (dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_get_rows_f32[src0->type];
+            return flat ? ctx->device->pipeline_get_rows_flat_f32[src0->type] : ctx->device->pipeline_get_rows_f32[src0->type];
         }
         return nullptr;
+        }
     case GGML_OP_GET_ROWS_BACK:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_get_rows_back_f32;
@@ -9944,6 +9966,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
         } break;
     case GGML_OP_GET_ROWS:
+        if (ggml_vk_get_rows_flat(src0, src1)) {
+            // x: the elements of all ne10 rows, y: the ne11 * ne12 batches. the shader loops past both limits
+            const uint64_t max_x = (uint64_t)ctx->device->properties.limits.maxComputeWorkGroupCount[0] * pipeline->wg_denoms[0];
+            elements = { (uint32_t)std::min<uint64_t>(ne00 * ne10, max_x), (uint32_t)(ne11 * ne12), 1 };
+            elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+            break;
+        }
         elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
         elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);

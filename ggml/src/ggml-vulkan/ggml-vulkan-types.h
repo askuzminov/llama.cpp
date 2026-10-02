@@ -825,6 +825,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
+    // rows shorter than the workgroup (f32, f16, bf16, i32 sources)
+    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;

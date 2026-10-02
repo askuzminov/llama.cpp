@@ -114,6 +114,20 @@ rem (BM+BN)*80; a tile over the limit (64 KB on the RDNA3 iGPU) is dropped for t
 rem the log. 128,128,32,32 is the large tile of the build
 set "INT8TILES="128,128,32,32" "128,128,64,32" "128,128,32,64" "128,128,64,64" "256,128,64,32" "256,128,32,32" "128,256,32,64" "256,64,64,32" "64,256,32,64" "128,64,32,32" "64,128,32,32""
 
+rem 32-depth.bat: prefill against the depth of the context. each depth is filled before it is measured, so
+rem an arm costs about the sum of the depths in prefill time (~13 min for this list). 139264 is past n_kv
+rem 131072, where the old indexer put its scores on the CPU at -ub 4096
+set "DEPTH32=0,32768,65536,122880,139264"
+rem arms of the sweep, "build ubatch [ctx]": new = this build, old = the llama-bench.exe in OLDBIN32, ctx = the
+rem context the buffers are reserved for (llama-bench -c, as llama-server -c; empty = the size of the test,
+rem an older llama-bench has no -c)
+set "ARMS32="new 4096 262144" "new 4096" "old 4096""
+rem per-op profiles of one ubatch, "build ubatch depth [ctx]", one model load and one fill each
+set "PROF32="new 4096 122880 262144" "old 4096 122880""
+rem the bin folder of an older build to compare with (the one that held its speed with depth); empty skips
+rem the old arms. set it in _local.bat
+set "OLDBIN32="
+
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
 rem the attention itself is capped by the indexer budget, but the block keys of the indexer
 rem are rebuilt from the whole cache on every pass, so the decode is expected to grow with

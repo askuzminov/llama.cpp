@@ -9349,6 +9349,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // one- and four-element rows (the qwen4exp sparse attention gathers) and an i32 row wider than 512
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 1, 64, 33, 16, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 32, 100000, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1000, 5, 4, 2, 1, false));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
@@ -10479,6 +10483,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+    // 512 experts at prefill ubatch sizes (about 40 and 80 rows per expert)
+    for (int n : {2048, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 10, false, 64, n, 256));
+    }
 
     // MoE cache: 37 slots and the zero slot, n_used 10 uses the templated ids helper and n_used 5 the generic one
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_M}) {
@@ -11976,6 +11984,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // qwen4exp sparse attention gathers at a 4096-token ubatch: the KQ mask value of each selected cell
+    // (one-element rows) and the cells of each selected 4-cell block
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 1, 4096, 2052, 4096, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 1024, 513*4096, 1, 1, false));
 
     return test_cases;
 }

@@ -34,6 +34,9 @@ rem set "PERFUB=1024"
 rem set "TILES="512,128,128,32,64,32,2,16,16,16,64" "256,128,64,32,64,32,2,16,16,16,64""
 rem set "INT8CTX=4096"
 rem set "INT8CHUNKS=2"
+rem 32-depth.bat: the older build to compare with, and the depths of the sweep
+rem set "OLDBIN32=C:\Users\AI\Documents\github\llamacpp\llama.cpp\build-win\bin\Release"
+rem set "DEPTH32=0,65536,122880"
 rem context and chunks of the quality runs, keep well above the ~513 block budget
 rem set "QCTX=65536"
 rem set "QCHUNKS=2"
