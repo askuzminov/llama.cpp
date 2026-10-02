@@ -4720,6 +4720,9 @@ vk_device ggml_vk_get_device(size_t idx) {
 
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
 
+            const char * int_coopmat_env = getenv("GGML_VK_INT_COOPMAT");
+            const bool int_coopmat_any_driver = int_coopmat_env && atoi(int_coopmat_env) != 0;
+
             for (auto& prop : cm_props) {
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
 
@@ -4764,13 +4767,22 @@ vk_device ggml_vk_get_device(size_t idx) {
                            (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup &&
                            device->coopmat_int_m == 0 &&
-                           // mul_mmq_cm1 assumes the RADV accumulator layout, the AMD proprietary driver gives wrong results (#29392)
-                           device->driver_id == vk::DriverId::eMesaRadv
+                           // mul_mmq_cm1 hardcodes the RDNA3 and RDNA4 accumulator layouts that RADV gives. #29392 (wrong
+                           // results with the AMD driver on Windows) came from an old driver without shader_float8, so RDNA4
+                           // got the RDNA3 layout; driver 26.10.44 fixed it. other drivers are not verified,
+                           // GGML_VK_INT_COOPMAT=1 allows them
+                           (device->driver_id == vk::DriverId::eMesaRadv || int_coopmat_any_driver)
                 ) {
                     device->coopmat_int_support = true;
                     device->coopmat_int_m = prop.MSize;
                     device->coopmat_int_n = prop.NSize;
                     device->coopmat_int_k = prop.KSize;
+                    if (device->driver_id != vk::DriverId::eMesaRadv) {
+                        GGML_LOG_INFO("ggml_vulkan: int8 coopmat %ux%ux%u on (GGML_VK_INT_COOPMAT), architecture %s, subgroup %u-%u\n",
+                            prop.MSize, prop.NSize, prop.KSize,
+                            device->architecture == AMD_RDNA3 ? "RDNA3" : device->architecture == AMD_RDNA4 ? "RDNA4" : "other, no int8 pipelines",
+                            device->subgroup_min_size, device->subgroup_max_size);
+                    }
                 }
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (bfloat16_support &&

@@ -32,6 +32,8 @@ rem set "PERFDEPTH=122880"
 rem set "PERFPP=2048"
 rem set "PERFUB=1024"
 rem set "TILES="512,128,128,32,64,32,2,16,16,16,64" "256,128,64,32,64,32,2,16,16,16,64""
+rem set "INT8CTX=4096"
+rem set "INT8CHUNKS=2"
 rem context and chunks of the quality runs, keep well above the ~513 block budget
 rem set "QCTX=65536"
 rem set "QCHUNKS=2"

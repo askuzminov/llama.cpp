@@ -99,6 +99,12 @@ rem pass, 512 threads on a 64 side give wrong results). the build default
 rem 128,64,64,32,64,32,2,16,16,16,64 always runs first
 set "TILES="128,64,64,32,32,64,2,16,16,16,64" "256,64,64,32,32,32,2,16,16,16,64" "256,128,64,32,64,32,2,16,16,16,64" "256,128,64,32,32,64,2,16,16,16,64" "256,64,128,32,64,32,2,16,16,16,64" "256,64,128,32,32,64,2,16,16,16,64" "256,128,128,32,64,64,2,16,16,16,64" "512,128,128,32,64,32,2,16,16,16,64" "512,128,128,32,32,64,2,16,16,16,64" "128,128,32,32,64,32,2,16,16,16,64" "128,32,128,32,32,64,2,16,16,16,64""
 
+rem 26-int8.bat: context and wikitext chunks of the KLD of the int8 coopmat path against the f16
+rem path. the base logits file takes about INT8CTX x INT8CHUNKS x n_vocab x 2 bytes, for qwen4exp
+rem 2048 x 4 x 248320 x 2 = about 4 GB, deleted at the end
+set "INT8CTX=2048"
+set "INT8CHUNKS=4"
+
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
 rem the attention itself is capped by the indexer budget, but the block keys of the indexer
 rem are rebuilt from the whole cache on every pass, so the decode is expected to grow with
