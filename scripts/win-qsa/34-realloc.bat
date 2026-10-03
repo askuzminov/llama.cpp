@@ -1,16 +1,17 @@
 @echo off
-rem why the scheduler reserves its buffers again on every ubatch (03.10). in the 33 run at -c 262144 -ub 4096 the graph
-rem phase of each ubatch of the depth fill waited for the gpu (4.9 to 5.8 s, the gpu time of the ubatch before) and
-rem took 555 ms on the measured ubatch: a sync of all backends, a new buffer plan and a larger buffer each time. on the
-rem Mac the same chain starts when the graph the buffers are reserved with (n_kv = n_ctx) has an op that supports_op
-rem sends to the CPU because a tensor is over the buffer limit, while the real graphs run it on the gpu: the first
-rem real graph reserves again with its own (small) sizes, and each later graph with a larger n_kv no longer fits. the
-rem KQ mask at n_ctx 262144 and a 4096-token ubatch is exactly 2 GiB (f16): on the Mac with the limit set to 2 GiB - 1
-rem its FILL and SET_ROWS go to the CPU in the reserved graph and the chain follows, with the limit at 2 GiB it does not.
-rem GGML_SCHED_LOG_REALLOC=1 prints the limits of the device, the splits of every reserved graph (with the ops that
-rem left the gpu) and the cause of each re-reserve.
-rem   llama-bench pp4096 at d8192 (two ubatches of fill, then the measured one) for each -c of CTX34. 261888 is the
-rem   largest multiple of 256 with the mask under 2 GiB, 131072 has it at 1 GiB
+rem the scheduler planned its buffers again on every ubatch of a prompt (03.10). the run of 03.10 11:32 found the cause:
+rem the graph the buffers are reserved with has the logits of all 4096 tokens, a [248320, 4096] f32 matmul of 4 GB,
+rem over the 2 GiB buffer limit of the driver, so that matmul runs on the CPU there (3 splits, 7157 nodes). a prompt
+rem ubatch needs the logits of one token at most and runs it on the gpu (2 splits, 7153 nodes): the first ubatch plans
+rem again for its own small sizes, and each next ubatch with a larger KV no longer fits and plans again. the graph phase
+rem of every ubatch then waits for the gpu (a sync, 4.9 to 5.8 s in the depth fill) and costs 125 ms at d8192, 555 ms at
+rem d122880. the same at -c 262144, 261888 and 131072: the size of the context does not matter, the ubatch does (the
+rem logits of 2048 tokens are 2.03 GB and fit). fix: after such a plan for a prompt ubatch, llama_context plans for
+rem that graph at the full KV, as the graph reserve does, and builds the graph again; the next ubatches fit.
+rem LLAMA_REPLAN_DISABLE=1 turns the fix off. GGML_SCHED_LOG_REALLOC=1 prints the limits of the device, the splits of
+rem every planned graph and the cause of each new plan.
+rem   llama-bench pp4096 at DEPTH34 with -c CTX34 for each arm of ARMS34, "name [VAR=value ...]"; the depth is filled
+rem   once per arm, outside the timing
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
@@ -33,16 +34,14 @@ if not exist "%MODEL%" (
 
 set "SUM=%LOGS%\34-realloc-%TS%-summary.txt"
 set "RC=0"
-set "GGML_SCHED_LOG_REALLOC="
-set "LLAMA_INPUT_TIMING="
+call :clearknobs
 echo writing %SUM%
-echo ### 34-realloc %TS%, contexts %CTX34% > "%SUM%"
+echo ### 34-realloc %TS%, depth %DEPTH34%, ctx %CTX34%, arms %ARMS34% > "%SUM%"
 echo. >> "%SUM%"
 
-for %%c in (%CTX34%) do call :bench %%c
+for %%v in (%ARMS34%) do call :bench %%v
 
-set "GGML_SCHED_LOG_REALLOC="
-set "LLAMA_INPUT_TIMING="
+call :clearknobs
 
 echo.
 type "%SUM%"
@@ -50,33 +49,59 @@ echo.
 echo done, %SUM%
 exit /b %RC%
 
-rem %1 = the context. the driver frees the memory of the previous process lazily, and a model load right after it can
-rem fail even after SETTLE (README, traps): one more try after another wait, the log of the first try stays
+:clearknobs
+set "LLAMA_REPLAN_DISABLE="
+set "GGML_SCHED_LOG_REALLOC="
+set "LLAMA_INPUT_TIMING="
+goto :eof
+
+rem %1 = the arm in quotes, "name [VAR=value ...]". = splits call arguments, so the arm comes in one piece and is split
+rem here: ANAME = the name, the rest is set one VAR=value at a time
+:armenv
+call :clearknobs
+set "ANAME="
+set "AENV="
+for /f "tokens=1,*" %%a in (%1) do (
+    set "ANAME=%%a"
+    set "AENV=%%b"
+)
+:armenv_next
+if not defined AENV goto :eof
+for /f "tokens=1,*" %%a in ("!AENV!") do (
+    set "%%a"
+    set "AENV=%%b"
+)
+goto :armenv_next
+
+rem %1 = the arm in quotes. the driver frees the memory of the previous process lazily, and a model load right after it
+rem can fail even after SETTLE (README, traps): one more try after another wait, the log of the first try stays
 :bench
+set "ARMENV=%~1"
 set "TRY=0"
 :bench_try
 set /a TRY+=1
 echo === waiting %SETTLE%s for the gpu to be released
 powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"
-set "LOG=%LOGS%\34-realloc-%TS%-c%~1.log"
-if %TRY% GTR 1 set "LOG=%LOGS%\34-realloc-%TS%-c%~1-try%TRY%.log"
+call :armenv "%ARMENV%"
+set "LOG=%LOGS%\34-realloc-%TS%-%ANAME%.log"
+if %TRY% GTR 1 set "LOG=%LOGS%\34-realloc-%TS%-%ANAME%-try%TRY%.log"
 set "GGML_SCHED_LOG_REALLOC=1"
 set "LLAMA_INPUT_TIMING=1"
-echo === -c %~1: llama-bench pp4096 d8192, try %TRY% -^> %LOG%
-"%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p 4096 -n 0 -b 4096 -ub 4096 -c %~1 -d 8192 %LOADMODE% -r 1 %EXTRA% --progress -o md > "%LOG%" 2>&1
+echo === %ARMENV%: llama-bench pp4096 d%DEPTH34% ctx %CTX34%, try %TRY% -^> %LOG%
+"%BIN%\llama-bench.exe" -m "%MODEL%" -fa on -p 4096 -n 0 -b 4096 -ub 4096 -c %CTX34% -d %DEPTH34% %LOADMODE% -r 2 %EXTRA% --progress -o md > "%LOG%" 2>&1
 set "EC=%ERRORLEVEL%"
-set "GGML_SCHED_LOG_REALLOC="
-set "LLAMA_INPUT_TIMING="
+call :clearknobs
 set "RETRY=0"
 if not "%EC%"=="0" set "RETRY=1"
 findstr /C:"failed to allocate" /C:"Device memory allocation" "%LOG%" >nul
 if "%ERRORLEVEL%"=="0" set "RETRY=1"
-if "%RETRY%"=="1" if %TRY% LSS 2 echo ### -c %~1: try %TRY% failed, exit=%EC%, %LOG% >> "%SUM%"
+if "%RETRY%"=="1" if %TRY% LSS 2 echo ### %ARMENV%: try %TRY% failed, exit=%EC%, %LOG% >> "%SUM%"
 if "%RETRY%"=="1" if %TRY% LSS 2 goto :bench_try
 if not "%EC%"=="0" set "RC=%EC%"
-echo ### -c %~1: llama-bench pp4096 d8192, try %TRY%, exit=%EC% >> "%SUM%"
-rem the limits, the splits of the reserved graphs, the causes of the re-reserves, the host time of each ubatch, the result
-findstr /B /C:"ggml_vulkan: max" /C:"sched " /C:"  split" /C:"    " /C:"galloc " /C:"ubatch timing" /C:"llama-bench: benchmark" /C:"ggml_uncaught" "%LOG%" >> "%SUM%"
-findstr /C:"| qwen4exp" "%LOG%" >> "%SUM%"
+echo ### %ARMENV%: llama-bench pp4096 d%DEPTH34% ctx %CTX34%, try %TRY%, exit=%EC% >> "%SUM%"
+findstr /C:"| qwen4exp" /C:"ggml_uncaught" "%LOG%" >> "%SUM%"
+rem the plans: counts, then the causes; the host time of the first ubatches of 4096 tokens and of the last ones (the end
+rem of the depth fill and the measured ones)
+powershell -NoProfile -Command "$t = Get-Content -LiteralPath '%LOG%'; 'plans at start (reserve): ' + @($t | Select-String -SimpleMatch -Pattern 'sched reserve:').Count + ', plans while computing (re-reserve): ' + @($t | Select-String -SimpleMatch -Pattern 'sched re-reserve:').Count; $t | Select-String -Pattern '^(sched realloc|galloc realloc)' | Select-Object -First 6 | ForEach-Object { $_.Line }; $u = @($t | Select-String -SimpleMatch -Pattern 'ubatch timing: 4096 tokens'); $u | Select-Object -First 3 | ForEach-Object { $_.Line }; '...'; $u | Select-Object -Last 4 | ForEach-Object { $_.Line }" >> "%SUM%"
 echo. >> "%SUM%"
 goto :eof

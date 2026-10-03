@@ -863,6 +863,9 @@ struct ggml_backend_sched {
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
     int debug_realloc;
+
+    // buffer plans made, see ggml_backend_sched_get_n_reserve
+    size_t n_reserve;
     int debug_graph_size;
     int debug_prev_graph_size;
 
@@ -1710,6 +1713,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
+        sched->n_reserve++;
         if (ggml_backend_sched_log_realloc()) {
             ggml_backend_sched_log_splits(sched, "re-reserve");
         }
@@ -2175,6 +2179,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
+    sched->n_reserve++;
     if (ggml_backend_sched_log_realloc()) {
         ggml_backend_sched_log_splits(sched, "reserve");
     }
@@ -2482,6 +2487,11 @@ bool ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backen
     sched->is_alloc       = true;
 
     return true;
+}
+
+size_t ggml_backend_sched_get_n_reserve(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_reserve;
 }
 
 void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snapshot) {

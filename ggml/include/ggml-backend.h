@@ -364,6 +364,9 @@ extern "C" {
     GGML_API bool                          ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snapshot);
     GGML_API void                          ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snapshot);
 
+    // Number of buffer plans made: by ggml_backend_sched_reserve, and by ggml_backend_sched_alloc_graph for a graph that did not fit the last plan
+    GGML_API size_t                        ggml_backend_sched_get_n_reserve(ggml_backend_sched_t sched);
+
     //
     // Meta backend
     //

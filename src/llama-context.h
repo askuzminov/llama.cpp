@@ -456,6 +456,9 @@ private:
     // env: LLAMA_GRAPH_CACHE, max graphs in gf_res_prev, 0 disables the scheduler snapshots
     uint32_t graph_cache_size = 8;
 
+    // node count of a graph that did not fit the buffer plan at the full KV either (see process_ubatch)
+    int replan_failed_n_nodes = -1;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

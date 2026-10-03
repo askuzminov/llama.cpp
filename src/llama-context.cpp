@@ -1776,10 +1776,57 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const size_t n_reserve = ggml_backend_sched_get_n_reserve(sched.get());
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // the scheduler planned its buffers again for this graph alone, because its nodes or their backends differ from
+        // the last plan (the reserved graph has the logits of every token, 4 GB at 248320 x 4096, and runs that matmul
+        // on the CPU). the next ubatches of a prompt have a larger KV, do not fit and plan again: a sync and a larger
+        // buffer per ubatch. plan for this graph at the full KV instead, as the graph reserve does, and build the graph
+        // again. a graph that does not fit that plan either (the nodes depend on the KV size) is not planned so again.
+        // only prompt ubatches: a draft check (up to 65 tokens) would drop the snapshots of the decode graphs.
+        // LLAMA_REPLAN_DISABLE: off, for comparisons
+        static const bool replan_disable = getenv("LLAMA_REPLAN_DISABLE") != nullptr;
+        if (!replan_disable && memory && ubatch.n_tokens >= std::max<uint32_t>(128, n_ubatch_split() / 2) &&
+            gtype == ctx_type_to_graph_type(cparams.ctx_type) &&
+            ggml_backend_sched_get_n_reserve(sched.get()) != n_reserve && ggml_graph_n_nodes(gf) != replan_failed_n_nodes) {
+            const int n_nodes = ggml_graph_n_nodes(gf);
+
+            {
+                memory->set_n_kv_full(phase_n_kv);
+                const auto mctx_full = memory->init_full();
+                memory->set_n_kv_full(0);
+                if (mctx_full) {
+                    graph_reserve(std::min(cparams.n_ctx, n_ubatch_split()), cparams.n_seq_max, std::max<uint32_t>(1, n_outputs), mctx_full.get());
+                }
+            }
+
+            // the reserve reset the scheduler and the previous graphs
+            res = get_gf_res_prev();
+            gparams.res = res;
+
+            gf_res_prev_active = nullptr;
+            res->reset();
+
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            const size_t n_reserve_full = ggml_backend_sched_get_n_reserve(sched.get());
+
+            gf = model.build_graph(gparams);
+            if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            if (ggml_backend_sched_get_n_reserve(sched.get()) != n_reserve_full) {
+                replan_failed_n_nodes = n_nodes;
+            }
         }
 
         gf_res_prev_active = res;
