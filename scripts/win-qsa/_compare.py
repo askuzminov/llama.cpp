@@ -70,7 +70,7 @@ def run(command, log, env=None, result=None):
 
 
 def save_summary(logs, summary):
-    (logs / "summary.txt").write_text("\n\n".join(summary) + "\n")
+    (logs / "summary.txt").write_text("\n\n".join(summary) + "\n", encoding="utf-8")
 
 
 def prepare(logs):
@@ -106,7 +106,7 @@ def prepare(logs):
     folder = build / "bin/Release" if (build / "bin/Release").is_dir() else build / "bin"
     data = {"commit": commit, "bench_source_sha256": digest(ROOT / bench),
             "binaries": {n: digest(executable(folder, n)) for n in ("llama-bench", "llama-perplexity")}}
-    (folder / "qsa-baseline.json").write_text(json.dumps(data, indent=2) + "\n")
+    (folder / "qsa-baseline.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     print(f"Baseline ready. Set ABBIN={folder} in _local.bat", flush=True)
 
 
@@ -149,7 +149,7 @@ def compare(mode, logs):
     if not default_baseline.is_dir():
         default_baseline = ROOT / "build-stable/bin"
     baseline = Path(os.environ.get("ABBIN") or default_baseline).resolve()
-    info = json.loads((baseline / "qsa-baseline.json").read_text())
+    info = json.loads((baseline / "qsa-baseline.json").read_text(encoding="utf-8"))
     if info["commit"] != git("rev-parse", "stable^{commit}") or info["bench_source_sha256"] != digest(ROOT / "tools/llama-bench/llama-bench.cpp"):
         raise RuntimeError("Baseline tag or benchmark source differs; run 35-build-stable.bat again")
     for name, sha in info["binaries"].items():
@@ -167,7 +167,7 @@ def compare(mode, logs):
                 "device": device,
                 "environment": {k: v for k, v in os.environ.items() if (k.startswith(("AB", "GGML_", "LLAMA_")) or k in ("EXTRA", "LOADMODE", "BACKEND", "CMAKE_BACKEND", "GENERATOR", "SETTLE")) and not re.search("TOKEN|SECRET|PASS|API_KEY", k)},
                 "binaries": {n: digest(executable(folder, n)) for n in ("llama-bench", "llama-perplexity", "test-backend-ops")}}
-    (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     checks(folder, logs, device, vulkan)
     common = ["-m", str(model), "-fa", "on", *arguments(os.environ.get("LOADMODE", "")), *arguments(os.environ.get("EXTRA", ""))]
     arms = [("stable-default", baseline, False, None), ("new-default", folder, False, None),
@@ -188,7 +188,7 @@ def compare(mode, logs):
             raise RuntimeError(f"Missing corpus: {text}; run get-wikitext.bat")
         metadata["corpus"] = {"path": str(text), "sha256": digest(text)}
         metadata["parameters"] = {"ctx": ctx, "chunks": chunks, "ubatch": ub}
-        (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         params = [*common, "-f", str(text), "-c", str(ctx), "--chunks", str(chunks), "-b", str(ub), "-ub", str(ub)]
         print(f"Free disk: {shutil.disk_usage(logs).free / 2**30:.1f} GiB. At 248320 vocab, base logits need about {ctx * chunks * 248320 / 2**30:.1f} GiB.", flush=True)
         stable_arms = [("stable-repeat", baseline, False, None), *arms[1:]]
@@ -243,7 +243,7 @@ def compare(mode, logs):
         if min(ctx, pp, tg, ub, reps) < 1 or min(depths) < 0 or max(depths) + max(pp, tg) > ctx:
             raise RuntimeError("Invalid benchmark sizes or depth exceeds ABCTX")
         metadata["parameters"] = {"ctx": ctx, "prompt": pp, "generation": tg, "ubatch": ub, "reps": reps, "depths": depths}
-        (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         for i, depth in enumerate(depths):
             for name, arm_bin, accurate, heads in (arms if i % 2 == 0 else list(reversed(arms))):
                 time.sleep(settle)
@@ -253,11 +253,11 @@ def compare(mode, logs):
                        "-p", str(pp), "-n", str(tg), "-d", str(depth), "-r", str(reps), "--progress", "-o", "json"]
                 try:
                     run(cmd, logs / f"{label}.log", base_env(accurate, heads, True), result)
-                    rows = json.loads(result.read_text())
+                    rows = json.loads(result.read_text(encoding="utf-8"))
                     if len(rows) != 2 or any(not math.isfinite(r["avg_ts"]) or r["avg_ts"] <= 0 or not math.isfinite(r["stddev_ts"]) for r in rows):
                         raise RuntimeError("Missing or invalid PP/TG results")
                     summary.append(label + " " + " ".join(f"{'PP' if r['n_prompt'] else 'TG'}={r['avg_ts']:.2f} +/- {r['stddev_ts']:.2f}" for r in rows))
-                    output = (logs / f"{label}.log").read_text(errors="replace")
+                    output = (logs / f"{label}.log").read_text(encoding="utf-8", errors="replace")
                     if "sched reserve:" in output or "sched re-reserve:" in output:
                         summary.append(f"  reserve={output.count('sched reserve:')} re-reserve={output.count('sched re-reserve:')}")
                     else:
@@ -273,6 +273,8 @@ def compare(mode, logs):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("prepare", "quality", "speed"))
     mode = parser.parse_args().mode
@@ -285,7 +287,7 @@ def main():
         else:
             compare(mode, logs)
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as e:
-        (logs / "failure.txt").write_text(str(e) + "\n")
+        (logs / "failure.txt").write_text(str(e) + "\n", encoding="utf-8")
         print(f"FAIL: {e}", file=sys.stderr)
         return 1
     return 0
