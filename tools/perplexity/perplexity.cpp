@@ -511,7 +511,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        logits.reserve(size_t(n_ctx - n_ctx/2) * n_vocab);
     }
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
@@ -524,7 +524,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
         const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize(size_t(n_ctx) * nv);
+        log_probs.resize(size_t(n_ctx - 1 - n_ctx/2) * nv);
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -1760,7 +1760,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        logits.reserve(size_t(n_ctx - n_ctx/2) * n_vocab);
     }
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);

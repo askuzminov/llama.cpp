@@ -69,6 +69,10 @@ def run(command, log, env=None, result=None):
     return log.read_text(encoding="utf-8", errors="replace")
 
 
+def save_summary(logs, summary):
+    (logs / "summary.txt").write_text("\n\n".join(summary) + "\n")
+
+
 def prepare(logs):
     source = Path(os.environ.get("ABSOURCE", ROOT / "build-stable-src")).resolve()
     build = Path(os.environ.get("ABBUILD", ROOT / "build-stable")).resolve()
@@ -195,17 +199,24 @@ def compare(mode, logs):
             data = logs / f"{ref_name}-base.dat"
             ref_params = [*params, "--kl-divergence-base", str(data)]
             time.sleep(settle)
-            output = run([str(executable(ref_bin, "llama-perplexity")), *ref_params], logs / f"{ref_name}-base.log", base_env(ref_accurate))
-            if "Final estimate" not in output:
-                raise RuntimeError(f"Baseline did not finish; see {ref_name}-base.log")
-            with data.open("rb") as f:
-                header = f.read(20)
-            if len(header) != 20 or header[:8] != b"_logits_":
-                raise RuntimeError("Invalid baseline logits header")
-            nctx, vocab, nchunk = struct.unpack("<Iii", header[8:])
-            expected = 20 + nctx * nchunk * 4 + nchunk * (nctx - nctx // 2 - 1) * (2 * ((vocab + 1) // 2) + 4) * 2
-            if (nctx, nchunk) != (ctx, chunks) or vocab < 1 or data.stat().st_size != expected:
-                raise RuntimeError("Baseline logits incomplete or corpus too short for requested chunks")
+            try:
+                output = run([str(executable(ref_bin, "llama-perplexity")), *ref_params], logs / f"{ref_name}-base.log", base_env(ref_accurate))
+                if "Final estimate" not in output:
+                    raise RuntimeError(f"Baseline did not finish; see {ref_name}-base.log")
+                with data.open("rb") as f:
+                    header = f.read(20)
+                if len(header) != 20 or header[:8] != b"_logits_":
+                    raise RuntimeError("Invalid baseline logits header")
+                nctx, vocab, nchunk = struct.unpack("<Iii", header[8:])
+                expected = 20 + nctx * nchunk * 4 + nchunk * (nctx - nctx // 2 - 1) * (2 * ((vocab + 1) // 2) + 4) * 2
+                if (nctx, nchunk) != (ctx, chunks) or vocab < 1 or data.stat().st_size != expected:
+                    raise RuntimeError("Baseline logits incomplete or corpus too short for requested chunks")
+            except (RuntimeError, OSError, ValueError) as e:
+                failed = True
+                summary.append(f"{ref_name}-base: FAIL: {e}")
+                summary.extend(f"{ref_name}-{name}: SKIPPED: reference failed" for name, *_ in candidates)
+                save_summary(logs, summary)
+                continue
             for name, arm_bin, accurate, heads in candidates:
                 time.sleep(settle)
                 label = f"{ref_name}-{name}"
@@ -219,6 +230,7 @@ def compare(mode, logs):
                 except (RuntimeError, ValueError) as e:
                     failed = True
                     summary.append(f"{label}: FAIL: {e}")
+                save_summary(logs, summary)
             if not failed and os.environ.get("ABKEEPLOGITS", "0") != "1":
                 data.unlink()
     else:
@@ -246,11 +258,15 @@ def compare(mode, logs):
                         raise RuntimeError("Missing or invalid PP/TG results")
                     summary.append(label + " " + " ".join(f"{'PP' if r['n_prompt'] else 'TG'}={r['avg_ts']:.2f} +/- {r['stddev_ts']:.2f}" for r in rows))
                     output = (logs / f"{label}.log").read_text(errors="replace")
-                    summary.append(f"  reserve={output.count('sched reserve:')} re-reserve={output.count('sched re-reserve:')}")
+                    if "sched reserve:" in output or "sched re-reserve:" in output:
+                        summary.append(f"  reserve={output.count('sched reserve:')} re-reserve={output.count('sched re-reserve:')}")
+                    else:
+                        summary.append("  scheduler counters unavailable in this build")
                 except (RuntimeError, ValueError, KeyError) as e:
                     failed = True
                     summary.append(f"{label}: FAIL: {e}")
-    (logs / "summary.txt").write_text("\n\n".join(summary) + "\n")
+                save_summary(logs, summary)
+    save_summary(logs, summary)
     print("\n\n".join(summary), flush=True)
     if failed:
         raise RuntimeError("One or more arms failed; results retained in logs")
