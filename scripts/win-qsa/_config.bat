@@ -128,6 +128,15 @@ rem the bin folder of an older build to compare with (the one that held its spee
 rem the old arms. set it in _local.bat
 set "OLDBIN32="
 
+rem 33-indexer.bat: the depth and the context of the model runs (those of the 32 profile), the arms of llama-bench
+rem pp4096 and tg32, "name [VAR=value ...]" in quotes (the depth is filled once per arm, about 4 min at 122880),
+rem and the arms of the per-op profile in the same form. nohs = no head sum (relu at the matmul store), oldidx =
+rem the indexer ops one by one, as in the 32 run
+set "DEPTH33=122880"
+set "CTX33=262144"
+set "ARMS33="default" "threads1 LLAMA_INPUT_THREADS=1" "nohs GGML_VK_DISABLE_MM_HEADSUM=1" "oldidx GGML_VK_DISABLE_MM_HEADSUM=1 GGML_VK_DISABLE_MM_RELU=1" "radix GGML_VK_TOPK_RADIX=1""
+set "PROF33="default" "radix GGML_VK_TOPK_RADIX=1""
+
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
 rem the attention itself is capped by the indexer budget, but the block keys of the indexer
 rem are rebuilt from the whole cache on every pass, so the decode is expected to grow with

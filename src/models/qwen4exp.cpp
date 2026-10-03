@@ -1057,17 +1057,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // on the GPU in the prompt chunks, every chunk re-reserves (a sync and a new buffer plan).
     // one stream at a time: a stream reads only the live part of its pool, so the step from one
     // stream to the next is larger than that part, and mul_mat carries one step for all of them
-    ggml_tensor * summed = nullptr;
+    std::vector<ggml_tensor *> head_scores;
+
+    // the block keys of each stream, one view for all heads
+    std::vector<ggml_tensor *> ks(n_stream);
+    for (int64_t s = 0; s < n_stream; ++s) {
+        ks[s] = ggml_view_2d(ctx0, pool, idx_dim, n_blocks, pool->nb[1], s*n_pool*pool->nb[1]);
+    }
 
     for (int64_t h = 0; h < n_idx_h; ++h) {
         ggml_tensor * score = nullptr;
 
         for (int64_t s = 0; s < n_stream; ++s) {
-            ggml_tensor * ks = ggml_view_2d(ctx0, pool, idx_dim, n_blocks, pool->nb[1], s*n_pool*pool->nb[1]);
             // head h of every token: the heads of a token are adjacent rows of q
             ggml_tensor * qs = ggml_view_2d(ctx0, q, idx_dim, n_tps, n_idx_h*q->nb[1], s*q->nb[2] + h*q->nb[1]);
 
-            ggml_tensor * sc = ggml_mul_mat(ctx0, ks, qs);
+            ggml_tensor * sc = ggml_mul_mat(ctx0, ks[s], qs);
 
             if (n_stream > 1) {
                 sc = ggml_reshape_3d(ctx0, sc, n_blocks, n_tps, 1);
@@ -1076,13 +1081,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             score = score ? ggml_concat(ctx0, score, sc, 2) : sc;
         }
 
-        // the allocator runs relu in place on the mul_mat or concat result
+        // the allocator runs relu in place on the mul_mat or concat result, and a backend can rectify at the
+        // matmul store (the relu right after the mul_mat)
         score = ggml_relu(ctx0, score);
 
-        summed = summed ? ggml_add(ctx0, summed, score) : score;
+        // in the graph before the sum: the adds of the sum (and the bias add below) then sit next to each other,
+        // and a backend can do them in one pass
+        ggml_build_forward_expand(gf, score);
+
+        head_scores.push_back(score);
     }
 
-    ggml_tensor * score = summed;
+    ggml_tensor * score = head_scores[0];
+    for (int64_t h = 1; h < n_idx_h; ++h) {
+        score = ggml_add(ctx0, score, head_scores[h]);
+    }
     cb(score, "indexer_score", il);
 
     // the per-block bias already says which blocks the query can see at all, so the selection can
@@ -1091,6 +1104,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (blk_bias) {
         score = ggml_add(ctx0, score, inp->bias);
         cb(score, "indexer_score_blocks", il);
+
+        // the head scores, their sum and the bias add in a row in the graph: a backend can do them in one matmul
+        ggml_build_forward_expand(gf, score);
 
         ggml_tensor * top_k_blk = ggml_top_k(ctx0, score, width_blk);
 

@@ -1612,125 +1612,129 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
-        std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
-        std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+        // the rows are filled in parts, in parallel for a large mask. each part keeps its own bookkeeping, so it
+        // fills its first row of a sequence in full and the next rows of that sequence copy it
+        llama_parallel_for(n_tps, (int64_t) n_tps*n_kv, [&](int64_t ii0, int64_t ii1) {
+            // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
+            std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
+            std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
-            const uint32_t i = s*n_tps + ii;
+            for (uint32_t ii = (uint32_t) ii0; ii < (uint32_t) ii1; ++ii) {
+                const uint32_t i = s*n_tps + ii;
 
-            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
-            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+                const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
-                  llama_pos p0 = -1;
-            const llama_pos p1 = ubatch->pos[i];
+                      llama_pos p0 = -1;
+                const llama_pos p1 = ubatch->pos[i];
 
-            // for M-RoPE
-            const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
-            const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+                // for M-RoPE
+                const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+                const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
-            const uint64_t idst = n_kv*i;
+                const uint64_t idst = n_kv*i;
 
-            // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
-            // the only cells that could change are the ones that are with similar positions as the
-            //   ones in the batch (i.e. due to causal masking, SWA, etc.)
-            // keep track of those cells and shortcut the loop to save time
-            // note: this optimization is not compatible with Alibi position encoding
-            // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
+                // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
+                // the only cells that could change are the ones that are with similar positions as the
+                //   ones in the batch (i.e. due to causal masking, SWA, etc.)
+                // keep track of those cells and shortcut the loop to save time
+                // note: this optimization is not compatible with Alibi position encoding
+                // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
+                bool prev = false;
 
-            auto & idxs = seq_idxs[seq_id];
+                auto & idxs = seq_idxs[seq_id];
 
-            if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
-                } else {
-                    idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
-
-                    seq_srct[seq_id] = i;
-                }
-            }
-
-            for (uint32_t jj = 0; jj < n_kv; ++jj) {
-                uint32_t j = jj;
-
-                // we have an exiting mask for this sequence -> update just seq_idxs
                 if (!alibi) {
-                    if (prev) {
-                        if (jj >= idxs.size()) {
-                            break;
-                        }
+                    if (seq_srct.find(seq_id) != seq_srct.end()) {
+                        const uint32_t srct = seq_srct[seq_id];
 
-                        j = idxs[jj];
+                        const uint64_t idst_prev = n_kv*srct;
+
+                        std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
+
+                        prev = true;
+                    } else {
+                        idxs.clear();
+                        idxs.reserve(ubatch->n_tokens + n_swa + 32);
+
+                        seq_srct[seq_id] = i;
                     }
                 }
 
-                if (cells.is_empty(j)) {
-                    goto skip;
-                }
+                for (uint32_t jj = 0; jj < n_kv; ++jj) {
+                    uint32_t j = jj;
 
-                // mask the token if not the same sequence
-                if (!cells.seq_has(j, seq_id)) {
-                    goto skip;
-                }
+                    // we have an exiting mask for this sequence -> update just seq_idxs
+                    if (!alibi) {
+                        if (prev) {
+                            if (jj >= idxs.size()) {
+                                break;
+                            }
 
-                p0 = cells.pos_get(j);
-
-                if (!alibi) {
-                    if (!prev) {
-                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                            idxs.push_back(j);
+                            j = idxs[jj];
                         }
                     }
-                }
 
-                if (causal) {
-                    // mask future tokens
-                    if (p0 > p1) {
+                    if (cells.is_empty(j)) {
                         goto skip;
                     }
 
-                    // M-RoPE causal mask
-                    if (is_2d) {
-                        if (p0 == p1) {
-                            const auto & p0_ext = cells.ext_get(j);
+                    // mask the token if not the same sequence
+                    if (!cells.seq_has(j, seq_id)) {
+                        goto skip;
+                    }
 
-                            if (p0_ext.is_2d_gt(p1_x, p1_y)) {
-                                goto skip;
+                    p0 = cells.pos_get(j);
+
+                    if (!alibi) {
+                        if (!prev) {
+                            // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
+                            if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                                idxs.push_back(j);
                             }
                         }
                     }
-                }
 
-                // apply SWA if any
-                if (swa) {
-                    // see llama_non_causal_type
-                    const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
-                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
-                        goto skip;
+                    if (causal) {
+                        // mask future tokens
+                        if (p0 > p1) {
+                            goto skip;
+                        }
+
+                        // M-RoPE causal mask
+                        if (is_2d) {
+                            if (p0 == p1) {
+                                const auto & p0_ext = cells.ext_get(j);
+
+                                if (p0_ext.is_2d_gt(p1_x, p1_y)) {
+                                    goto skip;
+                                }
+                            }
+                        }
                     }
-                }
 
-                if (alibi) {
-                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
-                } else {
-                    data[idst + j] = mask_keep;
-                }
+                    // apply SWA if any
+                    if (swa) {
+                        // see llama_non_causal_type
+                        const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
+                        if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                            goto skip;
+                        }
+                    }
 
-                continue;
-skip:
-                data[idst + j] = mask_drop;
+                    if (alibi) {
+                        data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                    } else {
+                        data[idst + j] = mask_keep;
+                    }
+
+                    continue;
+    skip:
+                    data[idst + j] = mask_drop;
+                }
             }
-        }
+        });
     }
 }
 

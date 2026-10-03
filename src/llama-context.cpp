@@ -1726,6 +1726,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // LLAMA_INPUT_TIMING: the host time of each ubatch on stderr (graph build and allocation, input fills,
+    // graph submission), with the fills of the slow inputs from llm_graph_result::set_inputs
+    static const bool timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
+    const int64_t t_start_us = timing ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1784,17 +1789,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t t_graph_us = timing ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_inputs_us = timing ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (timing) {
+        const int64_t t_end_us = ggml_time_us();
+        fprintf(stderr, "ubatch timing: %u tokens, graph %.1f ms, inputs %.1f ms, submit %.1f ms\n", ubatch.n_tokens,
+                (t_graph_us - t_start_us)/1000.0, (t_inputs_us - t_graph_us)/1000.0, (t_end_us - t_inputs_us)/1000.0);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

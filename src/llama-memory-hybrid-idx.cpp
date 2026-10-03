@@ -13,6 +13,7 @@
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 
 //
 // llama_memory_hybrid_idx
@@ -867,85 +868,106 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
-        for (int64_t ii = 0; ii < n_tps; ++ii) {
-            const int64_t      i      = s*n_tps + ii;
-            const llama_seq_id seq_id = ubatch->seq_id[i][0];
-
-            int64_t q = ubatch->pos[i];
-
-            if (g.ranked) {
-                const llama_pos qt = ubatch->pos[i];
-                const llama_pos qy = ubatch->pos[i + n_tokens];
-                const llama_pos qx = ubatch->pos[i + n_tokens*2];
-
-                int64_t lo = 0;
-                int64_t hi = (int64_t) g.order.size();
-
-                while (lo < hi) {
-                    const int64_t   mid = (lo + hi)/2;
-                    const int32_t   c   = g.order[mid];
-                    const llama_pos pc  = cells.pos_get(c);
-
-                    if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
+        // whether a block's cells belong to a sequence does not depend on the token: one pass per sequence
+        std::unordered_map<llama_seq_id, std::vector<uint8_t>> blk_in_seq;
+        if (blk_bias) {
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + ii][0];
+                if (blk_in_seq.count(seq_id)) {
+                    continue;
                 }
-
-                q = lo - 1;
-            }
-
-            // the tail is an incomplete block and is always visible, as in the reference
-            const int64_t tail_start = (q + 1)/r*r;
-
-            if (blk_bias) {
-                // a block sits wholly inside or outside the tail, so one value covers it.
-                // selection is per block, so when causal whole future blocks drop out here; the block
-                // that straddles the query stays and the caller's mask trims its future cells
-                float * cur_blk_bias = dst_bias + i*n_blocks;
-
+                std::vector<uint8_t> & in_seq = blk_in_seq[seq_id];
+                in_seq.resize(g.n_bid);
                 for (int64_t b = 0; b < g.n_bid; ++b) {
-                    if ((causal_attn && g.bid_idx[b] > q) || !cells.seq_has((uint32_t) g.bid_cell[b], seq_id)) {
-                        cur_blk_bias[b] = -INFINITY;
-                        continue;
-                    }
-
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = (causal_attn && g.bid_idx[b] >= tail_start) ? 1e9f : 0.0f;
+                    in_seq[b] = cells.seq_has((uint32_t) g.bid_cell[b], seq_id) ? 1 : 0;
                 }
-
-                // the spare blocks hold the unpooled cells, the incomplete tail among them, so
-                // they get the tail value. one stays finite whenever the sequence has any cell:
-                // a sequence shorter than `ratio` owns no full block, and a row of -inf only
-                // gives a nan.
-                for (int64_t b = g.n_bid; b < n_blocks; ++b) {
-                    cur_blk_bias[b] = g.spare_seq[b - g.n_bid].test((size_t) seq_id) ? 1e9f : -INFINITY;
-                }
-
-                continue;
-            }
-
-            float * cur_bias = dst_bias + i*n_kv;
-
-            for (int64_t j = 0; j < n_kv; ++j) {
-                float v = -INFINITY;
-
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
-                    const int64_t idx = g.ranked ? g.rank[j] : cells.pos_get(j);
-
-                    if (!causal_attn) {
-                        // every visible block competes on score and the unpooled cells are always selected
-                        v = g.blk_of[j] < 0 ? 1e9f : 0.0f;
-                    } else if (idx <= q) {
-                        // finite, so it can never meet a -inf and produce a nan
-                        v = idx >= tail_start ? 1e9f : (g.blk_of[j] < 0 ? -INFINITY : 0.0f);
-                    }
-                }
-
-                cur_bias[j] = v;
             }
         }
+
+        // the rows are independent, so they are filled in parts, in parallel for a large ubatch
+        llama_parallel_for(n_tps, n_tps*(blk_bias ? n_blocks : n_kv), [&](int64_t ii0, int64_t ii1) {
+            for (int64_t ii = ii0; ii < ii1; ++ii) {
+                const int64_t      i      = s*n_tps + ii;
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+                int64_t q = ubatch->pos[i];
+
+                if (g.ranked) {
+                    const llama_pos qt = ubatch->pos[i];
+                    const llama_pos qy = ubatch->pos[i + n_tokens];
+                    const llama_pos qx = ubatch->pos[i + n_tokens*2];
+
+                    int64_t lo = 0;
+                    int64_t hi = (int64_t) g.order.size();
+
+                    while (lo < hi) {
+                        const int64_t   mid = (lo + hi)/2;
+                        const int32_t   c   = g.order[mid];
+                        const llama_pos pc  = cells.pos_get(c);
+
+                        if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+
+                    q = lo - 1;
+                }
+
+                // the tail is an incomplete block and is always visible, as in the reference
+                const int64_t tail_start = (q + 1)/r*r;
+
+                if (blk_bias) {
+                    // a block sits wholly inside or outside the tail, so one value covers it.
+                    // selection is per block, so when causal whole future blocks drop out here; the block
+                    // that straddles the query stays and the caller's mask trims its future cells
+                    float * cur_blk_bias = dst_bias + i*n_blocks;
+
+                    const uint8_t * in_seq = blk_in_seq.at(seq_id).data();
+
+                    for (int64_t b = 0; b < g.n_bid; ++b) {
+                        if (!in_seq[b] || (causal_attn && g.bid_idx[b] > q)) {
+                            cur_blk_bias[b] = -INFINITY;
+                            continue;
+                        }
+
+                        // finite, so it can never meet a -inf and produce a nan
+                        cur_blk_bias[b] = (causal_attn && g.bid_idx[b] >= tail_start) ? 1e9f : 0.0f;
+                    }
+
+                    // the spare blocks hold the unpooled cells, the incomplete tail among them, so
+                    // they get the tail value. one stays finite whenever the sequence has any cell:
+                    // a sequence shorter than `ratio` owns no full block, and a row of -inf only
+                    // gives a nan.
+                    for (int64_t b = g.n_bid; b < n_blocks; ++b) {
+                        cur_blk_bias[b] = g.spare_seq[b - g.n_bid].test((size_t) seq_id) ? 1e9f : -INFINITY;
+                    }
+
+                    continue;
+                }
+
+                float * cur_bias = dst_bias + i*n_kv;
+
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    float v = -INFINITY;
+
+                    if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                        const int64_t idx = g.ranked ? g.rank[j] : cells.pos_get(j);
+
+                        if (!causal_attn) {
+                            // every visible block competes on score and the unpooled cells are always selected
+                            v = g.blk_of[j] < 0 ? 1e9f : 0.0f;
+                        } else if (idx <= q) {
+                            // finite, so it can never meet a -inf and produce a nan
+                            v = idx >= tail_start ? 1e9f : (g.blk_of[j] < 0 ? -INFINITY : 0.0f);
+                        }
+                    }
+
+                    cur_bias[j] = v;
+                }
+            }
+        });
     }
 }
 

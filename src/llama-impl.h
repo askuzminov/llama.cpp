@@ -2,6 +2,8 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -73,6 +75,11 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 
     return res;
 }
+
+// runs fn(begin, end) over [0, n) in contiguous parts, in parallel when work (the elements the parts write in
+// total) is large enough to pay for the threads. fn must write only its part. LLAMA_INPUT_THREADS sets the
+// thread count, 1 runs everything on the calling thread
+void llama_parallel_for(int64_t n, int64_t work, const std::function<void(int64_t, int64_t)> & fn);
 
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);

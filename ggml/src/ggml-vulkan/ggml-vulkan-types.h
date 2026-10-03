@@ -280,10 +280,12 @@ struct vk_matmul_pipeline_key {
     bool f16acc;
     // matmul_id of the experts' gate and up projections in one pass, silu(gate) * up out (FUSED_GLU)
     bool glu = false;
+    // the heads of the qwen4exp indexer in one matmul, relu and head sum at the store (MUL_MAT_HEADSUM)
+    bool headsum = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, glu)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.glu);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, glu, headsum)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.glu, o.headsum);
     }
 };
 
@@ -1313,6 +1315,10 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_mm_relu {};
+    // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
+    bool fused_mm_headsum {};
+    const ggml_tensor * fused_mm_headsum_bias {};
     // gated_delta_net + the cpy of its state into the recurrent cache: the cache view the op writes to
     const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

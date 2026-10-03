@@ -37,6 +37,10 @@ rem set "INT8CHUNKS=2"
 rem 32-depth.bat: the older build to compare with, and the depths of the sweep
 rem set "OLDBIN32=C:\Users\AI\Documents\github\llamacpp\llama.cpp\build-win\bin\Release"
 rem set "DEPTH32=0,65536,122880"
+
+rem 33-indexer.bat: a shorter depth, and one arm with all three switches back at once
+rem set "DEPTH33=65536"
+rem set "ARMS33="default" "old LLAMA_INPUT_THREADS=1 GGML_VK_DISABLE_MM_HEADSUM=1 GGML_VK_DISABLE_MM_RELU=1""
 rem context and chunks of the quality runs, keep well above the ~513 block budget
 rem set "QCTX=65536"
 rem set "QCHUNKS=2"

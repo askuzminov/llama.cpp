@@ -7170,6 +7170,106 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// MUL_MAT followed by RELU, as the per-head indexer scores of qwen4exp. heads > 1 reads b as every heads-th row of
+// a larger matrix (the scores of one head). backends may rectify the result at the matmul store
+struct test_mul_mat_relu : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t heads;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, type_b, m, n, k, heads);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_RELU";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_relu(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
+            int64_t m = 64, int64_t n = 32, int64_t k = 128, int64_t heads = 1)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), heads(heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n*heads);
+        ggml_set_name(b, "b");
+        if (heads > 1) {
+            b = ggml_view_2d(ctx, b, k, n, heads*b->nb[1], (heads - 1)*b->nb[1]);
+            ggml_set_name(b, "b_head");
+        }
+
+        ggml_tensor * out = ggml_relu(ctx, ggml_mul_mat(ctx, a, b));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// the scores of the qwen4exp indexer heads: for each head a MUL_MAT of the same a by the rows of that head in q (the heads
+// of a token are adjacent rows), a RELU, the sum over the heads and the add of a bias. backends may do it in one matmul.
+// no perf cases: perf mode repeats only the last node
+struct test_mul_mat_headsum : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t heads;
+    const bool bias;
+
+    std::string vars() override {
+        return VARS_TO_STR5(m, n, k, heads, bias);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_HEADSUM";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_headsum(int64_t m = 64, int64_t n = 32, int64_t k = 128, int64_t heads = 4, bool bias = true)
+        : m(m), n(n), k(k), heads(heads), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, heads*n);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * out = nullptr;
+        for (int64_t h = 0; h < heads; ++h) {
+            ggml_tensor * qh = ggml_view_2d(ctx, q, k, n, heads*q->nb[1], h*q->nb[1]);
+            ggml_tensor * score = ggml_relu(ctx, ggml_mul_mat(ctx, a, qh));
+            out = out ? ggml_add(ctx, out, score) : score;
+        }
+
+        if (bias) {
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+            ggml_set_name(b, "bias");
+            out = ggml_add(ctx, out, b);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10487,6 +10587,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {2048, 4096}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 10, false, 64, n, 256));
     }
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t heads : {1, 4}) {
+            test_cases.emplace_back(new test_mul_mat_relu(type_a, GGML_TYPE_F32, 64, 32, 128, heads));
+            test_cases.emplace_back(new test_mul_mat_relu(type_a, GGML_TYPE_F32, 1000, 300, 128, heads));
+            // a mat-vec size: no fusion, the same result
+            test_cases.emplace_back(new test_mul_mat_relu(type_a, GGML_TYPE_F32, 64, 4, 128, heads));
+        }
+    }
+    // the qwen4exp indexer has 4 heads; 1 token is a decode step, 3 a draft check, 2 and 8 heads are not fused
+    for (bool bias : {false, true}) {
+        for (auto mn : std::vector<std::array<int64_t, 2>>{{64, 32}, {1000, 300}, {513, 77}, {1000, 1}, {1000, 3}}) {
+            test_cases.emplace_back(new test_mul_mat_headsum(mn[0], mn[1], 128, 4, bias));
+        }
+        test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 2, bias));
+        test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 8, bias));
+    }
 
     // MoE cache: 37 slots and the zero slot, n_used 10 uses the templated ids helper and n_used 5 the generic one
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_M}) {
@@ -11901,6 +12017,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
         }
     }
+    // the same for the block top-k (513 blocks of 4 cells), and a 512-token ubatch
+    for (auto cols : {8192, 32768}) {
+        for (auto nrows : {1, 4, 16, 64, 512}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 513));
+        }
+    }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
@@ -11988,6 +12110,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // (one-element rows) and the cells of each selected 4-cell block
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 1, 4096, 2052, 4096, 1, false));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 1024, 513*4096, 1, 1, false));
+
+    // qwen4exp indexer at a 4096-token ubatch over 4-cell blocks, n_kv 32768 and 126976: the top-k of 513 blocks
+    for (int64_t n_blocks : {8192, 31744}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_blocks, 4096, 1, 1}, 513));
+    }
 
     return test_cases;
 }

@@ -24,6 +24,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -1366,9 +1367,26 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
-    for (auto & input : inputs) {
-        input->set_input(ubatch);
+    // LLAMA_INPUT_TIMING: the fills that take 0.1 ms or more, on stderr (see llama_context::process_ubatch)
+    static const bool timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
+    if (!timing) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
     }
+
+    std::string line;
+    for (auto & input : inputs) {
+        const int64_t t_start_us = ggml_time_us();
+        input->set_input(ubatch);
+        const int64_t t_us = ggml_time_us() - t_start_us;
+        if (t_us >= 100) {
+            const llm_graph_input_i & in = *input;
+            line += format(" %s %.1f ms,", typeid(in).name(), t_us/1000.0);
+        }
+    }
+    fprintf(stderr, "input timing: %u tokens:%s\n", ubatch->n_tokens, line.c_str());
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {

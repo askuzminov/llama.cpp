@@ -122,6 +122,13 @@ layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 1) readonly buffer B_SCALAR {B_TYPE_SCALAR data_b_scalar[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
+#ifdef MUL_MAT_HEADSUM
+// MUL_MAT_HEADSUM heads per token (the qwen4exp indexer): B holds the heads of a token in adjacent columns, and D has one
+// column per token. the store rectifies each head, sums the heads of a token and adds the bias (fusion_flags bit 1, the
+// layout of D). the host takes only tiles whose TN holds whole tokens
+layout (binding = 3) readonly buffer Bias {float data_bias[];};
+#endif
+
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
@@ -157,6 +164,9 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint padded_N;
+    // bit 0: a following RELU is fused in, the result is rectified at the store
+    uint fusion_flags;
 #endif
 } p;
 
@@ -164,6 +174,20 @@ layout (push_constant) uniform parameter
 // fusion_flags bit 0: the following MUL is fused in, one scale per (expert slot, token)
 ACC_TYPE get_fused_scale(u16vec2 row_idx) {
     return (p.fusion_flags & 1u) != 0 ? ACC_TYPE(data_fscale[row_idx.y * p.nei0 + row_idx.x]) : ACC_TYPE(1.0);
+}
+#else
+// fusion_flags bit 0: the following RELU is fused in
+float fused_store(float v) {
+    return (p.fusion_flags & 1u) != 0 ? max(v, 0.0f) : v;
+}
+#endif
+
+#ifdef MUL_MAT_HEADSUM
+void headsum_store(uint idx, float v) {
+    if ((p.fusion_flags & 2u) != 0) {
+        v += data_bias[idx];
+    }
+    data_d[idx] = D_TYPE(v);
 }
 #endif
 
@@ -495,6 +519,32 @@ void main() {
             barrier();
         }
     }
+#elif defined(MUL_MAT_HEADSUM)
+    [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+        [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+            const uint row0 = dr + cm_row * TM;
+            const uint col0 = dc + cm_col * TN;
+            if (row0 < p.M && col0 < p.N) {
+                coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+                // TM rows x TN / MUL_MAT_HEADSUM tokens, one sum per lane at a time
+                for (uint e = tiw; e < TM * (TN / MUL_MAT_HEADSUM); e += WARP) {
+                    const uint r   = e % TM;
+                    const uint t   = e / TM;
+                    const uint tok = col0 / MUL_MAT_HEADSUM + t;
+                    if (row0 + r < p.M && tok * MUL_MAT_HEADSUM < p.N) {
+                        float v = 0.0;
+                        [[unroll]] for (uint h = 0; h < MUL_MAT_HEADSUM; h++) {
+                            v += max(float(coopmat_stage[warp_i * TM * TN + (t * MUL_MAT_HEADSUM + h) * TM + r]), 0.0);
+                        }
+                        headsum_store(offsets + tok * p.stride_d + row0 + r, v);
+                    }
+                }
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            }
+        }
+    }
 #else
     const bool is_aligned = p.stride_d % 4 == 0;  // Assumption: D_TYPE == float
 
@@ -505,6 +555,11 @@ void main() {
             if (is_aligned && is_in_bounds) {
                 // Full coopMat is within bounds and stride_d is aligned with 16B
                 coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_dtype = coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[cm_col * cms_per_row + cm_row]);
+                if ((p.fusion_flags & 1u) != 0) {
+                    [[unroll]] for (uint i = 0; i < cm_dtype.length(); ++i) {
+                        cm_dtype[i] = max(cm_dtype[i], D_TYPE(0));
+                    }
+                }
                 coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
             } else if (is_in_bounds) {
                 // Full coopMat is within bounds, but stride_d is not aligned
@@ -512,7 +567,7 @@ void main() {
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(fused_store(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]));
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
             } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
@@ -522,7 +577,7 @@ void main() {
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                     if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
-                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(fused_store(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]));
                     }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
@@ -530,6 +585,34 @@ void main() {
         }
     }
 #endif // MUL_MAT_ID
+#elif defined(MUL_MAT_HEADSUM)
+    // the TN columns of a thread are whole tokens
+    [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
+        [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+            const uint dr_warp = dr + wsir * WSUBM + tiwr * TM;
+            const uint dc_warp = dc + wsic * WSUBN + tiwc * TN;
+            [[unroll]] for (uint cg = 0; cg + MUL_MAT_HEADSUM <= TN; cg += MUL_MAT_HEADSUM) {
+                const uint tok = (dc_warp + cg) / MUL_MAT_HEADSUM;
+                if (tok * MUL_MAT_HEADSUM >= p.N) {
+                    continue;
+                }
+                [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
+                    vec2 v = vec2(0.0);
+                    [[unroll]] for (uint h = 0; h < MUL_MAT_HEADSUM; h++) {
+                        const uint sums_idx = (wsic * TN + cg + h) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+                        v += max(vec2(sums[sums_idx]), vec2(0.0));
+                    }
+                    const uint row = dr_warp + 2 * cr;
+                    if (row < p.M) {
+                        headsum_store(offsets + tok * p.stride_d + row, v.x);
+                    }
+                    if (row + 1 < p.M) {
+                        headsum_store(offsets + tok * p.stride_d + row + 1, v.y);
+                    }
+                }
+            }
+        }
+    }
 #else
     [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
         [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
@@ -555,10 +638,10 @@ void main() {
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(fused_store(sums[sums_idx].x));
                     }
                     if (dr_warp + 2 * cr + 1 < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(fused_store(sums[sums_idx].y));
                     }
 #endif // MUL_MAT_ID
                 }

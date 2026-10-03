@@ -13,6 +13,8 @@ struct vk_mat_mat_push_constants {
     uint32_t k_split;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
     uint32_t padded_N;
+    // bit 0: rectify the result at the store (a following RELU is fused in), mul_mm.comp only
+    uint32_t fusion_flags;
 };
 
 struct vk_mat_vec_push_constants {
