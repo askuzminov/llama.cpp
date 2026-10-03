@@ -137,6 +137,10 @@ set "CTX33=262144"
 set "ARMS33="default" "threads1 LLAMA_INPUT_THREADS=1" "nohs GGML_VK_DISABLE_MM_HEADSUM=1" "oldidx GGML_VK_DISABLE_MM_HEADSUM=1 GGML_VK_DISABLE_MM_RELU=1" "radix GGML_VK_TOPK_RADIX=1""
 set "PROF33="default" "radix GGML_VK_TOPK_RADIX=1""
 
+rem 34-realloc.bat: the contexts to reserve the buffers for, one llama-bench run each (about 2 min). 262144 has the KQ
+rem mask of a 4096-token ubatch at exactly 2 GiB, 261888 just under, 131072 at 1 GiB
+set "CTX34=262144 261888 131072"
+
 rem 19-decode-depth.bat: how the generation speed falls with the depth of the context.
 rem the attention itself is capped by the indexer budget, but the block keys of the indexer
 rem are rebuilt from the whole cache on every pass, so the decode is expected to grow with

@@ -785,6 +785,13 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// GGML_SCHED_LOG_REALLOC: on stderr, why the scheduler reserves its buffers again while computing (each time a sync of
+// all backends and a new plan) and the splits of every reserved graph
+static bool ggml_backend_sched_log_realloc() {
+    static const bool enabled = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
+    return enabled;
+}
+
 // kinds of graphs, by split count, that GGML_SCHED_PROF reports apart
 #define GGML_SCHED_PROF_BUCKETS 4
 
@@ -1633,12 +1640,32 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// GGML_SCHED_LOG_REALLOC: the splits of the graph, with the nodes of every split that is not on the first backend
+static void ggml_backend_sched_log_splits(ggml_backend_sched_t sched, const char * what) {
+    fprintf(stderr, "sched %s: %d nodes, %d splits\n", what, sched->graph.n_nodes, sched->n_splits);
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        fprintf(stderr, "  split %d: %s, nodes %d to %d, %d inputs\n", i, ggml_backend_name(sched->backends[split->backend_id]),
+                split->i_start, split->i_end, split->n_inputs);
+        for (int j = 0; split->backend_id != 0 && j < split->graph.n_nodes && j < 8; j++) {
+            const struct ggml_tensor * t = split->graph.nodes[j];
+            fprintf(stderr, "    %s %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] %zu bytes\n", t->name, ggml_op_desc(t),
+                    t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_nbytes(t));
+        }
+    }
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
+            if (ggml_backend_sched_log_realloc()) {
+                const struct ggml_tensor * t = sched->graph.nodes[i];
+                fprintf(stderr, "sched realloc: node %d %s (%s) moved from %s to %s\n", i, t->name, ggml_op_desc(t),
+                        ggml_backend_name(sched->backends[sched->prev_node_backend_ids[i]]), ggml_backend_name(sched->backends[sched->node_backend_ids[i]]));
+            }
             break;
         }
     }
@@ -1647,6 +1674,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
                 sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
+                if (ggml_backend_sched_log_realloc()) {
+                    fprintf(stderr, "sched realloc: leaf %d %s moved from %s to %s\n", i, sched->graph.leafs[i]->name,
+                            ggml_backend_name(sched->backends[sched->prev_leaf_backend_ids[i]]), ggml_backend_name(sched->backends[sched->leaf_backend_ids[i]]));
+                }
                 break;
             }
         }
@@ -1678,6 +1709,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
+        }
+        if (ggml_backend_sched_log_realloc()) {
+            ggml_backend_sched_log_splits(sched, "re-reserve");
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -2140,6 +2174,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
+    }
+    if (ggml_backend_sched_log_realloc()) {
+        ggml_backend_sched_log_splits(sched, "reserve");
     }
 
     ggml_backend_sched_reset(sched);

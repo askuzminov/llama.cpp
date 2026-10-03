@@ -1012,7 +1012,23 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+// GGML_SCHED_LOG_REALLOC (see ggml-backend.cpp): why a graph does not fit the plan of the last reserve, on stderr
+static bool ggml_gallocr_log_realloc(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("GGML_SCHED_LOG_REALLOC") != NULL;
+    }
+    return enabled != 0;
+}
+
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (galloc->n_nodes != graph->n_nodes || galloc->n_leafs != graph->n_leafs) {
+        if (ggml_gallocr_log_realloc()) {
+            fprintf(stderr, "galloc realloc: graph of %d nodes and %d leafs, plan of %d and %d\n",
+                    graph->n_nodes, graph->n_leafs, galloc->n_nodes, galloc->n_leafs);
+        }
+    }
+
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
@@ -1035,6 +1051,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
+            if (ggml_gallocr_log_realloc()) {
+                fprintf(stderr, "galloc realloc: node %d %s (%s) needs %zu bytes, plan %zu\n", i, node->name, ggml_op_desc(node),
+                        ggml_nbytes(node), node_alloc->dst.size_max);
+            }
             return true;
         }
 
@@ -1047,6 +1067,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
+                if (ggml_gallocr_log_realloc()) {
+                    fprintf(stderr, "galloc realloc: src %d %s (%s) of node %d %s (%s) needs %zu bytes, plan %zu\n", j, src->name,
+                            ggml_op_desc(src), i, node->name, ggml_op_desc(node), ggml_nbytes(src), node_alloc->src[j].size_max);
+                }
                 return true;
             }
         }

@@ -13,9 +13,9 @@ rem     sum and the bias add. in decode it reads the keys once instead of once p
 rem     GGML_VK_DISABLE_MM_HEADSUM=1 turns it off
 rem   relu: without the head sum, the relu of each head is done at the store of its matmul (MUL_MAT_RELU) and the
 rem     head sum and the bias add are one MULTI_ADD. GGML_VK_DISABLE_MM_RELU=1 gives the separate RELU
-rem   top-k: GGML_VK_TOPK_RADIX=1 takes radix-select for every top-k. the default takes the tournament where
-rem     k fits, as the k=513 of the block top-k does. on the Mac 5500M radix was faster at all sizes tried
-rem     (8192 x 512 rows: 1.3 against 20 ms; 31744 x 4096: 24 ms, the tournament lost the device there)
+rem   top-k: since the run of 03.10 09:48 the default takes radix-select for k >= 256 over 8 or more rows of 4096 or
+rem     more (prefill: 31744 x 4096 k=513 5.0 against 19.3 ms there) and the tournament for fewer rows (decode, draft
+rem     checks). GGML_VK_TOPK_RADIX=1 takes radix-select for every top-k, 0 the tournament where k fits
 rem   1 tests against the CPU: MUL_MAT (the matmul push constants changed), MUL_MAT_RELU, MUL_MAT_HEADSUM (the
 rem     coopmat store of the head sum runs only here, the Mac has no coopmat), TOP_K with both top-k paths. a FAIL
 rem     stops before the model is loaded

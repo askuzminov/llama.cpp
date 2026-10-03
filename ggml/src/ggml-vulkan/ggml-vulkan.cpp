@@ -4491,6 +4491,13 @@ vk_device ggml_vk_get_device(size_t idx) {
         }
         device->suballocation_block_size = std::min(device->suballocation_block_size, device->max_memory_allocation_size);
 
+        // GGML_SCHED_LOG_REALLOC (ggml-backend.cpp): the limits behind the tensors supports_op sends to another backend
+        if (getenv("GGML_SCHED_LOG_REALLOC")) {
+            fprintf(stderr, "ggml_vulkan: max buffer size %llu, max storage buffer range %u, max allocation %llu, 64-bit indexing %d\n",
+                    (unsigned long long) device->max_buffer_size, device->properties.limits.maxStorageBufferRange,
+                    (unsigned long long) device->max_memory_allocation_size, (int) device->shader_64b_indexing);
+        }
+
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
@@ -12082,12 +12089,20 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     uint32_t nrows = ggml_nrows(src0);
     uint32_t k = dst->ne[0];
 
-    // GGML_VK_TOPK_RADIX=1: radix-select for every size, for comparisons
-    static const bool force_radix = getenv("GGML_VK_TOPK_RADIX") != nullptr;
+    // radix-select (one workgroup per row) for a large k over many long rows: the qwen4exp block top-k in prefill, k 513
+    // of 31744 x 4096, takes 5.0 ms against 19.3 for the tournament on Strix Halo (8192 x 16: 19 against 32 us). the
+    // tournament spreads a row over workgroups and stays faster for a few rows (decode, draft checks: 1 to 4 rows) and
+    // has the short rows of MoE routing. GGML_VK_TOPK_RADIX: 1 = radix-select for every top-k, 0 = only past the k
+    // limit of the tournament
+    static const int radix_mode = [] {
+        const char * env = getenv("GGML_VK_TOPK_RADIX");
+        return env ? atoi(env) : -1;
+    }();
+    const bool radix_wins = k >= 256 && ncols >= 4096 && nrows >= 8;
 
-    // tournament path is faster where it fits; use radix-select only past its k limit
     const uint32_t k_min_pipeline = std::max((uint32_t) log2f(float(k)) + 1, ctx->device->subgroup_size_log2);
-    if (force_radix || k_min_pipeline >= num_topk_pipelines || ctx->device->pipeline_topk_f32[k_min_pipeline] == nullptr) {
+    if (radix_mode == 1 || (radix_mode != 0 && radix_wins) ||
+        k_min_pipeline >= num_topk_pipelines || ctx->device->pipeline_topk_f32[k_min_pipeline] == nullptr) {
         vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
         GGML_ASSERT(pipeline != nullptr);
 
