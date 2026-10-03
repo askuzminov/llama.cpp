@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 
 // [TAG_QWEN4_REIMPLEMENT]
 // TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
@@ -1049,52 +1051,71 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
 
-    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer.
-    // one head at a time: the scores of all heads together are n_blocks*n_idx_h*n_tokens floats,
-    // 2 GiB at n_kv 131072 with a 4096-token ubatch, and a backend whose buffers stop at 2 GiB
-    // (Vulkan on the AMD driver) hands the ops on such a tensor to the CPU. the scheduler reserves
-    // with the graph at the full context, so the tensor there decides: on the CPU in that graph and
-    // on the GPU in the prompt chunks, every chunk re-reserves (a sync and a new buffer plan).
-    // one stream at a time: a stream reads only the live part of its pool, so the step from one
-    // stream to the next is larger than that part, and mul_mat carries one step for all of them
-    std::vector<ggml_tensor *> head_scores;
+    // Vulkan fuses split heads into one matmul with the sum at its store. Other backends batch the heads.
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    const bool is_vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0;
+    bool split_heads = is_vulkan;
+    if (const char * env = std::getenv("LLAMA_QSA_SPLIT_HEADS")) {
+        if (std::strcmp(env, "0") == 0 || std::strcmp(env, "1") == 0) {
+            split_heads = std::strcmp(env, "1") == 0;
+        }
+    }
 
-    // the block keys of each stream, one view for all heads
+    // Use the full pool size so reserve and execution choose the same graph at every KV depth.
+    const size_t max_size = ggml_backend_buft_get_max_size(ggml_backend_dev_buffer_type(dev));
+    const size_t score_row_size = ggml_row_size(GGML_TYPE_F32, n_pool);
+    if ((uint64_t) n_idx_h*n_tps*n_stream > max_size / score_row_size) {
+        split_heads = true;
+    }
+
     std::vector<ggml_tensor *> ks(n_stream);
     for (int64_t s = 0; s < n_stream; ++s) {
         ks[s] = ggml_view_2d(ctx0, pool, idx_dim, n_blocks, pool->nb[1], s*n_pool*pool->nb[1]);
     }
 
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * score = nullptr;
-
+    ggml_tensor * score = nullptr;
+    if (!split_heads) {
         for (int64_t s = 0; s < n_stream; ++s) {
-            // head h of every token: the heads of a token are adjacent rows of q
-            ggml_tensor * qs = ggml_view_2d(ctx0, q, idx_dim, n_tps, n_idx_h*q->nb[1], s*q->nb[2] + h*q->nb[1]);
-
+            ggml_tensor * qs = ggml_view_2d(ctx0, q, idx_dim, n_idx_h*n_tps, q->nb[1], s*q->nb[2]);
             ggml_tensor * sc = ggml_mul_mat(ctx0, ks[s], qs);
-
             if (n_stream > 1) {
-                sc = ggml_reshape_3d(ctx0, sc, n_blocks, n_tps, 1);
+                sc = ggml_reshape_3d(ctx0, sc, n_blocks, n_idx_h*n_tps, 1);
             }
-
             score = score ? ggml_concat(ctx0, score, sc, 2) : sc;
         }
-
-        // the allocator runs relu in place on the mul_mat or concat result, and a backend can rectify at the
-        // matmul store (the relu right after the mul_mat)
         score = ggml_relu(ctx0, score);
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
 
-        // in the graph before the sum: the adds of the sum (and the bias add below) then sit next to each other,
-        // and a backend can do them in one pass
-        ggml_build_forward_expand(gf, score);
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * head = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream, score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, head) : ggml_cont(ctx0, head);
+        }
+        score = summed;
+    } else {
+        std::vector<ggml_tensor *> head_scores;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * head = nullptr;
 
-        head_scores.push_back(score);
-    }
+            for (int64_t s = 0; s < n_stream; ++s) {
+                ggml_tensor * qs = ggml_view_2d(ctx0, q, idx_dim, n_tps, n_idx_h*q->nb[1], s*q->nb[2] + h*q->nb[1]);
+                ggml_tensor * sc = ggml_mul_mat(ctx0, ks[s], qs);
 
-    ggml_tensor * score = head_scores[0];
-    for (int64_t h = 1; h < n_idx_h; ++h) {
-        score = ggml_add(ctx0, score, head_scores[h]);
+                if (n_stream > 1) {
+                    sc = ggml_reshape_3d(ctx0, sc, n_blocks, n_tps, 1);
+                }
+                head = head ? ggml_concat(ctx0, head, sc, 2) : sc;
+            }
+
+            head = ggml_relu(ctx0, head);
+            ggml_build_forward_expand(gf, head);
+            head_scores.push_back(head);
+        }
+
+        score = head_scores[0];
+        for (int64_t h = 1; h < n_idx_h; ++h) {
+            score = ggml_add(ctx0, score, head_scores[h]);
+        }
     }
     cb(score, "indexer_score", il);
 

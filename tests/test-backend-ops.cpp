@@ -1308,6 +1308,7 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    virtual bool test_graph_optimize() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1491,6 +1492,26 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+
+        if (test_graph_optimize()) {
+            ggml_backend_t backends[] = { backend1, backend2 };
+            ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, ggml_graph_size(gf), false, true));
+            if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+                return test_status_t::FAIL;
+            }
+            std::set<ggml_tensor *> seen;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                for (ggml_tensor * src : node->src) {
+                    if (src && src->op != GGML_OP_NONE && seen.count(src) == 0) {
+                        test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "optimizer moved a node before its source");
+                        print_test_result_locked(output_printer, result);
+                        return test_status_t::FAIL;
+                    }
+                }
+                seen.insert(node);
+            }
         }
 
         // compare
@@ -4776,17 +4797,19 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K; // snapshot slot count (>1)
+    const int tail_reader;
 
     ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * tail_sum_node = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+        return VARS_TO_STR7(type, head_count, head_size, n_seq_tokens, n_seqs, K, tail_reader);
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2)
-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+            int64_t K = 2, int tail_reader = 0)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), tail_reader(tail_reader) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -4845,6 +4868,11 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         // read the cpy output (not the plain dst view, which would not pull the cpy into the graph)
         // so that neither the gdn nor the cpy is the graph output
         ggml_tensor * out = ggml_sum(ctx, cpy);
+        if (tail_reader != 0) {
+            ggml_tensor * tail = tail_reader == 1 ? src : ggml_view_tensor(ctx, src);
+            tail_sum_node = ggml_sum(ctx, tail);
+            out = ggml_add(ctx, out, tail_sum_node);
+        }
         return out;
     }
 
@@ -4854,7 +4882,9 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return tail_sum_node ? std::vector<ggml_tensor *>{ cpy_node, tail_sum_node } : std::vector<ggml_tensor *>{ cpy_node };
+    }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7284,19 +7314,20 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool gate_cont;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool gate_cont = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), gate_cont(gate_cont) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, gate_cont);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7305,6 +7336,7 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+    bool test_graph_optimize() override { return gate_cont; }
     bool use_weight_context() override { return use_id && with_lane_scale; }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
@@ -7416,7 +7448,8 @@ struct test_mul_mat_vec_fusion : public test_case {
             };
 
             auto build_lane_gate = [&]() {
-                ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gates, cur, ids);
+                ggml_tensor * gate_weights = gate_cont ? ggml_cont(ctx, gates) : gates;
+                ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gate_weights, cur, ids);
                 if (with_lane_scale) {
                     ffn_gate = build_lane_scale_id(ctx, ctx_weights, ffn_gate, ids);
                 }
@@ -7428,6 +7461,9 @@ struct test_mul_mat_vec_fusion : public test_case {
             };
 
             ggml_tensor * ffn_up = build_lane_up();
+            if (gate_cont) {
+                ggml_build_forward_expand(gf, ffn_up);
+            }
             ggml_tensor * ffn_gate = with_gate ? build_lane_gate() : nullptr;
 
             ggml_tensor * out = with_gate ? build_gate(ctx, ffn_gate, ffn_up) : ffn_up;
@@ -11456,6 +11492,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 32, 32, 256,
+            true, 8, 2, false, false, true, false, {1, 1}, true));
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
@@ -11554,6 +11595,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2, 2));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

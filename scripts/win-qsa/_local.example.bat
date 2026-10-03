@@ -102,3 +102,10 @@ rem set "UBMEMFILL=12"
 rem set "UBMEMARGS=-fit off -ncmoe 48 --moe-cache auto"
 rem set "UBMEMDRAFT=0"
 rem set "RUN_UBMEM=1"
+
+rem 35-37: stable baseline, long-context quality, PP and TG.
+rem set "ABBIN=D:\llama-stable-build\bin\Release"
+rem set "ABDEPTHS=0,65536,139264"
+rem set "ABQCTX=32768"
+rem set "ABQCHUNKS=1"
+rem set "ABKEEPLOGITS=1"

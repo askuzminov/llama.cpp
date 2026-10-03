@@ -4159,6 +4159,8 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
     vk::DescriptorPool pool;
     vk::CommandPool cmd_pool;
     vk::Fence fence;
+    uint32_t * errors = nullptr;
+    bool submitted = false;
     bool ok = false;
 
     try {
@@ -4186,7 +4188,7 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
         }
         memory = d.allocateMemory({ req.size, type_idx });
         d.bindBufferMemory(buffer, memory, 0);
-        uint32_t * errors = static_cast<uint32_t *>(d.mapMemory(memory, 0, size));
+        errors = static_cast<uint32_t *>(d.mapMemory(memory, 0, size));
         memset(errors, 0, size);
 
         const vk::DescriptorPoolSize pool_size { vk::DescriptorType::eStorageBuffer, 1 };
@@ -4209,15 +4211,16 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
 
         fence = d.createFence({});
         device->compute_queue->handle->submit(vk::SubmitInfo { {}, {}, cmd }, fence);
-        if (d.waitForFences(fence, true, 10ull * 1000 * 1000 * 1000) != vk::Result::eSuccess) {
-            throw std::runtime_error("no answer in 10 s");
+        submitted = true;
+        if (d.waitForFences(fence, true, UINT64_MAX) != vk::Result::eSuccess) {
+            throw std::runtime_error("probe did not complete");
         }
+        submitted = false;
 
         uint64_t bad = 0;
         for (uint32_t i = 0; i < n_wg; i++) {
             bad += errors[i];
         }
-        d.unmapMemory(memory);
         ok = bad == 0;
         if (!ok) {
             GGML_LOG_WARN("ggml_vulkan: shared memory probe of %u bytes: %llu words of %llu read back wrong\n", bytes,
@@ -4225,14 +4228,18 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
         }
     } catch (const std::exception & e) {
         GGML_LOG_WARN("ggml_vulkan: shared memory probe of %u bytes failed: %s\n", bytes, e.what());
+        if (submitted) {
+            d.waitIdle();
+        }
         ok = false;
     }
 
+    if (errors) d.unmapMemory(memory);
     if (fence) d.destroyFence(fence);
     if (cmd_pool) d.destroyCommandPool(cmd_pool);
     if (pool) d.destroyDescriptorPool(pool);
-    if (memory) d.freeMemory(memory);
     if (buffer) d.destroyBuffer(buffer);
+    if (memory) d.freeMemory(memory);
     if (pipeline) d.destroyPipeline(pipeline);
     if (layout) d.destroyPipelineLayout(layout);
     if (dsl) d.destroyDescriptorSetLayout(dsl);
@@ -14818,6 +14825,24 @@ static int ggml_vk_can_fuse_gdn_cache(ggml_backend_vk_context * ctx, const struc
         return 0;
     }
 
+    // The fused op does not write the snapshot tail. Only the cache copy may read it.
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_op_is_empty(node->op)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * t = node->src[s];
+            if (t == nullptr || (node == cpy && s == 0)) {
+                continue;
+            }
+            if (t == gdn || (t->view_src == gdn &&
+                (t->view_offs >= tail_off || ggml_nbytes(t) > tail_off - t->view_offs))) {
+                return 0;
+            }
+        }
+    }
+
     *cache = dst;
     return skip;
 }
@@ -15988,10 +16013,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         }
 
-        // MUL_MAT_ID that feeds a swiglu GLU whose other source is a MUL_MAT_ID on the same input and ids (the
-        // experts' up and gate projections): pull the other matmul and the GLU right after it, so the three run as one
-        // (FUSED_GLU, ggml_vk_can_fuse_mmid_glu). the other matmul reads only what this one reads, and the GLU only the
-        // two matmuls, so the move keeps the order valid
+        // Pull the MoE gate, up and swiglu together. Keep weight producers and alias dependencies before them.
         if (ctx->device->coopmat_int_support && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT_ID) {
             const ggml_tensor * mm = graph->nodes[first_unused];
             for (int k = first_unused + 1; k < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++k) {
@@ -16006,6 +16028,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (other->op == GGML_OP_MUL_MAT_ID && other->src[1] == mm->src[1] && other->src[2] == mm->src[2]) {
                     for (int q = first_unused + 1; q < k; ++q) {
                         if (graph->nodes[q] == other && !used[q]) {
+                            bool can_pull = true;
+                            for (int c = first_unused + 1; can_pull && c < k; ++c) {
+                                if (!used[c] && c != q && (is_src_of(q, c) || is_src_of(k, c))) {
+                                    can_pull = false;
+                                }
+                            }
+                            if (!can_pull) {
+                                break;
+                            }
                             current_set.push_back(q);
                             used[q] = true;
                             current_set.push_back(k);
