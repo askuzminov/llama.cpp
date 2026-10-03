@@ -1,15 +1,17 @@
 @echo off
-rem the scheduler planned its buffers again on every ubatch of a prompt (03.10). the run of 03.10 11:32 found the cause:
-rem the graph the buffers are reserved with has the logits of all 4096 tokens, a [248320, 4096] f32 matmul of 4 GB,
-rem over the 2 GiB buffer limit of the driver, so that matmul runs on the CPU there (3 splits, 7157 nodes). a prompt
-rem ubatch needs the logits of one token at most and runs it on the gpu (2 splits, 7153 nodes): the first ubatch plans
-rem again for its own small sizes, and each next ubatch with a larger KV no longer fits and plans again. the graph phase
-rem of every ubatch then waits for the gpu (a sync, 4.9 to 5.8 s in the depth fill) and costs 125 ms at d8192, 555 ms at
-rem d122880. the same at -c 262144, 261888 and 131072: the size of the context does not matter, the ubatch does (the
-rem logits of 2048 tokens are 2.03 GB and fit). fix: after such a plan for a prompt ubatch, llama_context plans for
-rem that graph at the full KV, as the graph reserve does, and builds the graph again; the next ubatches fit.
-rem LLAMA_REPLAN_DISABLE=1 turns the fix off. GGML_SCHED_LOG_REALLOC=1 prints the limits of the device, the splits of
-rem every planned graph and the cause of each new plan.
+rem the scheduler planned its buffers again on every ubatch of a llama-bench prompt (03.10). the run of 03.10 11:32
+rem found the cause: llama-bench leaves n_outputs_max at n_batch, so the graph the buffers are reserved with has the
+rem logits of all 4096 tokens, a [248320, 4096] f32 matmul of 4 GB over the 2 GiB buffer limit of the driver, run on the
+rem CPU there (3 splits, 7157 nodes). a prompt ubatch needs the logits of one token at most, on the gpu (2 splits, 7153
+rem nodes): the first ubatch plans again for its own small sizes, and each next one with a larger KV again. the graph
+rem phase of every ubatch then waits for the gpu (a sync, 4.9 to 5.8 s in the depth fill) and costs 125 ms at d8192,
+rem 555 ms at d122880. llama-server reserves with few outputs and never had it (checked on the Mac: no new plan with or
+rem without the fix). fix: the reserve at the start plans the prompt graph with one output per sequence last, and a
+rem plan made again for a prompt ubatch while computing is made at the full KV. the run of 03.10 11:58 also showed
+rem the cause of the silent crashes at the first ubatch: vk::Queue::submit: ErrorOutOfDeviceMemory (memory is at the
+rem edge at -c 262144 with this model; the first version of the fix planned at the full KV in the middle of the run
+rem and crashed so twice). LLAMA_REPLAN_DISABLE=1 turns the fix off. GGML_SCHED_LOG_REALLOC=1 prints the limits of the
+rem device, the splits of every planned graph and the cause of each new plan.
 rem   llama-bench pp4096 at DEPTH34 with -c CTX34 for each arm of ARMS34, "name [VAR=value ...]"; the depth is filled
 rem   once per arm, outside the timing
 setlocal enabledelayedexpansion

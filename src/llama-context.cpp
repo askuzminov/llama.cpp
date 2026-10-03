@@ -795,6 +795,20 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // a prompt ubatch has one output per sequence at most, and the graph with an output for every token can differ from
+    // it: the logits of every token can be over the buffer limit of a backend (4 GB at 248320 x 4096 on a 2 GiB limit)
+    // and go to another one. the first prompt ubatch would then plan the buffers again for its own sizes, and each next
+    // one with a larger KV again (a sync and a new plan per ubatch). plan the prompt graph last: the buffers keep the size
+    // of every plan, and a plan made again while computing (see process_ubatch) finds them large enough.
+    // LLAMA_REPLAN_DISABLE: off, together with that plan, for comparisons
+    if (n_outputs_pp > n_seqs && getenv("LLAMA_REPLAN_DISABLE") == nullptr) {
+        const uint32_t n_seqs_pp = model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01 ? 1 : n_seqs;
+        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_seqs_pp, mctx.get(), model.hparams.no_alloc);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+    }
+
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -1785,12 +1799,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         // the scheduler planned its buffers again for this graph alone, because its nodes or their backends differ from
-        // the last plan (the reserved graph has the logits of every token, 4 GB at 248320 x 4096, and runs that matmul
-        // on the CPU). the next ubatches of a prompt have a larger KV, do not fit and plan again: a sync and a larger
-        // buffer per ubatch. plan for this graph at the full KV instead, as the graph reserve does, and build the graph
-        // again. a graph that does not fit that plan either (the nodes depend on the KV size) is not planned so again.
-        // only prompt ubatches: a draft check (up to 65 tokens) would drop the snapshots of the decode graphs.
-        // LLAMA_REPLAN_DISABLE: off, for comparisons
+        // the last plan (after decode graphs, or with more outputs than the prompt graph planned at the start). the next
+        // ubatches of a prompt have a larger KV, do not fit and plan again: a sync and a new plan per ubatch. plan for
+        // this graph at the full KV instead, as the reserve at the start does (the buffers are already that large), and
+        // build the graph again. a graph that does not fit that plan either (the nodes depend on the KV size) is not
+        // planned so again. only prompt ubatches: a draft check (up to 65 tokens) would drop the snapshots of the decode
+        // graphs. LLAMA_REPLAN_DISABLE: off, together with the plan of the prompt graph at the start, for comparisons
         static const bool replan_disable = getenv("LLAMA_REPLAN_DISABLE") != nullptr;
         if (!replan_disable && memory && ubatch.n_tokens >= std::max<uint32_t>(128, n_ubatch_split() / 2) &&
             gtype == ctx_type_to_graph_type(cparams.ctx_type) &&
