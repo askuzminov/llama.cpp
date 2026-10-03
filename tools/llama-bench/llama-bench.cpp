@@ -1330,6 +1330,10 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        // a prompt batch and a decode step read the logits of their last token only (llama_batch_get_one). the default
+        // (0 = n_batch) reserves the logits of every token of a ubatch, 4 GB at 248320 x 4096, which runs on the CPU in
+        // the reserved graph when that is over the buffer limit of the gpu; llama-server sets the outputs it needs too
+        cparams.n_outputs_max   = embeddings ? 0 : 1;
 
         return cparams;
     }

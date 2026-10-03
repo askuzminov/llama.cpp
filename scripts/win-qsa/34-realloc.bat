@@ -11,7 +11,10 @@ rem plan made again for a prompt ubatch while computing is made at the full KV. 
 rem the cause of the silent crashes at the first ubatch: vk::Queue::submit: ErrorOutOfDeviceMemory (memory is at the
 rem edge at -c 262144 with this model; the first version of the fix planned at the full KV in the middle of the run
 rem and crashed so twice). LLAMA_REPLAN_DISABLE=1 turns the fix off. GGML_SCHED_LOG_REALLOC=1 prints the limits of the
-rem device, the splits of every planned graph and the cause of each new plan.
+rem device, the splits of every planned graph and the cause of each new plan. run of 03.10 12:44 (fix at the start):
+rem 650.05 t/s with 0 new plans against 628.68 with 32. since then llama-bench itself reserves one output
+rem (n_outputs_max 1, as llama-server): no logits split on the CPU and about 4 GB less pinned memory, so both arms here
+rem plan only at the start
 rem   llama-bench pp4096 at DEPTH34 with -c CTX34 for each arm of ARMS34, "name [VAR=value ...]"; the depth is filled
 rem   once per arm, outside the timing
 setlocal enabledelayedexpansion
