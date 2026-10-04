@@ -24,6 +24,7 @@ KNOBS = (
     "GGML_VK_DISABLE_GRAPH_OPTIMIZE", "GGML_VK_DISABLE_MM_HEADSUM",
     "GGML_VK_DISABLE_MM_RELU", "GGML_VK_TOPK_RADIX", "GGML_VK_FA_SPARSE_DISABLE",
     "GGML_VK_FA_SPARSE_GROUP", "GGML_VK_FA_SPARSE_GQA", "GGML_VK_PERF_LOGGER",
+    "GGML_VK_SHMEM_LIMIT",
     "LLAMA_INPUT_TIMING", "GGML_SCHED_LOG_REALLOC", "GGML_SCHED_PARALLEL_CPU",
 )
 
@@ -207,14 +208,24 @@ def compare(mode, logs):
         if not text.is_file():
             raise RuntimeError(f"Missing corpus: {text}; run get-wikitext.bat")
         metadata["corpus"] = {"path": str(text), "sha256": digest(text)}
-        metadata["parameters"] = {"ctx": ctx, "chunks": chunks, "ubatch": ub}
+        diagnostics = {}
+        if vulkan and os.environ.get("ABQDIAG", "0") == "1":
+            diagnostics = {
+                "new-no-fusion": {"GGML_VK_DISABLE_FUSION": "1", "GGML_VK_DISABLE_GRAPH_OPTIMIZE": "1"},
+                "new-no-replan": {"LLAMA_REPLAN_DISABLE": "1"},
+                "new-shmem32": {"GGML_VK_SHMEM_LIMIT": "32768"},
+            }
+        metadata["parameters"] = {"ctx": ctx, "chunks": chunks, "ubatch": ub, "diagnostics": diagnostics}
         (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         params = [*common, "-f", str(text), "-c", str(ctx), "--chunks", str(chunks), "-b", str(ub), "-ub", str(ub)]
         print(f"Free disk: {shutil.disk_usage(logs).free / 2**30:.1f} GiB. At 248320 vocab, base logits need about {ctx * chunks * 248320 / 2**30:.1f} GiB.", flush=True)
-        stable_arms = [("stable-repeat", baseline, False, None), *arms[1:]]
+        stable_arms = [("stable-repeat", baseline, False, None), *arms[1:],
+                       *((name, folder, False, None) for name in diagnostics)]
         references = [("stable", baseline, False, stable_arms)]
         if vulkan:
-            references.append(("accurate", folder, True, [("accurate-repeat", folder, True, None), arms[1]]))
+            accurate_arms = [("accurate-repeat", folder, True, None), arms[1],
+                             *((name, folder, True, None) for name in diagnostics)]
+            references.append(("accurate", folder, True, accurate_arms))
         for ref_name, ref_bin, ref_accurate, candidates in references:
             data = logs / f"{ref_name}-base.dat"
             ref_params = [*params, "--kl-divergence-base", str(data)]
@@ -241,7 +252,9 @@ def compare(mode, logs):
                 time.sleep(settle)
                 label = f"{ref_name}-{name}"
                 try:
-                    output = run([str(executable(arm_bin, "llama-perplexity")), *ref_params, "--kl-divergence"], logs / f"{label}.log", base_env(accurate, heads))
+                    env = base_env(accurate, heads)
+                    env.update(diagnostics.get(name, {}))
+                    output = run([str(executable(arm_bin, "llama-perplexity")), *ref_params, "--kl-divergence"], logs / f"{label}.log", env)
                     kld = re.search(r"Mean\s+KLD:\s*(\S+)", output)
                     ratio = re.search(r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*(\S+)", output)
                     if not kld or not ratio or not math.isfinite(float(kld[1])) or not math.isfinite(float(ratio[1])) or float(ratio[1]) <= 0:

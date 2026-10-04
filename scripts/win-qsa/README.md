@@ -134,6 +134,8 @@ Local checks use generated two-layer MoE models with cache hits, misses, batches
 
 `LLAMA_QSA_SPLIT_HEADS=1` задаёт раздельные головы, `0` запрашивает совместный matmul. Если тензор совместных оценок при полном размере пула превышает предел буфера backend, остаётся split. Поэтому на 395 с большим резервом контекста joint PP может совпасть с split, а TG использовать совместный matmul. По умолчанию Vulkan оставляет split для headsum fusion; CUDA использует совместный matmul там, где он помещается. Порядок relu и суммы голов сохранён.
 
+For Vulkan quality diagnosis, set `ABQDIAG=1` and run `36-quality.bat`. It adds three comparisons against each reference: `new-no-fusion` disables Vulkan fusion and graph optimization, `new-no-replan` disables prompt buffer replanning, and `new-shmem32` uses the reported 32 KiB shared memory limit on the 395. Each arm changes only its listed switches; comparisons against the accurate reference also disable INT8 and F16 accumulation. The metadata and each log record the switches. These extra arms are off by default. A lower PPL on one corpus does not establish that a changed token distribution preserves task quality.
+
 Настройки новых скриптов в `_local.bat`:
 
 ```bat
