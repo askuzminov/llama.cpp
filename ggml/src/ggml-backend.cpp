@@ -805,6 +805,7 @@ struct ggml_backend_sched_prof {
     int64_t t_in   [GGML_SCHED_MAX_BACKENDS]; // input copies, with the waits
     int64_t t_wait [GGML_SCHED_MAX_BACKENDS]; // waits for a backend in the input copies
     int64_t t_run  [GGML_SCHED_MAX_BACKENDS]; // graph compute call, the full compute for the CPU
+    int64_t n_overlap[GGML_SCHED_MAX_BACKENDS]; // CPU splits submitted without waiting for device-only work
 };
 
 struct ggml_backend_sched {
@@ -857,6 +858,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool parallel_cpu;
 
     int debug;
 
@@ -1744,6 +1746,9 @@ static void ggml_backend_sched_prof_print(ggml_backend_sched_t sched, int bucket
         busy += t_in + t_run;
         len += snprintf(buf + len, sizeof(buf) - len, "%s %s %.0f splits, wait %.2f, copy %.2f, run %.2f ms",
                 len > 0 ? ";" : "", ggml_backend_dev_name(sched->prof_devs[b]), (double) p->n_split[b]/n, t_wait, t_in - t_wait, t_run);
+        if (p->n_overlap[b] > 0 && len >= 0 && len < (int) sizeof(buf)) {
+            len += snprintf(buf + len, sizeof(buf) - len, ", %.0f CPU waits avoided", (double) p->n_overlap[b]/n);
+        }
     }
 
     char splits[32];
@@ -1766,6 +1771,34 @@ static void ggml_backend_sched_prof_print(ggml_backend_sched_t sched, int bucket
     p->n_splits = n_splits;
 }
 
+static bool ggml_backend_sched_split_uses_host_buffer(const ggml_backend_sched_split * split) {
+    auto is_host = [](const ggml_tensor * t) {
+        if (t == nullptr) {
+            return false;
+        }
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        return base->buffer == nullptr || ggml_backend_buffer_is_host(base->buffer);
+    };
+
+    for (int i = 0; i < split->n_inputs; ++i) {
+        if (is_host(split->inputs[i])) {
+            return true;
+        }
+    }
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const ggml_tensor * t = split->graph.nodes[i];
+        if (is_host(t)) {
+            return true;
+        }
+        for (const ggml_tensor * src : t->src) {
+            if (is_host(src)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1775,6 +1808,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
+    bool pending_host[GGML_SCHED_MAX_BACKENDS];
+    std::fill_n(pending_host, GGML_SCHED_MAX_BACKENDS, true);
 
     const bool prof = sched->prof_period > 0;
 
@@ -1810,12 +1845,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     auto sync_backend = [&](ggml_backend_t backend) {
         const int64_t t_start = prof ? ggml_time_us() : 0;
         ggml_backend_synchronize(backend);
+        if (sched->parallel_cpu) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                if (sched->backends[i] == backend) {
+                    pending_host[i] = false;
+                }
+            }
+        }
         t_wait += prof ? ggml_time_us() - t_start : 0;
     };
 
     auto sync_event = [&](ggml_backend_event_t event) {
         const int64_t t_start = prof ? ggml_time_us() : 0;
         ggml_backend_event_synchronize(event);
+        if (sched->parallel_cpu) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                if (sched->events[i][sched->cur_copy] == event) {
+                    pending_host[i] = false;
+                }
+            }
+        }
         t_wait += prof ? ggml_time_us() - t_start : 0;
     };
 
@@ -1827,10 +1876,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int64_t t_split_start = prof ? ggml_time_us() : 0;
         t_wait = 0;
 
-        // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
+        // Device-only work cannot access the CPU buffers reused by this split.
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+            const bool overlap = sched->parallel_cpu && !pending_host[prev_backend_id] &&
+                ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (overlap) {
+                if (prof) {
+                    sched->prof[bucket].n_overlap[split_backend_id]++;
+                }
+            } else if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 sync_event(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 sync_backend(sched->backends[prev_backend_id]);
@@ -1966,6 +2020,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         const int64_t t_run_start = prof ? ggml_time_us() : 0;
 
+        if (sched->parallel_cpu) {
+            pending_host[split_backend_id] = pending_host[split_backend_id] || ggml_backend_sched_split_uses_host_buffer(split);
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2054,6 +2112,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     static std::atomic<int> prof_count { 0 };
     const char * GGML_SCHED_PROF = getenv("GGML_SCHED_PROF");
     sched->prof_period = GGML_SCHED_PROF ? atoi(GGML_SCHED_PROF) : 0;
+    const char * parallel_cpu = getenv("GGML_SCHED_PARALLEL_CPU");
+    sched->parallel_cpu = parallel_cpu != nullptr && atoi(parallel_cpu) > 0;
     sched->prof_id     = sched->prof_period > 0 ? prof_count++ : 0;
     sched->prof_last   = -1;
 

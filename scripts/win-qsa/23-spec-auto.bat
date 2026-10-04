@@ -29,6 +29,32 @@ rem llama-server running on the machine. the script refuses to start if one is a
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
+set "OVERLAP_TEST="
+if /i "%~1"=="overlap-quality" set "OVERLAP_TEST=quality"
+if /i "%~1"=="overlap-speed" set "OVERLAP_TEST=speed"
+if defined OVERLAP_TEST (
+    if /i not "%BACKEND%"=="cuda" (
+        echo The overlap comparison needs a CUDA build.
+        exit /b 1
+    )
+    set "SPECAUTOPROMPTS=os code"
+    set "SPECAUTOSEEDS=1"
+    set "LLAMA_MOE_CACHE_STATS=128"
+    set "GGML_SCHED_PROF=64"
+    set "SPECAUTOARGS=-fit off -ncmoe 48 --moe-cache auto --no-repack -b 4096 -ub 4096"
+    if defined CUDAOVERLAPARGS set "SPECAUTOARGS=%CUDAOVERLAPARGS%"
+)
+if /i "%OVERLAP_TEST%"=="quality" (
+    set "GGML_SCHED_PROF=1"
+    set "SPECAUTOSAMP=0 20 0.95"
+    set "SPECAUTONGEN=256"
+    set "SPECAUTOARMS="serial-none none --phase-mem" "parallel-none none --phase-mem" "serial-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-n3 draft-mtp --phase-mem --spec-draft-n-max 3""
+)
+if /i "%OVERLAP_TEST%"=="speed" (
+    set "SPECAUTONGEN=512"
+    set "SPECAUTOARMS="serial-static none" "serial-phase none --phase-mem" "parallel-none none --phase-mem" "serial-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-auto draft-mtp --phase-mem --spec-auto" "parallel-t8 draft-mtp --phase-mem --spec-draft-n-max 3 -t 8 -tb 8" "parallel-t12 draft-mtp --phase-mem --spec-draft-n-max 3 -t 12 -tb 12" "parallel-t16 draft-mtp --phase-mem --spec-draft-n-max 3 -t 16 -tb 16""
+)
+
 if not defined SPECAUTOARMS    set "SPECAUTOARMS="none none" "n3 draft-mtp --spec-draft-n-max 3" "auto infer --spec-auto""
 if not defined SPECAUTOPROMPTS set "SPECAUTOPROMPTS=os db code repeat"
 if not defined SPECAUTOSEEDS   set "SPECAUTOSEEDS=1 2"
@@ -105,6 +131,8 @@ echo ### MODEL=%MODEL% >> "%SUM%"
 echo ### SPECDRAFT=%SPECDRAFT% >> "%SUM%"
 echo ### ctx=%SPECAUTOCTX% n_predict=%SPECAUTONGEN% prompts=%SPECAUTOPROMPTS% seeds=%SPECAUTOSEEDS% temp=%STEMP% top_k=%STOPK% top_p=%STOPP% >> "%SUM%"
 echo ### LOADMODE=%LOADMODE% EXTRA=%EXTRA% SPECAUTOARGS=%SPECAUTOARGS% >> "%SUM%"
+if defined OVERLAP_TEST echo ### overlap comparison=%OVERLAP_TEST%; weights and KV precision unchanged >> "%SUM%"
+if defined CUDAOVERLAPCHARS if defined OVERLAP_TEST echo ### prefix chars=%CUDAOVERLAPCHARS% from %PPLFILE% >> "%SUM%"
 echo. >> "%SUM%"
 
 call :mkreq warmup
@@ -113,6 +141,11 @@ if not "%RC%"=="0" exit /b 1
 
 set "ABORT=0"
 for %%a in (%SPECAUTOARMS%) do call :arm "%%~a"
+
+if /i "%OVERLAP_TEST%"=="quality" (
+    powershell -NoProfile -Command "$bad = $false; foreach ($kind in @('none', 'n3')) { foreach ($p in @('os', 'code')) { try { $a = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ('serial-' + $kind + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; $b = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ('parallel-' + $kind + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; if ($null -eq $a.timings -or $null -eq $b.timings) { throw 'missing timings' }; $ma = $a.choices[0].message; $mb = $b.choices[0].message; if ($null -eq $ma -or $null -eq $mb) { throw 'missing message' }; $same = ([string]$ma.content -ceq [string]$mb.content) -and ([string]$ma.reasoning_content -ceq [string]$mb.reasoning_content) -and ($a.timings.predicted_n -eq $b.timings.predicted_n); 'greedy match {0}/{1}: {2}' -f $kind, $p, $same; if (-not $same) { $bad = $true } } catch { $bad = $true; 'greedy comparison {0}/{1}: {2}' -f $kind, $p, $_.Exception.Message } } }; if ($bad) { exit 1 }" >> "%SUM%"
+    if errorlevel 1 set "RC=1"
+)
 
 set "LLAMA_SPEC_TRACE="
 
@@ -129,6 +162,10 @@ set "PNAME=%~1"
 set "PLINES=%SPECREPLINE%"
 set "POUT=%WORK%\prompt-%PNAME%.txt"
 powershell -NoProfile -Command "$n = $env:PNAME; if ($n -eq 'warmup') { $p = 'Describe your favourite season in a short paragraph.' } elseif ($n -eq 'os') { $p = 'Explain in detail how a modern operating system schedules threads on a multi core processor. Cover run queues, load balancing, priority inheritance and cache affinity.' } elseif ($n -eq 'db') { $p = 'Explain in detail how a relational database executes a join between two large tables. Cover hash join, merge join, nested loops, spilling to disk and cardinality estimation.' } elseif ($n -eq 'code') { $p = 'Write a C++17 header-only thread-safe LRU cache class template with get, put and erase, then a short usage example and unit tests with assert.' } elseif ($n -eq 'repeat') { $body = [string]::Join([string][char]10, (1..[int]$env:PLINES | ForEach-Object { '    const int row_{0:d3} = accumulate(buffer, stride * {0}, offset + {0}, mask_{0:d3});' -f $_ })); $p = 'Write the following block of text back to me, exactly as it is. Output only the block, no commentary and no code fences.' + [string][char]10 + [string][char]10 + $body } else { exit 1 }; [System.IO.File]::WriteAllText($env:POUT, $p, (New-Object System.Text.UTF8Encoding($false)))"
+if defined OVERLAP_TEST if defined CUDAOVERLAPCHARS if not "%CUDAOVERLAPCHARS%"=="0" (
+    powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; if ($env:PNAME -eq 'warmup') { exit 0 }; $t = [IO.File]::ReadAllText($env:PPLFILE); $n = [math]::Min($t.Length, [int]$env:CUDAOVERLAPCHARS); $p = $t.Substring(0, $n) + [string][char]10 + [string][char]10 + [IO.File]::ReadAllText($env:POUT); [IO.File]::WriteAllText($env:POUT, $p, (New-Object System.Text.UTF8Encoding($false)))"
+    if errorlevel 1 set "RC=1"
+)
 if not exist "%POUT%" (
     echo unknown prompt %PNAME%, known: os db code repeat
     set "RC=1"
@@ -151,6 +188,11 @@ if not defined STYPE (
     echo bad arm "%~1", expected "name types [args]"
     set "RC=1"
     goto :eof
+)
+
+if defined OVERLAP_TEST (
+    set "GGML_SCHED_PARALLEL_CPU=0"
+    if /i "!ARM:~0,9!"=="parallel-" set "GGML_SCHED_PARALLEL_CPU=1"
 )
 
 set "SPECT=--spec-type %STYPE%"
@@ -212,9 +254,26 @@ set "AWORK=%WORK%"
 set "AARM=%ARM%"
 echo. >> "%SUM%"
 echo ### %ARM%: types %STYPE% %AARGS% >> "%SUM%"
+if defined OVERLAP_TEST echo ### GGML_SCHED_PARALLEL_CPU=%GGML_SCHED_PARALLEL_CPU% >> "%SUM%"
+if defined OVERLAP_TEST powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $n = 0; $ms = 0; Get-ChildItem -LiteralPath $env:AWORK -Filter ($env:AARM + '-*-resp.json') | Where-Object { $_.Name -notlike '*-warmup-*' } | ForEach-Object { $r = Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName | ConvertFrom-Json; $n += $r.timings.prompt_n; $ms += $r.timings.prompt_ms }; $rate = if ($ms -gt 0) { 1000 * $n / $ms } else { 0 }; '### prompt {0} tokens in {1} ms = {2} t/s' -f $n, [math]::Round($ms, 1).ToString($c), [math]::Round($rate, 2).ToString($c)" >> "%SUM%"
 powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $n = 0; $ms = 0; $dn = 0; $da = 0; $rows = @(); Get-ChildItem -LiteralPath $env:AWORK -Filter ($env:AARM + '-*-resp.json') | Where-Object { $_.Name -notlike '*-warmup-*' } | Sort-Object Name | ForEach-Object { $f = $_.Name; try { $r = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json; $t = $r.timings; if ($null -eq $t) { throw [string]$r.error.message }; $n += $t.predicted_n; $ms += $t.predicted_ms; $dn += $t.draft_n; $da += $t.draft_n_accepted; $rows += ('    {0}: {1} tokens, {2} t/s, draft {3}/{4}' -f $_.Name, $t.predicted_n, [math]::Round($t.predicted_per_second, 2).ToString($c), $t.draft_n_accepted, $t.draft_n) } catch { $rows += ('    {0}: no timings: {1}' -f $f, $_.Exception.Message) } }; $rows | ForEach-Object { $_ }; $tps = if ($ms -gt 0) { 1000.0 * $n / $ms } else { 0 }; $acc = if ($dn -gt 0) { $da / $dn } else { 0 }; '### total {0} tokens in {1} ms = {2} t/s, draft acceptance {3} ({4} / {5})' -f $n, [math]::Round($ms, 1).ToString($c), [math]::Round($tps, 2).ToString($c), [math]::Round($acc, 4).ToString($c), $da, $dn" >> "%SUM%"
 rem the spec prints are cumulative and come after each request, keep the last one
 powershell -NoProfile -Command "$l = @(Select-String -LiteralPath $env:SRVLOG -SimpleMatch -Pattern 'auto:', 'statistics ' | ForEach-Object { $_.Line }); $i = -1; for ($k = 0; $k -lt $l.Count; $k++) { if ($l[$k] -match 'print: auto: (on|trace only),') { $i = $k } }; if ($i -ge 0) { $l[$i..($l.Count - 1)] }" >> "%SUM%"
+if defined OVERLAP_TEST powershell -NoProfile -Command "Select-String -LiteralPath $env:SRVLOG -SimpleMatch -Pattern 'moe_cache:', 'sched_prof ', 'phase_mem:' | Select-Object -Last 16 | ForEach-Object { $_.Line }" >> "%SUM%"
+if defined OVERLAP_TEST (
+    findstr /c:"slots per layer" "%SRVLOG%" >nul
+    if errorlevel 1 (
+        echo ### FAIL: the expert cache did not allocate slots >> "%SUM%"
+        set "RC=1"
+    )
+    if "%GGML_SCHED_PARALLEL_CPU%"=="1" (
+        findstr /c:"CPU waits avoided" "%SRVLOG%" >nul
+        if errorlevel 1 (
+            echo ### FAIL: no CPU overlap reported, inspect the scheduler profile >> "%SUM%"
+            set "RC=1"
+        )
+    )
+)
 
 echo === waiting %SETTLE%s for the gpu to be released
 powershell -NoProfile -Command "Start-Sleep -Seconds %SETTLE%"

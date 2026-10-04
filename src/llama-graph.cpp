@@ -2605,11 +2605,33 @@ ggml_tensor * llm_graph_context::build_moe_cache(
         }
     }
 
-    ggml_build_forward_expand(gf, down);
-
     // routing ids for llama_moe_cache::update()
     ggml_tensor * ids_dst = ggml_view_2d(ctx0, cl->ids, n_used, n_tok, n_used*ggml_element_size(cl->ids), 0);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, ids_dst));
+    ggml_tensor * ids_host = ggml_cpy(ctx0, selected_experts, ids_dst);
+
+    const char * parallel_cpu = getenv("GGML_SCHED_PARALLEL_CPU");
+    if (parallel_cpu != nullptr && atoi(parallel_cpu) > 0) {
+        // Copy the CPU inputs before the device starts the cached experts.
+        ggml_tensor * cur_host = ggml_dup(ctx0, cur);
+        ggml_set_name(cur_host, "ffn_moe_cache_input_host");
+        ggml_backend_sched_set_tensor_backend(sched, cur_host, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, ids_host, backend_cpu);
+        ggml_build_forward_expand(gf, cur_host);
+        ggml_build_forward_expand(gf, ids_host);
+
+        mm_up->src[1] = cur_host;
+        for (ggml_tensor * mm : mms) {
+            if (mm != nullptr) {
+                mm->src[2] = ids_host;
+            }
+        }
+        if (mm_gate != nullptr) {
+            mm_gate->src[1] = cur_host;
+        }
+    }
+
+    ggml_build_forward_expand(gf, down);
+    ggml_build_forward_expand(gf, ids_host);
 
     res->moe_cache_il.push_back(il);
     res->moe_cache_n_ids.push_back(n_used*n_tok);

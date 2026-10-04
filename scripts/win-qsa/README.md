@@ -58,6 +58,30 @@
 `run-all.bat` кладёт рядом `run-all-<время>-summary.txt` с кодом возврата
 каждого шага; ненулевой код значит, что инструмент упал, и надо смотреть его лог.
 
+## CUDA MoE overlap: 38-cuda-overlap.bat
+
+Build with `00-build.bat`, set `MODEL` and `SPECDRAFT` in `_local.bat`, then run `38-cuda-overlap.bat` on the 3090. It uses the existing server runner in `23-spec-auto.bat`; it does not need the stable build.
+
+The new mode copies the CPU expert inputs before submitting the cached GPU experts. The scheduler can then run the CPU branch while the GPU branch is pending. It keeps the wait if pending GPU work accesses host buffers, including host-to-device copy sources. `GGML_SCHED_PARALLEL_CPU=1` enables this mode; it is off by default. Expert weights, routing and KV precision stay the same.
+
+The first pass compares paired greedy outputs with and without overlap, both without speculation and with MTP capped at 3 draft tokens. A mismatch, an inactive expert cache or missing overlap counters stops the script before the speed pass. This is a regression check on two prompts, not a full quality evaluation. Use `36-quality.bat` for the existing model quality comparison; it clears the overlap switch and does not evaluate this cache path.
+
+The second pass separates the static layout, the existing `--phase-mem` layout, overlap, MTP capped at 3 tokens, and the existing `--spec-auto` controller. It also checks 8/12/16 CPU threads for both decode and batch compute (`-t` and `-tb`). All arms use the same GGUF and context capacity. The summaries include PP, TG, draft acceptance, cache slots and scheduler waits; responses and per-cycle traces stay in the `23-spec-auto-*` log folders. `CPU waits avoided` reports skipped host waits; it is not a GPU utilization measurement.
+
+Optional settings in `_local.bat`:
+
+```bat
+rem Keep the full context capacity; add a real text prefix to measure at depth.
+set "SPECAUTOCTX=262144"
+rem set "CUDAOVERLAPCHARS=65536"
+rem Overrides the common arguments of every arm, not the arm's phase/MTP/thread options.
+rem set "CUDAOVERLAPARGS=-fit off -ncmoe 48 --moe-cache auto --no-repack -b 4096 -ub 4096"
+```
+
+`CUDAOVERLAPCHARS` prepends that many characters from `PPLFILE` to both measured prompts. It is a character count, not a token count; check `prompt_n` in the responses. Without it the prompts are short even when the context capacity is 262144. For TG before and after a larger prefill, run the existing `22-ubmem.bat` with `set "GGML_SCHED_PARALLEL_CPU=1"` in the calling console.
+
+Local checks use generated two-layer MoE models with cache hits, misses, batches of 1/4/7 tokens and a PP/TG phase switch. Full logits match byte for byte for merged gate/up weights in Qwen4 and separate gate/up weights in Qwen2MoE, including Q4_K/Q5_1 expert weights in Qwen4. The RTX 3090 speed and the full model still need hardware validation. MTP and phase memory management already existed in this branch; this change adds overlap and the paired measurement.
+
 ## Скрипты
 
 | Файл | Нужна модель | Что даёт |
