@@ -73,22 +73,39 @@ def save_summary(logs, summary):
     (logs / "summary.txt").write_text("\n\n".join(summary) + "\n", encoding="utf-8")
 
 
+def baseline_perplexity(commit):
+    source = subprocess.check_output(["git", "-C", str(ROOT), "show", f"{commit}:tools/perplexity/perplexity.cpp"])
+    replacements = (
+        (b"logits.reserve(size_t(n_ctx) * n_vocab);", b"logits.reserve(size_t(n_ctx - n_ctx/2) * n_vocab);", 2),
+        (b"log_probs.resize(size_t(n_ctx) * nv);", b"log_probs.resize(size_t(n_ctx - 1 - n_ctx/2) * nv);", 1),
+    )
+    for old, new, count in replacements:
+        if source.count(old) != count:
+            raise RuntimeError("Stable perplexity buffer layout changed; review the baseline memory fix")
+        source = source.replace(old, new)
+    return source
+
+
 def prepare(logs):
     source = Path(os.environ.get("ABSOURCE", ROOT / "build-stable-src")).resolve()
     build = Path(os.environ.get("ABBUILD", ROOT / "build-stable")).resolve()
     commit = git("rev-parse", "stable^{commit}")
     bench = Path("tools/llama-bench/llama-bench.cpp")
+    ppl = Path("tools/perplexity/perplexity.cpp")
+    ppl_source = baseline_perplexity(commit)
     marker = source / ".qsa-stable-source"
     if source.exists():
         if not marker.is_file() or marker.read_text().strip() != commit or git("rev-parse", "HEAD", cwd=source) != commit:
             raise RuntimeError(f"Refusing to overwrite {source}; choose a new ABSOURCE")
-        allowed = {bench.as_posix(), "scripts/win-qsa/00-build.bat", "scripts/win-qsa/_config.bat"}
-        if set(git("diff", "HEAD", "--name-only", cwd=source).splitlines()) - allowed:
+        allowed = {bench.as_posix(), ppl.as_posix(), "scripts/win-qsa/00-build.bat", "scripts/win-qsa/_config.bat"}
+        modified = set(git("diff", "HEAD", "--name-only", cwd=source).splitlines())
+        if modified - allowed or (ppl.as_posix() in modified and (source / ppl).read_bytes() != ppl_source):
             raise RuntimeError(f"Baseline core was modified in {source}; choose a new ABSOURCE")
     else:
         subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(source), commit], check=True)
         marker.write_text(commit + "\n")
     shutil.copy2(ROOT / bench, source / bench)
+    (source / ppl).write_bytes(ppl_source)
     if os.name == "nt":
         scripts = source / "scripts/win-qsa"
         for name in ("00-build.bat", "_config.bat"):
@@ -105,6 +122,7 @@ def prepare(logs):
              "llama-bench", "llama-perplexity", "-j", str(os.cpu_count() or 4)], logs / "build.log")
     folder = build / "bin/Release" if (build / "bin/Release").is_dir() else build / "bin"
     data = {"commit": commit, "bench_source_sha256": digest(ROOT / bench),
+            "perplexity_source_sha256": digest(source / ppl),
             "binaries": {n: digest(executable(folder, n)) for n in ("llama-bench", "llama-perplexity")}}
     (folder / "qsa-baseline.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     print(f"Baseline ready. Set ABBIN={folder} in _local.bat", flush=True)
@@ -152,6 +170,8 @@ def compare(mode, logs):
     info = json.loads((baseline / "qsa-baseline.json").read_text(encoding="utf-8"))
     if info["commit"] != git("rev-parse", "stable^{commit}") or info["bench_source_sha256"] != digest(ROOT / "tools/llama-bench/llama-bench.cpp"):
         raise RuntimeError("Baseline tag or benchmark source differs; run 35-build-stable.bat again")
+    if mode == "quality" and info.get("perplexity_source_sha256") != hashlib.sha256(baseline_perplexity(info["commit"])).hexdigest():
+        raise RuntimeError("Baseline perplexity needs the buffer memory fix; run 35-build-stable.bat again")
     for name, sha in info["binaries"].items():
         if digest(executable(baseline, name)) != sha:
             raise RuntimeError(f"Baseline binary changed: {name}")
