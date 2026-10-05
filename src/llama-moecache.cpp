@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <queue>
 #include <thread>
@@ -56,9 +57,10 @@ llama_moe_stats::llama_moe_stats(const llama_model & model) : model(model) {
     il2idx.resize(model.layers.size(), -1);
 }
 
-void llama_moe_stats::set_cache(int32_t n_slots, int32_t max_ins) {
+void llama_moe_stats::set_cache(int32_t n_slots, int32_t max_ins, bool lfu) {
     cache_slots = n_slots;
     cache_ins   = max_ins;
+    cache_lfu   = lfu;
 }
 
 std::vector<int32_t> llama_moe_stats::table_slots() const {
@@ -646,7 +648,7 @@ void llama_moe_stats::report() {
     LLAMA_LOG_WARN(MOE_LOG ":   OPT   Belady with the future of the replayed steps, a limit for the other policies\n");
     LLAMA_LOG_WARN(MOE_LOG ": each cell: decode hit, upload MiB per step, host read MiB per step\n");
     if (cache_slots > 0) {
-        LLAMA_LOG_WARN(MOE_LOG ": * the slots and the upload limit of --moe-cache, its LRU cell must match the moe_cache line with the same steps\n");
+        LLAMA_LOG_WARN(MOE_LOG ": * the slots and the upload limit of --moe-cache, its %s cell must match the moe_cache line with the same steps\n", cache_lfu ? "LFU" : "LRU");
     }
     LLAMA_LOG_WARN(MOE_LOG ":  slots | VRAM total | ins |         LRU         |        LRU/1        |         2Q          |         LFU         |         OPT\n");
 
@@ -684,9 +686,14 @@ void llama_moe_stats::report() {
 static const size_t MOE_CACHE_MARGIN = 1024ull*1024*1024;
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, int32_t n_slots_req) : model(model), n_slots_req(n_slots_req) {
+    const char * policy = getenv("LLAMA_MOE_CACHE_POLICY");
+    frequency_admission = policy && strcmp(policy, "lfu") == 0;
+    const char * async = getenv("LLAMA_MOE_CACHE_ASYNC");
+    async_table = async && atoi(async) != 0;
 }
 
 llama_moe_cache::~llama_moe_cache() {
+    join_uploads();
     // the uploads read the host weights and write the slots, finish them before the buffers go away
     if (backend_up != nullptr) {
         ggml_backend_synchronize(backend_up);
@@ -805,6 +812,9 @@ void llama_moe_cache::init(ggml_backend_sched_t sched) {
     }
 
     ev_up = ggml_backend_event_new(dev);
+    async_upload = async_table && strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0;
+    LLAMA_LOG_INFO("%s: policy %s, async uploads %d, async table %d\n", MOE_CACHE_LOG,
+            frequency_admission ? "lfu" : "lru", async_upload, async_table);
 
     b_slot = 0;
     for (const auto & l : sel) {
@@ -871,12 +881,16 @@ void llama_moe_cache::alloc() {
             /*.no_alloc   =*/ true,
         };
         ctx_dev.reset(ggml_init(params));
-        params.mem_size = 2*n_layers*ggml_tensor_overhead();
+        params.mem_size = (2*n_layers + (async_table ? 1 : 0))*ggml_tensor_overhead();
         ctx_host.reset(ggml_init(params));
     }
 
     table_all = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_expert, n_layers);
     ggml_set_name(table_all, "moe_cache.table");
+    if (async_table) {
+        table_staging = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, n_expert, n_layers);
+        ggml_set_name(table_staging, "moe_cache.table_staging");
+    }
 
     const int64_t n_used_max = model.hparams.n_expert_used_max();
 
@@ -908,7 +922,11 @@ void llama_moe_cache::alloc() {
 
     buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), ggml_backend_dev_buffer_type(dev)));
     if (buf_dev) {
-        buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))));
+        ggml_backend_buffer_type_t buft_host = async_table ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (!buft_host) {
+            buft_host = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        }
+        buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
     }
     if (!buf_dev || !buf_host) {
         LLAMA_LOG_ERROR("%s: failed to allocate %d slots on %s, no slots\n", MOE_CACHE_LOG, (int) n, ggml_backend_dev_name(dev));
@@ -917,6 +935,7 @@ void llama_moe_cache::alloc() {
             l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = nullptr;
         }
         table_all = nullptr;
+        table_staging = nullptr;
         ctx_dev.reset();
         ctx_host.reset();
         return;
@@ -945,6 +964,9 @@ void llama_moe_cache::alloc() {
         c.expert.assign(n_slots, -1);
         c.live.assign(n_slots, 0);
         c.seen.assign(n_expert, UINT64_MAX);
+        if (frequency_admission) {
+            c.freq.assign(n_expert, 0);
+        }
 
         int32_t * skip  = (int32_t *) layers[idx].skip->data;
         int32_t * table = table_host.data() + idx*n_expert;
@@ -991,6 +1013,7 @@ void llama_moe_cache::release() {
     }
 
     const int64_t t_start_us = ggml_time_us();
+    join_uploads();
 
     // the last graph and the uploads can still use the slots
     ggml_backend_synchronize(backend);
@@ -1014,6 +1037,7 @@ void llama_moe_cache::release() {
     }
 
     table_all = nullptr;
+    table_staging = nullptr;
     buf_dev.reset();
     buf_host.reset();
     ctx_dev.reset();
@@ -1088,8 +1112,22 @@ void llama_moe_cache::insert(size_t idx, int32_t e) {
     lru_push(c, e);
     c.uploads_new.push_back(s);
 
-    b_ins += upload(idx, e, s);
+    if (async_upload) {
+        pending_uploads.push_back({ idx, e, s });
+        const layer & l = layers[idx];
+        b_ins += l.w_up->nb[2] + (l.w_gate ? l.w_gate->nb[2] : 0) + l.w_down->nb[2];
+    } else {
+        b_ins += upload(idx, e, s);
+    }
     n_ins++;
+}
+
+void llama_moe_cache::join_uploads() {
+    if (upload_thread.joinable()) {
+        upload_thread.join();
+        t_submit_us += upload_submit_us;
+    }
+    pending_uploads.clear();
 }
 
 size_t llama_moe_cache::upload(size_t idx, int32_t e, int32_t s) {
@@ -1124,6 +1162,7 @@ void llama_moe_cache::update(const llm_graph_result * res) {
     t_graph_us += t_graph_end_us - t_start_us;
 
     // the uploads of the last step ran during this graph
+    join_uploads();
     if (ev_up_recorded) {
         ggml_backend_event_synchronize(ev_up);
         ev_up_recorded = false;
@@ -1163,10 +1202,23 @@ void llama_moe_cache::update(const llm_graph_result * res) {
                 b_host += skip[e] != 0 ? 0 : b_exp;
             }
 
+            if (frequency_admission) {
+                c.freq[e] += c.freq[e] < UINT16_MAX;
+                if (++c.n_seen >= MOE_STATS_LFU_WINDOW*n_slots) {
+                    c.n_seen = 0;
+                    for (auto & count : c.freq) {
+                        count >>= 1;
+                    }
+                }
+            }
+
             if (c.slot[e] >= 0) {
                 lru_unlink(c, e);
                 lru_push(c, e);
             } else if (n_new < max_ins) {
+                if (frequency_admission && c.n_fill == n_slots && c.freq[e] <= c.freq[c.tail]) {
+                    continue;
+                }
                 n_new++;
                 insert(idx, e);
             }
@@ -1203,12 +1255,31 @@ void llama_moe_cache::update(const llm_graph_result * res) {
     }
 
     if (dirty) {
-        ggml_backend_tensor_set(table_all, table_host.data(), 0, ggml_nbytes(table_all));
+        if (async_table) {
+            memcpy(table_staging->data, table_host.data(), ggml_nbytes(table_all));
+            ggml_backend_tensor_set_async(backend, table_all, table_staging->data, 0, ggml_nbytes(table_all));
+        } else {
+            ggml_backend_tensor_set(table_all, table_host.data(), 0, ggml_nbytes(table_all));
+        }
     }
 
-    if (issued && ev_up != nullptr) {
-        ggml_backend_event_record(ev_up, backend_up);
-        ev_up_recorded = true;
+    auto submit = [this] {
+        const int64_t start = ggml_time_us();
+        for (const auto & up : pending_uploads) {
+            upload(up.idx, up.expert, up.slot);
+        }
+        if (ev_up != nullptr) {
+            ggml_backend_event_record(ev_up, backend_up);
+            ev_up_recorded = true;
+        }
+        upload_submit_us = ggml_time_us() - start;
+    };
+    if (issued) {
+        if (async_upload) {
+            upload_thread = std::thread(submit);
+        } else {
+            submit();
+        }
     }
 
     t_upd_us += ggml_time_us() - t_wait_end_us;
@@ -1234,6 +1305,9 @@ void llama_moe_cache::report() const {
             n_ins, (double) b_ins/mib/(double) n_steps, (double) b_host/mib/(double) n_steps);
     LLAMA_LOG_WARN("%s: host time per step: graph end wait %.2f ms, upload wait %.2f ms, update %.2f ms\n",
             MOE_CACHE_LOG, ms*(double) t_graph_us, ms*(double) t_wait_us, ms*(double) t_upd_us);
+    if (async_upload) {
+        LLAMA_LOG_WARN("%s: worker upload submission %.2f ms per step, join time is included in upload wait\n", MOE_CACHE_LOG, ms*(double) t_submit_us);
+    }
     if (n_alloc > 1) {
         LLAMA_LOG_WARN("%s: slots allocated %" PRIu64 " times, refilled %" PRIu64 " experts (%.1f MiB), alloc and release %.1f ms per call\n",
                 MOE_CACHE_LOG, n_alloc, n_refill, (double) b_refill/mib, 1e-3*(double) t_alloc_us/(double) n_alloc);

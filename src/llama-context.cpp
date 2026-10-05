@@ -489,7 +489,17 @@ llama_context::llama_context(
             // start in the generation layout, a large n_ubatch does not have to fit at the full KV depth
             phase          = LLAMA_PHASE_GEN;
             phase_n_gen    = (uint32_t) std::min<int64_t>(std::clamp<int64_t>(n_gen, 1, llama_moe_cache::N_TOKENS_MAX), cparams.n_ubatch);
-            phase_n_tokens = phase_n_gen;
+            phase_n_reserve = phase_n_gen;
+            const char * compact = getenv("LLAMA_PHASE_GEN_COMPACT");
+            if (compact && atoi(compact) != 0) {
+                uint64_t n_verify = uint64_t(cparams.n_seq_max)*(cparams.n_rs_seq > 0 ? uint64_t(cparams.n_rs_seq) + 2 : 1);
+                if (params.ctx_other && params.ctx_other->cparams.phase_mem) {
+                    n_verify = std::max<uint64_t>(n_verify, params.ctx_other->phase_n_reserve);
+                }
+                phase_n_reserve = (uint32_t) std::min<uint64_t>(phase_n_gen, std::max<uint64_t>(1, n_verify));
+                LLAMA_LOG_INFO("%s: phase_mem: compact generation workspace %u tokens, classification threshold %u\n", __func__, phase_n_reserve, phase_n_gen);
+            }
+            phase_n_tokens = phase_n_reserve;
         }
 
         sched_reserve();
@@ -907,7 +917,14 @@ void llama_context::phase_update(uint32_t n_tokens) {
 
     const bool gen = n_tokens <= phase_n_gen;
 
-    if (gen && phase != LLAMA_PHASE_GEN) {
+    if (gen && (phase != LLAMA_PHASE_GEN || n_tokens > phase_n_reserve)) {
+        if (n_tokens > phase_n_reserve) {
+            phase_n_reserve = n_tokens;
+        }
+        if (moe_cache) {
+            moe_cache->release();
+        }
+        phase_cache = false;
         phase_gen();
     }
 
@@ -926,7 +943,7 @@ void llama_context::phase_update(uint32_t n_tokens) {
         moe_cache->alloc();
 
         if (moe_stats && moe_cache->ready()) {
-            moe_stats->set_cache(moe_cache->get_n_slots(), moe_cache->get_max_ins());
+            moe_stats->set_cache(moe_cache->get_n_slots(), moe_cache->get_max_ins(), moe_cache->uses_frequency_admission());
         }
 
         // the graphs keep the tensors of the old slots
@@ -940,15 +957,16 @@ void llama_context::phase_gen() {
 
     // the followers first, so that the moe-cache gets all the memory that is left
     for (auto * f : phase_followers) {
+        f->phase_n_reserve     = std::max(f->phase_n_reserve, std::min(phase_n_reserve, f->phase_n_gen));
         f->phase              = LLAMA_PHASE_GEN;
-        f->phase_n_tokens     = f->phase_n_gen;
+        f->phase_n_tokens     = f->phase_n_reserve;
         f->phase_n_kv         = 0;
         f->sched_need_reserve = true;
         f->sched_reserve();
     }
 
     phase              = LLAMA_PHASE_GEN;
-    phase_n_tokens     = phase_n_gen;
+    phase_n_tokens     = phase_n_reserve;
     phase_n_kv         = 0;
     sched_need_reserve = true;
     sched_reserve();
@@ -2287,7 +2305,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         moe_cache->init(sched.get());
         moe_cache->alloc();
         if (moe_stats && moe_cache->ready()) {
-            moe_stats->set_cache(moe_cache->get_n_slots(), moe_cache->get_max_ins());
+            moe_stats->set_cache(moe_cache->get_n_slots(), moe_cache->get_max_ins(), moe_cache->uses_frequency_admission());
         }
     }
 

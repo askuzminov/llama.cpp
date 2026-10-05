@@ -360,10 +360,11 @@ private:
 
     llama_phase phase = LLAMA_PHASE_NONE;
 
-    uint32_t phase_n_gen    = 0; // batches of at most this many tokens are generation
-    uint32_t phase_n_tokens = 0; // max tokens per ubatch of the reserved graphs, 0 = n_ubatch
-    uint32_t phase_n_kv     = 0; // KV cells of the reserved graphs, 0 = all
-    bool     phase_cache    = false; // the moe-cache slots were allocated in this generation phase
+    uint32_t phase_n_gen     = 0; // batches of at most this many tokens are generation
+    uint32_t phase_n_reserve = 0; // generation workspace, grown before a larger generation batch
+    uint32_t phase_n_tokens  = 0; // max tokens per ubatch of the reserved graphs, 0 = n_ubatch
+    uint32_t phase_n_kv      = 0; // KV cells of the reserved graphs, 0 = all
+    bool     phase_cache     = false; // the moe-cache slots were allocated in this generation phase
 
     // a draft context follows the phase switches of its target
     llama_context *              phase_owner = nullptr;

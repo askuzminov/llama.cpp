@@ -26,6 +26,8 @@ KNOBS = (
     "GGML_VK_FA_SPARSE_GROUP", "GGML_VK_FA_SPARSE_GQA", "GGML_VK_PERF_LOGGER",
     "GGML_VK_SHMEM_LIMIT",
     "LLAMA_INPUT_TIMING", "GGML_SCHED_LOG_REALLOC", "GGML_SCHED_PARALLEL_CPU",
+    "LLAMA_QSA_KV_HOST", "LLAMA_PHASE_GEN_COMPACT", "LLAMA_MOE_CACHE_ASYNC",
+    "LLAMA_MOE_CACHE_POLICY",
 )
 
 
@@ -305,11 +307,86 @@ def compare(mode, logs):
         raise RuntimeError("One or more arms failed; results retained in logs")
 
 
+def memory_quality(logs):
+    folder = Path(os.environ["BIN"]).resolve()
+    tool = executable(folder, "llama-perplexity")
+    model = Path(os.environ["MODEL"]).resolve()
+    corpus = Path(os.environ["PPLFILE"]).resolve()
+    if not model.is_file() or not corpus.is_file():
+        raise RuntimeError("MODEL and PPLFILE must exist")
+    ctx = int(os.environ.get("MEMQCTX", "8192"))
+    ub = int(os.environ.get("MEMQUB", "8"))
+    chunks = int(os.environ.get("MEMQCHUNKS", "1"))
+    limit = float(os.environ.get("MEMQKLD", "0.0001"))
+    if ctx <= 4096 or not 1 <= ub < 32 or chunks < 1 or not math.isfinite(limit) or limit <= 0:
+        raise RuntimeError("Memory quality requires MEMQCTX > 4096, MEMQUB 1..31, MEMQCHUNKS >= 1 and positive MEMQKLD")
+    cuda = os.environ.get("BACKEND") == "cuda"
+    variants = {"repeat": {}, "compact": {"LLAMA_PHASE_GEN_COMPACT": "1"},
+                "kvhost": {"LLAMA_QSA_KV_HOST": "1"}}
+    combined = {"LLAMA_PHASE_GEN_COMPACT": "1", "LLAMA_QSA_KV_HOST": "1"}
+    if cuda:
+        variants.update({"async": {"LLAMA_MOE_CACHE_ASYNC": "1"}, "lfu": {"LLAMA_MOE_CACHE_POLICY": "lfu"}})
+        combined.update(LLAMA_MOE_CACHE_ASYNC="1", LLAMA_MOE_CACHE_POLICY="lfu", GGML_SCHED_PARALLEL_CPU="1")
+    variants["all"] = combined
+    metadata = {"git_head": git("rev-parse", "HEAD"), "git_status": git("status", "--short"),
+                "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "-C", str(ROOT), "diff", "HEAD"])).hexdigest(),
+                "binary_sha256": digest(tool), "model": str(model), "model_size": model.stat().st_size,
+                "corpus": str(corpus), "corpus_sha256": digest(corpus),
+                "ctx": ctx, "ubatch": ub, "chunks": chunks, "mean_kld_limit": limit, "variants": variants}
+    (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    data = logs / "current-base.dat"
+    params = ["-m", str(model), "-f", str(corpus), *arguments(os.environ.get("LOADMODE", "")),
+              *arguments(os.environ.get("EXTRA", "")), "-fa", "on", "-ctk", "f16", "-ctv", "f16",
+              "-c", str(ctx), "--chunks", str(chunks), "-b", str(ub), "-ub", str(ub), "-fit", "off", "--phase-mem", "--no-repack"]
+    if cuda:
+        params += ["-ncmoe", "48", "--moe-cache", "auto"]
+    params += ["--kl-divergence-base", str(data)]
+    settle = float(os.environ.get("SETTLE", "30"))
+    env = base_env()
+    env.update(LLAMA_MOE_CACHE_STATS="0", GGML_SCHED_PROF="0")
+    time.sleep(settle)
+    output = run([str(tool), *params], logs / "current-base.log", env)
+    if "Final estimate" not in output:
+        raise RuntimeError("Current quality reference did not finish")
+    with data.open("rb") as f:
+        header = f.read(20)
+    if len(header) != 20 or header[:8] != b"_logits_":
+        raise RuntimeError("Invalid current logits header")
+    nctx, vocab, nchunk = struct.unpack("<Iii", header[8:])
+    expected = 20 + nctx*nchunk*4 + nchunk*(nctx - nctx//2 - 1)*(2*((vocab + 1)//2) + 4)*2
+    if (nctx, nchunk) != (ctx, chunks) or vocab < 1 or data.stat().st_size != expected:
+        raise RuntimeError("Current logits incomplete or corpus too short")
+    summary = [f"Same current build, F16 KV, ctx={ctx}, ubatch={ub}, chunks={chunks}, mean KLD limit={limit}"]
+    failed = False
+    for name, knobs in variants.items():
+        time.sleep(settle)
+        candidate_env = env.copy()
+        candidate_env.update(knobs)
+        try:
+            output = run([str(tool), *params, "--kl-divergence"], logs / f"{name}.log", candidate_env)
+            kld = re.search(r"Mean\s+KLD:\s*(\S+)", output)
+            ratio = re.search(r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*(\S+)", output)
+            if not kld or not ratio or not math.isfinite(float(kld[1])) or not math.isfinite(float(ratio[1])):
+                raise RuntimeError("Missing or non-finite quality metrics")
+            if float(kld[1]) > limit or abs(float(ratio[1]) - 1) > 0.001:
+                raise RuntimeError(f"Quality threshold exceeded: mean KLD={kld[1]}, PPL ratio={ratio[1]}")
+            summary.append(name + " PASS\n" + "\n".join(line for line in output.splitlines()
+                           if any(s in line for s in ("Mean PPL", "Mean    KLD", "Maximum KLD", "Same top p"))))
+        except (RuntimeError, ValueError) as e:
+            failed = True
+            summary.append(f"{name} FAIL: {e}")
+        save_summary(logs, summary)
+    if not failed and os.environ.get("ABKEEPLOGITS", "0") != "1":
+        data.unlink()
+    if failed:
+        raise RuntimeError("Memory quality failed; see summary.txt")
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("prepare", "quality", "speed"))
+    parser.add_argument("mode", choices=("prepare", "quality", "speed", "memory-quality"))
     mode = parser.parse_args().mode
     logs = Path(os.environ.get("LOGS", ROOT / "scripts/win-qsa/logs")) / (f"{mode}-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
     logs.mkdir(parents=True)
@@ -317,6 +394,8 @@ def main():
     try:
         if mode == "prepare":
             prepare(logs)
+        elif mode == "memory-quality":
+            memory_quality(logs)
         else:
             compare(mode, logs)
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as e:

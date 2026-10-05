@@ -1162,6 +1162,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     return top_k;
 }
 
+static void qsa_pack_kv(ggml_tensor * dst, int ith, int nth, void *) {
+    const ggml_tensor * k    = dst->src[0];
+    const ggml_tensor * v    = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ids->type == GGML_TYPE_I32);
+
+    const int64_t width = ids->ne[0];
+    const int64_t n_tps = ids->ne[1];
+    const size_t k_bytes = k->ne[0]*k->ne[1]*sizeof(ggml_fp16_t);
+    const size_t v_bytes = v->ne[0]*v->ne[1]*sizeof(ggml_fp16_t);
+    const ggml_fp16_t masked = ggml_fp32_to_fp16(-INFINITY);
+    std::vector<int32_t> cells(width);
+
+    for (int64_t i = ith; i < n_tps*ids->ne[3]; i += nth) {
+        const int64_t t = i % n_tps;
+        const int64_t s = i / n_tps;
+        for (int64_t j = 0; j < width; ++j) {
+            cells[j] = *(const int32_t *) ((const char *) ids->data + j*ids->nb[0] + t*ids->nb[1] + s*ids->nb[3]);
+        }
+        // The dense mask visits a cell once, in cell order, even if top_k names it twice.
+        std::sort(cells.begin(), cells.end());
+        for (int64_t j = 0; j < dst->ne[1]; ++j) {
+            char * row = (char *) dst->data + j*dst->nb[1] + t*dst->nb[2] + s*dst->nb[3];
+            if (j >= width) {
+                memset(row, 0, k_bytes + v_bytes);
+                memcpy(row + k_bytes + v_bytes, &masked, sizeof(ggml_fp16_t));
+                continue;
+            }
+            const int32_t cell = cells[j];
+            GGML_ASSERT(cell >= 0 && cell < k->ne[2]);
+            memcpy(row,           (const char *) k->data + cell*k->nb[2] + s*k->nb[3], k_bytes);
+            memcpy(row + k_bytes, (const char *) v->data + cell*v->nb[2] + s*v->nb[3], v_bytes);
+            const void * bias = j > 0 && cell == cells[j - 1] ? (const void *) &masked :
+                (const char *) mask->data + cell*mask->nb[0] + t*mask->nb[1] + s*mask->nb[3];
+            memcpy(row + k_bytes + v_bytes, bias, sizeof(ggml_fp16_t));
+        }
+    }
+}
+
 // Dense GQA self-attention restricted to the cells that top_k names.
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -1171,6 +1211,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             v_cur,
         ggml_tensor *             top_k,
         float                     kq_scale,
+        bool                      kv_host,
         int                       il) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
@@ -1192,13 +1233,55 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     const auto * mctx_cur = inp->mctx;
 
+    ggml_tensor * k_store;
+    ggml_tensor * v_store;
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        k_store = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        v_store = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        if (kv_host) {
+            ggml_backend_sched_set_tensor_backend(sched, k_store, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, v_store, backend_cpu);
+        }
+        ggml_build_forward_expand(gf, k_store);
+        ggml_build_forward_expand(gf, v_store);
+    }
+
+    if (kv_host && n_tokens < 32) {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+        k = ggml_view_4d(ctx0, k_store, k->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], k->view_offs);
+        v = ggml_view_4d(ctx0, v_store, v->ne[0], v->ne[1], v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], v->view_offs);
+        GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+        GGML_ASSERT(k->nb[1] == k->ne[0]*sizeof(ggml_fp16_t) && v->nb[1] == v->ne[0]*sizeof(ggml_fp16_t));
+
+        const int64_t width = GGML_PAD(top_k->ne[0], 256);
+        const int64_t n_tps = top_k->ne[1];
+        const int64_t ns    = top_k->ne[3];
+        const int64_t nk    = k->ne[0]*k->ne[1];
+        const int64_t nv    = v->ne[0]*v->ne[1];
+        ggml_tensor * args[] = { k, v, top_k, inp->get_kq_mask() };
+        ggml_tensor * pack = ggml_custom_4d(ctx0, GGML_TYPE_F16, GGML_PAD(nk + nv + 1, 64), width, n_tps, ns,
+                args, 4, qsa_pack_kv, GGML_N_TASKS_MAX, nullptr);
+        cb(pack, "qsa_kv_pack", il);
+
+        auto extract = [&](int64_t ne0, size_t offset) {
+            ggml_tensor * t = ggml_view_4d(ctx0, pack, ne0, width, n_tps, ns, pack->nb[1], pack->nb[2], pack->nb[3], offset);
+            t = ggml_cont(ctx0, t);
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+            return t;
+        };
+        ggml_tensor * mask = extract(1, (nk + nv)*sizeof(ggml_fp16_t));
+        k = ggml_reshape_4d(ctx0, extract(nk, 0), k->ne[0], k->ne[1], width, n_tps*ns);
+        v = ggml_reshape_4d(ctx0, extract(nv, nk*sizeof(ggml_fp16_t)), v->ne[0], v->ne[1], width, n_tps*ns);
+        mask = ggml_reshape_4d(ctx0, mask, width, 1, 1, n_tps*ns);
+
+        ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        return cur;
     }
 
     // view of the mask with rows of size 1, to read the selected rows out of:
@@ -1317,7 +1400,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (top_k) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, mctx_hyb->is_kv_host(), il);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,

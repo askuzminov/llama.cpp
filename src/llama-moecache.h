@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 class llm_graph_result;
@@ -29,7 +30,7 @@ public:
     void report();
 
     // add the size and the upload limit of the real cache to the tables, call before the first report
-    void set_cache(int32_t n_slots, int32_t max_ins);
+    void set_cache(int32_t n_slots, int32_t max_ins, bool lfu = false);
 
 private:
     enum policy {
@@ -118,6 +119,7 @@ private:
 
     int32_t cache_slots = 0; // --moe-cache, 0 when there is no cache
     int32_t cache_ins   = 0;
+    bool    cache_lfu   = false;
 
     uint64_t n_steps_dec  = 0;
     uint64_t n_steps_all  = 0;
@@ -181,6 +183,7 @@ public:
 
     int32_t get_n_slots() const { return n_slots; }
     int32_t get_max_ins() const { return max_ins; }
+    bool uses_frequency_admission() const { return frequency_admission; }
 
     // nullptr when the experts of the layer are not cached
     const layer * get_layer(int il) const;
@@ -201,6 +204,7 @@ private:
         std::vector<int32_t> expert; // [n_slots] expert in the slot
         std::vector<uint8_t> live;   // [n_slots] 1 when the graph can read the slot
         std::vector<uint64_t> seen;  // [n_expert] last step that counted the expert in b_host
+        std::vector<uint16_t> freq;
 
         std::vector<int32_t> uploads_new;  // slots with an upload that the last update() started
         std::vector<int32_t> uploads_done; // slots with an upload that finished, but is not published yet
@@ -209,12 +213,14 @@ private:
         int32_t head   = -1;
         int32_t tail   = -1;
         int32_t n_fill = 0;
+        int32_t n_seen = 0;
     };
 
     void   lru_unlink(lru & c, int32_t e);
     void   lru_push  (lru & c, int32_t e);
     void   insert    (size_t idx, int32_t e);
     size_t upload    (size_t idx, int32_t e, int32_t s);
+    void   join_uploads();
 
     const llama_model & model;
 
@@ -222,6 +228,19 @@ private:
 
     bool initialized  = false;
     bool alloc_logged = false; // the first alloc() logs at warn level
+    bool frequency_admission = false;
+    bool async_upload = false;
+    bool async_table = false;
+
+    struct pending_upload {
+        size_t idx;
+        int32_t expert;
+        int32_t slot;
+    };
+    std::vector<pending_upload> pending_uploads;
+    std::thread upload_thread;
+    int64_t upload_submit_us = 0; // read only after the worker is joined
+    int64_t t_submit_us = 0;
 
     int64_t n_expert  = 0;
     int32_t n_slots   = 0;
@@ -245,6 +264,7 @@ private:
     ggml_backend_buffer_ptr buf_host;
 
     ggml_tensor * table_all = nullptr; // device I32 [n_expert, n_layers]
+    ggml_tensor * table_staging = nullptr;
 
     std::vector<int32_t> table_host; // host copy of table_all
     std::vector<int>     il2idx;

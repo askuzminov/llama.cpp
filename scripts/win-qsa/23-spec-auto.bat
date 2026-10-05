@@ -30,10 +30,14 @@ setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
 set "OVERLAP_TEST="
+set "MEMORY_TEST="
+if /i "%~1"=="memory-quality" set "MEMORY_TEST=quality"
+if /i "%~1"=="memory-speed" set "MEMORY_TEST=speed"
+if defined MEMORY_TEST set "OVERLAP_TEST=%MEMORY_TEST%"
 if /i "%~1"=="overlap-quality" set "OVERLAP_TEST=quality"
 if /i "%~1"=="overlap-speed" set "OVERLAP_TEST=speed"
 if defined OVERLAP_TEST (
-    if /i not "%BACKEND%"=="cuda" (
+    if not defined MEMORY_TEST if /i not "%BACKEND%"=="cuda" (
         echo The overlap comparison needs a CUDA build.
         exit /b 1
     )
@@ -42,17 +46,26 @@ if defined OVERLAP_TEST (
     set "LLAMA_MOE_CACHE_STATS=128"
     set "GGML_SCHED_PROF=64"
     set "SPECAUTOARGS=-fit off -ncmoe 48 --moe-cache auto --no-repack -b 4096 -ub 4096"
+    if defined MEMORY_TEST if /i not "%BACKEND%"=="cuda" set "SPECAUTOARGS=-fit off -b 4096 -ub 4096"
     if defined CUDAOVERLAPARGS set "SPECAUTOARGS=%CUDAOVERLAPARGS%"
 )
 if /i "%OVERLAP_TEST%"=="quality" (
     set "GGML_SCHED_PROF=1"
     set "SPECAUTOSAMP=0 20 0.95"
     set "SPECAUTONGEN=256"
-    set "SPECAUTOARMS="serial-none none --phase-mem" "parallel-none none --phase-mem" "serial-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-n3 draft-mtp --phase-mem --spec-draft-n-max 3""
+    set "SPECAUTOARMS="serial-none none --phase-mem" "parallel-none none --phase-mem" "serial-n1 draft-mtp --phase-mem --spec-draft-n-max 1" "parallel-n1 draft-mtp --phase-mem --spec-draft-n-max 1" "serial-n2 draft-mtp --phase-mem --spec-draft-n-max 2" "parallel-n2 draft-mtp --phase-mem --spec-draft-n-max 2" "serial-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-n3 draft-mtp --phase-mem --spec-draft-n-max 3""
 )
 if /i "%OVERLAP_TEST%"=="speed" (
     set "SPECAUTONGEN=512"
-    set "SPECAUTOARMS="serial-static none" "serial-phase none --phase-mem" "parallel-none none --phase-mem" "serial-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-auto draft-mtp --phase-mem --spec-auto" "parallel-t8 draft-mtp --phase-mem --spec-draft-n-max 3 -t 8 -tb 8" "parallel-t12 draft-mtp --phase-mem --spec-draft-n-max 3 -t 12 -tb 12" "parallel-t16 draft-mtp --phase-mem --spec-draft-n-max 3 -t 16 -tb 16""
+    set "SPECAUTOARMS="serial-static none" "serial-phase none --phase-mem" "parallel-none none --phase-mem" "parallel-n1 draft-mtp --phase-mem --spec-draft-n-max 1" "parallel-n2 draft-mtp --phase-mem --spec-draft-n-max 2" "serial-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-n3 draft-mtp --phase-mem --spec-draft-n-max 3" "parallel-auto draft-mtp --phase-mem --spec-auto" "parallel-auto-n1 draft-mtp --phase-mem --spec-auto --spec-draft-n-max 1" "parallel-auto-n2 draft-mtp --phase-mem --spec-auto --spec-draft-n-max 2" "parallel-t8 draft-mtp --phase-mem --spec-draft-n-max 3 -t 8 -tb 8" "parallel-t12 draft-mtp --phase-mem --spec-draft-n-max 3 -t 12 -tb 12" "parallel-t16 draft-mtp --phase-mem --spec-draft-n-max 3 -t 16 -tb 16""
+)
+
+
+if defined MEMORY_TEST (
+    set "SPECAUTOARMS="base-none none --phase-mem" "compact-none none --phase-mem" "kvhost-none none --phase-mem" "all-none none --phase-mem" "base-n1 draft-mtp --phase-mem --spec-draft-n-max 1" "all-n1 draft-mtp --phase-mem --spec-draft-n-max 1" "base-n2 draft-mtp --phase-mem --spec-draft-n-max 2" "all-n2 draft-mtp --phase-mem --spec-draft-n-max 2""
+    if /i "%BACKEND%"=="cuda" set "SPECAUTOARMS="base-none none --phase-mem" "compact-none none --phase-mem" "async-none none --phase-mem" "lfu-none none --phase-mem" "kvhost-none none --phase-mem" "all-none none --phase-mem" "base-n1 draft-mtp --phase-mem --spec-draft-n-max 1" "all-n1 draft-mtp --phase-mem --spec-draft-n-max 1" "base-n2 draft-mtp --phase-mem --spec-draft-n-max 2" "all-n2 draft-mtp --phase-mem --spec-draft-n-max 2""
+    if /i "%MEMORY_TEST%"=="speed" set "SPECAUTOARMS=!SPECAUTOARMS! "base-auto-n2 draft-mtp --phase-mem --spec-auto --spec-draft-n-max 2" "all-auto-n2 draft-mtp --phase-mem --spec-auto --spec-draft-n-max 2""
+    set "SPECAUTOARGS=!SPECAUTOARGS! -ctk f16 -ctv f16"
 )
 
 if not defined SPECAUTOARMS    set "SPECAUTOARMS="none none" "n3 draft-mtp --spec-draft-n-max 3" "auto infer --spec-auto""
@@ -129,6 +142,7 @@ set "RC=0"
 echo ### 23-spec-auto %TS% > "%SUM%"
 echo ### MODEL=%MODEL% >> "%SUM%"
 echo ### SPECDRAFT=%SPECDRAFT% >> "%SUM%"
+if defined OVERLAP_TEST "%BIN%\llama-server.exe" --version >> "%SUM%" 2>&1
 echo ### ctx=%SPECAUTOCTX% n_predict=%SPECAUTONGEN% prompts=%SPECAUTOPROMPTS% seeds=%SPECAUTOSEEDS% temp=%STEMP% top_k=%STOPK% top_p=%STOPP% >> "%SUM%"
 echo ### LOADMODE=%LOADMODE% EXTRA=%EXTRA% SPECAUTOARGS=%SPECAUTOARGS% >> "%SUM%"
 if defined OVERLAP_TEST echo ### overlap comparison=%OVERLAP_TEST%; weights and KV precision unchanged >> "%SUM%"
@@ -142,8 +156,16 @@ if not "%RC%"=="0" exit /b 1
 set "ABORT=0"
 for %%a in (%SPECAUTOARMS%) do call :arm "%%~a"
 
-if /i "%OVERLAP_TEST%"=="quality" (
-    powershell -NoProfile -Command "$bad = $false; foreach ($kind in @('none', 'n3')) { foreach ($p in @('os', 'code')) { try { $a = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ('serial-' + $kind + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; $b = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ('parallel-' + $kind + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; if ($null -eq $a.timings -or $null -eq $b.timings) { throw 'missing timings' }; $ma = $a.choices[0].message; $mb = $b.choices[0].message; if ($null -eq $ma -or $null -eq $mb) { throw 'missing message' }; $same = ([string]$ma.content -ceq [string]$mb.content) -and ([string]$ma.reasoning_content -ceq [string]$mb.reasoning_content) -and ($a.timings.predicted_n -eq $b.timings.predicted_n); 'greedy match {0}/{1}: {2}' -f $kind, $p, $same; if (-not $same) { $bad = $true } } catch { $bad = $true; 'greedy comparison {0}/{1}: {2}' -f $kind, $p, $_.Exception.Message } } }; if ($bad) { exit 1 }" >> "%SUM%"
+if /i "%OVERLAP_TEST%"=="quality" if not defined MEMORY_TEST (
+    powershell -NoProfile -Command "$bad = $false; foreach ($kind in @('none', 'n1', 'n2', 'n3')) { foreach ($p in @('os', 'code')) { try { $a = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ('serial-' + $kind + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; $b = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ('parallel-' + $kind + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; if ($null -eq $a.timings -or $null -eq $b.timings) { throw 'missing timings' }; $ma = $a.choices[0].message; $mb = $b.choices[0].message; if ($null -eq $ma -or $null -eq $mb) { throw 'missing message' }; $same = ([string]$ma.content -ceq [string]$mb.content) -and ([string]$ma.reasoning_content -ceq [string]$mb.reasoning_content) -and ($a.timings.predicted_n -eq $b.timings.predicted_n); 'greedy match {0}/{1}: {2}' -f $kind, $p, $same; if (-not $same) { $bad = $true } } catch { $bad = $true; 'greedy comparison {0}/{1}: {2}' -f $kind, $p, $_.Exception.Message } } }; if ($bad) { exit 1 }" >> "%SUM%"
+    if errorlevel 1 set "RC=1"
+)
+
+
+if /i "%MEMORY_TEST%"=="quality" (
+    set "MEMPAIRS=base-none:compact-none base-none:kvhost-none base-none:all-none base-n1:all-n1 base-n2:all-n2"
+    if /i "%BACKEND%"=="cuda" set "MEMPAIRS=!MEMPAIRS! base-none:async-none base-none:lfu-none"
+    powershell -NoProfile -Command "$bad = $false; foreach ($pair in $env:MEMPAIRS.Split(' ')) { $names = $pair.Split(':'); foreach ($p in $env:SPECAUTOPROMPTS.Split(' ')) { try { $a = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ($names[0] + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; $b = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:WORK ($names[1] + '-' + $p + '-s1-resp.json')) | ConvertFrom-Json; $ma = $a.choices[0].message; $mb = $b.choices[0].message; if ($null -eq $ma -or $null -eq $mb) { throw 'missing message' }; $same = ([string]$ma.content -ceq [string]$mb.content) -and ([string]$ma.reasoning_content -ceq [string]$mb.reasoning_content) -and ($a.timings.predicted_n -eq $b.timings.predicted_n); 'greedy match {0}/{1}: {2}' -f $pair, $p, $same; if (-not $same) { $bad = $true } } catch { $bad = $true; 'greedy comparison {0}/{1}: {2}' -f $pair, $p, $_.Exception.Message } } }; if ($bad) { exit 1 }" >> "%SUM%"
     if errorlevel 1 set "RC=1"
 )
 
@@ -193,6 +215,27 @@ if not defined STYPE (
 if defined OVERLAP_TEST (
     set "GGML_SCHED_PARALLEL_CPU=0"
     if /i "!ARM:~0,9!"=="parallel-" set "GGML_SCHED_PARALLEL_CPU=1"
+)
+
+
+if defined MEMORY_TEST (
+    set "LLAMA_PHASE_GEN_COMPACT=0"
+    set "LLAMA_QSA_KV_HOST=0"
+    set "LLAMA_MOE_CACHE_ASYNC=0"
+    set "LLAMA_MOE_CACHE_POLICY=lru"
+    if /i "%BACKEND%"=="cuda" set "GGML_SCHED_PARALLEL_CPU=1"
+    if /i "!ARM:~0,8!"=="compact-" set "LLAMA_PHASE_GEN_COMPACT=1"
+    if /i "!ARM:~0,7!"=="kvhost-" set "LLAMA_QSA_KV_HOST=1"
+    if /i "!ARM:~0,6!"=="async-" set "LLAMA_MOE_CACHE_ASYNC=1"
+    if /i "!ARM:~0,4!"=="lfu-" set "LLAMA_MOE_CACHE_POLICY=lfu"
+    if /i "!ARM:~0,4!"=="all-" (
+        set "LLAMA_PHASE_GEN_COMPACT=1"
+        set "LLAMA_QSA_KV_HOST=1"
+        if /i "%BACKEND%"=="cuda" (
+            set "LLAMA_MOE_CACHE_ASYNC=1"
+            set "LLAMA_MOE_CACHE_POLICY=lfu"
+        )
+    )
 )
 
 set "SPECT=--spec-type %STYPE%"
@@ -255,16 +298,22 @@ set "AARM=%ARM%"
 echo. >> "%SUM%"
 echo ### %ARM%: types %STYPE% %AARGS% >> "%SUM%"
 if defined OVERLAP_TEST echo ### GGML_SCHED_PARALLEL_CPU=%GGML_SCHED_PARALLEL_CPU% >> "%SUM%"
+if defined MEMORY_TEST echo ### COMPACT=%LLAMA_PHASE_GEN_COMPACT% KV_HOST=%LLAMA_QSA_KV_HOST% CACHE_ASYNC=%LLAMA_MOE_CACHE_ASYNC% CACHE_POLICY=%LLAMA_MOE_CACHE_POLICY% >> "%SUM%"
 if defined OVERLAP_TEST powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $n = 0; $ms = 0; Get-ChildItem -LiteralPath $env:AWORK -Filter ($env:AARM + '-*-resp.json') | Where-Object { $_.Name -notlike '*-warmup-*' } | ForEach-Object { $r = Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName | ConvertFrom-Json; $n += $r.timings.prompt_n; $ms += $r.timings.prompt_ms }; $rate = if ($ms -gt 0) { 1000 * $n / $ms } else { 0 }; '### prompt {0} tokens in {1} ms = {2} t/s' -f $n, [math]::Round($ms, 1).ToString($c), [math]::Round($rate, 2).ToString($c)" >> "%SUM%"
 powershell -NoProfile -Command "$c = [System.Globalization.CultureInfo]::InvariantCulture; $n = 0; $ms = 0; $dn = 0; $da = 0; $rows = @(); Get-ChildItem -LiteralPath $env:AWORK -Filter ($env:AARM + '-*-resp.json') | Where-Object { $_.Name -notlike '*-warmup-*' } | Sort-Object Name | ForEach-Object { $f = $_.Name; try { $r = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json; $t = $r.timings; if ($null -eq $t) { throw [string]$r.error.message }; $n += $t.predicted_n; $ms += $t.predicted_ms; $dn += $t.draft_n; $da += $t.draft_n_accepted; $rows += ('    {0}: {1} tokens, {2} t/s, draft {3}/{4}' -f $_.Name, $t.predicted_n, [math]::Round($t.predicted_per_second, 2).ToString($c), $t.draft_n_accepted, $t.draft_n) } catch { $rows += ('    {0}: no timings: {1}' -f $f, $_.Exception.Message) } }; $rows | ForEach-Object { $_ }; $tps = if ($ms -gt 0) { 1000.0 * $n / $ms } else { 0 }; $acc = if ($dn -gt 0) { $da / $dn } else { 0 }; '### total {0} tokens in {1} ms = {2} t/s, draft acceptance {3} ({4} / {5})' -f $n, [math]::Round($ms, 1).ToString($c), [math]::Round($tps, 2).ToString($c), [math]::Round($acc, 4).ToString($c), $da, $dn" >> "%SUM%"
 rem the spec prints are cumulative and come after each request, keep the last one
 powershell -NoProfile -Command "$l = @(Select-String -LiteralPath $env:SRVLOG -SimpleMatch -Pattern 'auto:', 'statistics ' | ForEach-Object { $_.Line }); $i = -1; for ($k = 0; $k -lt $l.Count; $k++) { if ($l[$k] -match 'print: auto: (on|trace only),') { $i = $k } }; if ($i -ge 0) { $l[$i..($l.Count - 1)] }" >> "%SUM%"
 if defined OVERLAP_TEST powershell -NoProfile -Command "Select-String -LiteralPath $env:SRVLOG -SimpleMatch -Pattern 'moe_cache:', 'sched_prof ', 'phase_mem:' | Select-Object -Last 16 | ForEach-Object { $_.Line }" >> "%SUM%"
-if defined OVERLAP_TEST (
+if defined OVERLAP_TEST powershell -NoProfile -Command "Select-String -LiteralPath $env:SRVLOG -Pattern 'moe_cache:.*(slots per layer|no slots|cache is off|pageable memory)', 'phase_mem:', 'QSA KV in RAM', 'KV buffer size', 'moe_cache: policy', 'system_info:' | ForEach-Object { $_.Line }" >> "%SUM%"
+if defined OVERLAP_TEST if /i "%BACKEND%"=="cuda" (
     findstr /c:"slots per layer" "%SRVLOG%" >nul
     if errorlevel 1 (
-        echo ### FAIL: the expert cache did not allocate slots >> "%SUM%"
-        set "RC=1"
+        if /i "%ARM%"=="serial-static" (
+            echo ### NOTE: the static baseline has no expert cache slots >> "%SUM%"
+        ) else (
+            echo ### FAIL: the expert cache did not allocate slots >> "%SUM%"
+            set "RC=1"
+        )
     )
     if "%GGML_SCHED_PARALLEL_CPU%"=="1" (
         findstr /c:"CPU waits avoided" "%SRVLOG%" >nul

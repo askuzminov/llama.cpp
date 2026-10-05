@@ -2434,6 +2434,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * v_cur,
                     ggml_tensor * top_k,
                           float   kq_scale,
+                           bool   kv_host,
                             int   il);
 
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,

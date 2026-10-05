@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -18,6 +19,22 @@
 //
 // llama_memory_hybrid_idx
 //
+
+static bool qsa_kv_host(const llama_model & model, ggml_type type_k, ggml_type type_v, bool v_trans) {
+    const char * value = getenv("LLAMA_QSA_KV_HOST");
+    if (!value || atoi(value) == 0) {
+        return false;
+    }
+    if (model.arch != LLM_ARCH_QWEN4EXP || type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16 || v_trans) {
+        throw std::runtime_error("LLAMA_QSA_KV_HOST requires qwen4exp with F16 KV and Flash Attention");
+    }
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        if (!model.hparams.is_recr(il) && model.hparams.dsv4_compress_ratios[il] == 0) {
+            throw std::runtime_error("LLAMA_QSA_KV_HOST requires QSA on every attention layer");
+        }
+    }
+    return true;
+}
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
@@ -47,7 +64,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr),
+        filter_attn, filter_recr, qsa_kv_host(model, type_k, type_v, v_trans)),
+    kv_host(qsa_kv_host(model, type_k, type_v, v_trans)),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -69,6 +87,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    if (kv_host) {
+        LLAMA_LOG_INFO("%s: QSA KV in RAM, selected F16 rows staged for attention; indexer and recurrent state keep their device placement\n", __func__);
+    }
     if (!mem_idx) {
         return;
     }
