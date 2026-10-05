@@ -1,5 +1,5 @@
 @echo off
-rem downloads the text used by 05 and 06 next to these scripts. a zip already
+rem downloads the text used by 03-quality and 04-decode next to these scripts. a zip already
 rem lying here is used as is, so it can be copied by hand from another machine.
 rem PPLURL in _local.bat points at a different source.
 setlocal enabledelayedexpansion
@@ -29,7 +29,7 @@ if not "!EC!"=="0" if exist "%ZIP%" del "%ZIP%"
 if not exist "%ZIP%" (
     echo.
     echo download failed, exit=!EC!
-    echo 05 and 06 need %PPLFILE%
+    echo 03-quality needs %PPLFILE%
     echo put wikitext-2-raw-v1.zip next to these scripts and run this again,
     echo or set PPLURL in _local.bat to a source this machine can reach
     exit /b 1

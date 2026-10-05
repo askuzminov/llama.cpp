@@ -1,6 +1,7 @@
 @echo off
 rem starts llama-server in router mode on a models preset: the daily launcher, not a measurement.
 rem standalone - copy it anywhere, it needs no other file from this folder. run-all.bat skips it.
+rem it takes llama-server.exe of the build next to it (..\..\build-win), else the path below.
 rem
 rem how to stop it so the prompt cache reaches the disk:
 rem   Ctrl+C, Ctrl+Break, closing the window, logging off and shutting the pc down all run the
@@ -21,6 +22,7 @@ set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%PATH%"
 
 rem ---- edit these, or set them in the environment before calling this file ----
 
+if not defined LLAMA_SERVER  if exist "%~dp0..\..\build-win\bin\Release\llama-server.exe" set "LLAMA_SERVER=%~dp0..\..\build-win\bin\Release\llama-server.exe"
 if not defined LLAMA_SERVER  set "LLAMA_SERVER=C:\Users\AI\Documents\github\llamacpp\llama.cpp\build-win\bin\Release\llama-server.exe"
 if not defined MODELS_PRESET set "MODELS_PRESET=%USERPROFILE%\.config\llama-server\models.ini"
 if not defined MODELS_MAX    set "MODELS_MAX=1"

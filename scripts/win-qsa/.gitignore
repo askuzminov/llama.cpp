@@ -5,3 +5,4 @@ wikitext-2-raw/
 *.ZIP
 diskspd/
 _local.bat
+cache/

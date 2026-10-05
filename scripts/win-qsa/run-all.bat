@@ -1,94 +1,40 @@
 @echo off
-rem every step of this folder, in order, one log each. 14-server and 18-serve are left out:
-rem they run until stopped. which steps run is set by RUN_* in _config.bat, most of them
-rem are 1 by default; the exit code of each is collected into one summary at the end.
+rem the build and every measurement, in order: 00-build, 01-check, 02-bench, 03-quality, 04-decode. each one
+rem runs only what the same sources have not measured yet, so after a change of the code everything runs, and
+rem after a change of the scripts only the new arms do. RUN_* in _local.bat turn steps off; 05-profile and
+rem serve.bat are not part of it.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem defaults, in case _config.bat on this machine predates the RUN_* switches
-if not defined RUN_BUILD   set "RUN_BUILD=1"
-if not defined RUN_PREFILL set "RUN_PREFILL=1"
-if not defined RUN_QUALITY set "RUN_QUALITY=1"
-if not defined RUN_KL      set "RUN_KL=1"
-if not defined RUN_TIMING  set "RUN_TIMING=1"
-if not defined RUN_DIAG    set "RUN_DIAG=1"
-if not defined RUN_PLE     set "RUN_PLE=1"
-if not defined RUN_DISK    set "RUN_DISK=1"
-if not defined RUN_MMID    set "RUN_MMID=1"
-if not defined RUN_SPEC    set "RUN_SPEC=0"
-if not defined RUN_DECODE  set "RUN_DECODE=0"
-if not defined RUN_MOECACHE set "RUN_MOECACHE=0"
-if not defined RUN_UBMEM   set "RUN_UBMEM=0"
-if not defined RUN_SPECAUTO set "RUN_SPECAUTO=0"
-
 set "STEPS="
 if "%RUN_BUILD%"=="1"   set "STEPS=%STEPS% 00-build"
-if "%RUN_PREFILL%"=="1" set "STEPS=%STEPS% 01-fa-correct 02-fa-perf 03-prefill 04-fa-sparse"
-if "%RUN_QUALITY%"=="1" set "STEPS=%STEPS% 05-perplexity"
-if "%RUN_KL%"=="1"      set "STEPS=%STEPS% 06-kl-divergence"
-if "%RUN_TIMING%"=="1"  set "STEPS=%STEPS% 07-perf-logger"
-if "%RUN_DIAG%"=="1"    set "STEPS=%STEPS% 08-model-check"
-if "%RUN_TIMING%"=="1"  set "STEPS=%STEPS% 10-load-time"
-if "%RUN_PLE%"=="1"     set "STEPS=%STEPS% 11-ple-cache 12-ple-real"
-if "%RUN_DISK%"=="1"    set "STEPS=%STEPS% 13-disk-iops"
-if "%RUN_MMID%"=="1"    set "STEPS=%STEPS% 15-mmid"
-if "%RUN_DIAG%"=="1"    set "STEPS=%STEPS% 16-ctx"
-if "%RUN_SPEC%"=="1"    set "STEPS=%STEPS% 17-spec-np"
-if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 19-decode-depth"
-if "%RUN_MOECACHE%"=="1" set "STEPS=%STEPS% 20-moecache"
-if "%RUN_UBMEM%"=="1"   set "STEPS=%STEPS% 22-ubmem"
-if "%RUN_SPECAUTO%"=="1" set "STEPS=%STEPS% 23-spec-auto"
-
+if "%RUN_CHECK%"=="1"   set "STEPS=%STEPS% 01-check"
+if "%RUN_BENCH%"=="1"   set "STEPS=%STEPS% 02-bench"
+if "%RUN_QUALITY%"=="1" set "STEPS=%STEPS% 03-quality"
+if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 04-decode"
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do
     exit /b 1
 )
 
-rem 05, 06 and 12 need the wikitext text, drop them if it cannot be fetched
-if "%RUN_QUALITY%%RUN_KL%%RUN_PLE%"=="000" goto :no_text
-if not exist "%PPLFILE%" call "%~dp0get-wikitext.bat"
-if not exist "%PPLFILE%" (
-    echo no wikitext text, skipping 05, 06 and 12
-    set "STEPS=!STEPS: 05-perplexity=!"
-    set "STEPS=!STEPS: 06-kl-divergence=!"
-    set "STEPS=!STEPS: 12-ple-real=!"
-)
-:no_text
+if "%RUN_QUALITY%"=="1" if not exist "%PPLFILE%" call "%~dp0get-wikitext.bat"
 
-echo steps:!STEPS!
-echo.
-
-rem 06 asks before writing its ~10 GB logits file, run-all has already decided
+rem 00-build waits for a key after a failure, run-all goes on by itself
 set "QSA_UNATTENDED=1"
-
-set "SUM=%LOGS%\run-all-%TS%-summary.txt"
-echo ### run-all %TS% > "%SUM%"
-echo ### MODEL=%MODEL% >> "%SUM%"
-echo ### BACKEND=%BACKEND% LOADMODE=%LOADMODE% EXTRA=%EXTRA% >> "%SUM%"
-echo. >> "%SUM%"
-
 set "RC=0"
-
+set "RESULTS="
 for %%s in (%STEPS%) do (
     echo === %%s
     call "%~dp0%%s.bat"
     set "EC=!ERRORLEVEL!"
     if not "!EC!"=="0" set "RC=!EC!"
-    echo %%s exit=!EC! >> "%SUM%"
-    echo === %%s exit=!EC!
+    set "RESULTS=!RESULTS! %%s=!EC!"
     echo.
-
-    rem a failed build makes every step after it measure the old binaries, or nothing
-    if "%%s"=="00-build" if not "!EC!"=="0" (
-        echo build failed, stopping
-        goto :done
-    )
+    rem the steps after a failed build would measure the old binaries
+    if "%%s"=="00-build" if not "!EC!"=="0" goto :done
 )
 
 :done
-echo.
-echo === summary
-type "%SUM%"
-echo.
-echo logs are in %LOGS%
+echo === exit codes:%RESULTS%
+echo the summary of each step is in its folder in %LOGS%
 exit /b %RC%
