@@ -2112,8 +2112,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     static std::atomic<int> prof_count { 0 };
     const char * GGML_SCHED_PROF = getenv("GGML_SCHED_PROF");
     sched->prof_period = GGML_SCHED_PROF ? atoi(GGML_SCHED_PROF) : 0;
+    // on by default: it only changes a CPU split without inputs after a device split that touches no host buffer,
+    // in llama.cpp the CPU experts next to the cached ones of --moe-cache. GGML_SCHED_PARALLEL_CPU=0 turns it off
     const char * parallel_cpu = getenv("GGML_SCHED_PARALLEL_CPU");
-    sched->parallel_cpu = parallel_cpu != nullptr && atoi(parallel_cpu) > 0;
+    sched->parallel_cpu = parallel_cpu == nullptr || atoi(parallel_cpu) > 0;
     sched->prof_id     = sched->prof_period > 0 ? prof_count++ : 0;
     sched->prof_last   = -1;
 

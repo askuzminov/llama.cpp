@@ -679,7 +679,7 @@ static ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml_cgra
 
 static void test_cpu_device_overlap() {
     const char * mode = getenv("GGML_SCHED_PARALLEL_CPU");
-    const bool enabled = mode != nullptr && atoi(mode) > 0;
+    const bool enabled = mode == nullptr || atoi(mode) > 0;
 
     for (int scenario = 0; scenario < 4; ++scenario) {
         const bool host = (scenario & 1) != 0;

@@ -81,41 +81,61 @@ rem ---- 395 / vulkan: everything on the gpu ----
 if not defined EXTRA      set "EXTRA=-ngl 99"
 rem accurate: the f16 matmuls with f32 accumulators instead of int8 coopmat and f16 accumulators
 if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
-if not defined QCTX       set "QCTX=32768"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model
 if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
 if not defined DECARGS    set "DECARGS=-fit off"
-if not defined DECARMS    set "DECARMS=none;n3 @draft --spec-type draft-mtp --spec-draft-n-max 3;auto @draft --spec-auto"
-if not defined PROFDEPTH  set "PROFDEPTH=122880"
+rem stable: the server of the tag, its TG and its compute buffers (DECGREP) next to the current ones
+if not defined DECARMS    set "DECARMS=stable @stable;none;n3 @draft --spec-type draft-mtp --spec-draft-n-max 3;auto @draft --spec-auto"
+rem the search of 05.10: TG at 122880 is 2 percent below stable (22.48 against 22.98, 22.68 against 23.18 on
+rem 03.10). the arms at that depth turn back what changed since stable for decode: nohs no head sum matmul at
+rem all, hsmin the head sum matmul for the prompt only (decode keeps a matrix-vector kernel per head, prefill keeps
+rem its gain), shmem32 the 32 KB shared memory of stable (flash attention tiles). the input fills of a decode step
+rem already run on one thread. 05-profile puts the gpu time of each kind of op of stable and default side by side,
+rem for the prompt at depth 0 (the gap to gufo) as well. remove the arms when the cause is found
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;nohs GGML_VK_DISABLE_MM_HEADSUM=1 @d=122880;hsmin GGML_VK_HEADSUM_MIN_TOKENS=9 @d=122880;shmem32 GGML_VK_SHMEM_LIMIT=32768 @d=122880"
+if not defined PROFKINDS  set "PROFKINDS=pp tg"
+if not defined PROFARMS   set "PROFARMS=stable @stable;default"
+if not defined RUN_PROFILE set "RUN_PROFILE=1"
+if not defined PROFDEPTH  set "PROFDEPTH=0,122880"
+rem the server of the 395 runs at -c 262144 with its buffers for the full context, llama-bench does the same
+if not defined BENCHCTX   set "BENCHCTX=262144"
 goto :defaults_done
 
 :cuda_defaults
 rem ---- 3090 / cuda: the experts of the first layers on the cpu, -ncmoe depends on the card ----
 if not defined EXTRA      set "EXTRA=-ngl 99 -ncmoe 30"
 if not defined CHECKARMS  set "CHECKARMS=default"
-rem the logits of half the context stay in ram during the run, 8 GB at 16384
-if not defined QCTX       set "QCTX=16384"
 if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 4096 -ub 4096"
-rem overlap: the cpu experts run while the gpu runs the cached ones, TG +3.5 percent on 04.10, +6 with MTP
-if not defined DECARMS    set "DECARMS=base;overlap GGML_SCHED_PARALLEL_CPU=1;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;overlap-n2 GGML_SCHED_PARALLEL_CPU=1 @draft --spec-type draft-mtp --spec-draft-n-max 2"
+rem since 05.10 the build runs the cpu experts while the gpu runs the cached ones (+3.5 percent TG on 04.10 and
+rem 05.10, +7 with MTP), and a prompt of up to 256 tokens in the generation layout with the moe-cache kept.
+rem serial and prompt0 turn each back for the comparison
+if not defined DECARMS    set "DECARMS=base;prompt0 LLAMA_PHASE_SMALL_PROMPT=0;serial GGML_SCHED_PARALLEL_CPU=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;serial-n2 GGML_SCHED_PARALLEL_CPU=0 @draft --spec-type draft-mtp --spec-draft-n-max 2"
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
+rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined PROFDEPTH  set "PROFDEPTH=32768"
+rem auto: -c of each depth is depth + prompt, as --phase-mem sizes the buffers in the server. at a fixed -c 262144
+rem the buffers did not fit the 24 GB and the driver moved some to system memory: PP 115-145 or 285-430 t/s
+rem from one process to the next on 05.10, the same within a process
+if not defined BENCHCTX   set "BENCHCTX=auto"
 
 :defaults_done
 rem ---- the same on both ----
 rem 01-check: test-backend-ops ops, "OP [regex of the case parameters]", separated by ;
 if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;FLASH_ATTN_EXT n_kv_max=[1-9]"
 rem 02-bench: llama-bench, one run per arm and depth
-if not defined BENCHARMS   set "BENCHARMS=stable @stable;default"
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,32768,65536,122880"
 if not defined BENCHPP     set "BENCHPP=4096"
 if not defined BENCHTG     set "BENCHTG=64"
 if not defined BENCHUB     set "BENCHUB=4096"
-if not defined BENCHCTX    set "BENCHCTX=262144"
 if not defined BENCHREPS   set "BENCHREPS=3"
-rem 03-quality: llama-perplexity, KLD of each arm against QREF (empty: stable when built, else default)
-if not defined QCHUNKS     set "QCHUNKS=1"
+rem 03-quality: llama-perplexity, KLD of each arm against QREF (empty: stable when built, else default).
+rem a run holds the logits of half a chunk and the reference of a chunk in ram, 12 GB at 16384. at 32768
+rem (24 GB) the 395 failed with bad allocation and row cache read errors on 05.10: the model takes the rest
+if not defined QCTX        set "QCTX=16384"
+if not defined QCHUNKS     set "QCHUNKS=2"
 if not defined QUB         set "QUB=2048"
 rem 04-decode: llama-server, one start per arm and DECPREFIX
 if not defined DECCTX      set "DECCTX=262144"
@@ -125,7 +145,10 @@ if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
-if not defined DECGREP     set "DECGREP=moe_cache:.*slots|phase_mem:|sched_prof"
+if not defined DECGREP     set "DECGREP=moe_cache:.*slots|phase_mem:|sched_prof|compute buffer size"
+rem 1: the warmup run of llama-bench, llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds
+rem load time and memory pressure, -lm dio reads the weights at load and the median of 02 drops a cold first rep
+if not defined WARMUP      set "WARMUP=0"
 rem 05-profile: one ubatch of the prompt (pp) and one decode step (tg) at PROFDEPTH
 if not defined PROFKINDS   set "PROFKINDS=pp"
 if not defined PROFARMS    set "PROFARMS=default"

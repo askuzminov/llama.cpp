@@ -13,6 +13,7 @@ import platform
 import re
 import shlex
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -29,8 +30,9 @@ VERSION = 1
 BUILD_RECORD = "qsa-build.json"
 ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "OMP_")
 ENV_IGNORED = ("LLAMA_SPEC_TRACE",)
+# the 395 runs at the edge of its memory at -c 262144: right after another model run these come and go
 MEMORY_ERRORS = ("ErrorOutOfDeviceMemory", "ErrorMemoryMapFailed", "Device memory allocation", "failed to allocate",
-                 "unable to allocate", "out of memory", "cudaMalloc failed")
+                 "unable to allocate", "out of memory", "cudaMalloc failed", "bad allocation", "row cache: read error")
 DEVICES = {"vulkan": "Vulkan0", "cuda": "CUDA0"}
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -78,8 +80,10 @@ def env_ints(name, default):
         raise Fail(f"{name} must be numbers, got {env(name)!r}")
 
 
-def forced():
-    return env("FORCE") == "1"
+def forced(label):
+    """FORCE=1 runs everything again, any other value is a regex of the labels to run again."""
+    force = env("FORCE")
+    return force == "1" or (force != "" and re.search(force, label) is not None)
 
 
 def split_args(text):
@@ -101,9 +105,9 @@ def stable_folder():
 
 
 class Arm:
-    """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [tool arguments ...]".
-    VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable, @draft loads
-    SPECDRAFT with -md, the rest goes to the tool."""
+    """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [@d=depth,...] [tool
+    arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
+    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, the rest goes to the tool."""
 
     def __init__(self, text):
         tokens = split_args(text)
@@ -115,9 +119,15 @@ class Arm:
         self.build = None
         self.stable = False
         self.draft = False
+        self.depths = None
         for t in tokens[1:]:
             if t == "@draft":
                 self.draft = True
+            elif t.startswith("@d="):
+                try:
+                    self.depths = {int(d) for d in t[3:].split(",") if d}
+                except ValueError:
+                    raise Fail(f"arm {self.name}: {t} must list depths, as @d=122880")
             elif t == "@stable":
                 self.build = stable_folder()
                 self.stable = True
@@ -151,8 +161,15 @@ def model_path(name="MODEL"):
     return path.resolve()
 
 
+def warmup_args():
+    # the warmup run pages in mmap weights and pays first-use costs before the measurement. -lm dio reads the
+    # weights at load, the depth fill and the warmup request of 04 warm the rest, and the median of 02 drops a
+    # cold first rep: WARMUP=1 only adds load time and memory pressure at start
+    return [] if env("WARMUP") == "1" else ["--no-warmup"]
+
+
 def model_args(model):
-    return ["-m", str(model), "-fa", "on", *split_args(env("LOADMODE")), *split_args(env("EXTRA"))]
+    return ["-m", str(model), "-fa", "on", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args()]
 
 
 # ---------------------------------------------------------------- identity
@@ -269,8 +286,8 @@ def identity_key(identity):
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
-def cache_get(identity):
-    if forced():
+def cache_get(identity, label):
+    if forced(label):
         return None
     try:
         record = json.loads((CACHE / "results" / (identity_key(identity) + ".json")).read_text(encoding="utf-8"))
@@ -316,16 +333,35 @@ def exit_text(code):
 def last_error(text):
     lines = [s.strip() for s in text.splitlines() if s.strip()]
     errors = [s for s in lines if re.search(r"error|exception|failed|abort", s, re.IGNORECASE)]
-    return (errors or lines or [""])[-1][:200]
+    if errors:
+        return errors[-1][:200]
+    return "no error message, the log ends with: " + (lines or [""])[-1][:160]
+
+
+def read_log(path):
+    # a windows error text comes in the ansi code page, the rest is utf-8
+    out = []
+    for line in Path(path).read_bytes().splitlines():
+        try:
+            out.append(line.decode("utf-8"))
+        except UnicodeDecodeError:
+            out.append(line.decode("mbcs" if os.name == "nt" else "latin-1", errors="replace"))
+    return "\n".join(out)
+
+
+def retryable(code, text):
+    # an exception exit code without a message: the process died before it could print one (a load or an abort)
+    return any(s in text for s in MEMORY_ERRORS) or (code & 0xffffffff >= 0xC0000000 and "error" not in text.lower())
 
 
 def execute(cmd, log, run_env, stdout=None, model=True, check=True):
     """Run cmd with its output in log, its stdout in a separate file when given. A model run that fails on memory gets
-    one more try: the driver frees the memory of the previous process lazily."""
+    two more tries after longer waits: the driver frees the memory of the previous process lazily."""
     cmd = [str(c) for c in cmd]
     if model:
         no_server_running()
-    for attempt in (1, 2):
+    first = log
+    for attempt in (1, 2, 3):
         if model:
             settle()
         with log.open("w", encoding="utf-8") as f:
@@ -339,14 +375,16 @@ def execute(cmd, log, run_env, stdout=None, model=True, check=True):
                     out.close()
         if model:
             mark_end()
-        text = log.read_text(encoding="utf-8", errors="replace")
+        text = read_log(log)
         if code == 0 or not check:
             return code, text
-        if attempt == 1 and model and any(s in text for s in MEMORY_ERRORS):
-            print(f"{log.name}: {exit_text(code)} with a memory error, one more try", flush=True)
-            log = log.with_name(log.stem + "-try2.log")
+        if attempt < 3 and model and retryable(code, text):
+            wait = float(env("SETTLE", "30")) * attempt
+            print(f"{log.name}: {exit_text(code)}, {last_error(text)}; one more try in {wait:.0f} s", flush=True)
+            time.sleep(wait)
+            log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue
-        raise Fail(f"{exit_text(code)}: {last_error(text)} ({log.name})")
+        raise Fail(f"{exit_text(code)}: {last_error(text)} ({log.name}, try {attempt})")
 
 
 class Run:
@@ -367,7 +405,7 @@ class Run:
 
     def measure(self, label, identity, run):
         """The kept result of this identity, or a new one from run(log). Returns (result, kept)."""
-        record = cache_get(identity)
+        record = cache_get(identity, label)
         if record:
             self.kept += 1
             print(f"{label}: kept result of {record['time']}", flush=True)
@@ -380,8 +418,10 @@ class Run:
         return result, False
 
     def finish(self):
-        self.add("", f"{self.new} new, {self.kept} kept (k): the same build measured them before, FORCE=1 runs them "
-                     f"again. logs in {self.dir}")
+        if self.new or self.kept:
+            self.add("", f"{self.new} new, {self.kept} kept (k): the same build measured them before. FORCE=1 runs "
+                         f"them again, FORCE=<regex> the matching ones (as default-d32768)")
+        self.add(f"logs in {self.dir}")
         print("\n" + "\n".join(self.lines), flush=True)
         return 1 if self.failed else 0
 
@@ -452,21 +492,28 @@ def cmd_bench():
     model = model_path()
     depths = env_ints("BENCHDEPTHS", "0,32768,65536,122880")
     pp, tg = env_int("BENCHPP", 4096), env_int("BENCHTG", 64)
-    ub, ctx, reps = env_int("BENCHUB", 4096), env_int("BENCHCTX", 262144), env_int("BENCHREPS", 3)
+    ub, reps = env_int("BENCHUB", 4096), env_int("BENCHREPS", 3)
+    # auto: the context of each depth is just large enough, as --phase-mem sizes the buffers in the server. a fixed
+    # -c reserves the compute buffer for the full context at every depth
+    auto = env("BENCHCTX", "262144") == "auto"
+    ctx = 0 if auto else env_int("BENCHCTX", 262144)
     arms = parse_arms("BENCHARMS", "default")
-    if max(depths) + max(pp, tg) > ctx:
+    if not auto and max(depths) + max(pp, tg) > ctx:
         raise Fail("the deepest BENCHDEPTHS plus the prompt does not fit BENCHCTX")
     results = {}
     for i, depth in enumerate(depths):
         # the order turns at each depth, so that no arm always runs right after the same one
         for arm in (arms if i % 2 == 0 else arms[::-1]):
             label = f"{arm.name}-d{depth}"
+            if arm.depths is not None and depth not in arm.depths:
+                continue
             try:
                 exe = arm.binary("llama-bench")
             except Skip as e:
                 results[arm.name, depth] = f"skip: {e}"
                 continue
-            cmd = [exe, *model_args(model), "-c", ctx, "-b", max(pp, ub), "-ub", ub, "-p", pp, "-n", tg, "-d", depth,
+            c = -(-(depth + max(pp, tg)) // 256) * 256 if auto else ctx
+            cmd = [exe, *model_args(model), "-c", c, "-b", max(pp, ub), "-ub", ub, "-p", pp, "-n", tg, "-d", depth,
                    "-r", reps, "-o", "json", *arm.args]
             run_env = arm_env(arm, {"GGML_SCHED_LOG_REALLOC": "1"})
             identity = {"v": VERSION, "kind": "bench", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
@@ -477,7 +524,9 @@ def cmd_bench():
                 _, text = execute(cmd, log, run_env, stdout=out)
                 r = {"replans": text.count("sched re-reserve:")}
                 for row in json.loads(out.read_text(encoding="utf-8")):
-                    r["pp" if row["n_prompt"] else "tg"] = [row["avg_ts"], row["stddev_ts"]]
+                    samples = sorted(row.get("samples_ts") or [row["avg_ts"]])
+                    r["pp" if row["n_prompt"] else "tg"] = [row["avg_ts"], row["stddev_ts"], statistics.median(samples),
+                                                            samples[0], samples[-1]]
                 if (pp and "pp" not in r) or (tg and "tg" not in r):
                     raise Fail(f"llama-bench gave no PP or TG row ({log.name})")
                 return r
@@ -487,7 +536,8 @@ def cmd_bench():
             except Fail as e:
                 run.failed = True
                 results[arm.name, depth] = f"FAIL {e}"
-    run.add(f"bench: llama-bench pp{pp} tg{tg} -ub {ub} -c {ctx}, {reps} reps, {model.name}, build {current_build()}")
+    run.add(f"bench: llama-bench pp{pp} tg{tg} -ub {ub} -c {'depth + pp' if auto else ctx}, median of {reps} reps "
+            f"(min-max), {model.name}, build {current_build()}")
     for kind in [k for k, n in (("pp", pp), ("tg", tg)) if n]:
         rows = []
         for depth in depths:
@@ -495,10 +545,10 @@ def cmd_bench():
             for arm in arms:
                 r = results.get((arm.name, depth))
                 if isinstance(r, tuple):
-                    (avg, sd), kept = r[0][kind], r[1]
-                    row.append(f"{avg:.2f} +-{sd:.2f}" + (" k" if kept else ""))
+                    _, _, med, lo, hi = r[0][kind]
+                    row.append(f"{med:.2f} ({lo:.1f}-{hi:.1f})" + (" k" if r[1] else ""))
                 else:
-                    row.append("FAIL" if r and r.startswith("FAIL") else "skip")
+                    row.append("" if r is None else "FAIL" if r.startswith("FAIL") else "skip")
             rows.append(row)
         run.add("", f"{kind.upper()} t/s", *table(["depth", *[a.name for a in arms]], rows))
     notes = sorted({f"  {a}: {r}" for (a, d), r in results.items() if isinstance(r, str) and r.startswith("skip")})
@@ -537,7 +587,7 @@ def cmd_quality():
     corpus = Path(env("PPLFILE"))
     if not corpus.is_file():
         raise Fail(f"no corpus {corpus}, run get-wikitext.bat")
-    ctx, chunks, ub = env_int("QCTX", 32768), env_int("QCHUNKS", 1), env_int("QUB", 2048)
+    ctx, chunks, ub = env_int("QCTX", 16384), env_int("QCHUNKS", 2), env_int("QUB", 2048)
     keep = max(1, env_int("QREFKEEP", 2))
     spec = env("QREF", "stable @stable" if (stable_folder() / ("llama-perplexity" + EXE)).is_file() else "default")
     ref, repeat = Arm(spec), Arm(spec)
@@ -557,7 +607,7 @@ def cmd_quality():
     folder.mkdir(parents=True, exist_ok=True)
     data, meta = folder / f"{key[:24]}.dat", folder / f"{key[:24]}.json"
     record = None
-    if not forced():
+    if not forced(f"reference {ref.name}"):
         try:
             record = json.loads(meta.read_text(encoding="utf-8"))
             logits_info(data, ctx, chunks)
@@ -684,7 +734,7 @@ def serve(exe, args, run_env, log, requests, sampling, port):
             time.sleep(3)
             if proc.poll() is not None:
                 raise Fail(f"llama-server {exit_text(proc.returncode)} while loading: "
-                           f"{last_error(log.read_text(encoding='utf-8', errors='replace'))} ({log.name})")
+                           f"{last_error(read_log(log))} ({log.name})")
             try:
                 if http(url + "/health")[0] == 200:
                     break
@@ -721,7 +771,7 @@ def serve(exe, args, run_env, log, requests, sampling, port):
         proc.kill()
         proc.wait()
         mark_end()
-    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = read_log(log).splitlines()
     # the speculative statistics are printed after each request and add up, keep the last block
     spec = [s.strip() for s in lines if "auto:" in s or "statistics " in s]
     starts = [i for i, s in enumerate(spec) if re.search(r"print: auto: (on|trace only),", s)]
@@ -759,7 +809,7 @@ def cmd_decode():
                 continue
             args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1,
                     "-fa", "on", "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")),
-                    *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
+                    *warmup_args(), *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
             run_env = arm_env(arm)
             identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
@@ -786,10 +836,14 @@ def cmd_decode():
             r, kept = entry
             rs = r["rows"]
             n, ms = sum(x["n"] for x in rs), sum(x["ms"] for x in rs)
-            pn, pms = sum(x["prompt_n"] for x in rs), sum(x["prompt_ms"] for x in rs)
             dn, da = sum(x["draft_n"] for x in rs), sum(x["draft_acc"] for x in rs)
-            rows.append([arm.name, f"{rate(n, ms):.2f}", f"{da / dn:.3f} ({da}/{dn})" if dn else "-",
-                         f"{rate(pn, pms):.1f}", f"{pn}" + (" k" if kept else "")])
+            # short prompts and long ones apart: a short one can take the generation layout (LLAMA_PHASE_SMALL_PROMPT)
+            pp = []
+            for part in ([x for x in rs if x["prompt_n"] <= 512], [x for x in rs if x["prompt_n"] > 512]):
+                pn, pms = sum(x["prompt_n"] for x in part), sum(x["prompt_ms"] for x in part)
+                pp.append(f"{rate(pn, pms):.1f} ({pn})" if part else "-")
+            rows.append([arm.name, f"{rate(n, ms):.2f}", f"{da / dn:.3f} ({da}/{dn})" if dn else "-", *pp]
+                        + (["k"] if kept else []))
             details += ["", f"{arm.name}, prefix {prefix} chars:"]
             details += [f"  {x['name']}: {x['n']} tokens, {rate(x['n'], x['ms']):.2f} t/s, draft {x['draft_acc']}/"
                         f"{x['draft_n']}, prompt {x['prompt_n']} tokens {rate(x['prompt_n'], x['prompt_ms']):.1f} t/s"
@@ -797,7 +851,7 @@ def cmd_decode():
             grep = env("DECGREP")
             details += [f"  {s}" for s in r["spec"] + ([s for s in r["extra"] if re.search(grep, s)][-12:] if grep else [])]
         run.add("", f"prefix {prefix} chars of {Path(env('PPLFILE')).name}" if prefix else "short prompts",
-                *table(["arm", "TG t/s", "draft accepted", "PP t/s", "prompt tokens"], rows))
+                *table(["arm", "TG t/s", "draft accepted", "PP t/s <= 512 (tokens)", "PP t/s > 512 (tokens)"], rows))
         for pair in split_args(env("DECSAME")):
             a, _, b = pair.partition(":")
             ra, rb = results.get((a, prefix)), results.get((b, prefix))
@@ -813,45 +867,61 @@ def cmd_decode():
 
 # ---------------------------------------------------------------- profile
 
+def op_group(name):
+    return re.split(r"[ (]", name, 1)[0]
+
+
 def cmd_profile():
     run = Run("profile")
     model = model_path()
     vulkan = env("BACKEND") == "vulkan"
-    depth, pp, tg = env_int("PROFDEPTH", 65536), env_int("PROFPP", 4096), env_int("PROFTG", 4)
+    depths, pp, tg = env_ints("PROFDEPTH", "65536"), env_int("PROFPP", 4096), env_int("PROFTG", 4)
     ub, ctx = env_int("PROFUB", 4096), env_int("PROFCTX", 262144)
     arms = parse_arms("PROFARMS", "default")
-    run.add(f"profile: {'GGML_VK_PERF_LOGGER per op' if vulkan else 'GGML_SCHED_PROF per split'}, "
-            f"llama-bench -ub {ub} -c {ctx}, {model.name}, build {current_build()}")
-    for kind in split_args(env("PROFKINDS", "pp")):
+    run.add(f"profile: {'GGML_VK_PERF_LOGGER per op' if vulkan else 'GGML_SCHED_PROF per split'}, host time per ubatch "
+            f"from LLAMA_INPUT_TIMING, llama-bench -ub {ub} -c {ctx}, {model.name}, build {current_build()}")
+    for kind, depth in [(k, d) for k in split_args(env("PROFKINDS", "pp")) for d in depths]:
+        done = {}
         for arm in arms:
-            label = f"{kind}-{arm.name}"
+            label = f"{kind}-d{depth}-{arm.name}"
+            if arm.depths is not None and depth not in arm.depths:
+                continue
             try:
                 exe = arm.binary("llama-bench")
             except Skip as e:
                 run.add("", f"{label}: skip: {e}")
                 continue
             sizes = ["-p", pp, "-n", 0] if kind == "pp" else ["-p", 0, "-n", tg]
-            cmd = [exe, *model_args(model), "-c", ctx, "-b", max(pp, ub), "-ub", ub, "-d", depth, *sizes, "-r", 1,
-                   "--no-warmup", *arm.args]
-            run_env = arm_env(arm, {"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_SCHED_PROF": "1"})
+            # two reps: the last graph then comes from the second, warm, without the warmup run (WARMUP); the depth
+            # state of the first rep is restored, not computed again
+            cmd = [exe, *model_args(model), "-c", ctx, "-b", max(pp, ub), "-ub", ub, "-d", depth, *sizes, "-r", 2,
+                   *arm.args]
+            run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1",
+                                    **({"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_SCHED_PROF": "1"})})
             identity = {"v": VERSION, "kind": "profile", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
                         "env": env_identity(run_env), "model": model_identity(model), "machine": machine()}
+            n_tokens = min(pp, ub) if kind == "pp" else 1
 
             def go(log):
                 _, text = execute(cmd, log, run_env)
                 lines = text.splitlines()
+                # host time of the last ubatches of the measured size; a build without LLAMA_INPUT_TIMING has none
+                host = [[float(m[2]), float(m[3]), float(m[4])] for m in
+                        (re.match(r"ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", x)
+                         for x in lines) if m and int(m[1]) == n_tokens][-3:]
+                host = [statistics.median(h[i] for h in host) for i in range(3)] if host else None
                 if not vulkan:
-                    return {"lines": [s.strip() for s in lines if "sched_prof" in s][-4:]}
+                    return {"lines": [x.strip() for x in lines if "sched_prof" in x][-4:], "host": host}
                 # the last graph is the measured one: the ubatch of the prompt or the last decode step at the depth
-                starts = [i for i, s in enumerate(lines) if s.startswith("Vulkan Timings:")]
+                starts = [i for i, x in enumerate(lines) if x.startswith("Vulkan Timings:")]
                 if not starts:
                     raise Fail(f"no Vulkan Timings in the log ({log.name})")
                 ops = []
-                for s in lines[starts[-1] + 1:]:
-                    m = re.match(r"(.+): (\d+) x [\d.e+-]+ us = ([\d.e+-]+) us", s)
+                for x in lines[starts[-1] + 1:]:
+                    m = re.match(r"(.+): (\d+) x [\d.e+-]+ us = ([\d.e+-]+) us", x)
                     if m:
                         ops.append([m[1], int(m[2]), float(m[3]) / 1000])
-                return {"ops": sorted(ops, key=lambda o: -o[2])}
+                return {"ops": sorted(ops, key=lambda o: -o[2]), "host": host}
 
             try:
                 r, kept = run.measure(label, identity, go)
@@ -859,19 +929,28 @@ def cmd_profile():
                 run.failed = True
                 run.add("", f"{label}: FAIL {e}")
                 continue
+            done[arm.name] = r
             title = f"{label}: {'prompt ' + str(pp) if kind == 'pp' else 'decode step'} at depth {depth}" + (" k" if kept else "")
+            host = r.get("host")
+            host_line = (f"  host: graph build {host[0]:.2f} ms, inputs {host[1]:.2f} ms, compute call {host[2]:.2f} ms"
+                         if host else "  host: no LLAMA_INPUT_TIMING in this build")
             if not vulkan:
-                run.add("", title, *[f"  {s}" for s in r["lines"]])
+                run.add("", title, host_line, *[f"  {x}" for x in r["lines"]])
                 continue
             total = sum(o[2] for o in r["ops"]) or 1
-            groups = {}
-            for name, count, ms in r["ops"]:
-                op = re.split(r"[ (]", name, 1)[0]
-                groups[op] = groups.get(op, 0) + ms
-            run.add("", f"{title}, {total:.1f} ms of gpu time",
-                    "  " + ", ".join(f"{op} {ms:.1f} ({100 * ms / total:.0f}%)"
-                                     for op, ms in sorted(groups.items(), key=lambda g: -g[1])[:12]),
+            run.add("", f"{title}, {total:.2f} ms of gpu time", host_line,
                     *table(["  ms", "count", "op"], [[f"  {ms:.2f}", count, name] for name, count, ms in r["ops"][:25]]))
+        if vulkan and len(done) > 1:
+            # gpu time per kind of op, side by side: where one arm loses against the other
+            groups = {}
+            for name, r in done.items():
+                for op, _, ms in r["ops"]:
+                    groups.setdefault(op_group(op), {}).setdefault(name, 0.0)
+                    groups[op_group(op)][name] += ms
+            top = sorted(groups, key=lambda g: -max(groups[g].values()))[:20]
+            rows = [[g, *[f"{groups[g].get(n, 0):.2f}" for n in done]] for g in top]
+            rows.append(["total", *[f"{sum(o[2] for o in r['ops']):.2f}" for r in done.values()]])
+            run.add("", f"{kind} at depth {depth}: gpu ms per kind of op", *table(["op", *done], rows))
     return run.finish()
 
 

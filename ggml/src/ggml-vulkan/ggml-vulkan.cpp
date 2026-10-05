@@ -8466,7 +8466,16 @@ static int ggml_vk_find_headsum(const ggml_cgraph * cgraph, int start, int end, 
 // length of the run (0: not fused) and the bias tensor (nullptr: no bias add). GGML_VK_DISABLE_MM_HEADSUM turns it off
 static int ggml_vk_can_fuse_mul_mat_headsum(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias) {
     static const bool disabled = getenv("GGML_VK_DISABLE_MM_HEADSUM") != nullptr;
+    // tokens per stream below which the heads stay apart: a few tokens take the matrix-vector kernel per head, which
+    // the fused matmul replaces with a tile of 4 columns. GGML_VK_HEADSUM_MIN_TOKENS, 0 fuses at any size
+    static const int64_t min_tokens = [] {
+        const char * env = getenv("GGML_VK_HEADSUM_MIN_TOKENS");
+        return env ? (int64_t) atoi(env) : 0;
+    }();
     if (disabled || ctx->device->coopmat2 || cgraph->nodes[node_idx]->op != GGML_OP_MUL_MAT || !ggml_vk_headsum_pipelines(ctx)) {
+        return 0;
+    }
+    if (cgraph->nodes[node_idx]->src[1]->ne[1] < min_tokens) {
         return 0;
     }
 

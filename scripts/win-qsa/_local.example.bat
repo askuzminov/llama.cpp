@@ -7,8 +7,8 @@ rem an older _local.bat: since 05.10.2026 the scripts read only the names in thi
 rem README.md. the variables of the old scripts do nothing now, delete them: SPECAUTO*, SPECARMS,
 rem SPECNGEN, SPECPROMPTFILE*, MOE*, UBMEM*, AB*, FAVARIANTS, REPS, DEPTHS, PERF*, TILES, INT8*,
 rem DEPTH32-34, ARMS32-34, SRVCTX, SRVARGS. keep MODEL, SPECDRAFT, and EXTRA on the 3090. QCTX and
-rem QCHUNKS keep their names and now set 03-quality: an old QCTX=65536 there means 16 GB of logits in
-rem ram and a reference file of the same size.
+rem QCHUNKS keep their names and now set 03-quality: delete an old QCTX=65536 there, 03 needs about
+rem 12 GB of ram at its default 16384 and fails at 32768 on the 395.
 rem
 rem the first run on a machine measures everything, there are no kept results yet. the arm
 rem "stable @stable" needs 00-build.bat stable once (a build-stable of the old 35-build-stable.bat
@@ -42,6 +42,9 @@ rem set "DECSEEDS=1"
 rem ---- the same answers with and without a switch: greedy sampling and pairs of arms ----
 rem set "DECSAMP=0 20 0.95"
 rem set "DECSAME=base:overlap n2:overlap-n2"
+
+rem ---- the warmup run at start back on (off by default: --no-warmup) ----
+rem set "WARMUP=1"
 
 rem ---- per-op profile of a decode step as well ----
 rem set "PROFKINDS=pp tg"
