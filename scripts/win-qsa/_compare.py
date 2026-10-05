@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import shlex
 import shutil
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from contextlib import contextmanager
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +76,100 @@ def run(command, log, env=None, result=None):
 
 def save_summary(logs, summary):
     (logs / "summary.txt").write_text("\n\n".join(summary) + "\n", encoding="utf-8")
+
+
+def quality_summary(output):
+    return "\n".join(line for line in output.splitlines()
+                     if any(s in line for s in ("Mean PPL", "Mean    KLD", "Maximum KLD", "99.9%", "99.0%", "Same top p:")))
+
+
+def model_identity(model):
+    split = re.fullmatch(r"(.*)-(\d{5})-of-(\d{5})(\.gguf)", model.name, re.IGNORECASE)
+    files = [model] if not split else [model.with_name(f"{split[1]}-{i:05d}-of-{split[3]}{split[4]}")
+                                      for i in range(1, int(split[3]) + 1)]
+    if not files:
+        raise RuntimeError("Invalid model shard count")
+    return [{"path": str(p), "size": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns} for p in files]
+
+
+def logits_info(data, ctx, chunks):
+    with data.open("rb") as f:
+        header = f.read(20)
+    if len(header) != 20 or header[:8] != b"_logits_":
+        raise RuntimeError("Invalid base logits header")
+    nctx, vocab, nchunk = struct.unpack("<Iii", header[8:])
+    expected = 20 + nctx*nchunk*4 + nchunk*(nctx - nctx//2 - 1)*(2*((vocab + 1)//2) + 4)*2
+    if (nctx, nchunk) != (ctx, chunks) or vocab < 1 or data.stat().st_size != expected:
+        raise RuntimeError("Base logits incomplete or corpus too short")
+    return {"ctx": nctx, "vocab": vocab, "chunks": nchunk, "bytes": expected}
+
+
+@contextmanager
+def reference_lock(path):
+    with path.open("a+b") as f:
+        if path.stat().st_size == 0:
+            f.write(b"0")
+            f.flush()
+        f.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise RuntimeError(f"Reference cache is in use by another run: {path}") from e
+        yield
+
+
+@contextmanager
+def reference_logits(tool, params, env, logs, label, model, corpus, ctx, chunks, settle):
+    libraries = {p.name: digest(p) for p in sorted(tool.parent.iterdir())
+                 if p.is_file() and (p.suffix.lower() in (".dll", ".dylib", ".so") or ".so." in p.name)}
+    identity = {"version": 1, "binary": {"path": str(tool), "sha256": digest(tool), "libraries": libraries},
+                "model": model_identity(model), "corpus": {"path": str(corpus), "sha256": digest(corpus)},
+                "arguments": params, "environment": {k: v for k, v in env.items()
+                    if k.startswith(("LLAMA_", "GGML_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_"))
+                    and not re.search("TOKEN|SECRET|PASS|API_KEY", k)},
+                "machine": {"host": platform.node(), "system": platform.platform(),
+                            "processor": platform.processor(), "cpu_count": os.cpu_count()}}
+    cache = logs.parent / "tmp"
+    cache.mkdir(parents=True, exist_ok=True)
+    data = cache / f"{label}-base.dat"
+    manifest = data.with_suffix(".json")
+    partial = data.with_suffix(".part.dat")
+    base_log = logs / f"{label}-base.log"
+    with reference_lock(data.with_suffix(".lock")):
+        reused = False
+        try:
+            record = json.loads(manifest.read_text(encoding="utf-8"))
+            if record["identity"] == identity:
+                info = logits_info(data, ctx, chunks)
+                if digest(data) == record["sha256"] and "Final estimate" in record["output"]:
+                    reused = True
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            pass
+        if not reused:
+            manifest.unlink(missing_ok=True)
+            data.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
+            try:
+                time.sleep(settle)
+                output = run([str(tool), *params, "--kl-divergence-base", str(partial)], base_log, env)
+                if "Final estimate" not in output:
+                    raise RuntimeError(f"Quality reference did not finish; see {base_log}")
+                info = logits_info(partial, ctx, chunks)
+                record = {"identity": identity, "sha256": digest(partial), "output": output,
+                          "created_from": str(logs)}
+                partial.replace(data)
+                manifest.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            finally:
+                partial.unlink(missing_ok=True)
+        info.update(path=str(data), reused=reused, sha256=record["sha256"])
+        base_log.write_text(json.dumps({"reference_cache": info}) + "\n" + record["output"], encoding="utf-8")
+        print(f"Reference cache {'reused' if reused else 'created'}: {data}, {info['bytes'] / 2**30:.2f} GiB", flush=True)
+        yield data, info
 
 
 def baseline_perplexity(commit):
@@ -229,45 +325,35 @@ def compare(mode, logs):
                              *((name, folder, True, None) for name in diagnostics)]
             references.append(("accurate", folder, True, accurate_arms))
         for ref_name, ref_bin, ref_accurate, candidates in references:
-            data = logs / f"{ref_name}-base.dat"
-            ref_params = [*params, "--kl-divergence-base", str(data)]
-            time.sleep(settle)
             try:
-                output = run([str(executable(ref_bin, "llama-perplexity")), *ref_params], logs / f"{ref_name}-base.log", base_env(ref_accurate))
-                if "Final estimate" not in output:
-                    raise RuntimeError(f"Baseline did not finish; see {ref_name}-base.log")
-                with data.open("rb") as f:
-                    header = f.read(20)
-                if len(header) != 20 or header[:8] != b"_logits_":
-                    raise RuntimeError("Invalid baseline logits header")
-                nctx, vocab, nchunk = struct.unpack("<Iii", header[8:])
-                expected = 20 + nctx * nchunk * 4 + nchunk * (nctx - nctx // 2 - 1) * (2 * ((vocab + 1) // 2) + 4) * 2
-                if (nctx, nchunk) != (ctx, chunks) or vocab < 1 or data.stat().st_size != expected:
-                    raise RuntimeError("Baseline logits incomplete or corpus too short for requested chunks")
+                tool = executable(ref_bin, "llama-perplexity")
+                with reference_logits(tool, params, base_env(ref_accurate), logs, ref_name, model, text, ctx, chunks, settle) as (data, reference):
+                    metadata.setdefault("references", {})[ref_name] = reference
+                    (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+                    summary.append(f"{ref_name}-base: cache {'reused' if reference['reused'] else 'created'} at {data}")
+                    ref_params = [*params, "--kl-divergence-base", str(data)]
+                    for name, arm_bin, accurate, heads in candidates:
+                        time.sleep(settle)
+                        label = f"{ref_name}-{name}"
+                        try:
+                            env = base_env(accurate, heads)
+                            env.update(diagnostics.get(name, {}))
+                            output = run([str(executable(arm_bin, "llama-perplexity")), *ref_params, "--kl-divergence"], logs / f"{label}.log", env)
+                            kld = re.search(r"Mean\s+KLD:\s*(\S+)", output)
+                            ratio = re.search(r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*(\S+)", output)
+                            if not kld or not ratio or not math.isfinite(float(kld[1])) or not math.isfinite(float(ratio[1])) or float(ratio[1]) <= 0:
+                                raise RuntimeError(f"Missing KLD: {label}.log")
+                            summary.append(label + "\n" + quality_summary(output))
+                        except (RuntimeError, ValueError) as e:
+                            failed = True
+                            summary.append(f"{label}: FAIL: {e}")
+                        save_summary(logs, summary)
             except (RuntimeError, OSError, ValueError) as e:
                 failed = True
                 summary.append(f"{ref_name}-base: FAIL: {e}")
                 summary.extend(f"{ref_name}-{name}: SKIPPED: reference failed" for name, *_ in candidates)
                 save_summary(logs, summary)
                 continue
-            for name, arm_bin, accurate, heads in candidates:
-                time.sleep(settle)
-                label = f"{ref_name}-{name}"
-                try:
-                    env = base_env(accurate, heads)
-                    env.update(diagnostics.get(name, {}))
-                    output = run([str(executable(arm_bin, "llama-perplexity")), *ref_params, "--kl-divergence"], logs / f"{label}.log", env)
-                    kld = re.search(r"Mean\s+KLD:\s*(\S+)", output)
-                    ratio = re.search(r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*(\S+)", output)
-                    if not kld or not ratio or not math.isfinite(float(kld[1])) or not math.isfinite(float(ratio[1])) or float(ratio[1]) <= 0:
-                        raise RuntimeError(f"Missing KLD: {label}.log")
-                    summary.append(label + "\n" + "\n".join(line for line in output.splitlines() if any(s in line for s in ("Mean PPL", "Mean    KLD", "Maximum KLD", "99.9%", "99.0%", "Same top p"))))
-                except (RuntimeError, ValueError) as e:
-                    failed = True
-                    summary.append(f"{label}: FAIL: {e}")
-                save_summary(logs, summary)
-            if not failed and os.environ.get("ABKEEPLOGITS", "0") != "1":
-                data.unlink()
     else:
         ctx = int(os.environ.get("ABCTX", "262144"))
         pp = int(os.environ.get("ABPP", "4096"))
@@ -334,50 +420,47 @@ def memory_quality(logs):
                 "corpus": str(corpus), "corpus_sha256": digest(corpus),
                 "ctx": ctx, "ubatch": ub, "chunks": chunks, "mean_kld_limit": limit, "variants": variants}
     (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    data = logs / "current-base.dat"
+    print(f"Quality reference cache: {logs.parent / 'tmp'}", flush=True)
     params = ["-m", str(model), "-f", str(corpus), *arguments(os.environ.get("LOADMODE", "")),
               *arguments(os.environ.get("EXTRA", "")), "-fa", "on", "-ctk", "f16", "-ctv", "f16",
               "-c", str(ctx), "--chunks", str(chunks), "-b", str(ub), "-ub", str(ub), "-fit", "off", "--phase-mem", "--no-repack"]
     if cuda:
         params += ["-ncmoe", "48", "--moe-cache", "auto"]
-    params += ["--kl-divergence-base", str(data)]
     settle = float(os.environ.get("SETTLE", "30"))
     env = base_env()
     env.update(LLAMA_MOE_CACHE_STATS="0", GGML_SCHED_PROF="0")
-    time.sleep(settle)
-    output = run([str(tool), *params], logs / "current-base.log", env)
-    if "Final estimate" not in output:
-        raise RuntimeError("Current quality reference did not finish")
-    with data.open("rb") as f:
-        header = f.read(20)
-    if len(header) != 20 or header[:8] != b"_logits_":
-        raise RuntimeError("Invalid current logits header")
-    nctx, vocab, nchunk = struct.unpack("<Iii", header[8:])
-    expected = 20 + nctx*nchunk*4 + nchunk*(nctx - nctx//2 - 1)*(2*((vocab + 1)//2) + 4)*2
-    if (nctx, nchunk) != (ctx, chunks) or vocab < 1 or data.stat().st_size != expected:
-        raise RuntimeError("Current logits incomplete or corpus too short")
-    summary = [f"Same current build, F16 KV, ctx={ctx}, ubatch={ub}, chunks={chunks}, mean KLD limit={limit}"]
     failed = False
-    for name, knobs in variants.items():
-        time.sleep(settle)
-        candidate_env = env.copy()
-        candidate_env.update(knobs)
-        try:
-            output = run([str(tool), *params, "--kl-divergence"], logs / f"{name}.log", candidate_env)
-            kld = re.search(r"Mean\s+KLD:\s*(\S+)", output)
-            ratio = re.search(r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*(\S+)", output)
-            if not kld or not ratio or not math.isfinite(float(kld[1])) or not math.isfinite(float(ratio[1])):
-                raise RuntimeError("Missing or non-finite quality metrics")
-            if float(kld[1]) > limit or abs(float(ratio[1]) - 1) > 0.001:
-                raise RuntimeError(f"Quality threshold exceeded: mean KLD={kld[1]}, PPL ratio={ratio[1]}")
-            summary.append(name + " PASS\n" + "\n".join(line for line in output.splitlines()
-                           if any(s in line for s in ("Mean PPL", "Mean    KLD", "Maximum KLD", "Same top p"))))
-        except (RuntimeError, ValueError) as e:
-            failed = True
-            summary.append(f"{name} FAIL: {e}")
+    with reference_logits(tool, params, env, logs, "current", model, corpus, ctx, chunks, settle) as (data, reference):
+        metadata["reference"] = reference
+        (logs / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        vocab = reference["vocab"]
+        summary = [f"Same current build, F16 KV, ctx={ctx}, ubatch={ub}, chunks={chunks}, mean KLD limit={limit}",
+                   f"Base probabilities: {reference['bytes'] / 2**30:.2f} GiB, vocab={vocab}, scored positions={chunks*(ctx - ctx//2 - 1)}",
+                   f"Reference cache {'reused' if reference['reused'] else 'created'}: {data}"]
         save_summary(logs, summary)
-    if not failed and os.environ.get("ABKEEPLOGITS", "0") != "1":
-        data.unlink()
+        print("\n".join(summary), flush=True)
+        params += ["--kl-divergence-base", str(data)]
+        for name, knobs in variants.items():
+            time.sleep(settle)
+            candidate_env = env.copy()
+            candidate_env.update(knobs)
+            details = ""
+            try:
+                output = run([str(tool), *params, "--kl-divergence"], logs / f"{name}.log", candidate_env)
+                details = quality_summary(output)
+                kld = re.search(r"Mean\s+KLD:\s*(\S+)", output)
+                ratio = re.search(r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*(\S+)", output)
+                if not kld or not ratio or not math.isfinite(float(kld[1])) or not math.isfinite(float(ratio[1])):
+                    raise RuntimeError("Missing or non-finite quality metrics")
+                if float(kld[1]) > limit or abs(float(ratio[1]) - 1) > 0.001:
+                    raise RuntimeError(f"Quality threshold exceeded: mean KLD={kld[1]}, PPL ratio={ratio[1]}")
+                block = name + " PASS\n" + details
+            except (RuntimeError, ValueError) as e:
+                failed = True
+                block = f"{name} FAIL: {e}" + ("\n" + details if details else "")
+            summary.append(block)
+            save_summary(logs, summary)
+            print(block + "\n", flush=True)
     if failed:
         raise RuntimeError("Memory quality failed; see summary.txt")
 
