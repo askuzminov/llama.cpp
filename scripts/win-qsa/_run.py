@@ -32,7 +32,8 @@ ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "OMP_")
 ENV_IGNORED = ("LLAMA_SPEC_TRACE",)
 # the 395 runs at the edge of its memory at -c 262144: right after another model run these come and go
 MEMORY_ERRORS = ("ErrorOutOfDeviceMemory", "ErrorMemoryMapFailed", "Device memory allocation", "failed to allocate",
-                 "unable to allocate", "out of memory", "cudaMalloc failed", "bad allocation", "row cache: read error")
+                 "unable to allocate", "out of memory", "cudaMalloc failed", "bad allocation", "row cache: read error",
+                 "failed to create context")
 DEVICES = {"vulkan": "Vulkan0", "cuda": "CUDA0"}
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -107,7 +108,8 @@ def stable_folder():
 class Arm:
     """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [@d=depth,...] [tool
     arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
-    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, the rest goes to the tool."""
+    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @c= sets the -c of 02 and 05
+    for this arm, the rest goes to the tool."""
 
     def __init__(self, text):
         tokens = split_args(text)
@@ -120,9 +122,15 @@ class Arm:
         self.stable = False
         self.draft = False
         self.depths = None
+        self.ctx = None
         for t in tokens[1:]:
             if t == "@draft":
                 self.draft = True
+            elif t.startswith("@c="):
+                try:
+                    self.ctx = int(t[3:])
+                except ValueError:
+                    raise Fail(f"arm {self.name}: {t} must be a context size, as @c=131072")
             elif t.startswith("@d="):
                 try:
                     self.depths = {int(d) for d in t[3:].split(",") if d}
@@ -210,9 +218,11 @@ def machine():
 
 
 def env_identity(run_env):
+    # a secret ends in one of these words. a substring test dropped GGML_VK_HEADSUM_MIN_TOKENS on 06.10, so the arm
+    # that set it and the default shared one result
     return {k: v for k, v in sorted(run_env.items())
             if k.upper().startswith(ENV_PREFIXES) and k.upper() not in ENV_IGNORED
-            and not re.search("TOKEN|SECRET|PASS|API_KEY", k.upper())}
+            and not re.search(r"(^|_)(TOKEN|SECRET|PASSWORD|PASS|KEY)$", k.upper())}
 
 
 def arm_env(arm, extra=None):
@@ -512,7 +522,7 @@ def cmd_bench():
             except Skip as e:
                 results[arm.name, depth] = f"skip: {e}"
                 continue
-            c = -(-(depth + max(pp, tg)) // 256) * 256 if auto else ctx
+            c = arm.ctx or (-(-(depth + max(pp, tg)) // 256) * 256 if auto else ctx)
             cmd = [exe, *model_args(model), "-c", c, "-b", max(pp, ub), "-ub", ub, "-p", pp, "-n", tg, "-d", depth,
                    "-r", reps, "-o", "json", *arm.args]
             run_env = arm_env(arm, {"GGML_SCHED_LOG_REALLOC": "1"})
@@ -551,6 +561,55 @@ def cmd_bench():
                     row.append("" if r is None else "FAIL" if r.startswith("FAIL") else "skip")
             rows.append(row)
         run.add("", f"{kind.upper()} t/s", *table(["depth", *[a.name for a in arms]], rows))
+    # prompts of an agent turn at depth 0: one llama-bench run per arm over the sizes of BENCHSMALL. a small -c is
+    # enough here, the graph of a short prompt at depth 0 does not depend on it
+    small = env_ints("BENCHSMALL", "") if env("BENCHSMALL") else []
+    if small:
+        small_arms = parse_arms("BENCHSMALLARMS", "default")
+        small_ctx = env_int("BENCHSMALLCTX", 16384)
+        small_res = {}
+        for arm in small_arms:
+            try:
+                exe = arm.binary("llama-bench")
+            except Skip as e:
+                small_res[arm.name] = f"skip: {e}"
+                continue
+            cmd = [exe, *model_args(model), "-c", arm.ctx or small_ctx, "-b", max(ub, max(small)), "-ub", ub,
+                   "-p", ",".join(map(str, small)), "-n", 0, "-r", reps, "-o", "json", *arm.args]
+            run_env = arm_env(arm)
+            identity = {"v": VERSION, "kind": "bench-small", "build": build_id(exe.parent),
+                        "args": [str(c) for c in cmd[1:]], "env": env_identity(run_env), "model": model_identity(model),
+                        "machine": machine()}
+
+            def go(log):
+                out = log.with_suffix(".json")
+                execute(cmd, log, run_env, stdout=out)
+                r = {}
+                for row in json.loads(out.read_text(encoding="utf-8")):
+                    samples = sorted(row.get("samples_ts") or [row["avg_ts"]])
+                    r[str(row["n_prompt"])] = [statistics.median(samples), samples[0], samples[-1]]
+                if any(str(n) not in r for n in small):
+                    raise Fail(f"llama-bench gave no row for every size of BENCHSMALL ({log.name})")
+                return r
+
+            try:
+                small_res[arm.name] = run.measure(f"{arm.name}-small", identity, go)
+            except Fail as e:
+                run.failed = True
+                small_res[arm.name] = f"FAIL {e}"
+        rows = []
+        for n in small:
+            row = [n]
+            for arm in small_arms:
+                r = small_res.get(arm.name)
+                if isinstance(r, tuple):
+                    med, lo, hi = r[0][str(n)]
+                    row.append(f"{med:.1f} ({lo:.1f}-{hi:.1f})" + (" k" if r[1] else ""))
+                else:
+                    row.append("skip" if r is None or r.startswith("skip") else "FAIL")
+            rows.append(row)
+        run.add("", f"PP t/s of short prompts at depth 0, -c {small_ctx}", *table(["prompt", *[a.name for a in small_arms]], rows))
+        results.update({(a, "small"): r for a, r in small_res.items() if isinstance(r, str)})
     notes = sorted({f"  {a}: {r}" for (a, d), r in results.items() if isinstance(r, str) and r.startswith("skip")})
     notes += [f"  {a}-d{d}: {r}" for (a, d), r in results.items() if isinstance(r, str) and not r.startswith("skip")]
     notes += [f"  {a}-d{d}: {r[0]['replans']} re-plans of the buffers while computing" for (a, d), r in results.items()
@@ -876,11 +935,24 @@ def cmd_profile():
     model = model_path()
     vulkan = env("BACKEND") == "vulkan"
     depths, pp, tg = env_ints("PROFDEPTH", "65536"), env_int("PROFPP", 4096), env_int("PROFTG", 4)
-    ub, ctx = env_int("PROFUB", 4096), env_int("PROFCTX", 262144)
+    ub = env_int("PROFUB", 4096)
+    # auto: -c of each depth is depth + prompt; a profile asks where the time of a graph goes, and the buffers of a
+    # full context put the 395 at the edge of its memory (05.10: ErrorOutOfDeviceMemory at 122880)
+    prof_auto = env("PROFCTX", "auto") == "auto"
+    ctx = 0 if prof_auto else env_int("PROFCTX", 262144)
     arms = parse_arms("PROFARMS", "default")
     run.add(f"profile: {'GGML_VK_PERF_LOGGER per op' if vulkan else 'GGML_SCHED_PROF per split'}, host time per ubatch "
-            f"from LLAMA_INPUT_TIMING, llama-bench -ub {ub} -c {ctx}, {model.name}, build {current_build()}")
-    for kind, depth in [(k, d) for k in split_args(env("PROFKINDS", "pp")) for d in depths]:
+            f"from LLAMA_INPUT_TIMING, llama-bench -ub {ub} -c {'depth + prompt' if prof_auto else ctx}, {model.name}, "
+            f"build {current_build()}")
+    # a kind is pp (PROFPP tokens), ppN (N tokens) or tg, with @d1,d2 for its own depths instead of PROFDEPTH
+    plan = []
+    for k in split_args(env("PROFKINDS", "pp")):
+        name, _, at = k.partition("@")
+        if not re.fullmatch(r"pp\d*|tg", name):
+            raise Fail(f"PROFKINDS: {k} is not pp, ppN or tg")
+        plan += [(name, d) for d in ([int(x) for x in at.split(",") if x] if at else depths)]
+    for kind, depth in plan:
+        n_pp = int(kind[2:]) if kind.startswith("pp") and len(kind) > 2 else pp
         done = {}
         for arm in arms:
             label = f"{kind}-d{depth}-{arm.name}"
@@ -891,16 +963,17 @@ def cmd_profile():
             except Skip as e:
                 run.add("", f"{label}: skip: {e}")
                 continue
-            sizes = ["-p", pp, "-n", 0] if kind == "pp" else ["-p", 0, "-n", tg]
+            sizes = ["-p", n_pp, "-n", 0] if kind != "tg" else ["-p", 0, "-n", tg]
             # two reps: the last graph then comes from the second, warm, without the warmup run (WARMUP); the depth
             # state of the first rep is restored, not computed again
-            cmd = [exe, *model_args(model), "-c", ctx, "-b", max(pp, ub), "-ub", ub, "-d", depth, *sizes, "-r", 2,
+            c = arm.ctx or (-(-(depth + max(n_pp, tg)) // 256) * 256 if prof_auto else ctx)
+            cmd = [exe, *model_args(model), "-c", c, "-b", max(n_pp, ub), "-ub", ub, "-d", depth, *sizes, "-r", 2,
                    *arm.args]
             run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1",
                                     **({"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_SCHED_PROF": "1"})})
             identity = {"v": VERSION, "kind": "profile", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
                         "env": env_identity(run_env), "model": model_identity(model), "machine": machine()}
-            n_tokens = min(pp, ub) if kind == "pp" else 1
+            n_tokens = min(n_pp, ub) if kind != "tg" else 1
 
             def go(log):
                 _, text = execute(cmd, log, run_env)
@@ -930,7 +1003,7 @@ def cmd_profile():
                 run.add("", f"{label}: FAIL {e}")
                 continue
             done[arm.name] = r
-            title = f"{label}: {'prompt ' + str(pp) if kind == 'pp' else 'decode step'} at depth {depth}" + (" k" if kept else "")
+            title = f"{label}: {'prompt ' + str(n_pp) if kind != 'tg' else 'decode step'} at depth {depth}" + (" k" if kept else "")
             host = r.get("host")
             host_line = (f"  host: graph build {host[0]:.2f} ms, inputs {host[1]:.2f} ms, compute call {host[2]:.2f} ms"
                          if host else "  host: no LLAMA_INPUT_TIMING in this build")
@@ -951,6 +1024,74 @@ def cmd_profile():
             rows = [[g, *[f"{groups[g].get(n, 0):.2f}" for n in done]] for g in top]
             rows.append(["total", *[f"{sum(o[2] for o in r['ops']):.2f}" for r in done.values()]])
             run.add("", f"{kind} at depth {depth}: gpu ms per kind of op", *table(["op", *done], rows))
+    return run.finish()
+
+
+# ---------------------------------------------------------------- kernels
+
+def case_name(op, params):
+    # the parameters that tell the shapes of a model apart
+    keep = [m[0] for m in re.finditer(r"\b(type_a=\w+|n_mats=\d+|n_used=\d+|m=\d+|n=\d+|k=\d+)", params)]
+    return " ".join([op, *(k.replace("type_a=", "") for k in keep)]) if keep else f"{op}({params})"
+
+
+def cmd_kernels():
+    run = Run("kernels")
+    device = env("CHECKDEVICE", DEVICES.get(env("BACKEND"), "CPU"))
+    ops = [split_args(o) for o in env("KERNOPS", "MUL_MAT").split(";") if o.strip()]
+    arms = parse_arms("KERNARMS", "default")
+    results, cases, fails = {}, [], []
+    for arm in arms:
+        try:
+            exe = arm.binary("test-backend-ops")
+        except Skip as e:
+            fails.append(f"  {arm.name}: skip: {e}")
+            continue
+        for op in ops:
+            cmd = [exe, "perf", "-b", device, "-o", op[0], *(["-p", op[1]] if len(op) > 1 else []), *arm.args]
+            run_env = arm_env(arm)
+            identity = {"v": VERSION, "kind": "kernels", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
+                        "env": env_identity(run_env), "machine": machine()}
+
+            def go(log):
+                code, text = execute(cmd, log, run_env, model=False, check=False)
+                text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+                rows = []
+                for m in re.finditer(r"^\s+(\w+)\((.*?)\):\s+\d+ runs\s+-\s+([\d.]+) us/run\s+-\s+[\d.]+ \w+/run\s+-\s+([\d.]+) (\S+)",
+                                     text, re.MULTILINE):
+                    value, unit = float(m[4]), m[5]
+                    scale = {"MFLOPS": 1e-6, "GFLOPS": 1e-3, "TFLOPS": 1.0}.get(unit)
+                    rows.append([case_name(m[1], m[2]), float(m[3]), value * scale if scale else value,
+                                 "TFLOPS" if scale else unit])
+                if not rows:
+                    raise Fail(f"{exit_text(code)}, no perf result: {last_error(text)} ({log.name})")
+                return {"rows": rows}
+
+            try:
+                r, kept = run.measure(f"{' '.join(op)} {arm.name}", identity, go)
+            except Fail as e:
+                run.failed = True
+                fails.append(f"  {' '.join(op)} {arm.name}: FAIL {e}")
+                continue
+            for case, us, value, unit in r["rows"]:
+                if case not in cases:
+                    cases.append(case)
+                results[arm.name, case] = (us, value, unit, kept)
+    rows = []
+    for case in cases:
+        values = [results[a.name, case][1] for a in arms if (a.name, case) in results]
+        best = max(values) if values else None
+        row = [case]
+        for a in arms:
+            r = results.get((a.name, case))
+            row.append("" if r is None else f"{r[1]:.2f}" + (" *" if len(values) > 1 and r[1] == best else "")
+                       + (" k" if r[3] else ""))
+        rows.append(row)
+    unit = next((r[2] for r in results.values()), "")
+    run.add(f"kernels: test-backend-ops perf on {device}, {unit} per case, * the best arm, build {current_build()}", "",
+            *table(["case", *[a.name for a in arms]], rows))
+    if fails:
+        run.add("", "notes:", *fails)
     return run.finish()
 
 
@@ -1039,7 +1180,7 @@ def cmd_build_stable():
 
 
 COMMANDS = {"check": cmd_check, "bench": cmd_bench, "quality": cmd_quality, "decode": cmd_decode,
-            "profile": cmd_profile, "build-begin": cmd_build_begin, "build-end": cmd_build_end,
+            "profile": cmd_profile, "kernels": cmd_kernels, "build-begin": cmd_build_begin, "build-end": cmd_build_end,
             "build-stable": cmd_build_stable}
 
 

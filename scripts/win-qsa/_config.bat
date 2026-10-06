@@ -83,20 +83,31 @@ rem accurate: the f16 matmuls with f32 accumulators instead of int8 coopmat and 
 if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model
 if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
-if not defined DECARGS    set "DECARGS=-fit off"
-rem stable: the server of the tag, its TG and its compute buffers (DECGREP) next to the current ones
+rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
+if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
+rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones
 if not defined DECARMS    set "DECARMS=stable @stable;none;n3 @draft --spec-type draft-mtp --spec-draft-n-max 3;auto @draft --spec-auto"
-rem the search of 05.10: TG at 122880 is 2 percent below stable (22.48 against 22.98, 22.68 against 23.18 on
-rem 03.10). the arms at that depth turn back what changed since stable for decode: nohs no head sum matmul at
-rem all, hsmin the head sum matmul for the prompt only (decode keeps a matrix-vector kernel per head, prefill keeps
-rem its gain), shmem32 the 32 KB shared memory of stable (flash attention tiles). the input fills of a decode step
-rem already run on one thread. 05-profile puts the gpu time of each kind of op of stable and default side by side,
-rem for the prompt at depth 0 (the gap to gufo) as well. remove the arms when the cause is found
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;nohs GGML_VK_DISABLE_MM_HEADSUM=1 @d=122880;hsmin GGML_VK_HEADSUM_MIN_TOKENS=9 @d=122880;shmem32 GGML_VK_SHMEM_LIMIT=32768 @d=122880"
-if not defined PROFKINDS  set "PROFKINDS=pp tg"
+rem search 1, TG at depth: 2 to 5 percent below stable at 122880 (06.10: 22.10-22.56 against 23.28). not the head
+rem sum matmul: without it TG stayed at 22.56. the c131 arms take -c 131072 at that depth: if stable and default
+rem meet there, the loss comes from the memory pressure of -c 262144 (the new build fails on memory there more
+rem often). shmem32 (the 32 KB of stable) failed on memory three times at 262144, nofusion turns off every fusion.
+rem 05-profile puts the gpu time per kind of op of a decode step of stable and default side by side
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;stable-c131 @stable @c=131072 @d=122880;default-c131 @c=131072 @d=122880;shmem32-c131 GGML_VK_SHMEM_LIMIT=32768 @c=131072 @d=122880;nofusion-c131 GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1 @c=131072 @d=122880"
+rem search 2, short prompts: the server of 06.10 took 2.2 s for 82 tokens against 1.76 s of stable, 10.7 s for 2541
+rem tokens against 7.8 s (-ub 512), while pp4096 is 26 percent faster. each arm turns back one change of the prompt
+rem kernels: accurate the f16 matmuls instead of int8 coopmat, noglu the fused gate/up/swiglu of the experts,
+rem shmem32 the 32 KB of stable, nofusion every fusion
+if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
+if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;noglu GGML_VK_DISABLE_MMID_GLU=1;shmem32 GGML_VK_SHMEM_LIMIT=32768;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1"
+rem the prompt at depth 0 and 512 tokens, a decode step at 122880, stable and default side by side
+if not defined PROFKINDS  set "PROFKINDS=pp@0 pp512@0 tg@122880"
 if not defined PROFARMS   set "PROFARMS=stable @stable;default"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
-if not defined PROFDEPTH  set "PROFDEPTH=0,122880"
+rem search 3, prompt kernels: the experts ran at about 13 TFLOPS on 06.10, the q8_0 projections at about 22. a sweep
+rem of the int8 coopmat tiles (GGML_VK_MMQ_INT_TILE BM,BN,WM,WN on the large tile) and the f16 path on the model
+rem shapes of test-backend-ops perf, no model needed
+if not defined KERNARMS   set "KERNARMS=default;noint GGML_VK_INT_COOPMAT=0;large GGML_VK_INT_LARGE_TILE=1;l128x128w32 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,128,32,32;l128x128w64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,128,64,32;l128x64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,64,32,32;l64x128 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,32;l128x32 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,32,32,16;l256x64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=256,64,64,32"
+if not defined RUN_KERNELS set "RUN_KERNELS=1"
 rem the server of the 395 runs at -c 262144 with its buffers for the full context, llama-bench does the same
 if not defined BENCHCTX   set "BENCHCTX=262144"
 goto :defaults_done
@@ -108,14 +119,16 @@ if not defined CHECKARMS  set "CHECKARMS=default"
 if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 4096 -ub 4096"
-rem since 05.10 the build runs the cpu experts while the gpu runs the cached ones (+3.5 percent TG on 04.10 and
-rem 05.10, +7 with MTP), and a prompt of up to 256 tokens in the generation layout with the moe-cache kept.
-rem serial and prompt0 turn each back for the comparison
-if not defined DECARMS    set "DECARMS=base;prompt0 LLAMA_PHASE_SMALL_PROMPT=0;serial GGML_SCHED_PARALLEL_CPU=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;serial-n2 GGML_SCHED_PARALLEL_CPU=0 @draft --spec-type draft-mtp --spec-draft-n-max 2"
+rem since 05.10 the cpu experts run while the gpu runs the cached ones (06.10: TG +2 percent, +4.6 with MTP n2;
+rem GGML_SCHED_PARALLEL_CPU=0 turns it off) and a prompt of up to 192 tokens takes the generation layout with the
+rem moe-cache kept (06.10: an 82-token prompt 1.6 s instead of 2.7 s, no 0.73 s refill after it;
+rem LLAMA_PHASE_SMALL_PROMPT=0 turns it off). auto compares --spec-auto with the fixed n-max 2
+if not defined DECARMS    set "DECARMS=base;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;auto @draft --spec-auto"
 if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
-if not defined PROFDEPTH  set "PROFDEPTH=32768"
+if not defined KERNARMS   set "KERNARMS=default"
+if not defined RUN_KERNELS set "RUN_KERNELS=0"
 rem auto: -c of each depth is depth + prompt, as --phase-mem sizes the buffers in the server. at a fixed -c 262144
 rem the buffers did not fit the 24 GB and the driver moved some to system memory: PP 115-145 or 285-430 t/s
 rem from one process to the next on 05.10, the same within a process
@@ -145,13 +158,16 @@ if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
-if not defined DECGREP     set "DECGREP=moe_cache:.*slots|phase_mem:|sched_prof|compute buffer size"
+if not defined DECGREP     set "DECGREP=moe_cache:.*slots|phase_mem:|sched_prof|buffer size"
 rem 1: the warmup run of llama-bench, llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds
 rem load time and memory pressure, -lm dio reads the weights at load and the median of 02 drops a cold first rep
 if not defined WARMUP      set "WARMUP=0"
+rem 06-kernels: test-backend-ops perf of the model shapes at -ub 4096, "OP [regex of the case parameters]"
+if not defined KERNOPS     set "KERNOPS=MUL_MAT_ID n_mats=512,n_used=10,b=0,m=[0-9]+,n=4096,;MUL_MAT type_a=q8_0,type_b=f32,m=[0-9]+,n=4096,"
 rem 05-profile: one ubatch of the prompt (pp) and one decode step (tg) at PROFDEPTH
 if not defined PROFKINDS   set "PROFKINDS=pp"
 if not defined PROFARMS    set "PROFARMS=default"
+if not defined PROFDEPTH   set "PROFDEPTH=32768"
 rem run-all.bat
 if not defined RUN_BUILD   set "RUN_BUILD=1"
 if not defined RUN_CHECK   set "RUN_CHECK=1"

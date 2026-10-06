@@ -1,14 +1,15 @@
 @echo off
-rem the build and every measurement, in order: 00-build, 01-check, 02-bench, 03-quality, 04-decode, 05-profile.
-rem each one runs only what the same sources have not measured yet, so after a change of the code everything
-rem runs, and after a change of the scripts only the new arms do. RUN_* in _local.bat turn steps off (05 is on
-rem for the 395 only); serve.bat is not part of it.
+rem the build and every measurement, in order: 00-build, 01-check, 06-kernels (no model), 02-bench, 03-quality,
+rem 04-decode, 05-profile. each one runs only what the same sources have not measured yet, so after a change of the
+rem code everything runs, and after a change of the scripts only the new arms do. RUN_* in _local.bat turn steps
+rem off (05 and 06 are on for the 395 only); serve.bat is not part of it.
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
 set "STEPS="
 if "%RUN_BUILD%"=="1"   set "STEPS=%STEPS% 00-build"
 if "%RUN_CHECK%"=="1"   set "STEPS=%STEPS% 01-check"
+if "%RUN_KERNELS%"=="1" set "STEPS=%STEPS% 06-kernels"
 if "%RUN_BENCH%"=="1"   set "STEPS=%STEPS% 02-bench"
 if "%RUN_QUALITY%"=="1" set "STEPS=%STEPS% 03-quality"
 if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 04-decode"

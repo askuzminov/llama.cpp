@@ -916,12 +916,13 @@ void llama_context::phase_update(uint32_t n_tokens) {
     }
 
     // a short prompt runs in the generation layout, in ubatches of its workspace: the moe-cache stays, and the host
-    // experts are not streamed to the device for a few tokens. on the 3090 a 42-85 token prompt took the prompt layout
-    // at about 30 t/s and then 0.73 s to fill 9.7 GB of the moe-cache again. LLAMA_PHASE_SMALL_PROMPT sets the limit,
-    // 0 turns it off
+    // experts are not streamed to the device for a few tokens. on the 3090 (06.10) an 82-token prompt took 1.6 s so
+    // (about 0.53 s per 31-token ubatch) against 2.7 s in the prompt layout and 0.73 s to fill the moe-cache again
+    // after it; the prompt layout costs about 2.5 s + 1.8 ms per token, so the two meet near 200 tokens.
+    // LLAMA_PHASE_SMALL_PROMPT sets the limit, 0 turns it off
     static const uint32_t n_small = [] {
         const char * s = getenv("LLAMA_PHASE_SMALL_PROMPT");
-        return s ? (uint32_t) std::max(0, atoi(s)) : 256u;
+        return s ? (uint32_t) std::max(0, atoi(s)) : 192u;
     }();
     const bool small = n_tokens > phase_n_gen && n_tokens <= n_small;
     const bool gen   = n_tokens <= phase_n_gen || small;
