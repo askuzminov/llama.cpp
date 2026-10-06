@@ -5114,11 +5114,16 @@ vk_device ggml_vk_get_device(size_t idx) {
             }
         }
 
-        // GGML_VK_INT_LARGE_TILE=1 (experiment): the large int8 coopmat tiles even where the large f16 tile is off,
-        // as on the AMD driver, where the f16 one spills (28.09). the shared memory check below still applies
-        const bool int_large_tile = getenv("GGML_VK_INT_LARGE_TILE") != nullptr && atoi(getenv("GGML_VK_INT_LARGE_TILE")) != 0;
+        // GGML_VK_INT_LARGE_TILE (experiment): the large int8 coopmat tiles even where the large f16 tile is off, as on
+        // the AMD driver, where the f16 one spills (28.09). 1 for matmul and matmul_id, 2 for matmul only: on the 395
+        // (06.10) the 64x128 tile took 4 percent off the dense matmuls but slowed the experts on a real routing. the
+        // shared memory check below still applies
+        const int int_large_tile_mode = getenv("GGML_VK_INT_LARGE_TILE") != nullptr ? atoi(getenv("GGML_VK_INT_LARGE_TILE")) : 0;
+        const bool int_large_tile    = int_large_tile_mode != 0;
+        const bool int_large_tile_id = int_large_tile_mode == 1;
         if (int_large_tile) {
-            GGML_LOG_INFO("ggml_vulkan: large int8 coopmat tiles on (GGML_VK_INT_LARGE_TILE)\n");
+            GGML_LOG_INFO("ggml_vulkan: large int8 coopmat tiles on for matmul%s (GGML_VK_INT_LARGE_TILE)\n",
+                int_large_tile_id ? " and matmul_id" : "");
         }
 
         // Shaders
@@ -5189,7 +5194,7 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mul_mat_l_int[i]    = device->mul_mat_l[i] || int_large_tile;
             device->mul_mat_m_int[i]    = device->mul_mat_m[i];
             device->mul_mat_s_int[i]    = device->mul_mat_s[i];
-            device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i] || int_large_tile;
+            device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i] || int_large_tile_id;
             device->mul_mat_id_m_int[i] = device->mul_mat_id_m[i];
             device->mul_mat_id_s_int[i] = device->mul_mat_id_s[i];
         }

@@ -2474,6 +2474,7 @@ private:
     // Keep one base and append deltas until the chain is evicted.
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+        const int64_t t_start_us = ggml_time_us();
 
         // Optional cap on chain length (--ctx-checkpoints, or the fallback when the host-RAM probe
         // failed). A count does not help when the memory is short, so what normally bounds the
@@ -2661,10 +2662,10 @@ private:
         }
 
         SLT_TRC(slot,
-                "created context checkpoint %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s, budget %zu MiB per slot)\n",
+                "created context checkpoint %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s, budget %zu MiB per slot, %.1f ms)\n",
                 (int) slot.prompt.checkpoints.size(), cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
-                cur.is_delta() ? "DELTA" : "BASE", budget >> 20);
+                cur.is_delta() ? "DELTA" : "BASE", budget >> 20, 1e-3 * (ggml_time_us() - t_start_us));
     }
 
     // Prompt reconcile: reuse the longest common prefix with the live sequence, optionally
@@ -2837,6 +2838,7 @@ private:
                     const common_prompt_checkpoint & base_cp = *it_base;
                     const bool not_captured = cur_cp.data_tgt.empty();
                     const common_prompt_checkpoint & restored_cp = not_captured ? base_cp : cur_cp;
+                    const int64_t t_restore_us = ggml_time_us();
 
                     bool ok = !base_cp.is_delta() && !base_cp.data_tgt.empty();
                     if (ok) {
@@ -2865,9 +2867,9 @@ private:
 
                         pos_next = std::min(pos_next, std::max(restored_cp.pos_min + 1, restored_cp.pos_max));
                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) restored_cp.n_tokens);
-                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n",
+                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, %.1f ms)\n",
                                 restored_cp.pos_min, restored_cp.pos_max, restored_cp.n_tokens, n_past,
-                                (float) restored_cp.size() / 1024 / 1024);
+                                (float) restored_cp.size() / 1024 / 1024, 1e-3 * (ggml_time_us() - t_restore_us));
                     }
                 }
 
