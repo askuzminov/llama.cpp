@@ -218,6 +218,23 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // LLAMA_KV_SHARED=1: the K/V of the attention (not the caches with a name tag, as the indexer keys) in the
+            // shared buffer type of the device, the host memory a UMA gpu reads in place (Vulkan0_Shared). sparse
+            // attention reads only the selected cells, and the device memory of the 395 is at its edge at 262144
+            static const bool kv_shared = getenv("LLAMA_KV_SHARED") != nullptr && atoi(getenv("LLAMA_KV_SHARED")) != 0;
+            if (kv_shared && (name_tag == nullptr || name_tag[0] == '\0')) {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto get_extra_bufts = reg ? (ggml_backend_dev_get_extra_bufts_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+                for (auto * extra = get_extra_bufts ? get_extra_bufts(dev) : nullptr; extra && *extra; ++extra) {
+                    const std::string name = ggml_backend_buft_name(*extra);
+                    if (name.size() > 7 && name.compare(name.size() - 7, 7, "_Shared") == 0) {
+                        buft = *extra;
+                        break;
+                    }
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

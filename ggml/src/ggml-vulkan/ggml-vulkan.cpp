@@ -5235,6 +5235,12 @@ vk_device ggml_vk_get_device(size_t idx) {
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
+        device->buffer_type_shared = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "_Shared", device, true },
+        };
+        device->extra_bufts[0] = &device->buffer_type_shared;
 
         device->fence = device->device.createFence({});
 
@@ -8610,6 +8616,16 @@ static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struc
         return false;
     }
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+        return false;
+    }
+    // tokens below which the gate and up matmuls stay apart: with few rows per expert the fused shader is slower. on
+    // the 395 (06.10, 512 experts, 10 per token) gate/up took 880 ms fused against 323 ms apart at 512 tokens, the
+    // same at 2541 and less fused at 4096. GGML_VK_MMID_GLU_MIN_TOKENS, 0 fuses at any size
+    static const int64_t min_tokens = [] {
+        const char * env = getenv("GGML_VK_MMID_GLU_MIN_TOKENS");
+        return env ? (int64_t) atoi(env) : 2048;
+    }();
+    if (a->src[2]->ne[1] < min_tokens) {
         return false;
     }
     return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, w0->type, GGML_TYPE_Q8_1, (ggml_prec) a->op_params[0], true, true) != nullptr;
@@ -13853,7 +13869,7 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        dev_buffer = ctx->shared ? ggml_vk_create_buffer_shared(ctx->device, size) : ggml_vk_create_buffer_device(ctx->device, size);
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
@@ -17374,11 +17390,27 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// the shared buffer type of the device (<name>_Shared). llama.cpp lists it after the default one, so it holds only
+// the tensors an override (-ot) or LLAMA_KV_SHARED puts there
+static ggml_backend_buffer_type_t * ggml_backend_vk_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    ggml_vk_instance_init();
+    return ggml_vk_get_device(ctx->device)->extra_bufts;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *) ggml_backend_vk_device_get_extra_bufts;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

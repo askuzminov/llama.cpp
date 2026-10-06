@@ -108,8 +108,8 @@ def stable_folder():
 class Arm:
     """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [@d=depth,...] [tool
     arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
-    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @c= sets the -c of 02 and 05
-    for this arm, the rest goes to the tool."""
+    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @c= and @ub= set the -c and
+    the -ub of 02 and 05 for this arm, the rest goes to the tool."""
 
     def __init__(self, text):
         tokens = split_args(text)
@@ -123,9 +123,15 @@ class Arm:
         self.draft = False
         self.depths = None
         self.ctx = None
+        self.ub = None
         for t in tokens[1:]:
             if t == "@draft":
                 self.draft = True
+            elif t.startswith("@ub="):
+                try:
+                    self.ub = int(t[4:])
+                except ValueError:
+                    raise Fail(f"arm {self.name}: {t} must be a ubatch size, as @ub=2048")
             elif t.startswith("@c="):
                 try:
                     self.ctx = int(t[3:])
@@ -523,7 +529,8 @@ def cmd_bench():
                 results[arm.name, depth] = f"skip: {e}"
                 continue
             c = arm.ctx or (-(-(depth + max(pp, tg)) // 256) * 256 if auto else ctx)
-            cmd = [exe, *model_args(model), "-c", c, "-b", max(pp, ub), "-ub", ub, "-p", pp, "-n", tg, "-d", depth,
+            u = arm.ub or ub
+            cmd = [exe, *model_args(model), "-c", c, "-b", max(pp, u), "-ub", u, "-p", pp, "-n", tg, "-d", depth,
                    "-r", reps, "-o", "json", *arm.args]
             run_env = arm_env(arm, {"GGML_SCHED_LOG_REALLOC": "1"})
             identity = {"v": VERSION, "kind": "bench", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
@@ -574,7 +581,7 @@ def cmd_bench():
             except Skip as e:
                 small_res[arm.name] = f"skip: {e}"
                 continue
-            cmd = [exe, *model_args(model), "-c", arm.ctx or small_ctx, "-b", max(ub, max(small)), "-ub", ub,
+            cmd = [exe, *model_args(model), "-c", arm.ctx or small_ctx, "-b", max(arm.ub or ub, max(small)), "-ub", arm.ub or ub,
                    "-p", ",".join(map(str, small)), "-n", 0, "-r", reps, "-o", "json", *arm.args]
             run_env = arm_env(arm)
             identity = {"v": VERSION, "kind": "bench-small", "build": build_id(exe.parent),
@@ -967,13 +974,13 @@ def cmd_profile():
             # two reps: the last graph then comes from the second, warm, without the warmup run (WARMUP); the depth
             # state of the first rep is restored, not computed again
             c = arm.ctx or (-(-(depth + max(n_pp, tg)) // 256) * 256 if prof_auto else ctx)
-            cmd = [exe, *model_args(model), "-c", c, "-b", max(n_pp, ub), "-ub", ub, "-d", depth, *sizes, "-r", 2,
+            cmd = [exe, *model_args(model), "-c", c, "-b", max(n_pp, arm.ub or ub), "-ub", arm.ub or ub, "-d", depth, *sizes, "-r", 2,
                    *arm.args]
             run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1",
                                     **({"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_SCHED_PROF": "1"})})
             identity = {"v": VERSION, "kind": "profile", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
                         "env": env_identity(run_env), "model": model_identity(model), "machine": machine()}
-            n_tokens = min(n_pp, ub) if kind != "tg" else 1
+            n_tokens = min(n_pp, arm.ub or ub) if kind != "tg" else 1
 
             def go(log):
                 _, text = execute(cmd, log, run_env)
@@ -1031,8 +1038,8 @@ def cmd_profile():
 
 def case_name(op, params):
     # the parameters that tell the shapes of a model apart
-    keep = [m[0] for m in re.finditer(r"\b(type_a=\w+|n_mats=\d+|n_used=\d+|m=\d+|n=\d+|k=\d+)", params)]
-    return " ".join([op, *(k.replace("type_a=", "") for k in keep)]) if keep else f"{op}({params})"
+    keep = [m[0] for m in re.finditer(r"\b(type_a=\w+|type=\w+|n_mats=\d+|n_used=\d+|m=\d+|n=\d+|k=\d+)", params)]
+    return " ".join([op, *(re.sub(r"^type(_a)?=", "", k) for k in keep)]) if keep else f"{op}({params})"
 
 
 def cmd_kernels():

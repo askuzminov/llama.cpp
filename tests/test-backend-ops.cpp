@@ -7335,6 +7335,12 @@ struct test_mul_mat_vec_fusion : public test_case {
         return "MUL_MAT_VEC_FUSION";
     }
 
+    // m tokens by n rows of k, per used expert, for the gate and the up matrix
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * (uint64_t) m * n * k * (use_id ? n_used : 1) * (with_gate ? 2 : 1);
+    }
+
     bool run_whole_graph() override { return true; }
     bool test_graph_optimize() override { return gate_cont; }
     bool use_weight_context() override { return use_id && with_lane_scale; }
@@ -11867,6 +11873,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
         }
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+    }
+    // the same gate and up with the swiglu as one graph, which Vulkan fuses into one shader (FUSED_GLU) from
+    // GGML_VK_MMID_GLU_MIN_TOKENS tokens on: a short prompt and -ub 4096
+    for (int64_t bs : {512, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
+            true, 512, 10, true, false, true, false, {1, 1}));
     }
 
     // gpt-oss-20b

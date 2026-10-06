@@ -1093,7 +1093,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
         score = summed;
     } else {
-        std::vector<ggml_tensor *> head_scores;
+        // each head joins the sum right after it is computed: the allocator then holds two head scores at most, not
+        // all of them. a head score is 1 GiB at n_kv 262144 with a 4096-token ubatch, and with all four alive the
+        // compute buffer of the 395 grew to 10.5 GB and put the device at the edge of its memory (06.10)
         for (int64_t h = 0; h < n_idx_h; ++h) {
             ggml_tensor * head = nullptr;
 
@@ -1107,14 +1109,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 head = head ? ggml_concat(ctx0, head, sc, 2) : sc;
             }
 
-            head = ggml_relu(ctx0, head);
-            ggml_build_forward_expand(gf, head);
-            head_scores.push_back(head);
-        }
-
-        score = head_scores[0];
-        for (int64_t h = 1; h < n_idx_h; ++h) {
-            score = ggml_add(ctx0, score, head_scores[h]);
+            head  = ggml_relu(ctx0, head);
+            score = score ? ggml_add(ctx0, score, head) : head;
+            ggml_build_forward_expand(gf, score);
         }
     }
     cb(score, "indexer_score", il);

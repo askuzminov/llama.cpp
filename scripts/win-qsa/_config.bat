@@ -79,34 +79,36 @@ if /i "%BACKEND%"=="cuda" goto :cuda_defaults
 
 rem ---- 395 / vulkan: everything on the gpu ----
 if not defined EXTRA      set "EXTRA=-ngl 99"
-rem accurate: the f16 matmuls with f32 accumulators instead of int8 coopmat and f16 accumulators
-if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
+rem accurate: the f16 matmuls with f32 accumulators instead of int8 coopmat and f16 accumulators. glu0: the fused
+rem gate/up/swiglu of the experts at any size, the test cases are below the 2048 tokens it waits for by default
+if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model
 if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
-rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones
-if not defined DECARMS    set "DECARMS=stable @stable;none;n3 @draft --spec-type draft-mtp --spec-draft-n-max 3;auto @draft --spec-auto"
-rem search 1, TG at depth: 2 to 5 percent below stable at 122880 (06.10: 22.10-22.56 against 23.28). not the head
-rem sum matmul: without it TG stayed at 22.56. the c131 arms take -c 131072 at that depth: if stable and default
-rem meet there, the loss comes from the memory pressure of -c 262144 (the new build fails on memory there more
-rem often). shmem32 (the 32 KB of stable) failed on memory three times at 262144, nofusion turns off every fusion.
-rem 05-profile puts the gpu time per kind of op of a decode step of stable and default side by side
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;stable-c131 @stable @c=131072 @d=122880;default-c131 @c=131072 @d=122880;shmem32-c131 GGML_VK_SHMEM_LIMIT=32768 @c=131072 @d=122880;nofusion-c131 GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1 @c=131072 @d=122880"
-rem search 2, short prompts: the server of 06.10 took 2.2 s for 82 tokens against 1.76 s of stable, 10.7 s for 2541
-rem tokens against 7.8 s (-ub 512), while pp4096 is 26 percent faster. each arm turns back one change of the prompt
-rem kernels: accurate the f16 matmuls instead of int8 coopmat, noglu the fused gate/up/swiglu of the experts,
-rem shmem32 the 32 KB of stable, nofusion every fusion
+rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. ub2048: the
+rem server at -ub 2048, half the compute buffer. shared: the attention K/V (6 GB) and the experts of layers 44-47
+rem (about 6 GB) in the 16 GB of shared gpu memory (Vulkan0_Shared), off the device heap
+if not defined DECARMS    set "DECARMS=stable @stable;none;ub2048 -b 2048 -ub 2048;shared LLAMA_KV_SHARED=1 -ot blk\.4[4-7]\.ffn_.*_exps=Vulkan0_Shared;auto @draft --spec-auto;auto-ub2048 @draft --spec-auto -b 2048 -ub 2048"
+rem 06.10: at 122880 TG of stable and default met at -c 131072 (23.45 and 23.12) but not at -c 262144 (23.28 and
+rem 22.35): the device memory. the compute buffer at -ub 4096 was 10.5 GB against 7.4 GB of stable (the indexer runs
+rem on the gpu now), 95.4 GB on the device with the model and KV. since then the four head scores of the indexer
+rem (1 GiB each there) are added up one after another, about 2 GB less. ub2048 halves the buffer for comparison,
+rem tile64 is the int8 coopmat tile of the 06-kernels sweep (+19 percent on the expert gate/up, +3 to +5 on q8_0)
+rem shexp4 and kvshared put the experts of layers 44-47 and the attention K/V in the shared gpu memory: the gpu reads
+rem them in place. depth 0 shows what the slower memory costs, 122880 what the freed device memory gives
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;ub2048 @ub=2048;tile64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,32 @d=0,122880;shexp4 -ot blk\.4[4-7]\.ffn_.*_exps=Vulkan0_Shared @d=0,122880;kvshared LLAMA_KV_SHARED=1 @d=0,122880"
+rem 06.10: prompts of 82 and 512 tokens ran 43 and 34 percent below stable, the fused gate/up/swiglu of the experts
+rem (noglu and accurate gave the speed of stable back). since then it fuses from 2048 tokens on; glu0 is the old way
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
-if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;noglu GGML_VK_DISABLE_MMID_GLU=1;shmem32 GGML_VK_SHMEM_LIMIT=32768;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1"
-rem the prompt at depth 0 and 512 tokens, a decode step at 122880, stable and default side by side
-if not defined PROFKINDS  set "PROFKINDS=pp@0 pp512@0 tg@122880"
-if not defined PROFARMS   set "PROFARMS=stable @stable;default"
+if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0;tile64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,32"
+rem the prompt at depth 0 and 512 tokens, stable, default and the tile side by side
+if not defined PROFKINDS  set "PROFKINDS=pp@0 pp512@0"
+if not defined PROFARMS   set "PROFARMS=stable @stable;default;tile64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,32"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
-rem search 3, prompt kernels: the experts ran at about 13 TFLOPS on 06.10, the q8_0 projections at about 22. a sweep
-rem of the int8 coopmat tiles (GGML_VK_MMQ_INT_TILE BM,BN,WM,WN on the large tile) and the f16 path on the model
-rem shapes of test-backend-ops perf, no model needed
-if not defined KERNARMS   set "KERNARMS=default;noint GGML_VK_INT_COOPMAT=0;large GGML_VK_INT_LARGE_TILE=1;l128x128w32 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,128,32,32;l128x128w64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,128,64,32;l128x64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,64,32,32;l64x128 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,32;l128x32 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=128,32,32,16;l256x64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=256,64,64,32"
+rem the int8 coopmat tiles around 64x128, the best of 06.10, on the large tile; glu0 fuses the gate/up/swiglu at
+rem 512 tokens too
+if not defined KERNARMS   set "KERNARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0;l64x128 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,32;l64x128-glu0 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,32 GGML_VK_MMID_GLU_MIN_TOKENS=0;l64x128w64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,128,32,64;l64x256 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,256,32,64;l64x64 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=64,64,32,32;l32x128 GGML_VK_INT_LARGE_TILE=1 GGML_VK_MMQ_INT_TILE=32,128,16,32"
 if not defined RUN_KERNELS set "RUN_KERNELS=1"
 rem the server of the 395 runs at -c 262144 with its buffers for the full context, llama-bench does the same
 if not defined BENCHCTX   set "BENCHCTX=262144"
@@ -163,7 +165,7 @@ rem 1: the warmup run of llama-bench, llama-perplexity and llama-server at start
 rem load time and memory pressure, -lm dio reads the weights at load and the median of 02 drops a cold first rep
 if not defined WARMUP      set "WARMUP=0"
 rem 06-kernels: test-backend-ops perf of the model shapes at -ub 4096, "OP [regex of the case parameters]"
-if not defined KERNOPS     set "KERNOPS=MUL_MAT_ID n_mats=512,n_used=10,b=0,m=[0-9]+,n=4096,;MUL_MAT type_a=q8_0,type_b=f32,m=[0-9]+,n=4096,"
+if not defined KERNOPS     set "KERNOPS=MUL_MAT_ID n_mats=512,n_used=10,b=0,m=[0-9]+,n=4096,;MUL_MAT_VEC_FUSION n_mats=512;MUL_MAT type_a=q8_0,type_b=f32,m=[0-9]+,n=4096,"
 rem 05-profile: one ubatch of the prompt (pp) and one decode step (tg) at PROFDEPTH
 if not defined PROFKINDS   set "PROFKINDS=pp"
 if not defined PROFARMS    set "PROFARMS=default"

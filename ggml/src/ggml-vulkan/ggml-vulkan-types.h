@@ -320,6 +320,8 @@ typedef std::weak_ptr<vk_buffer_struct> vk_buffer_ref;
 struct ggml_backend_vk_buffer_type_context {
     std::string name;
     vk_device device;
+    // memory the host sees and that is not device local, as the shared gpu memory of a UMA device
+    bool shared = false;
 };
 
 struct vk_command_buffer {
@@ -1033,6 +1035,9 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
+    ggml_backend_buffer_type buffer_type_shared;
+    ggml_backend_buffer_type_t extra_bufts[2] = {};
 
     bool disable_fusion;
     // matmuls with a small A split their columns so that A and the part of B in use stay in this many bytes of cache, 0 = off
