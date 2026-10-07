@@ -81,20 +81,26 @@ rem ---- 395 / vulkan: everything on the gpu ----
 if not defined EXTRA      set "EXTRA=-ngl 99"
 rem accurate: the f16 matmuls with f32 accumulators instead of int8 coopmat and f16 accumulators. glu0: the fused
 rem gate/up/swiglu of the experts at any size, the test cases are below the 2048 tokens it waits for by default
-if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0"
+rem tile64mm: the 64x128 int8 coopmat tile on the dense matmuls, the candidate for the default (07.10: -1.6 percent of
+rem the gpu time of a 4096-token prompt)
+if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0;tile64mm GGML_VK_INT_LARGE_TILE=2 GGML_VK_MMQ_INT_TILE=64,128,32,32"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model
 if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
 rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. none logs the
-rem host and compute time of each ubatch (LLAMA_INPUT_TIMING) and the checkpoint times: a short prompt took 1.8 s in the
-rem server on 06.10 (stable the same) against 0.34 s in llama-bench. shexp: the experts of layers 44-47 (6.5 GB) in the
-rem shared gpu memory (Vulkan0_Shared); 06.10: no cost in PP or TG, 6.5 GB off the device heap
+rem host and compute time of each ubatch (LLAMA_INPUT_TIMING) and the checkpoint times. 07.10: a short prompt took 1.8 s
+rem in the server against 0.34 s in llama-bench because each context checkpoint (112.6 MiB of recurrent state) took
+rem 850 ms: the host read the device memory in place, which the AMD driver does not cache (30 ms on the 3090). since
+rem then such reads go through a copy to cached memory. shexp: the experts of layers 44-47 (6.5 GB) in the shared gpu
+rem memory (Vulkan0_Shared); 06.10: no cost in PP or TG, 6.5 GB off the device heap
 if not defined DECARMS    set "DECARMS=stable @stable;none LLAMA_INPUT_TIMING=1 GGML_SCHED_LOG_REALLOC=1;shexp -ot blk\.4[4-7]\.ffn_.*_exps=Vulkan0_Shared;auto @draft --spec-auto"
 rem 06.10 evening: the head scores added one by one took the compute buffer at -ub 4096 from 10.5 to 8.4 GB, and TG
 rem at 122880 from 4 to 0.6 percent below stable (23.15 against 23.28); PP +26 to +41 percent over stable. -ub 2048
 rem cost 5 percent PP for no TG, the K/V in shared memory 2.6 percent TG at depth, the experts there nothing. the
 rem 64x128 int8 tile took 4 percent off the dense matmuls but slowed the experts; tile64mm keeps it to the dense ones
+rem (07.10: -1.6 percent of the gpu time at depth 0). 02 runs a warmup process first since 07.10 (the first process of
+rem a step was up to 9 percent slower) and measures every arm again once, stable included
 if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;tile64mm GGML_VK_INT_LARGE_TILE=2 GGML_VK_MMQ_INT_TILE=64,128,32,32 @d=0,122880"
 rem 06.10 evening: with the fused gate/up/swiglu from 2048 tokens on, prompts of 82 and 512 tokens run as fast as
 rem stable (244 and 555 against 252 and 556 t/s), 2541 tokens 23 percent faster

@@ -27,6 +27,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 CACHE = HERE / "cache"
 VERSION = 1
+# the speed results of 02 are kept under their own version: 2 since 07.10, when 02 got its warmup process (the
+# numbers before it had a cold first process in every step)
+BENCH_VERSION = 2
 BUILD_RECORD = "qsa-build.json"
 ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "OMP_")
 ENV_IGNORED = ("LLAMA_SPEC_TRACE",)
@@ -516,6 +519,23 @@ def cmd_bench():
     arms = parse_arms("BENCHARMS", "default")
     if not auto and max(depths) + max(pp, tg) > ctx:
         raise Fail("the deepest BENCHDEPTHS plus the prompt does not fit BENCHCTX")
+
+    # the first model process of a step ran slower (07.10: PP 761 against 833 t/s at depth 0, at 122880 the arm that
+    # came first lost, TG included), the file cache of the PLE rows and the gpu clocks are cold: one process that is not
+    # measured runs before the first measured one
+    warmed = []
+
+    def warm_up():
+        if warmed or env("BENCHWARMUP", "1") != "1":
+            return
+        warmed.append(True)
+        exe = Arm("warmup").binary("llama-bench")
+        print("warmup: one llama-bench process that is not measured", flush=True)
+        try:
+            execute([exe, *model_args(model), "-c", 16384, "-b", ub, "-ub", ub, "-p", ub, "-n", 16, "-r", 1, "-o", "json"],
+                    run.dir / "warmup.log", os.environ.copy(), stdout=run.dir / "warmup.json")
+        except Fail as e:
+            print(f"warmup: {e}", flush=True)
     results = {}
     for i, depth in enumerate(depths):
         # the order turns at each depth, so that no arm always runs right after the same one
@@ -533,10 +553,11 @@ def cmd_bench():
             cmd = [exe, *model_args(model), "-c", c, "-b", max(pp, u), "-ub", u, "-p", pp, "-n", tg, "-d", depth,
                    "-r", reps, "-o", "json", *arm.args]
             run_env = arm_env(arm, {"GGML_SCHED_LOG_REALLOC": "1"})
-            identity = {"v": VERSION, "kind": "bench", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
+            identity = {"v": BENCH_VERSION, "kind": "bench", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
                         "env": env_identity(run_env), "model": model_identity(model), "machine": machine()}
 
             def go(log):
+                warm_up()
                 out = log.with_suffix(".json")
                 _, text = execute(cmd, log, run_env, stdout=out)
                 r = {"replans": text.count("sched re-reserve:")}
@@ -584,11 +605,12 @@ def cmd_bench():
             cmd = [exe, *model_args(model), "-c", arm.ctx or small_ctx, "-b", max(arm.ub or ub, max(small)), "-ub", arm.ub or ub,
                    "-p", ",".join(map(str, small)), "-n", 0, "-r", reps, "-o", "json", *arm.args]
             run_env = arm_env(arm)
-            identity = {"v": VERSION, "kind": "bench-small", "build": build_id(exe.parent),
+            identity = {"v": BENCH_VERSION, "kind": "bench-small", "build": build_id(exe.parent),
                         "args": [str(c) for c in cmd[1:]], "env": env_identity(run_env), "model": model_identity(model),
                         "machine": machine()}
 
             def go(log):
+                warm_up()
                 out = log.with_suffix(".json")
                 execute(cmd, log, run_env, stdout=out)
                 r = {}
