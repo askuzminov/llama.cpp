@@ -82,9 +82,8 @@ if not defined EXTRA      set "EXTRA=-ngl 99"
 rem accurate: the f16 matmuls with f32 accumulators instead of int8 coopmat and f16 accumulators. glu0: the fused
 rem gate/up/swiglu of the experts at any size, the test cases are below the 2048 tokens it waits for by default
 rem notile: the medium int8 tile on the dense matmuls, as before 07.10 (the 64x128 tile is the default since then)
-rem glu0 also covers the 32x64 tile of the fused gate/up (the default since 07.10): its 200-token cases take it.
-rem glu32x128, glu16x64, glu32x32: the candidates of 05-profile for that tile, on the fused cases only (@o=)
-if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0;notile GGML_VK_INT_LARGE_TILE=0;glu32x128 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMQ_INT_TILE_GLU=32,128,16,32 @o=MUL_MAT_VEC_FUSION;glu16x64 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMQ_INT_TILE_GLU=16,64,16,32 @o=MUL_MAT_VEC_FUSION;glu32x32 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMQ_INT_TILE_GLU=32,32,16,16 @o=MUL_MAT_VEC_FUSION"
+rem glu0 also covers the 32x64 tile of the fused gate/up (the default since 07.10): its 200-token cases take it
+if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0;notile GGML_VK_INT_LARGE_TILE=0"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model
 if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
@@ -97,18 +96,19 @@ rem graph). 07.10: one decode step every 36.45 ms, the gpu busy for 35.13 of the
 if not defined DECARMS    set "DECARMS=stable @stable;none GGML_VK_GRAPH_TIMING=64;auto @draft --spec-auto"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
-rem 07.10: without the hc fusions PP 833 against 789 and TG 28.07 against 27.63 at depth 0; the fused mix and
-rem injection went, the fused combine and norm runs from 32 tokens only since then. nopn and noglu: the defaults of
-rem 07.10 evening off (HC_POST_NORM; the 32x64 tile of the fused gate/up), they do not depend on the depth
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;nopn GGML_VK_HC_POST_NORM=0 @d=0;noglu GGML_VK_MMQ_INT_TILE_GLU=0 @d=0"
+rem nopn and noglu: the defaults of 07.10 evening off (HC_POST_NORM from 32 tokens; the 32x64 tile of the fused
+rem gate/up). their first run was void: default ran first and read the PLE rows from the drive (warm_page_cache in
+rem _run.py), 786 against 840 t/s; the gpu time of the profile has both ahead. gt: the gpu idle time between graphs
+rem (GGML_VK_GRAPH_TIMING) at 0 and 122880, where TG is 2 percent below stable at the same gpu time per step
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;nopn GGML_VK_HC_POST_NORM=0 @d=0;noglu GGML_VK_MMQ_INT_TILE_GLU=0 @d=0;gt GGML_VK_GRAPH_TIMING=16 @d=0,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default"
-rem the prompt at depth 0 and a decode step at 122880 (TG there 2 percent below stable on 07.10), stable and default
-rem side by side. glu*: the tile of the fused gate/up of the experts at depth 0 only, BM x BN (BN counts the tokens:
-rem about 80 per expert at -ub 4096). 07.10: 32x64 the best of 64x32, 128x32, 128x64, 32x64 and the medium 64x64
+rem the prompt at depth 0 and a decode step at 122880, stable and default side by side. 07.10: the tile of the fused
+rem gate/up, gpu ms of a 4096-token prompt: 32x64 884, medium 64x64 933, 32x128 922, 16x64 1024, 32x32 1011, 64x32,
+rem 128x32 and 128x64 above 1000. a decode step at 122880: 42.60 ms of gpu time against 42.89 of stable
 if not defined PROFKINDS  set "PROFKINDS=pp@0 tg@122880"
-if not defined PROFARMS   set "PROFARMS=stable @stable;default;glu0 GGML_VK_MMQ_INT_TILE_GLU=0 @d=0;glu32x128 GGML_VK_MMQ_INT_TILE_GLU=32,128,16,32 @d=0;glu16x64 GGML_VK_MMQ_INT_TILE_GLU=16,64,16,32 @d=0;glu32x32 GGML_VK_MMQ_INT_TILE_GLU=32,32,16,16 @d=0"
+if not defined PROFARMS   set "PROFARMS=stable @stable;default"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -129,11 +129,11 @@ rem GGML_SCHED_PARALLEL_CPU=0 turns it off) and a prompt of up to 192 tokens tak
 rem moe-cache kept (06.10: an 82-token prompt 1.6 s instead of 2.7 s, no 0.73 s refill after it;
 rem LLAMA_PHASE_SMALL_PROMPT=0 turns it off). auto compares --spec-auto with the fixed n-max 2
 rem 07.10: a context checkpoint takes 30-39 ms here, a short prompt is compute (three 31-token ubatches)
-rem 07.10, the memory switches of 05.10 against base (24.55 t/s): lfu 26.38, every request faster, the default of the
-rem cache since then; compact 24.17 and async 24.35, no gain; kvhost 111 slots instead of 68, TG +3.6 percent on
-rem the short prompts, -5 percent on the 2541-token one and PP -7 percent. lru: the policy before, once more against
-rem the new default
-if not defined DECARMS    set "DECARMS=base;lru LLAMA_MOE_CACHE_POLICY=lru;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;auto @draft --spec-auto"
+rem 07.10, the memory switches of 05.10 against base: lfu 26.38 against 24.55 t/s, then as the default 26.69 against
+rem 24.13 of lru, every request faster in both runs (n2 29.54 against 26.92); compact 24.17 and async 24.35, no
+rem gain; kvhost 111 slots instead of 68, TG +3.6 percent on the short prompts, -5 percent on the 2541-token one
+rem and PP -7 percent
+if not defined DECARMS    set "DECARMS=base;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;auto @draft --spec-auto"
 if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
@@ -154,6 +154,9 @@ if not defined BENCHPP     set "BENCHPP=4096"
 if not defined BENCHTG     set "BENCHTG=64"
 if not defined BENCHUB     set "BENCHUB=4096"
 if not defined BENCHREPS   set "BENCHREPS=3"
+rem tokens of the warmup process of 02 and 05: llama-bench draws the same ones in every process, below 32768 with
+rem msvc, and 98304 draws read 95 percent of their PLE rows into the page cache (warm_page_cache in _run.py)
+if not defined BENCHWARMTOKENS set "BENCHWARMTOKENS=98304"
 rem 03-quality: llama-perplexity, KLD of each arm against QREF (empty: stable when built, else default).
 rem a run holds the logits of half a chunk and the reference of a chunk in ram, 12 GB at 16384. at 32768
 rem (24 GB) the 395 failed with bad allocation and row cache read errors on 05.10: the model takes the rest

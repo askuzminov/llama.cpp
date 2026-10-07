@@ -28,8 +28,9 @@ ROOT = HERE.parents[1]
 CACHE = HERE / "cache"
 VERSION = 1
 # the speed results of 02 are kept under their own version: 2 since 07.10, when 02 got its warmup process (the
-# numbers before it had a cold first process in every step)
-BENCH_VERSION = 2
+# numbers before it had a cold first process in every step), 3 since 07.10 evening, when the warmup started to read
+# the PLE rows of every token llama-bench draws (warm_page_cache)
+BENCH_VERSION = 3
 BUILD_RECORD = "qsa-build.json"
 ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "OMP_")
 ENV_IGNORED = ("LLAMA_SPEC_TRACE",)
@@ -511,6 +512,26 @@ def cmd_check():
 
 # ---------------------------------------------------------------- bench
 
+def warm_page_cache(run, model, ub, done):
+    """One llama-bench process that is not measured, before the first measured one of a step. llama-bench draws its
+    tokens with std::rand(): the same tokens in every process, below 32768 with msvc. The PLE rows of those tokens
+    (llama_row_cache, a 26.8 GiB table on disk) come from the page cache once read, from the drive before. 07.10: the
+    arm that ran first read them cold, 530 against 170 ms of inputs per 4096-token ubatch, PP 786 against 840 t/s at
+    depth 0 on the 395, TG -6 percent at 32768 on the 3090. BENCHWARMTOKENS draws (98304: 24 prompts of 4096) read
+    95 percent of those rows, and the gpu clocks are up after it."""
+    if done or env("BENCHWARMUP", "1") != "1":
+        return
+    done.append(True)
+    exe = Arm("warmup").binary("llama-bench")
+    reps = max(1, -(-env_int("BENCHWARMTOKENS", 98304) // ub))
+    print(f"warmup: one llama-bench process of {reps} prompts of {ub} tokens, not measured", flush=True)
+    try:
+        execute([exe, *model_args(model), "-c", 16384, "-b", ub, "-ub", ub, "-p", ub, "-n", 0, "-r", reps, "-o", "json"],
+                run.dir / "warmup.log", os.environ.copy(), stdout=run.dir / "warmup.json")
+    except Fail as e:
+        print(f"warmup: {e}", flush=True)
+
+
 def cmd_bench():
     run = Run("bench")
     model = model_path()
@@ -525,22 +546,10 @@ def cmd_bench():
     if not auto and max(depths) + max(pp, tg) > ctx:
         raise Fail("the deepest BENCHDEPTHS plus the prompt does not fit BENCHCTX")
 
-    # the first model process of a step ran slower (07.10: PP 761 against 833 t/s at depth 0, at 122880 the arm that
-    # came first lost, TG included), the file cache of the PLE rows and the gpu clocks are cold: one process that is not
-    # measured runs before the first measured one
     warmed = []
 
     def warm_up():
-        if warmed or env("BENCHWARMUP", "1") != "1":
-            return
-        warmed.append(True)
-        exe = Arm("warmup").binary("llama-bench")
-        print("warmup: one llama-bench process that is not measured", flush=True)
-        try:
-            execute([exe, *model_args(model), "-c", 16384, "-b", ub, "-ub", ub, "-p", ub, "-n", 16, "-r", 1, "-o", "json"],
-                    run.dir / "warmup.log", os.environ.copy(), stdout=run.dir / "warmup.json")
-        except Fail as e:
-            print(f"warmup: {e}", flush=True)
+        warm_page_cache(run, model, ub, warmed)
     results = {}
     for i, depth in enumerate(depths):
         # the order turns at each depth, so that no arm always runs right after the same one
@@ -565,7 +574,7 @@ def cmd_bench():
                 warm_up()
                 out = log.with_suffix(".json")
                 _, text = execute(cmd, log, run_env, stdout=out)
-                r = {"replans": text.count("sched re-reserve:")}
+                r = {"replans": text.count("sched re-reserve:"), "graph_timing": graph_timing(text.splitlines())}
                 for row in json.loads(out.read_text(encoding="utf-8")):
                     samples = sorted(row.get("samples_ts") or [row["avg_ts"]])
                     r["pp" if row["n_prompt"] else "tg"] = [row["avg_ts"], row["stddev_ts"], statistics.median(samples),
@@ -648,6 +657,8 @@ def cmd_bench():
     notes += [f"  {a}-d{d}: {r}" for (a, d), r in results.items() if isinstance(r, str) and not r.startswith("skip")]
     notes += [f"  {a}-d{d}: {r[0]['replans']} re-plans of the buffers while computing" for (a, d), r in results.items()
               if isinstance(r, tuple) and r[0]["replans"]]
+    notes += [f"  {a}-d{d}: {graph_timing_text(r[0]['graph_timing'])}" for (a, d), r in results.items()
+              if isinstance(r, tuple) and r[0].get("graph_timing")]
     if notes:
         run.add("", "notes:", *notes)
     return run.finish()
@@ -808,9 +819,10 @@ def prompt(name):
     raise Fail(f"unknown prompt {name}: one of {', '.join(PROMPTS)} or a text file")
 
 
-def serve(exe, args, run_env, log, requests, sampling, port):
+def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
     """Start llama-server, send the warmup and the requests one after another, stop it. The answers stay next to
-    the log."""
+    the log. rows_text, one token long and not measured, reads the PLE rows of the prompts into the page cache first:
+    otherwise the arm that runs first reads them from the drive (see warm_page_cache)."""
     wait, timeout = env_int("DECWAIT", 900), env_int("DECTIMEOUT", 1800)
     url = f"http://127.0.0.1:{port}"
     run_env = dict(run_env, LLAMA_SPEC_TRACE=str(log.with_suffix(".trace.csv")))
@@ -836,7 +848,8 @@ def serve(exe, args, run_env, log, requests, sampling, port):
             if time.time() - start > wait:
                 raise Fail(f"no answer from /health in {wait} s ({log.name})")
         temp, top_k, top_p = sampling
-        for name, text, seed, n in [("warmup", WARMUP, 0, 256), *requests]:
+        warm = [("warmup", WARMUP, 0, 256)] + ([("rows", rows_text, 0, 1)] if rows_text else [])
+        for name, text, seed, n in [*warm, *requests]:
             body = {"messages": [{"role": "user", "content": text}], "max_tokens": n, "temperature": temp,
                     "top_k": top_k, "top_p": top_p, "seed": seed, "cache_prompt": False, "stream": False}
             try:
@@ -850,7 +863,7 @@ def serve(exe, args, run_env, log, requests, sampling, port):
                 json.dumps(answer, ensure_ascii=False, indent=1), encoding="utf-8")
             if "timings" not in answer:
                 raise Fail(f"request {name} seed {seed}: no timings in the answer {raw[:300]!r}")
-            if name == "warmup":
+            if name in ("warmup", "rows"):
                 continue
             t = answer["timings"]
             message = answer["choices"][0]["message"]
@@ -886,6 +899,11 @@ def graph_timing(lines):
     return {"windows": len(windows), "period": med[0], "gpu": med[1], "host": med[2], "idle": med[3]}
 
 
+def graph_timing_text(gt):
+    return (f"graph timing, median of {gt['windows']} windows: one graph every {gt['period']:.2f} ms, gpu {gt['gpu']:.2f} ms, "
+            f"host in graph_compute {gt['host']:.2f} ms, gpu idle {gt['idle']:.2f} ms ({100 * gt['idle'] / gt['period']:.0f}%)")
+
+
 def cmd_decode():
     run = Run("decode")
     model = model_path()
@@ -905,6 +923,7 @@ def cmd_decode():
     for prefix in prefixes:
         head = corpus[:prefix] + "\n\n" if prefix else ""
         requests = [(name, head + text, seed, ngen) for name, text in prompts for seed in seeds]
+        rows_text = head + "\n\n".join(text for _, text in prompts)
         for arm in arms:
             label = f"{arm.name}-p{prefix}"
             try:
@@ -922,10 +941,10 @@ def cmd_decode():
                         "env": env_identity(run_env), "model": model_identity(model),
                         "draft": model_identity(draft) if arm.draft else None, "sampling": sampling,
                         "requests": [[name, text_digest(text), seed, n] for name, text, seed, n in requests],
-                        "machine": machine()}
+                        "rows": text_digest(rows_text), "machine": machine()}
             try:
                 results[arm.name, prefix] = run.measure(label, identity,
-                                                        lambda log: serve(exe, args, run_env, log, requests, sampling, port))
+                                                        lambda log: serve(exe, args, run_env, log, requests, sampling, port, rows_text))
             except Fail as e:
                 run.failed = True
                 results[arm.name, prefix] = f"FAIL {e}"
@@ -955,11 +974,8 @@ def cmd_decode():
             details += [f"  {x['name']}: {x['n']} tokens, {rate(x['n'], x['ms']):.2f} t/s, draft {x['draft_acc']}/"
                         f"{x['draft_n']}, prompt {x['prompt_n']} tokens {rate(x['prompt_n'], x['prompt_ms']):.1f} t/s"
                         for x in rs]
-            gt = r.get("graph_timing")
-            if gt:
-                details.append(f"  graph timing, median of {gt['windows']} windows: one graph every {gt['period']:.2f} ms, "
-                               f"gpu {gt['gpu']:.2f} ms, host in graph_compute {gt['host']:.2f} ms, gpu idle "
-                               f"{gt['idle']:.2f} ms ({100 * gt['idle'] / gt['period']:.0f}%)")
+            if r.get("graph_timing"):
+                details.append(f"  {graph_timing_text(r['graph_timing'])}")
             grep = env("DECGREP")
             details += [f"  {s}" for s in r["spec"] + ([s for s in r["extra"] if re.search(grep, s)][-20:] if grep else [])]
         run.add("", f"prefix {prefix} chars of {Path(env('PPLFILE')).name}" if prefix else "short prompts",
@@ -1004,6 +1020,7 @@ def cmd_profile():
         if not re.fullmatch(r"pp\d*|tg", name):
             raise Fail(f"PROFKINDS: {k} is not pp, ppN or tg")
         plan += [(name, d) for d in ([int(x) for x in at.split(",") if x] if at else depths)]
+    warmed = []
     for kind, depth in plan:
         n_pp = int(kind[2:]) if kind.startswith("pp") and len(kind) > 2 else pp
         done = {}
@@ -1029,6 +1046,8 @@ def cmd_profile():
             n_tokens = min(n_pp, arm.ub or ub) if kind != "tg" else 1
 
             def go(log):
+                # the host time of the inputs depends on the PLE rows in the page cache (warm_page_cache)
+                warm_page_cache(run, model, ub, warmed)
                 _, text = execute(cmd, log, run_env)
                 lines = text.splitlines()
                 # host time of the last ubatches of the measured size; a build without LLAMA_INPUT_TIMING has none
