@@ -581,14 +581,6 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_edges {
     { 5, 0, 4 }, // mul->src[0]      == rms_norm
 };
 
-// gated hc_pre and the injection cont(transpose(mul_mat(xn, w_inject))) that reads the same xn (qwen4exp hc_mix)
-static constexpr std::initializer_list<ggml_op> hc_pre_inject_pattern { GGML_OP_DSV4_HC_PRE, GGML_OP_MUL_MAT, GGML_OP_TRANSPOSE, GGML_OP_CONT };
-
-static constexpr std::initializer_list<std::array<int, 3>> hc_pre_inject_edges {
-    { 2, 0, 1 }, // transpose->src[0] == mul_mat
-    { 3, 0, 2 }, // cont->src[0]      == transpose
-};
-
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softmax_norm_edges {
     { 1, 0, 0 }, // reshape->src[0]  == softmax
     { 2, 0, 0 }, // argsort->src[0]  == softmax
@@ -993,7 +985,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
-    vk_pipeline pipeline_dsv4_hc_pre_inject_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_dsv4_hc_post_norm_f32;
@@ -1343,8 +1334,6 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     // HC_POST_GATE + the RMS_NORM and MUL of the next hc mix
     bool fused_hc_post_norm {};
-    // gated DSV4_HC_PRE + the hc injection matmul of the same input
-    bool fused_hc_pre_inject {};
     bool fused_mm_relu {};
     // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
     bool fused_mm_headsum {};

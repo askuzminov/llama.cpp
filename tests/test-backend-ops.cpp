@@ -1482,10 +1482,6 @@ struct test_case {
 
         // build graph
         ggml_build_forward_expand(gf, out);
-        // fused outputs that are not inputs of out, e.g. a second branch of the same input
-        for (ggml_tensor * t : fusion_test_nodes()) {
-            ggml_build_forward_expand(gf, t);
-        }
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
@@ -1673,9 +1669,6 @@ struct test_case {
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
-        for (ggml_tensor * t : fusion_test_nodes()) {
-            ggml_build_forward_expand(gf, t);
-        }
 
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
@@ -4351,9 +4344,6 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_hc;
     const int64_t n_tokens;
     const bool    gated;
-    const bool    inject;
-
-    ggml_tensor * out_inject = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4361,27 +4351,15 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_embd, n_hc, n_tokens, gated, inject);
+        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated);
     }
 
-    // inject: the hc injection of the same input follows, as qwen4exp builds it, both outputs are checked
-    bool run_whole_graph() override { return inject; }
-
-    std::vector<ggml_tensor *> fusion_test_nodes() override {
-        if (inject) {
-            return { out, out_inject };
-        }
-        return {};
-    }
-
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, bool inject = false)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), inject(inject) {}
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*n_hc, n_tokens);
-        ggml_set_name(xn, "x");
-
-        ggml_tensor * x = ggml_reshape_3d(ctx, xn, n_embd, n_hc, n_tokens);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_set_name(x, "x");
 
         if (gated) {
             ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
@@ -4395,14 +4373,6 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
             out = ggml_dsv4_hc_pre(ctx, x, weights);
         }
         ggml_set_name(out, "out");
-
-        if (inject) {
-            ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*n_hc, n_hc);
-            ggml_set_name(w_inject, "w_inject");
-
-            out_inject = ggml_cont(ctx, ggml_transpose(ctx, ggml_mul_mat(ctx, xn, w_inject)));
-            ggml_set_name(out_inject, "out_inject");
-        }
         return out;
     }
 };
@@ -9474,11 +9444,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
-    for (int64_t n_tokens : {1, 31, 32, 33, 130}) {
-        test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, n_tokens, true, true));
-        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n_tokens, true, true));
-    }
-    test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 33, false, true));
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
@@ -9489,13 +9454,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // Vulkan fuses the norm from 32 tokens on (GGML_VK_HC_POST_NORM_MIN_TOKENS)
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1, true, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true, true));
-    test_cases.emplace_back(new test_dsv4_hc_post(257, 9, true, true, true));
-    test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true, true));
-    test_cases.emplace_back(new test_dsv4_hc_post(4096, 5, true, true, true));
-    test_cases.emplace_back(new test_dsv4_hc_post(4097, 5, true, true, true));
-    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 33, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(257, 40, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 64, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 32, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(4097, 32, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 33, false, true, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -11943,12 +11910,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t bs : {512, 4096}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
             true, 512, 10, true, false, true, false, {1, 1}));
-    }
-
-    // qwen4exp hc_mix at -ub 4096 and at a short prompt, alone and with the injection (HC_PRE_INJECT on Vulkan)
-    for (int64_t n_tokens : {4, 32, 512, 4096}) {
-        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n_tokens, true));
-        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n_tokens, true, true));
     }
 
     // qwen4exp hc_combine at -ub 4096, alone and with the RMSNorm of the next hc mix (HC_POST_NORM on Vulkan)

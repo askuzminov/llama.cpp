@@ -193,25 +193,6 @@ struct vk_op_dsv4_hc_pre_push_constants {
     float scale;
 };
 
-struct vk_op_dsv4_hc_pre_inject_push_constants {
-    uint32_t n_embd;
-    uint32_t n_tokens;
-
-    uint32_t nbx1; uint32_t nbx2;
-    uint32_t nbg1; uint32_t nbg2;
-    uint32_t nbw1;
-    uint32_t nbd1;
-    uint32_t nbo1;
-
-    uint32_t x_offset;
-    uint32_t g_offset;
-    uint32_t w_offset;
-    uint32_t d_offset;
-    uint32_t o_offset;
-
-    float scale;
-};
-
 struct vk_op_dsv4_hc_post_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
