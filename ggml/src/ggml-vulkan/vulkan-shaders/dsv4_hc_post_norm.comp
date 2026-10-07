@@ -1,0 +1,102 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// dsv4_hc_post with identity mixing, followed by the grouped RMSNorm and gamma
+// of the next hc mix (qwen4exp hc_combine -> hc_mix):
+//
+//   d[i0, s, it] = x[i0, it]*post[s, it] + residual[i0, s, it]
+//   n[i0, s, it] = d[i0, s, it]*inversesqrt(mean_i0(d[., s, it]^2) + eps)*w[i0, s, it]
+//
+// One workgroup per token and stream. Each invocation keeps its d values in
+// registers, so d is not read back for the norm.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd;
+    uint n_tokens;
+
+    uint nbx1;                  // x
+    uint nbr1; uint nbr2;       // residual
+    uint nbp0; uint nbp1;       // post
+    uint nbw1; uint nbw2;       // gamma, 0 for a broadcast dim
+    uint nbd1; uint nbd2;       // d
+    uint nbn1; uint nbn2;       // n
+
+    uint x_offset;
+    uint r_offset;
+    uint p_offset;
+    uint w_offset;
+    uint d_offset;
+    uint n_offset;
+
+    uint gate;               // post = gate_scale_out*sigmoid(gate_scale_in*p)
+    float gate_scale_in;
+    float gate_scale_out;
+    float eps;
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer R { float data_r[]; };
+layout(binding = 2, std430) readonly buffer P { float data_p[]; };
+layout(binding = 3, std430) readonly buffer W { float data_w[]; };
+layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
+layout(binding = 5, std430) writeonly buffer N { float data_n[]; };
+
+// n_embd <= MAX_COLS*BLOCK_SIZE, the host checks it
+const uint MAX_COLS = 8;
+
+shared float sum_s[BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint s   = gl_WorkGroupID.x;
+    const uint it  = gl_WorkGroupID.y;
+
+    const float p    = data_p[p_offset + s * nbp0 + it * nbp1];
+    const float post = gate != 0 ? (1.0f / (1.0f + exp(-(p * gate_scale_in)))) * gate_scale_out : p;
+
+    const uint xb = x_offset + it * nbx1;
+    const uint rb = r_offset + s * nbr1 + it * nbr2;
+    const uint db = d_offset + s * nbd1 + it * nbd2;
+
+    float v[MAX_COLS];
+    float ss = 0.0f;
+
+    [[unroll]]
+    for (uint k = 0; k < MAX_COLS; ++k) {
+        const uint i0 = k * BLOCK_SIZE + tid;
+        v[k] = 0.0f;
+        if (i0 < n_embd) {
+            v[k] = fma(data_x[xb + i0], post, data_r[rb + i0]);
+            ss = fma(v[k], v[k], ss);
+        }
+    }
+
+    sum_s[tid] = ss;
+    barrier();
+    [[unroll]]
+    for (uint h = BLOCK_SIZE / 2; h > 0; h >>= 1) {
+        if (tid < h) {
+            sum_s[tid] += sum_s[tid + h];
+        }
+        barrier();
+    }
+    const float scale = inversesqrt(sum_s[0] / float(n_embd) + eps);
+
+    const uint wb = w_offset + s * nbw1 + it * nbw2;
+    const uint nb = n_offset + s * nbn1 + it * nbn2;
+
+    [[unroll]]
+    for (uint k = 0; k < MAX_COLS; ++k) {
+        const uint i0 = k * BLOCK_SIZE + tid;
+        if (i0 < n_embd) {
+            data_d[db + i0] = v[k];
+            data_n[nb + i0] = v[k] * scale * data_w[wb + i0];
+        }
+    }
+}

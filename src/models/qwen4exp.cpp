@@ -400,6 +400,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             *inject = ggml_mul_mat(ctx0, w_inject, xn);
         }
         cb(*inject, "hc_inject", il);
+
+        // compute the injection right after the mix: xn ([hc_dim, nt] f32) is then freed before the
+        // block, not kept until the combine, and backends can fuse it into DSV4_HC_PRE
+        ggml_build_forward_expand(gf, mixed);
+        ggml_build_forward_expand(gf, *inject);
     }
 
     return mixed;

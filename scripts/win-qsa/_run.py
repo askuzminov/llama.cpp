@@ -112,7 +112,7 @@ class Arm:
     """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [@d=depth,...] [tool
     arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
     @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @c= and @ub= set the -c and
-    the -ub of 02 and 05 for this arm, the rest goes to the tool."""
+    the -ub of 02 and 05 for this arm, @o=OP,... limits it to these ops of 01 and 06, the rest goes to the tool."""
 
     def __init__(self, text):
         tokens = split_args(text)
@@ -127,9 +127,12 @@ class Arm:
         self.depths = None
         self.ctx = None
         self.ub = None
+        self.ops = None
         for t in tokens[1:]:
             if t == "@draft":
                 self.draft = True
+            elif t.startswith("@o="):
+                self.ops = {o for o in t[3:].split(",") if o}
             elif t.startswith("@ub="):
                 try:
                     self.ub = int(t[4:])
@@ -472,6 +475,8 @@ def cmd_check():
             continue
         bid = build_id(exe.parent)
         for op in ops:
+            if arm.ops and op[0] not in arm.ops:
+                continue
             cmd = [exe, "test", "-b", device, "-o", op[0], *(["-p", op[1]] if len(op) > 1 else []), *arm.args]
             run_env = arm_env(arm)
             identity = {"v": VERSION, "kind": "check", "build": bid, "args": [str(c) for c in cmd[1:]],
@@ -864,7 +869,21 @@ def serve(exe, args, run_env, log, requests, sampling, port):
     spec = [s.strip() for s in lines if "auto:" in s or "statistics " in s]
     starts = [i for i, s in enumerate(spec) if re.search(r"print: auto: (on|trace only),", s)]
     extra = [s.strip() for s in lines if re.search(KEPT_LINES, s)]
-    return {"rows": rows, "spec": spec[starts[-1]:] if starts else [], "extra": extra[-60:]}
+    return {"rows": rows, "spec": spec[starts[-1]:] if starts else [], "extra": extra[-60:],
+            "graph_timing": graph_timing(lines)}
+
+
+def graph_timing(lines):
+    """The medians over the windows of GGML_VK_GRAPH_TIMING (Vulkan): the time from one graph to the next, the gpu
+    time of a graph, the host time in graph_compute and the gpu idle time. A window with a prompt ubatch is an
+    outlier, the median drops it."""
+    windows = [[float(v) for v in m.groups()] for s in lines for m in [re.search(
+        r"graph timing over \d+ graphs: one every ([\d.]+) ms, gpu ([\d.]+) ms, in graph_compute ([\d.]+) ms, "
+        r"gpu idle (-?[\d.]+) ms", s)] if m]
+    if not windows:
+        return None
+    med = [statistics.median(w[i] for w in windows) for i in range(4)]
+    return {"windows": len(windows), "period": med[0], "gpu": med[1], "host": med[2], "idle": med[3]}
 
 
 def cmd_decode():
@@ -936,8 +955,13 @@ def cmd_decode():
             details += [f"  {x['name']}: {x['n']} tokens, {rate(x['n'], x['ms']):.2f} t/s, draft {x['draft_acc']}/"
                         f"{x['draft_n']}, prompt {x['prompt_n']} tokens {rate(x['prompt_n'], x['prompt_ms']):.1f} t/s"
                         for x in rs]
+            gt = r.get("graph_timing")
+            if gt:
+                details.append(f"  graph timing, median of {gt['windows']} windows: one graph every {gt['period']:.2f} ms, "
+                               f"gpu {gt['gpu']:.2f} ms, host in graph_compute {gt['host']:.2f} ms, gpu idle "
+                               f"{gt['idle']:.2f} ms ({100 * gt['idle'] / gt['period']:.0f}%)")
             grep = env("DECGREP")
-            details += [f"  {s}" for s in r["spec"] + ([s for s in r["extra"] if re.search(grep, s)][-12:] if grep else [])]
+            details += [f"  {s}" for s in r["spec"] + ([s for s in r["extra"] if re.search(grep, s)][-20:] if grep else [])]
         run.add("", f"prefix {prefix} chars of {Path(env('PPLFILE')).name}" if prefix else "short prompts",
                 *table(["arm", "TG t/s", "draft accepted", "PP t/s <= 512 (tokens)", "PP t/s > 512 (tokens)"], rows))
         for pair in split_args(env("DECSAME")):
@@ -1077,6 +1101,8 @@ def cmd_kernels():
             fails.append(f"  {arm.name}: skip: {e}")
             continue
         for op in ops:
+            if arm.ops and op[0] not in arm.ops:
+                continue
             cmd = [exe, "perf", "-b", device, "-o", op[0], *(["-p", op[1]] if len(op) > 1 else []), *arm.args]
             run_env = arm_env(arm)
             identity = {"v": VERSION, "kind": "kernels", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],

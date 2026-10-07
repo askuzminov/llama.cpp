@@ -1,0 +1,116 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// dsv4_hc_pre with a sigmoid gate, together with the hc injection of the same
+// normalized input (qwen4exp hc_mix):
+//
+//   d[i0, it] = scale * sum_s x[i0, s, it]*sigmoid(g[i0, s, it])
+//   o[j, it]  = sum_s sum_i0 x[i0, s, it]*w[i0 + s*n_embd, j]
+//
+// x is read once for both. One workgroup per TOKENS tokens, so each w value
+// read from cache serves TOKENS tokens.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd;
+    uint n_tokens;
+
+    uint nbx1; uint nbx2;   // x, contiguous
+    uint nbg1; uint nbg2;   // gate
+    uint nbw1;              // w [hc*n_embd, hc]
+    uint nbd1;              // d
+    uint nbo1;              // o [hc, n_tokens]
+
+    uint x_offset;
+    uint g_offset;
+    uint w_offset;
+    uint d_offset;
+    uint o_offset;
+
+    float scale;
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer G { float data_g[]; };
+layout(binding = 2, std430) readonly buffer W { float data_w[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
+layout(binding = 4, std430) writeonly buffer O { float data_o[]; };
+
+const uint hc = 4;
+const uint TOKENS = 4;
+
+shared vec4 red_s[TOKENS][BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t0  = gl_WorkGroupID.x * TOKENS;
+
+    vec4 inj[TOKENS];
+    [[unroll]]
+    for (uint t = 0; t < TOKENS; ++t) {
+        inj[t] = vec4(0.0f);
+    }
+
+    for (uint i0 = tid; i0 < n_embd; i0 += BLOCK_SIZE) {
+        float mix[TOKENS];
+        [[unroll]]
+        for (uint t = 0; t < TOKENS; ++t) {
+            mix[t] = 0.0f;
+        }
+
+        [[unroll]]
+        for (uint s = 0; s < hc; ++s) {
+            const uint k = w_offset + s * n_embd + i0;
+            const vec4 wv = vec4(data_w[k], data_w[k + nbw1], data_w[k + 2 * nbw1], data_w[k + 3 * nbw1]);
+
+            [[unroll]]
+            for (uint t = 0; t < TOKENS; ++t) {
+                const uint it = t0 + t;
+                if (it < n_tokens) {
+                    const float xv = data_x[x_offset + i0 + s * nbx1 + it * nbx2];
+                    const float gv = data_g[g_offset + i0 + s * nbg1 + it * nbg2];
+                    mix[t] = fma(xv, 1.0f / (1.0f + exp(-gv)), mix[t]);
+                    inj[t] = fma(vec4(xv), wv, inj[t]);
+                }
+            }
+        }
+
+        [[unroll]]
+        for (uint t = 0; t < TOKENS; ++t) {
+            const uint it = t0 + t;
+            if (it < n_tokens) {
+                data_d[d_offset + i0 + it * nbd1] = scale * mix[t];
+            }
+        }
+    }
+
+    [[unroll]]
+    for (uint t = 0; t < TOKENS; ++t) {
+        red_s[t][tid] = inj[t];
+    }
+    barrier();
+    [[unroll]]
+    for (uint h = BLOCK_SIZE / 2; h > 0; h >>= 1) {
+        if (tid < h) {
+            [[unroll]]
+            for (uint t = 0; t < TOKENS; ++t) {
+                red_s[t][tid] += red_s[t][tid + h];
+            }
+        }
+        barrier();
+    }
+
+    if (tid < TOKENS * hc) {
+        const uint t  = tid / hc;
+        const uint j  = tid % hc;
+        const uint it = t0 + t;
+        if (it < n_tokens) {
+            data_o[o_offset + j + it * nbo1] = red_s[t][0][j];
+        }
+    }
+}
