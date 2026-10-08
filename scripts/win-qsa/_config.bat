@@ -98,11 +98,11 @@ rem graph). 07.10: one decode step every 36.45 ms, the gpu busy for 35.13 of the
 if not defined DECARMS    set "DECARMS=stable @stable;none GGML_VK_GRAPH_TIMING=64;auto @draft --spec-auto"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
-rem nopn and noglu: the defaults of 07.10 evening off (HC_POST_NORM from 32 tokens; the 32x64 tile of the fused
-rem gate/up). their first run was void: default ran first and read the PLE rows from the drive (warm_page_cache in
-rem _run.py), 786 against 840 t/s; the gpu time of the profile has both ahead. gt: the gpu idle time between graphs
-rem (GGML_VK_GRAPH_TIMING) at 0 and 122880, where TG is 2 percent below stable at the same gpu time per step
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;nopn GGML_VK_HC_POST_NORM=0 @d=0;noglu GGML_VK_MMQ_INT_TILE_GLU=0 @d=0;gt GGML_VK_GRAPH_TIMING=16 @d=0,122880"
+rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
+rem 32x64 gate/up tile, both kept; PP +24 to +45 percent over stable, TG +2.7 percent at 0 and even at 122880. gt: the
+rem gpu idle time between graphs (GGML_VK_GRAPH_TIMING) and the host time per decode step (LLAMA_INPUT_TIMING) at 0 and
+rem 122880. 07.10: idle 0.64 ms (2 percent) at 0 and 4.01 ms (9 percent) at 122880, which way the host spends it is open
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;gt GGML_VK_GRAPH_TIMING=16 LLAMA_INPUT_TIMING=1 @d=0,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default"

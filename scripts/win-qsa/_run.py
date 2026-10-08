@@ -574,7 +574,9 @@ def cmd_bench():
                 warm_up()
                 out = log.with_suffix(".json")
                 _, text = execute(cmd, log, run_env, stdout=out)
-                r = {"replans": text.count("sched re-reserve:"), "graph_timing": graph_timing(text.splitlines())}
+                lines = text.splitlines()
+                r = {"replans": text.count("sched re-reserve:"), "graph_timing": graph_timing(lines),
+                     "host_tg": host_timing(lines, 1)}
                 for row in json.loads(out.read_text(encoding="utf-8")):
                     samples = sorted(row.get("samples_ts") or [row["avg_ts"]])
                     r["pp" if row["n_prompt"] else "tg"] = [row["avg_ts"], row["stddev_ts"], statistics.median(samples),
@@ -659,6 +661,9 @@ def cmd_bench():
               if isinstance(r, tuple) and r[0]["replans"]]
     notes += [f"  {a}-d{d}: {graph_timing_text(r[0]['graph_timing'])}" for (a, d), r in results.items()
               if isinstance(r, tuple) and r[0].get("graph_timing")]
+    notes += [f"  {a}-d{d}: host per decode step (LLAMA_INPUT_TIMING), median of {h['n']}: graph build {h['graph']:.2f} ms, "
+              f"inputs {h['inputs']:.2f} ms, submit {h['submit']:.2f} ms" for (a, d), r in results.items()
+              if isinstance(r, tuple) and (h := r[0].get("host_tg"))]
     if notes:
         run.add("", "notes:", *notes)
     return run.finish()
@@ -897,6 +902,18 @@ def graph_timing(lines):
         return None
     med = [statistics.median(w[i] for w in windows) for i in range(4)]
     return {"windows": len(windows), "period": med[0], "gpu": med[1], "host": med[2], "idle": med[3]}
+
+
+def host_timing(lines, n_tokens):
+    """Medians of the LLAMA_INPUT_TIMING lines of the ubatches of n_tokens tokens: graph build and allocation, input
+    fills, the compute call. None without such lines."""
+    rows = [[float(m[2]), float(m[3]), float(m[4])] for m in
+            (re.search(r"ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", x) for x in lines)
+            if m and int(m[1]) == n_tokens]
+    if not rows:
+        return None
+    med = [statistics.median(r[i] for r in rows) for i in range(3)]
+    return {"n": len(rows), "graph": med[0], "inputs": med[1], "submit": med[2]}
 
 
 def graph_timing_text(gt):
