@@ -2848,8 +2848,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
-                // fork: the MTP head of the fork's qwen4exp is dense too, the upstream one runs on llama_memory_hybrid_idx
-                const bool mtp_dense_fork = arch == LLM_ARCH_QWEN4EXP && dynamic_cast<const llama_model_qwen4exp_fork *>(this) != nullptr;
+                // fork: the MTP head of the fork's qwen4exp is dense unless LLAMA_MTP_QSA gave it a ratio, the upstream one
+                // runs on llama_memory_hybrid_idx
+                const bool mtp_dense_fork = arch == LLM_ARCH_QWEN4EXP && dynamic_cast<const llama_model_qwen4exp_fork *>(this) != nullptr &&
+                    hparams.dsv4_compress_ratios[hparams.n_layer()] == 0;
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||

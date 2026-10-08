@@ -2,6 +2,7 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <limits>
 #include <map>
 #include <memory>
 #include <vector>
@@ -107,8 +108,9 @@ public:
     // group the cells into blocks and compare them with the blocks the pool already holds.
     // this runs at graph build time, so the graph can size its dirty list before set_input_qsa
     // fills it. the result is kept until the next ubatch, so a second call costs nothing.
+    // sinfo names the cells of this ubatch, so that the grouping of the last ubatch can be carried forward
     qsa_plan qsa_prepare(const llama_ubatch * ubatch, uint32_t n_kv, uint32_t ratio, bool blk_bias,
-                         uint32_t s0, uint32_t ns) const;
+                         uint32_t s0, uint32_t ns, const llama_kv_cache::slot_info * sinfo = nullptr) const;
 
     // cells and rows of the blocks qsa_prepare marked dirty, and their mrope positions
     //   dirty_cells I32 [ratio*n_dirty, ns]
@@ -162,7 +164,23 @@ private:
         int32_t  n_keep = 0;              // leading blocks the pool already holds
         uint32_t strm   = 0;              // cache stream this ubatch stream sits in
         bool     ranked = false;
+
+        // carried forward to the next ubatch by qsa_group_update: one sequence seq on positions 0.., full blocks in
+        // order, n_spare cells of the incomplete tail. dirty_pos: a rollback took the positions from there on
+        bool         inc_ok    = false;
+        llama_seq_id seq       = -1;
+        int32_t      n_spare   = 0;
+        int32_t      n_same    = 0;       // leading blocks the last update left as they were
+        llama_pos    dirty_pos = std::numeric_limits<llama_pos>::max();
     };
+
+    // regroup only the blocks of g that can have changed since the last ubatch: those from the first incomplete
+    // one, the first one a rollback took, or the first one a new cell falls into. false when g cannot be carried,
+    // the caller then groups every cell
+    bool qsa_group_update(qsa_group & g, const llama_kv_cells & cells, const std::vector<uint32_t> & new_cells,
+                          int64_t n_kv, int64_t r) const;
+
+    mutable std::vector<int32_t> qsa_scratch;
 
     struct qsa_state {
         uint64_t epoch    = 0;            // the ubatch this was computed for

@@ -112,8 +112,9 @@ def stable_folder():
 class Arm:
     """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [@d=depth,...] [tool
     arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
-    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @c= and @ub= set the -c and
-    the -ub of 02 and 05 for this arm, @o=OP,... limits it to these ops of 01 and 06, the rest goes to the tool."""
+    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @p= to these prefixes of 04
+    (DECPREFIX), @c= and @ub= set the -c and the -ub of 02 and 05 for this arm, @o=OP,... limits it to these ops of
+    01 and 06, the rest goes to the tool."""
 
     def __init__(self, text):
         tokens = split_args(text)
@@ -126,6 +127,7 @@ class Arm:
         self.stable = False
         self.draft = False
         self.depths = None
+        self.prefixes = None
         self.ctx = None
         self.ub = None
         self.ops = None
@@ -149,6 +151,11 @@ class Arm:
                     self.depths = {int(d) for d in t[3:].split(",") if d}
                 except ValueError:
                     raise Fail(f"arm {self.name}: {t} must list depths, as @d=122880")
+            elif t.startswith("@p="):
+                try:
+                    self.prefixes = {int(p) for p in t[3:].split(",") if p}
+                except ValueError:
+                    raise Fail(f"arm {self.name}: {t} must list prefixes, as @p=0,500000")
             elif t == "@stable":
                 self.build = stable_folder()
                 self.stable = True
@@ -942,6 +949,8 @@ def cmd_decode():
         requests = [(name, head + text, seed, ngen) for name, text in prompts for seed in seeds]
         rows_text = head + "\n\n".join(text for _, text in prompts)
         for arm in arms:
+            if arm.prefixes is not None and prefix not in arm.prefixes:
+                continue
             label = f"{arm.name}-p{prefix}"
             try:
                 if arm.draft and not draft:
@@ -972,6 +981,8 @@ def cmd_decode():
     for prefix in prefixes:
         rows = []
         for arm in arms:
+            if arm.prefixes is not None and prefix not in arm.prefixes:
+                continue
             entry = results.get((arm.name, prefix))
             if not isinstance(entry, tuple):
                 rows.append([arm.name, entry or "skip"])

@@ -387,8 +387,13 @@ _loaded_mmproj_modules: set[str] = set()
 
 
 def _import_fork(module_name: str) -> None:
-    # the fork's converter for this module (conversion/<module>_fork.py) registers over the upstream classes
+    # the fork's converter for this module (conversion/<module>_fork.py) registers over the upstream classes;
+    # LLAMA_UPSTREAM=<module>[,...] or all keeps the upstream ones, as for the copies in src/fork
     import importlib.util
+    import os
+    upstream = [m.strip() for m in os.environ.get("LLAMA_UPSTREAM", "").split(",")]
+    if module_name in upstream or "all" in upstream:
+        return
     if importlib.util.find_spec(f"conversion.{module_name}_fork") is not None:
         __import__(f"conversion.{module_name}_fork")
 

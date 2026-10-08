@@ -467,6 +467,9 @@ public:
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // fork: the cells of the current ubatch, nullptr for a context without a batch (src/fork, qwen4exp QSA)
+    const llama_kv_cache::slot_info * get_sinfo() const { return sinfos.empty() ? nullptr : &sinfos[i_cur]; }
+
 private:
     llama_memory_status status;
 

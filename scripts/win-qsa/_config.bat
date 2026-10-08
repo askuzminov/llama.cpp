@@ -87,7 +87,9 @@ if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
 rem loads the PLE table whole if that version does not read it lazily, a FAIL on memory is then expected
-if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;upstream LLAMA_UPSTREAM=qwen4exp"
+rem nolid: the block scores of QSA by the matmul paths instead of the lightning indexer (08.10, LLAMA_QSA_LID); the
+rem vulkan indexer rounds q and k to f16, so a near tie can pick the next block
+if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;upstream LLAMA_UPSTREAM=qwen4exp;nolid LLAMA_QSA_LID=0"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
 rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. 07.10: a short
@@ -95,14 +97,23 @@ rem prompt 0.66 s instead of 1.8 s once the host read of the context checkpoints
 rem 1.7 s), the 2541-token prompt 697 t/s against 443 of stable, TG 27.2 against 26.7, with --spec-auto 37.6
 rem none logs the gpu time of the graphs and the gpu idle time between them (GGML_VK_GRAPH_TIMING, two timestamps per
 rem graph). 07.10: one decode step every 36.45 ms, the gpu busy for 35.13 of them, idle 4 percent: TG is gpu time
-if not defined DECARMS    set "DECARMS=stable @stable;none GGML_VK_GRAPH_TIMING=64;auto @draft --spec-auto"
+rem mtp3 / mtp3qsa (08.10): the MTP block dense over a plain KV cache (the default) against a QSA layer over its own
+rem indexer cache, as upstream and the reference have it (LLAMA_MTP_QSA=1). below about 2K tokens of context the
+rem two compute the same, so they also run after a 500000-character prefix (about 110K tokens): draft acceptance
+rem and TG there
+if not defined DECARMS    set "DECARMS=stable @stable @p=0;none GGML_VK_GRAPH_TIMING=64 @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0,500000;mtp3qsa @draft --spec-type draft-mtp --spec-draft-n-max 3 LLAMA_MTP_QSA=1 @p=0,500000"
+if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
 rem 32x64 gate/up tile, both kept; PP +24 to +45 percent over stable, TG +2.7 percent at 0 and even at 122880. gt: the
 rem gpu idle time between graphs (GGML_VK_GRAPH_TIMING) and the host time per decode step (LLAMA_INPUT_TIMING) at 0 and
 rem 122880. 07.10: idle 0.64 ms (2 percent) at 0 and 4.01 ms (9 percent) at 122880, which way the host spends it is open
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;gt GGML_VK_GRAPH_TIMING=16 LLAMA_INPUT_TIMING=1 @d=0,122880"
+rem nolid: the QSA block scores by MUL_MAT_HEADSUM instead of the lightning indexer (the default since 08.10, one
+rem [n_blocks, n_tokens] output and an f16 bias instead of a score per head); PP, TG and the compute buffer
+rem mmidup: the upstream tile choice of mul_mat_id (nei1, #29936) instead of the rows per expert, PP at 0. faup: the
+rem upstream sparse FA rule alone (no prefill fold, no union of tile rows), PP at 122880 (08.10)
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;nolid LLAMA_QSA_LID=0;mmidup GGML_VK_MMID_TILE_UPSTREAM=1 @d=0;faup GGML_VK_FA_SPARSE_UPSTREAM=1 @d=122880;gt GGML_VK_GRAPH_TIMING=16 LLAMA_INPUT_TIMING=1 @d=0,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default"
@@ -123,7 +134,7 @@ goto :defaults_done
 rem ---- 3090 / cuda: the experts of the first layers on the cpu, -ncmoe depends on the card ----
 if not defined EXTRA      set "EXTRA=-ngl 99 -ncmoe 30"
 if not defined CHECKARMS  set "CHECKARMS=default"
-if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1"
+if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1;nolid LLAMA_QSA_LID=0"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 4096 -ub 4096"
 rem since 05.10 the cpu experts run while the gpu runs the cached ones (06.10: TG +2 percent, +4.6 with MTP n2;
@@ -135,8 +146,13 @@ rem 07.10, the memory switches of 05.10 against base: lfu 26.38 against 24.55 t/
 rem 24.13 of lru, every request faster in both runs (n2 29.54 against 26.92); compact 24.17 and async 24.35, no
 rem gain; kvhost 111 slots instead of 68, TG +3.6 percent on the short prompts, -5 percent on the 2541-token one
 rem and PP -7 percent
-if not defined DECARMS    set "DECARMS=base;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;auto @draft --spec-auto"
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
+rem nolid: the QSA block scores by the batched matmuls instead of the lightning indexer (the default since 08.10):
+rem a smaller compute buffer leaves more memory to the moe-cache, see its slots in DECGREP
+rem n2qsa (08.10): the MTP block as a QSA layer over its own indexer cache (LLAMA_MTP_QSA=1) against the dense one of
+rem n2; both also after a 500000-character prefix (about 110K tokens), where QSA prunes the context
+if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;nolid LLAMA_QSA_LID=0 @p=0;n2qsa @draft --spec-type draft-mtp --spec-draft-n-max 2 LLAMA_MTP_QSA=1 @p=0,500000"
+if not defined DECPREFIX  set "DECPREFIX=0 500000"
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;nolid LLAMA_QSA_LID=0"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined KERNARMS   set "KERNARMS=default"

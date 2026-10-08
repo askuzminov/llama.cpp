@@ -5,9 +5,9 @@
 # LLAMA_UPSTREAM=<component> runs the upstream original instead of the copy.
 #
 # copy                                         original                              commit     component  [lines]
-src/fork/qwen4exp-fork.cpp                     src/models/qwen4exp.cpp               6a2743f02  qwen4exp
-src/fork/qwen4exp-fork.h                       src/models/models.h                   6a2743f02  qwen4exp   /^struct llama_model_qwen4exp :/,/^};/
-src/fork/llama-memory-hybrid-idx-fork.cpp      src/llama-memory-hybrid-idx.cpp       6a2743f02  qwen4exp
-src/fork/llama-memory-hybrid-idx-fork.h        src/llama-memory-hybrid-idx.h         6a2743f02  qwen4exp
-src/fork/llama-kv-cache-mask-fork.inc         src/llama-kv-cache.cpp                6a2743f02  kq-mask    /^template<typename T, bool causal, bool swa, bool is_2d, bool alibi>$/,/^}$/
-conversion/qwen4exp_fork.py                   conversion/qwen4exp.py                6a2743f02  qwen4exp
+src/fork/qwen4exp-fork.cpp                     src/models/qwen4exp.cpp               c811cb8f0  qwen4exp
+src/fork/qwen4exp-fork.h                       src/models/models.h                   c811cb8f0  qwen4exp   /^struct llama_model_qwen4exp :/,/^};/
+src/fork/llama-memory-hybrid-idx-fork.cpp      src/llama-memory-hybrid-idx.cpp       c811cb8f0  qwen4exp
+src/fork/llama-memory-hybrid-idx-fork.h        src/llama-memory-hybrid-idx.h         c811cb8f0  qwen4exp
+src/fork/llama-kv-cache-mask-fork.inc         src/llama-kv-cache.cpp                c811cb8f0  kq-mask    /^template<typename T, bool causal, bool swa, bool is_2d, bool alibi>$/,/^}$/
+conversion/qwen4exp_fork.py                   conversion/qwen4exp.py                c811cb8f0  qwen4exp

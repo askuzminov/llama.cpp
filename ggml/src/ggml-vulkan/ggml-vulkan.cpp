@@ -7613,10 +7613,17 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     GGML_ASSERT(mmp_map != nullptr);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
+    // fork: the tile follows the rows each expert gets (#29182); upstream went back to nei1 in #29936 (an Intel
+    // prefill regression), GGML_VK_MMID_TILE_UPSTREAM=1 takes that
+    static const bool mmid_tile_upstream = [] {
+        const char * val = getenv("GGML_VK_MMID_TILE_UPSTREAM");
+        return val != nullptr && atoi(val) != 0;
+    }();
+    const uint32_t n_per_expert = mmid_tile_upstream ? (uint32_t) nei1 : (uint32_t)CEIL_DIV(nei0 * nei1, n_as);
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, n_per_expert, true));
+    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && n_per_expert > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, n_per_expert, aligned, true);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -8370,8 +8377,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const char * val = getenv("GGML_VK_FA_SPARSE_GQA");
         return val == nullptr || atoi(val) != 0;
     }();
+    // fork: GGML_VK_FA_SPARSE_UPSTREAM=1 takes the upstream rule alone: sparse only for a folded decode or a one-row
+    // scalar tile, without the prefill fold, the union of the tile rows and the re-tune to a one-row tile below
+    static const bool sparse_upstream = [] {
+        const char * val = getenv("GGML_VK_FA_SPARSE_UPSTREAM");
+        return val != nullptr && atoi(val) != 0;
+    }();
 
-    if ((N <= 8 || (sparse_gqa && sparse_ok(tuning_params.path))) &&
+    if ((N <= 8 || (!sparse_upstream && sparse_gqa && sparse_ok(tuning_params.path))) &&
         qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
@@ -8404,7 +8417,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const int64_t row_tile_ratio = 8;
 
     const int64_t group_ratio = group_ratio_env >= 0 ? group_ratio_env : 1;
-    const bool    multi_row   = sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1;
+    const bool    multi_row   = !sparse_upstream && sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1;
 
     // the tile keeps its rows and walks their union. Without the tile size in the threshold the
     // list can be as long as KV, and then the gather costs a pre-pass and buys nothing
@@ -8419,7 +8432,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // block_rows == 1 only happens on the scalar path, where the tile is one query row
-    const bool use_sparse = sparse_shape_ok && (use_group || gqa_ratio > 1 || tuning_params.block_rows == 1);
+    const bool use_sparse = sparse_upstream ?
+        sparse_shape_ok && (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1)) :
+        sparse_shape_ok && (use_group || gqa_ratio > 1 || tuning_params.block_rows == 1);
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));

@@ -1264,8 +1264,14 @@ ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_cb(
         ggml_backend_alloc_range_cb cb, void * user_data) {
     GGML_ASSERT(ggml_get_no_alloc(ctx) == true);
 
-    // a buffer type with its own alloc_buffer_n (meta) hands its tensors over as one range when it is done
-    if (cb == NULL || buft->iface.alloc_buffer_n != NULL) {
+    // a buffer type with its own alloc_buffer_n (meta) hands its tensors over as one range when it is done, and so
+    // does every buffer type with GGML_ALLOC_UPSTREAM=1: the upstream allocation, the loader then starts at the end
+    static int upstream = -1;
+    if (upstream < 0) {
+        const char * val = getenv("GGML_ALLOC_UPSTREAM");
+        upstream = val != NULL && atoi(val) != 0;
+    }
+    if (cb == NULL || buft->iface.alloc_buffer_n != NULL || upstream) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (buf && cb) {
             cb(ggml_get_first_tensor(ctx), NULL, user_data);
