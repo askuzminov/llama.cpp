@@ -51,8 +51,10 @@ void topk(bool needs_bounds_check, const uint row) {
             if (col < s) {
                 ivec2 a = dst_row[col];
                 ivec2 b = dst_row[col + s];
+                // fork: compare as floats, the bit patterns of negative values order the other way as integers
+                // (the fix of topk_nary_search.comp in upstream ff5888f99, which missed this shader)
                 if (a.x >= p.orig_ncols ||
-                    b.x < p.orig_ncols && b.y > a.y) {
+                    b.x < p.orig_ncols && intBitsToFloat(b.y) > intBitsToFloat(a.y)) {
                     dst_row[col] = b;
                 }
             }

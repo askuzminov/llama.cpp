@@ -38,3 +38,21 @@ set_tests_properties(test-checkpoint-delta PROPERTIES FIXTURES_REQUIRED test-dow
 # Test checkpoint delta-only chain (all checkpoints are deltas)
 llama_build_and_test(test-checkpoint-delta-chain.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-checkpoint-delta-chain PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# the rollback test aborts on any graph reallocation (GGML_SCHED_DEBUG_REALLOC=1). the fork plans the 1-output prompt
+# graph last and plans a graph with more outputs again while computing (llama_context::sched_reserve, LLAMA_REPLAN_DISABLE),
+# which that check counts as unexpected: run it without the replan, and once more with it but without the check
+if (TEST test-recurrent-state-rollback)
+    set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1;LLAMA_REPLAN_DISABLE=1"
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-replan
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-recurrent-state-rollback-replan PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+endif()

@@ -1642,10 +1642,9 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    // 64MB works well for NVMe drives.
     // the read lands at the first aligned address inside the staging buffer, so the buffer
     // holds one alignment unit more than the largest read can be
-    const size_t chunk_size  = alignment != 1 ? 64 * 1024 * 1024 : 1 * 1024 * 1024;
+    const size_t chunk_size  = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE : 1 * 1024 * 1024;
     const size_t buffer_size = chunk_size + 2 * alignment;
 
     std::vector<ggml_backend_buffer_t> host_buffers;

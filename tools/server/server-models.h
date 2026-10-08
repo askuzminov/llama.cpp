@@ -86,8 +86,8 @@ struct server_model_meta {
     json progress; // reflect load or download progress info, if any
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
-    mtmd_caps multimodal; // multimodal capabilities
     bool hidden = false; // hidden from GET /models, but still accept if requested
+    json architecture = server_model_architecture_json(false, false, false, {"text"});
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -106,7 +106,7 @@ struct server_model_meta {
     }
 
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
-    void update_caps();
+    void update_caps(const common_params & base);
 };
 
 struct server_models_routes;
@@ -337,6 +337,11 @@ struct server_child {
     std::mutex mtx_stdout;
     std::atomic<bool> is_finished_downloading = false; // set by run_download
 
+    // in a child, keeps stdout for the commands to the router, so it is created before anything is written;
+    // everything else written to stdout goes to stderr with the logs
+    server_child();
+    ~server_child();
+
     // return true if the current process is a child server instance
     bool is_child();
     server_child_mode get_mode();
@@ -365,6 +370,8 @@ struct server_child {
     json mem_report();
 
 private:
+    FILE * cmd_out = nullptr; // the stdout the router reads the commands from
+
     std::vector<ggml_backend_dev_t> mem_devs;
     std::map<std::string, std::pair<size_t, size_t>> mem_start; // device name -> free, total
 };

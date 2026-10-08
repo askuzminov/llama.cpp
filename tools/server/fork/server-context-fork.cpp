@@ -19,30 +19,6 @@ static constexpr int32_t CKPT_COUNT_CAP_FALLBACK = 32;
 // smallest checkpoint pool handed out over all slots
 static constexpr size_t CKPT_BUDGET_FLOOR = 512ull*1024*1024;
 
-std::vector<llama_token> server_sample_and_accept_replay(
-        common_sampler * smpl,
-        llama_context * ctx,
-        const std::vector<int32_t> & idxs,
-        const llama_tokens & draft) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1);
-
-    std::vector<llama_token> result;
-    result.reserve(idxs.size());
-
-    for (size_t i = 0; i < draft.size(); ++i) {
-        // sample only to advance the RNG as the first check did
-        common_sampler_sample(smpl, ctx, idxs[i]);
-        common_sampler_accept(smpl, draft[i], true);
-        result.push_back(draft[i]);
-    }
-
-    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
-    common_sampler_accept(smpl, id, true);
-    result.push_back(id);
-
-    return result;
-}
-
 //
 // server_ckpt_limits
 //

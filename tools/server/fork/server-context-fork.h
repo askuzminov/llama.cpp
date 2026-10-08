@@ -15,14 +15,6 @@
 
 struct server_prompt_cache;
 
-// replay after a checkpoint restore: the target sampled these tokens before, so accept them as they are.
-// a new check can reject them, because the logits can change with the batch (e.g. MoE routing), and the replay then does not end
-std::vector<llama_token> server_sample_and_accept_replay(
-        common_sampler * smpl,
-        llama_context * ctx,
-        const std::vector<int32_t> & idxs,
-        const llama_tokens & draft);
-
 // host-RAM bounds of the prompt cache and the context checkpoints
 struct server_ckpt_limits {
     // resolved host-RAM reserve for context checkpoints, in bytes (0 = disabled)

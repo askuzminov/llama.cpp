@@ -408,11 +408,12 @@ void llama_memory_hybrid_idx_fork::state_drop(llama_seq_id seq_id) {
         return;
     }
 
-    get_mem_attn()->seq_rm(seq_id, -1, -1);
+    // state_clear also zeroes the cells, a restore that failed halfway can leave NaN in them (upstream 649dcb103)
+    get_mem_attn()->state_clear(seq_id);
     get_mem_recr()->seq_rm(seq_id, -1, -1);
 
     if (mem_idx) {
-        mem_idx->seq_rm(seq_id, -1, -1);
+        mem_idx->state_clear(seq_id);
     }
 }
 
@@ -824,8 +825,9 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
         need = std::max(need, (uint32_t) (g.n_end - g.n_keep));
     }
 
+    // a ubatch that fills the whole cache would ask for more than the blocks there are (upstream 81e39ad34)
     st.warm    = need <= cap;
-    st.n_dirty = st.warm ? cap : (uint32_t) n_blocks;
+    st.n_dirty = st.warm ? std::min<uint32_t>(cap, (uint32_t) n_blocks) : (uint32_t) n_blocks;
 
     return { st.n_dirty, st.warm };
 }

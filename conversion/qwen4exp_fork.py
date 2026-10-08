@@ -68,8 +68,9 @@ class Qwen4ExpTextModelFork(Qwen4ExpTextModel):
         return tensors
 
     # the upstream method with the MTP block in the ratios and no PLE keys for a draft-only export. It skips the
-    # upstream body, which writes the same keys; filter_tensors and index_tensors chain to the mixins through the
-    # upstream class, which defines neither as of the commit in copies.txt
+    # upstream body, which writes the same keys except the ratio of the MTP block (upstream: the trunk ratio, a QSA
+    # block; here 0, dense). Since upstream c061df198 the upstream filter_tensors renames mtp.fc_* and fuses them in
+    # modify_tensors, so the fusion in index_tensors above only runs for names that filter does not match
     def set_gguf_parameters(self):
         super(Qwen4ExpTextModel, self).set_gguf_parameters()
         hp = self.hparams

@@ -480,6 +480,9 @@ llama_model_qwen4exp_fork::graph::graph(const llama_model & model, const llm_gra
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
+    // make sure hc_init is in the same graph split as the first layer (-sm tensor); with host embeddings the
+    // REPEAT would otherwise stay on the CPU and the device gets hc copies of the embedding (upstream 10f340d1a)
+    ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
@@ -1640,8 +1643,10 @@ void llm_graph_input_ple_fork::set_input(const llama_ubatch * ubatch) {
     const llama_token img_tok = hp.ple_image_token_id != 0
         ? (llama_token) hp.ple_image_token_id
         : (llama_token) hp.ple_eos_token_id;
+    // a mixed ubatch has token ids and embd rows, its embd rows hold a placeholder token (upstream 0bb496dbd)
     auto tok_of = [&](int64_t k) -> llama_token {
-        return ubatch->token ? ubatch->token[k] : img_tok;
+        const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[k]);
+        return is_embd ? img_tok : ubatch->token[k];
     };
 
     const int64_t n_tokens = ubatch->n_tokens;
