@@ -19,9 +19,9 @@ bool llama_moe_stats_enabled();
 // several cache policies, sizes and insert budgets. all of them see the same routing, so
 // they compare without the noise of two runs. reports the decode hit rate, the upload
 // traffic and the host reads of each combination.
-class llama_moe_stats {
+class llama_moe_stats_fork {
 public:
-    llama_moe_stats(const llama_model & model);
+    llama_moe_stats_fork(const llama_model & model);
 
     // read back the routing ids recorded by the graph and add them to the trace
     void add_ubatch(const llm_graph_result * res, ggml_backend_sched_t sched, uint32_t n_tokens);
@@ -141,7 +141,7 @@ private:
 // device cache of the MoE experts that stay in host memory (--moe-cache)
 // the graph computes the cached experts from device slots and the host mul_mat_id nodes skip them.
 // one context owns one cache, the slots are uploaded on a separate backend instance of the device.
-class llama_moe_cache {
+class llama_moe_cache_fork {
 public:
     // the graph uses the cache only for batches of at most this many tokens
     static constexpr int64_t N_TOKENS_MAX = 128;
@@ -166,8 +166,8 @@ public:
         ggml_tensor * ids   = nullptr; // host I32 [n_used_max*N_TOKENS_MAX]: routing ids of the last step
     };
 
-    llama_moe_cache(const llama_model & model, int32_t n_slots_req);
-    ~llama_moe_cache();
+    llama_moe_cache_fork(const llama_model & model, int32_t n_slots_req);
+    ~llama_moe_cache_fork();
 
     // select the layers and create the upload backend, called once before alloc()
     void init(ggml_backend_sched_t sched);

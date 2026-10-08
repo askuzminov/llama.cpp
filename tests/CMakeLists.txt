@@ -150,21 +150,10 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
-llama_build(test-checkpoint-partial.cpp)
-
-# prompt-cache disk spill: block-aligned unbuffered file layout, cold-start adoption, rejection of
-# foreign or truncated files. server-context is a static library, so this links on Windows too.
-llama_build_and_test(test-prompt-cache-spill.cpp)
-target_include_directories(test-prompt-cache-spill PRIVATE
-    ${PROJECT_SOURCE_DIR}/tools/server
-    ${PROJECT_SOURCE_DIR}/tools/mtmd)
-target_link_libraries(test-prompt-cache-spill PRIVATE server-context)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
-    llama_build_and_test(test-row-cache.cpp)
-    target_include_directories(test-row-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -225,20 +214,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
-
-    # partial (PARTIAL_ONLY) context checkpoints, one test per memory family:
-    # plain attention, iSWA, hybrid (attention + recurrent) and pure recurrent
-    foreach(CKPT_MODEL llama-dense gemma2-dense phi3-dense granitehybrid-dense nemotron_h-dense falcon-h1-dense mamba2-dense)
-        llama_test(
-            test-checkpoint-partial
-            NAME test-checkpoint-partial-${CKPT_MODEL}
-            LABEL main
-            ARGS -m "${MODEL_DIR}/${CKPT_MODEL}.gguf"
-        )
-        set_tests_properties(test-checkpoint-partial-${CKPT_MODEL} PROPERTIES
-            FIXTURES_REQUIRED generate-models
-        )
-    endforeach()
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
@@ -316,14 +291,6 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# Test checkpoint delta encoding/decoding
-llama_build_and_test(test-checkpoint-delta.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-checkpoint-delta PROPERTIES FIXTURES_REQUIRED test-download-model)
-
-# Test checkpoint delta-only chain (all checkpoints are deltas)
-llama_build_and_test(test-checkpoint-delta-chain.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-checkpoint-delta-chain PROPERTIES FIXTURES_REQUIRED test-download-model)
-
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
@@ -385,3 +352,6 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# fork: the fork's tests
+include(${CMAKE_CURRENT_SOURCE_DIR}/tests-fork.cmake)

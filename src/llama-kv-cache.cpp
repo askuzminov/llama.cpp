@@ -1,5 +1,7 @@
 #include "llama-kv-cache.h"
 
+#include "fork/llama-fork.h"
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1629,136 +1631,138 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        // the rows are filled in parts, in parallel for a large mask. each part keeps its own bookkeeping, so it
-        // fills its first row of a sequence in full and the next rows of that sequence copy it
-        llama_parallel_for(n_tps, (int64_t) n_tps*n_kv, [&](int64_t ii0, int64_t ii1) {
-            // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
-            std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
-            std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+        // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
+        std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
+        std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-            for (uint32_t ii = (uint32_t) ii0; ii < (uint32_t) ii1; ++ii) {
-                const uint32_t i = s*n_tps + ii;
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s*n_tps + ii;
 
-                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
-                const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
-                      llama_pos p0 = -1;
-                const llama_pos p1 = ubatch->pos[i];
+                  llama_pos p0 = -1;
+            const llama_pos p1 = ubatch->pos[i];
 
-                // for M-RoPE
-                const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
-                const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+            // for M-RoPE
+            const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+            const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
-                const uint64_t idst = n_kv*i;
+            const uint64_t idst = n_kv*i;
 
-                // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
-                // the only cells that could change are the ones that are with similar positions as the
-                //   ones in the batch (i.e. due to causal masking, SWA, etc.)
-                // keep track of those cells and shortcut the loop to save time
-                // note: this optimization is not compatible with Alibi position encoding
-                // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-                bool prev = false;
+            // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
+            // the only cells that could change are the ones that are with similar positions as the
+            //   ones in the batch (i.e. due to causal masking, SWA, etc.)
+            // keep track of those cells and shortcut the loop to save time
+            // note: this optimization is not compatible with Alibi position encoding
+            // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
+            bool prev = false;
 
-                auto & idxs = seq_idxs[seq_id];
+            auto & idxs = seq_idxs[seq_id];
 
-                if (!alibi) {
-                    if (seq_srct.find(seq_id) != seq_srct.end()) {
-                        const uint32_t srct = seq_srct[seq_id];
+            if (!alibi) {
+                if (seq_srct.find(seq_id) != seq_srct.end()) {
+                    const uint32_t srct = seq_srct[seq_id];
 
-                        const uint64_t idst_prev = n_kv*srct;
+                    const uint64_t idst_prev = n_kv*srct;
 
-                        std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
+                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
 
-                        prev = true;
-                    } else {
-                        idxs.clear();
-                        idxs.reserve(ubatch->n_tokens + n_swa + 32);
+                    prev = true;
+                } else {
+                    idxs.clear();
+                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
-                        seq_srct[seq_id] = i;
-                    }
-                }
-
-                for (uint32_t jj = 0; jj < n_kv; ++jj) {
-                    uint32_t j = jj;
-
-                    // we have an exiting mask for this sequence -> update just seq_idxs
-                    if (!alibi) {
-                        if (prev) {
-                            if (jj >= idxs.size()) {
-                                break;
-                            }
-
-                            j = idxs[jj];
-                        }
-                    }
-
-                    if (cells.is_empty(j)) {
-                        goto skip;
-                    }
-
-                    // mask the token if not the same sequence
-                    if (!cells.seq_has(j, seq_id)) {
-                        goto skip;
-                    }
-
-                    p0 = cells.pos_get(j);
-
-                    if (!alibi) {
-                        if (!prev) {
-                            // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                            if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                                idxs.push_back(j);
-                            }
-                        }
-                    }
-
-                    if (causal) {
-                        // mask future tokens
-                        if (p0 > p1) {
-                            goto skip;
-                        }
-
-                        // M-RoPE causal mask
-                        if (is_2d) {
-                            if (p0 == p1) {
-                                const auto & p0_ext = cells.ext_get(j);
-
-                                if (p0_ext.is_2d_gt(p1_x, p1_y)) {
-                                    goto skip;
-                                }
-                            }
-                        }
-                    }
-
-                    // apply SWA if any
-                    if (swa) {
-                        // see llama_non_causal_type
-                        const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
-                        if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
-                            goto skip;
-                        }
-                    }
-
-                    if (alibi) {
-                        data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
-                    } else {
-                        data[idst + j] = mask_keep;
-                    }
-
-                    continue;
-    skip:
-                    data[idst + j] = mask_drop;
+                    seq_srct[seq_id] = i;
                 }
             }
-        });
+
+            for (uint32_t jj = 0; jj < n_kv; ++jj) {
+                uint32_t j = jj;
+
+                // we have an exiting mask for this sequence -> update just seq_idxs
+                if (!alibi) {
+                    if (prev) {
+                        if (jj >= idxs.size()) {
+                            break;
+                        }
+
+                        j = idxs[jj];
+                    }
+                }
+
+                if (cells.is_empty(j)) {
+                    goto skip;
+                }
+
+                // mask the token if not the same sequence
+                if (!cells.seq_has(j, seq_id)) {
+                    goto skip;
+                }
+
+                p0 = cells.pos_get(j);
+
+                if (!alibi) {
+                    if (!prev) {
+                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
+                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                            idxs.push_back(j);
+                        }
+                    }
+                }
+
+                if (causal) {
+                    // mask future tokens
+                    if (p0 > p1) {
+                        goto skip;
+                    }
+
+                    // M-RoPE causal mask
+                    if (is_2d) {
+                        if (p0 == p1) {
+                            const auto & p0_ext = cells.ext_get(j);
+
+                            if (p0_ext.is_2d_gt(p1_x, p1_y)) {
+                                goto skip;
+                            }
+                        }
+                    }
+                }
+
+                // apply SWA if any
+                if (swa) {
+                    // see llama_non_causal_type
+                    const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
+                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                        goto skip;
+                    }
+                }
+
+                if (alibi) {
+                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                } else {
+                    data[idst + j] = mask_keep;
+                }
+
+                continue;
+skip:
+                data[idst + j] = mask_drop;
+            }
+        }
     }
 }
+
+// fork: see the file
+#include "fork/llama-kv-cache-mask-fork.inc"
 
 template<typename T, bool causal, bool swa, bool is_2d>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
     const bool alibi = args.hparams.use_alibi;
-    if (alibi) {
+    static const bool fork = !llama_fork_upstream("kq-mask");
+    if (fork) {
+        alibi ? set_input_kq_mask_impl_fork<T, causal, swa, is_2d, true>(args, data) : set_input_kq_mask_impl_fork<T, causal, swa, is_2d, false>(args, data);
+    } else if (alibi) {
         set_input_kq_mask_impl<T, causal, swa, is_2d, true> (args, data);
     } else {
         set_input_kq_mask_impl<T, causal, swa, is_2d, false>(args, data);
@@ -2989,136 +2993,4 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
-}
-
-//
-// Delta state write/read for KV cache
-//
-
-// a delta checkpoint starts with this, so a full state can never be mistaken for one
-static constexpr uint32_t KV_DELTA_MAGIC = 0x4B56444C; // "KVdL"
-
-size_t llama_kv_cache::state_write_delta(
-        llama_io_write_i & io,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags,
-        llama_pos base_pos) const {
-    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-    // a mirrored cache writes nothing in state_write, so it has no delta of its own either
-    if (other) {
-        return 0;
-    }
-
-    // the reader restores into a single sequence, so a whole-context delta has no way back
-    if (seq_id < 0) {
-        return 0;
-    }
-
-    GGML_UNUSED(flags);
-
-    GGML_ASSERT((size_t) seq_id < seq_to_stream.size());
-
-    const size_t start_bytes = io.n_bytes();
-
-    const uint32_t magic = KV_DELTA_MAGIC;
-    io.write(&magic, sizeof(magic));
-
-    io.write(&base_pos, sizeof(base_pos));
-    io.write(&n_stream, sizeof(n_stream));
-
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        uint32_t cell_count = 0;
-
-        // only the cells added after base_pos: everything up to it is in the base checkpoint
-        const cell_ranges_t cr = state_ranges(s, seq_id, base_pos, cell_count);
-
-        io.write(&cell_count, sizeof(cell_count));
-
-        if (cell_count == 0) {
-            continue;
-        }
-
-        state_write_meta(io, cr, seq_id);
-        state_write_data(io, cr);
-    }
-
-    return io.n_bytes() - start_bytes;
-}
-
-bool llama_kv_cache::state_read_delta(
-        llama_io_read_i  & io,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags,
-        llama_pos base_pos) {
-    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-    // nothing was written for a mirrored cache, so there is nothing to restore
-    if (other) {
-        return true;
-    }
-
-    GGML_UNUSED(flags);
-
-    uint32_t delta_magic;
-    io.read(&delta_magic, sizeof(delta_magic));
-
-    if (delta_magic != KV_DELTA_MAGIC) {
-        LLAMA_LOG_ERROR("%s: invalid delta magic: 0x%08X\n", __func__, delta_magic);
-        return false;
-    }
-
-    llama_pos delta_base_pos;
-    io.read(&delta_base_pos, sizeof(delta_base_pos));
-
-    if (delta_base_pos != base_pos) {
-        LLAMA_LOG_ERROR("%s: base_pos mismatch: checkpoint has %d, expected %d\n",
-                        __func__, (int) delta_base_pos, (int) base_pos);
-        return false;
-    }
-
-    uint32_t n_stream_cur;
-    io.read(&n_stream_cur, sizeof(n_stream_cur));
-
-    if (n_stream_cur != n_stream) {
-        LLAMA_LOG_ERROR("%s: stream count mismatch\n", __func__);
-        return false;
-    }
-
-    // must match the write side, which refuses to produce a whole-context delta
-    if (seq_id < 0) {
-        LLAMA_LOG_ERROR("%s: whole-cache delta restore is not supported\n", __func__);
-        return false;
-    }
-
-    GGML_ASSERT((size_t) seq_id < seq_to_stream.size());
-
-    const uint32_t strm = seq_to_stream[seq_id];
-
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        uint32_t cell_count;
-        io.read(&cell_count, sizeof(cell_count));
-
-        if (cell_count == 0) {
-            continue;
-        }
-
-        slot_info sinfo;
-
-        // clear_seq = false: the delta adds to the cells the base checkpoint already put in place
-        bool res = state_read_meta(io, strm, cell_count, sinfo, seq_id, nullptr, false);
-
-        try {
-            res = res && state_read_data(io, strm, cell_count, sinfo);
-        } catch (...) {
-            res = false;
-        }
-
-        if (!res) {
-            // half a delta is neither the base nor the checkpoint - drop the sequence, the caller recomputes it
-            state_clear(seq_id, strm, sinfo);
-
-            return false;
-        }
-    }
-
-    return true;
 }

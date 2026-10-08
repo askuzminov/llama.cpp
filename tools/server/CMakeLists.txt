@@ -33,6 +33,14 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# fork: sources kept apart from the upstream list above
+target_sources(${TARGET} PRIVATE
+    fork/server-context-fork.cpp
+    fork/server-context-fork.h
+    fork/server-task-fork.cpp
+    fork/server-task-fork.h
+)
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
@@ -55,6 +63,12 @@ add_dependencies(${TARGET} llama-ui-assets)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()
+
+# fork: sources kept apart from the upstream list above
+target_sources(${TARGET} PRIVATE
+    fork/server-models-fork.cpp
+    fork/server-models-fork.h
+)
 
 # llama-server executable
 

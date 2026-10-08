@@ -1,4 +1,4 @@
-#include "llama-moecache.h"
+#include "llama-moecache-fork.h"
 
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -23,7 +23,7 @@ static const int32_t MOE_STATS_SLOTS[] = { 8, 16, 32, 48, 64, 96, 128, 192, 256 
 // max expert uploads per layer per decode step
 static const int32_t MOE_STATS_INS[] = { 1, 2, 4, 8 };
 
-// steps from a miss to the first step that reads the new slot, as in llama_moe_cache::update()
+// steps from a miss to the first step that reads the new slot, as in llama_moe_cache_fork::update()
 static const int32_t MOE_STATS_DELAY = 2;
 
 // the LFU counts halve after this many accesses per slot, as in TinyLFU
@@ -32,7 +32,7 @@ static const int32_t MOE_STATS_LFU_WINDOW = 10;
 // assumed host RAM read bandwidth, used only for the time estimate of the report
 static const double MOE_STATS_BW_HOST = 35.0; // GB/s
 
-// read once: llama_moe_cache::update() asks for it on every step
+// read once: llama_moe_cache_fork::update() asks for it on every step
 static int moe_stats_period() {
     static const int period = [] {
         const char * s = getenv("LLAMA_MOE_CACHE_STATS");
@@ -49,21 +49,21 @@ bool llama_moe_stats_enabled() {
     return moe_stats_period() > 0;
 }
 
-llama_moe_stats::llama_moe_stats(const llama_model & model) : model(model) {
+llama_moe_stats_fork::llama_moe_stats_fork(const llama_model & model) : model(model) {
     n_expert     = model.hparams.n_expert;
     period       = moe_stats_period();
-    n_tokens_dec = llama_moe_cache::N_TOKENS_MAX;
+    n_tokens_dec = llama_moe_cache_fork::N_TOKENS_MAX;
 
     il2idx.resize(model.layers.size(), -1);
 }
 
-void llama_moe_stats::set_cache(int32_t n_slots, int32_t max_ins, bool lfu) {
+void llama_moe_stats_fork::set_cache(int32_t n_slots, int32_t max_ins, bool lfu) {
     cache_slots = n_slots;
     cache_ins   = max_ins;
     cache_lfu   = lfu;
 }
 
-std::vector<int32_t> llama_moe_stats::table_slots() const {
+std::vector<int32_t> llama_moe_stats_fork::table_slots() const {
     std::vector<int32_t> v;
     for (int32_t n : MOE_STATS_SLOTS) {
         if (n <= n_expert) {
@@ -77,7 +77,7 @@ std::vector<int32_t> llama_moe_stats::table_slots() const {
     return v;
 }
 
-std::vector<int32_t> llama_moe_stats::table_ins() const {
+std::vector<int32_t> llama_moe_stats_fork::table_ins() const {
     std::vector<int32_t> v(std::begin(MOE_STATS_INS), std::end(MOE_STATS_INS));
     if (cache_ins > 0 && std::find(v.begin(), v.end(), cache_ins) == v.end()) {
         v.push_back(cache_ins);
@@ -86,7 +86,7 @@ std::vector<int32_t> llama_moe_stats::table_ins() const {
     return v;
 }
 
-int llama_moe_stats::layer_idx(int il) {
+int llama_moe_stats_fork::layer_idx(int il) {
     if (il < 0 || il >= (int) model.layers.size()) {
         return -1;
     }
@@ -120,7 +120,7 @@ int llama_moe_stats::layer_idx(int il) {
     return idx;
 }
 
-void llama_moe_stats::add_ubatch(const llm_graph_result * res, ggml_backend_sched_t sched, uint32_t n_tokens) {
+void llama_moe_stats_fork::add_ubatch(const llm_graph_result * res, ggml_backend_sched_t sched, uint32_t n_tokens) {
     if (res->t_moe_topk.empty()) {
         return;
     }
@@ -206,7 +206,7 @@ void llama_moe_stats::add_ubatch(const llm_graph_result * res, ggml_backend_sche
     }
 }
 
-void llama_moe_stats::sim_layer::unlink(int32_t e) {
+void llama_moe_stats_fork::sim_layer::unlink(int32_t e) {
     const int     li = list[e];
     const int32_t p  = prev[e];
     const int32_t n  = next[e];
@@ -226,7 +226,7 @@ void llama_moe_stats::sim_layer::unlink(int32_t e) {
     size[li]--;
 }
 
-void llama_moe_stats::sim_layer::push(int li, int32_t e) {
+void llama_moe_stats_fork::sim_layer::push(int li, int32_t e) {
     prev[e] = -1;
     next[e] = head[li];
     if (head[li] >= 0) {
@@ -240,7 +240,7 @@ void llama_moe_stats::sim_layer::push(int li, int32_t e) {
     size[li]++;
 }
 
-void llama_moe_stats::sim_layer::evict(int32_t e, int32_t step) {
+void llama_moe_stats_fork::sim_layer::evict(int32_t e, int32_t step) {
     // the graph of this step read the slot before the eviction
     if (ready[e] >= 0 && ready[e] <= step) {
         gone[e] = step;
@@ -249,7 +249,7 @@ void llama_moe_stats::sim_layer::evict(int32_t e, int32_t step) {
     unlink(e);
 }
 
-void llama_moe_stats::sim_init(sim & s) const {
+void llama_moe_stats_fork::sim_init(sim & s) const {
     while (s.layers.size() < mlayers.size()) {
         sim_layer l;
         l.ready.assign(n_expert, -1);
@@ -268,8 +268,8 @@ void llama_moe_stats::sim_init(sim & s) const {
     }
 }
 
-// LRU, LRU/1, 2Q and LFU, the order of the updates is the order of update() in llama_moe_cache
-void llama_moe_stats::replay_layer(sim & s, int idx) const {
+// LRU, LRU/1, 2Q and LFU, the order of the updates is the order of update() in llama_moe_cache_fork
+void llama_moe_stats_fork::replay_layer(sim & s, int idx) const {
     const moe_layer & ml = mlayers[idx];
     sim_layer       & l  = s.layers[idx];
 
@@ -362,7 +362,7 @@ void llama_moe_stats::replay_layer(sim & s, int idx) const {
 
 // Belady with the budget and the delay of the other policies: in each step it takes the misses with
 // the nearest next use and evicts the cached expert with the farthest next use, while that is farther
-void llama_moe_stats::replay_layer_opt(sim & s, int idx) const {
+void llama_moe_stats_fork::replay_layer_opt(sim & s, int idx) const {
     const moe_layer & ml = mlayers[idx];
     sim_layer       & l  = s.layers[idx];
 
@@ -478,7 +478,7 @@ void llama_moe_stats::replay_layer_opt(sim & s, int idx) const {
     }
 }
 
-void llama_moe_stats::replay() {
+void llama_moe_stats_fork::replay() {
     const int64_t t_start_us = ggml_time_us();
 
     // the cells of one table row are next to each other
@@ -555,7 +555,7 @@ void llama_moe_stats::replay() {
     t_replay_us = ggml_time_us() - t_start_us;
 }
 
-void llama_moe_stats::report() {
+void llama_moe_stats_fork::report() {
     if (n_steps_dec == 0) {
         if (n_steps_all > 0) {
             LLAMA_LOG_WARN(MOE_LOG ": none of the %" PRIu64 " steps can use a cache, it needs at most %u tokens and the host experts computed on the CPU\n",
@@ -677,7 +677,7 @@ void llama_moe_stats::report() {
 }
 
 //
-// llama_moe_cache
+// llama_moe_cache_fork
 //
 
 #define MOE_CACHE_LOG "moe_cache"
@@ -685,7 +685,7 @@ void llama_moe_stats::report() {
 // device memory that the automatic slot count leaves free
 static const size_t MOE_CACHE_MARGIN = 1024ull*1024*1024;
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, int32_t n_slots_req) : model(model), n_slots_req(n_slots_req) {
+llama_moe_cache_fork::llama_moe_cache_fork(const llama_model & model, int32_t n_slots_req) : model(model), n_slots_req(n_slots_req) {
     // lfu: a missing expert evicts the least recent one only when it was routed more often (windowed counts). the
     // default since 07.10: on the 3090 (-ncmoe 48, 68 slots) TG 26.38 against 24.55 t/s with lru, every request faster.
     // LLAMA_MOE_CACHE_POLICY=lru admits every miss
@@ -695,7 +695,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, int32_t n_slots_req)
     async_table = async && atoi(async) != 0;
 }
 
-llama_moe_cache::~llama_moe_cache() {
+llama_moe_cache_fork::~llama_moe_cache_fork() {
     join_uploads();
     // the uploads read the host weights and write the slots, finish them before the buffers go away
     if (backend_up != nullptr) {
@@ -709,7 +709,7 @@ llama_moe_cache::~llama_moe_cache() {
     }
 }
 
-void llama_moe_cache::init(ggml_backend_sched_t sched) {
+void llama_moe_cache_fork::init(ggml_backend_sched_t sched) {
     initialized = true;
 
     const auto & hparams = model.hparams;
@@ -844,7 +844,7 @@ void llama_moe_cache::init(ggml_backend_sched_t sched) {
     }
 }
 
-void llama_moe_cache::alloc() {
+void llama_moe_cache_fork::alloc() {
     if (layers.empty() || backend_up == nullptr || ready()) {
         return;
     }
@@ -1010,7 +1010,7 @@ void llama_moe_cache::alloc() {
             ggml_backend_buffer_get_size(buf_dev.get())/mib, free/mib, max_ins, n_up, b_up/mib, 1e-3*t_us);
 }
 
-void llama_moe_cache::release() {
+void llama_moe_cache_fork::release() {
     if (!ready()) {
         return;
     }
@@ -1054,14 +1054,14 @@ void llama_moe_cache::release() {
     t_alloc_us += ggml_time_us() - t_start_us;
 }
 
-const llama_moe_cache::layer * llama_moe_cache::get_layer(int il) const {
+const llama_moe_cache_fork::layer * llama_moe_cache_fork::get_layer(int il) const {
     if (!ready() || il < 0 || il >= (int) il2idx.size() || il2idx[il] < 0) {
         return nullptr;
     }
     return &layers[il2idx[il]];
 }
 
-void llama_moe_cache::lru_unlink(lru & c, int32_t e) {
+void llama_moe_cache_fork::lru_unlink(lru & c, int32_t e) {
     const int32_t p = c.prev[e];
     const int32_t n = c.next[e];
     if (p >= 0) {
@@ -1078,7 +1078,7 @@ void llama_moe_cache::lru_unlink(lru & c, int32_t e) {
     c.next[e] = -1;
 }
 
-void llama_moe_cache::lru_push(lru & c, int32_t e) {
+void llama_moe_cache_fork::lru_push(lru & c, int32_t e) {
     c.prev[e] = -1;
     c.next[e] = c.head;
     if (c.head >= 0) {
@@ -1090,7 +1090,7 @@ void llama_moe_cache::lru_push(lru & c, int32_t e) {
     }
 }
 
-void llama_moe_cache::insert(size_t idx, int32_t e) {
+void llama_moe_cache_fork::insert(size_t idx, int32_t e) {
     lru & c = lrus[idx];
 
     int32_t s = -1;
@@ -1125,7 +1125,7 @@ void llama_moe_cache::insert(size_t idx, int32_t e) {
     n_ins++;
 }
 
-void llama_moe_cache::join_uploads() {
+void llama_moe_cache_fork::join_uploads() {
     if (upload_thread.joinable()) {
         upload_thread.join();
         t_submit_us += upload_submit_us;
@@ -1133,7 +1133,7 @@ void llama_moe_cache::join_uploads() {
     pending_uploads.clear();
 }
 
-size_t llama_moe_cache::upload(size_t idx, int32_t e, int32_t s) {
+size_t llama_moe_cache_fork::upload(size_t idx, int32_t e, int32_t s) {
     const layer & l = layers[idx];
 
     size_t b = 0;
@@ -1151,7 +1151,7 @@ size_t llama_moe_cache::upload(size_t idx, int32_t e, int32_t s) {
     return b;
 }
 
-void llama_moe_cache::update(const llm_graph_result * res) {
+void llama_moe_cache_fork::update(const llm_graph_result * res) {
     if (!ready() || res->moe_cache_il.empty()) {
         return;
     }
@@ -1293,7 +1293,7 @@ void llama_moe_cache::update(const llm_graph_result * res) {
     }
 }
 
-void llama_moe_cache::report() const {
+void llama_moe_cache_fork::report() const {
     if (n_alloc == 0 || n_steps == 0) {
         return;
     }

@@ -84,8 +84,10 @@ rem gate/up/swiglu of the experts at any size, the test cases are below the 2048
 rem notile: the medium int8 tile on the dense matmuls, as before 07.10 (the 64x128 tile is the default since then)
 rem glu0 also covers the 32x64 tile of the fused gate/up (the default since 07.10): its 200-token cases take it
 if not defined CHECKARMS  set "CHECKARMS=default;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0;notile GGML_VK_INT_LARGE_TILE=0"
-rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model
-if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0"
+rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
+rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
+rem loads the PLE table whole if that version does not read it lazily, a FAIL on memory is then expected
+if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;accurate GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0;upstream LLAMA_UPSTREAM=qwen4exp"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
 rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. 07.10: a short

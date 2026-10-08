@@ -22,6 +22,11 @@
 #include "llama.h"
 #include "models/models.h"
 
+// the fork's own versions of upstream components, picked unless LLAMA_UPSTREAM lists them
+#include "fork/llama-fork.h"
+#include "fork/llama-memory-hybrid-idx-fork.h"
+#include "fork/qwen4exp-fork.h"
+
 #include "ggml.h"
 #include "ggml-cpp.h"
 
@@ -331,6 +336,9 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_QWEN35MOE:
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_QWEN4EXP:
+            if (!llama_fork_upstream("qwen4exp")) {
+                return new llama_model_qwen4exp_fork(params);
+            }
             return new llama_model_qwen4exp(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
@@ -2822,6 +2830,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+                    } else if (needs_mem_idx && dynamic_cast<const llama_model_qwen4exp_fork *>(this) != nullptr) {
+                        // the fork's qwen4exp keeps its pooled block keys in its own copy of the memory type
+                        res = new llama_memory_hybrid_idx_fork(
+                            /* model             */ *this,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_pad        */ 1,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ std::move(filter_attn),
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* filter_idx        */ std::move(filter_idx));
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(

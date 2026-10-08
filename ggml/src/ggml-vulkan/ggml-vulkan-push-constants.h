@@ -214,30 +214,6 @@ struct vk_op_dsv4_hc_post_push_constants {
     float    gate_scale_out;
 };
 
-struct vk_op_dsv4_hc_post_norm_push_constants {
-    uint32_t n_embd;
-    uint32_t n_tokens;
-
-    uint32_t nbx1;
-    uint32_t nbr1; uint32_t nbr2;
-    uint32_t nbp0; uint32_t nbp1;
-    uint32_t nbw1; uint32_t nbw2;
-    uint32_t nbd1; uint32_t nbd2;
-    uint32_t nbn1; uint32_t nbn2;
-
-    uint32_t x_offset;
-    uint32_t r_offset;
-    uint32_t p_offset;
-    uint32_t w_offset;
-    uint32_t d_offset;
-    uint32_t n_offset;
-
-    uint32_t gate;
-    float    gate_scale_in;
-    float    gate_scale_out;
-    float    eps;
-};
-
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;

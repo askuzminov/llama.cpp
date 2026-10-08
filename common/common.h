@@ -7,6 +7,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
+#include "fork/common-fork.h"
 
 #include <array>
 #include <list>
@@ -36,11 +37,6 @@
 #define COM_WRN(fmt, ...) LOG_WRN("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define COM_ERR(fmt, ...) LOG_ERR("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define COM_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
-
-// Host (system) RAM introspection. Returns 0 when the value cannot be determined.
-// Unlike ggml's CPU device query, these report the real available memory on all platforms.
-size_t common_host_mem_total();     // total physical RAM in bytes
-size_t common_host_mem_available(); // currently available/free RAM in bytes
 
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
@@ -328,13 +324,9 @@ struct common_params_model {
     }
 };
 
-// draft length cap of --spec-auto when --spec-draft-n-max is not given
-#define COMMON_SPECULATIVE_AUTO_N_MAX 6
-
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
-    bool    n_max_set = false; // n_max was given explicitly, --spec-auto then keeps it as the cap
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
@@ -358,6 +350,9 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // fork:
+    bool n_max_set = false; // n_max was given explicitly, --spec-auto then keeps it as the cap
 };
 
 struct common_params_speculative_ngram_mod {
@@ -384,8 +379,6 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
-    bool auto_n = false; // pick the draft length per cycle from the measured cost and acceptance, n_max is the cap
-
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
@@ -411,6 +404,9 @@ struct common_params_speculative {
 
         return needs_rs_seq ? draft.n_max : 0u;
     }
+
+    // fork:
+    bool auto_n = false; // pick the draft length per cycle from the measured cost and acceptance, n_max is the cap
 };
 
 struct common_params_diffusion {
@@ -469,7 +465,6 @@ struct common_params {
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
-    int32_t n_moe_cache           =     0; // device cache of host MoE experts: slots per layer, 0 = off, -1 = auto
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -585,7 +580,6 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
-    bool phase_mem         = false; // size the compute buffers per phase (prompt / generation), n_parallel == 1
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -642,13 +636,9 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = -1;    // explicit count cap on context checkpoints per slot; -1 = no count limit (bounded by available host RAM), 0 = disabled
-    int32_t cache_ram_reserve_mib = -1;  // keep at least this much host RAM free by evicting checkpoints; -1 = auto (fraction of total RAM), 0 = disabled
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = -1;    // -1 = auto (fraction of total RAM), 0 = disable, 1 = 1 MiB, etc.
-    std::string cache_spill_dir = "";    // [experimental] spill cold prompt-cache states to this dir (on disk) instead of dropping them ("" = disabled)
-    int32_t cache_disk_mib      = 0;     // disk budget (MiB) for spilled prompt-cache states; least-recently-used dropped over this (0 = unlimited)
-    int32_t cache_min_tokens    = 0;     // do not cache prompts shorter than this many tokens (0 = no minimum)
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -775,6 +765,16 @@ struct common_params {
     std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
+
+    // fork:
+    int32_t n_moe_cache = 0;     // device cache of host MoE experts: slots per layer, 0 = off, -1 = auto
+    bool    phase_mem   = false; // size the compute buffers per phase (prompt / generation), n_parallel == 1
+
+    // fork: server prompt cache
+    int32_t cache_ram_reserve_mib = -1;  // keep at least this much host RAM free by evicting checkpoints; -1 = auto (fraction of total RAM), 0 = disabled
+    std::string cache_spill_dir   = "";  // [experimental] spill cold prompt-cache states to this dir (on disk) instead of dropping them ("" = disabled)
+    int32_t cache_disk_mib        = 0;   // disk budget (MiB) for spilled prompt-cache states; least-recently-used dropped over this (0 = unlimited)
+    int32_t cache_min_tokens      = 0;   // do not cache prompts shorter than this many tokens (0 = no minimum)
 };
 
 // call once at the start of a program if it uses libcommon
@@ -1256,9 +1256,6 @@ struct common_prompt_checkpoint {
     llama_pos pos_min = 0;
     llama_pos pos_max = 0;
 
-    // Base position for delta checkpoints (-1 = BASE checkpoint)
-    llama_pos base_pos = -1;
-
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
@@ -1270,8 +1267,6 @@ struct common_prompt_checkpoint {
 
     bool empty() const;
     void clear();
-
-    bool is_delta() const { return base_pos >= 0; }
 
     void update_pos(
             int64_t n_tokens,
@@ -1301,6 +1296,13 @@ struct common_prompt_checkpoint {
 
     void clear_tgt();
     void clear_dft();
+
+    // fork: delta checkpoints (common/fork/common-fork.cpp)
+
+    // Base position for delta checkpoints (-1 = BASE checkpoint)
+    llama_pos base_pos = -1;
+
+    bool is_delta() const { return base_pos >= 0; }
 
     // Apply checkpoint: full restore (base_pos < 0) or delta (base_pos >= 0)
     // Returns true if checkpoint was successfully applied

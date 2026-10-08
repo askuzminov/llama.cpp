@@ -365,6 +365,13 @@ _loaded_text_modules: set[str] = set()
 _loaded_mmproj_modules: set[str] = set()
 
 
+def _import_fork(module_name: str) -> None:
+    # the fork's converter for this module (conversion/<module>_fork.py) registers over the upstream classes
+    import importlib.util
+    if importlib.util.find_spec(f"conversion.{module_name}_fork") is not None:
+        __import__(f"conversion.{module_name}_fork")
+
+
 def load_all_models() -> None:
     """Import all model modules to trigger @ModelBase.register() decorators."""
     if len(_loaded_text_modules) != len(_TEXT_MODEL_MODULES):
@@ -372,6 +379,7 @@ def load_all_models() -> None:
             if module_name not in _loaded_text_modules:
                 try:
                     __import__(f"conversion.{module_name}")
+                    _import_fork(module_name)
                     _loaded_text_modules.add(module_name)
                 except Exception as e:
                     logger.warning(f"Failed to load model module {module_name}: {e}")
@@ -393,6 +401,7 @@ def get_model_class(name: str, mmproj: bool = False) -> Type[ModelBase]:
         raise NotImplementedError(f"Architecture {name!r} not supported!")
     module_name = relevant_map[name]
     __import__(f"conversion.{module_name}")
+    _import_fork(module_name)
     model_type = ModelType.MMPROJ if mmproj else ModelType.TEXT
     return ModelBase._model_classes[model_type][name]
 

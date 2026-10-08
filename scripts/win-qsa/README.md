@@ -122,6 +122,9 @@ set "BENCHDEPTHS=0,65536,122880"
 
 Переменная `GGML_*` или `LLAMA_*`, заданная в консоли, идёт во все плечи и в ключ.
 
+Сверка с апстримом: `LLAMA_UPSTREAM=qwen4exp` в плече запускает апстримовую реализацию вместо нашей копии из
+`src/fork/` (см. `src/fork/llama-fork.h`, список копий в `scripts/fork/copies.txt`). На 395 это плечо `upstream` в 03.
+
 ## Значения по умолчанию
 
 Различаются по машинам:
@@ -130,7 +133,7 @@ set "BENCHDEPTHS=0,65536,122880"
 | --- | --- | --- |
 | `EXTRA` | `-ngl 99` | `-ngl 99 -ncmoe 30` |
 | `CHECKARMS` | `default`, `accurate` (f16 и f32-накопление вместо int8 coopmat), `glu0` (сшитые gate/up при любом размере, с тайлом 32x64), `notile` | `default` |
-| `QARMS` | `default`, `nofusion`, `accurate` | `default`, `nofusion` |
+| `QARMS` | `default`, `nofusion`, `accurate`, `upstream` (`LLAMA_UPSTREAM=qwen4exp`) | `default`, `nofusion` |
 | `DECARGS` | `-fit off -b 4096 -ub 4096` (как `models.ini`) | `-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 4096 -ub 4096` |
 | `BENCHARMS` | `stable`, `default`, `nopn` (без `HC_POST_NORM`) и `noglu` (gate/up средним тайлом) на глубине 0, `gt` (`GGML_VK_GRAPH_TIMING=16`) на 0 и 122880 | `stable`, `default` |
 | `BENCHSMALL`, `BENCHSMALLARMS` | `82,512,2541`; `stable`, `default` | пусто: не запускается |

@@ -570,17 +570,6 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
     { 3, 2, 2 }, // hc_post->src[2] == scale (post)
 };
 
-// hc_post_gate followed by the grouped RMSNorm and gamma of the next hc mix (qwen4exp hc_combine -> hc_mix)
-static constexpr std::initializer_list<ggml_op> hc_post_norm_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL };
-
-static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_edges {
-    { 1, 0, 0 }, // sigmoid->src[0]  == scale
-    { 2, 0, 1 }, // scale->src[0]    == sigmoid
-    { 3, 2, 2 }, // hc_post->src[2]  == scale (post)
-    { 4, 0, 3 }, // rms_norm->src[0] == hc_post
-    { 5, 0, 4 }, // mul->src[0]      == rms_norm
-};
-
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softmax_norm_edges {
     { 1, 0, 0 }, // reshape->src[0]  == softmax
     { 2, 0, 0 }, // argsort->src[0]  == softmax
@@ -779,8 +768,6 @@ struct vk_device_struct {
     uint32_t coopmat_int_m;
     uint32_t coopmat_int_n;
     uint32_t coopmat_int_k;
-    // the ops that take the int8 coopmat path: bit 0 MUL_MAT, bit 1 MUL_MAT_ID
-    uint32_t coopmat_int_ops;
 
     bool coopmat2;
     bool coopmat2_bf16_support {};
@@ -840,9 +827,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
-    // rows shorter than the workgroup (f32, f16, bf16, i32 sources)
-    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];
-    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;
@@ -866,7 +850,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_add_id_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
-    vk_pipeline pipeline_concat_transpose_16, pipeline_concat_transpose_32;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
     vk_pipeline pipeline_log[2];
@@ -987,7 +970,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
-    vk_pipeline pipeline_dsv4_hc_post_norm_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1047,13 +1029,8 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
-    // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
-    ggml_backend_buffer_type buffer_type_shared;
-    ggml_backend_buffer_type_t extra_bufts[2] = {};
 
     bool disable_fusion;
-    // matmuls with a small A split their columns so that A and the part of B in use stay in this many bytes of cache, 0 = off
-    uint64_t mm_chunk_bytes;
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
     bool disable_host_visible_vidmem;
@@ -1064,6 +1041,19 @@ struct vk_device_struct {
 
     ~vk_device_struct();
 
+    // fork: see fork/ggml-vulkan-fork.h
+    // the ops that take the int8 coopmat path: bit 0 MUL_MAT, bit 1 MUL_MAT_ID
+    uint32_t coopmat_int_ops;
+    // rows shorter than the workgroup (f32, f16, bf16, i32 sources)
+    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_concat_transpose_16, pipeline_concat_transpose_32;
+    vk_pipeline pipeline_dsv4_hc_post_norm_f32;
+    // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
+    ggml_backend_buffer_type buffer_type_shared;
+    ggml_backend_buffer_type_t extra_bufts[2] = {};
+    // matmuls with a small A split their columns so that A and the part of B in use stay in this many bytes of cache, 0 = off
+    uint64_t mm_chunk_bytes;
 };
 
 inline void vk_command_pool::init(vk_device& device, vk_queue *q_) {
@@ -1332,14 +1322,6 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
-    // HC_POST_GATE + the RMS_NORM and MUL of the next hc mix
-    bool fused_hc_post_norm {};
-    bool fused_mm_relu {};
-    // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
-    bool fused_mm_headsum {};
-    const ggml_tensor * fused_mm_headsum_bias {};
-    // gated_delta_net + the cpy of its state into the recurrent cache: the cache view the op writes to
-    const ggml_tensor * fused_gdn_cache {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
@@ -1352,6 +1334,15 @@ struct ggml_backend_vk_context {
     int32_t num_queries {};
     int32_t query_idx {};
 
+    // fork: see fork/ggml-vulkan-fork.h
+    // HC_POST_GATE + the RMS_NORM and MUL of the next hc mix
+    bool fused_hc_post_norm {};
+    bool fused_mm_relu {};
+    // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
+    bool fused_mm_headsum {};
+    const ggml_tensor * fused_mm_headsum_bias {};
+    // gated_delta_net + the cpy of its state into the recurrent cache: the cache view the op writes to
+    const ggml_tensor * fused_gdn_cache {};
     // for GGML_VK_GRAPH_TIMING: a timestamp at the start and one at the end of each graph, read at the next graph
     vk::QueryPool gt_pool;
     bool gt_recording {};

@@ -2,7 +2,7 @@
 // looks like one: a header of an odd length, then the rows. F32 covers the plain copy, Q8_0 the
 // dequantizing path.
 
-#include "llama-row-cache.h"
+#include "fork/llama-row-cache-fork.h"
 
 #include "ggml.h"
 

@@ -259,6 +259,14 @@ if (Vulkan_FOUND)
 
     source_group("Vulkan shaders" FILES ${_ggml_vk_shader_files})
     source_group("Generated Vulkan shaders" FILES ${_ggml_vk_generated_shader_files})
+
+    # fork: the sources only the fork has, kept out of the upstream list above
+    target_sources(ggml-vulkan PRIVATE
+                   fork/ggml-vulkan-fork.h
+                   fork/ggml-vulkan-fork.cpp
+                   fork/ggml-vulkan-fusion-fork.cpp
+                   fork/ggml-vulkan-ops-fork.cpp
+                  )
 else()
     message(WARNING "Vulkan not found")
 endif()

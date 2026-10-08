@@ -3,16 +3,15 @@
 #include "common.h"
 #include "llama.h"
 
-#include <filesystem>
 #include <string>
 #include <unordered_set>
 #include <list>
 #include <map>
-#include <new>
-#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+
+#include "fork/server-task-fork.h"
 
 
 enum server_task_type {
@@ -571,11 +570,6 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
-    // how many times this prompt was restored from the prompt cache. Travels with the prompt in
-    // and out of the cache and survives a restart via the spill file, so the disk budget can keep
-    // the most frequently used prompts.
-    uint32_t n_used = 0;
-
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -593,33 +587,12 @@ struct server_prompt {
             n_used,
         };
     }
+
+    // fork: how many times this prompt was restored from the prompt cache. Travels with the prompt in
+    // and out of the cache and survives a restart via the spill file, so the disk budget can keep
+    // the most frequently used prompts.
+    uint32_t n_used = 0;
 };
-
-// the spill writes the state blobs with the OS cache bypassed, which needs a sector-aligned source.
-// allocating them aligned lets the spill move them without a bounce buffer
-constexpr size_t SERVER_STATE_ALIGN = 4096;
-
-template <typename T>
-struct server_state_alloc {
-    using value_type = T;
-
-    server_state_alloc() = default;
-
-    template <typename U> server_state_alloc(const server_state_alloc<U> &) {}
-
-    T * allocate(size_t n) {
-        return (T *) ::operator new(n*sizeof(T), std::align_val_t(SERVER_STATE_ALIGN));
-    }
-
-    void deallocate(T * p, size_t) noexcept {
-        ::operator delete(p, std::align_val_t(SERVER_STATE_ALIGN));
-    }
-
-    template <typename U> bool operator==(const server_state_alloc<U> &) const { return true;  }
-    template <typename U> bool operator!=(const server_state_alloc<U> &) const { return false; }
-};
-
-using server_state_buf = std::vector<uint8_t, server_state_alloc<uint8_t>>;
 
 struct server_prompt_data {
     server_state_buf main;
@@ -634,8 +607,21 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
-    // spill bookkeeping: on_disk means a file named after `uid` holds this exact state and
-    // disk_bytes is what it occupies there. `data` may be freed from RAM or kept alongside it.
+    size_t size() const {
+        size_t res = data.size();
+
+        for (const auto & ckpt : prompt.checkpoints) {
+            res += ckpt.size();
+        }
+
+        return res;
+    }
+
+    // fork: spill bookkeeping. size() counts RAM-resident bytes: a spilled state contributes 0 for
+    // `data` (written out and freed), but its checkpoints stay in RAM until free_ram drops them.
+
+    // on_disk means a file named after `uid` holds this exact state and disk_bytes is what it
+    // occupies there. `data` may be freed from RAM or kept alongside it.
     uint64_t uid        = 0;
     bool     on_disk    = false;
     size_t   disk_bytes = 0;
@@ -647,18 +633,6 @@ struct server_prompt_cache_state {
     // the disk copy is up to date and the blobs are still in RAM: dropping the RAM costs no I/O,
     // and a cache hit needs no read back
     bool is_clean() const { return on_disk && data.size() > 0; }
-
-    // RAM-resident bytes: the state blobs plus the context checkpoints. A spilled state contributes
-    // 0 for `data` (written out and freed), but its checkpoints stay in RAM until free_ram drops them.
-    size_t size() const {
-        size_t res = data.size();
-
-        for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
-        }
-
-        return res;
-    }
 };
 
 struct server_prompt_cache {
@@ -667,7 +641,6 @@ struct server_prompt_cache {
     server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes = 0,
                         const std::string & spill_dir = "", size_t spill_limit_bytes = 0,
                         uint64_t signature = 0, uint64_t owner = 0, bool has_mtmd = false);
-    ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
 
@@ -676,6 +649,19 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    size_t size() const;
+
+    size_t n_tokens() const;
+
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    void update();
+
+    // fork: host-RAM reserve and disk spill, defined in fork/server-task-fork.cpp
+    ~server_prompt_cache();
 
     // the smallest piece of work worth a disk write: prompts shorter than this are not cached at
     // all, and a state whose front is already on disk is not written again until it grows this much
@@ -702,19 +688,10 @@ struct server_prompt_cache {
     // an mmproj is loaded, so a spilled prompt may hold media chunks and can be restored with them
     bool has_mtmd = false;
 
-    size_t size() const;      // RAM-resident bytes across all states
     size_t disk_size() const; // bytes currently spilled to disk
-
-    size_t n_tokens() const;
-
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     // the cached state that load() restores for tokens_new: it keeps more of itself and of tokens_new than tokens_cur does. states.end() when there is none
     std::list<server_prompt_cache_state>::iterator find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new);
-
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
-
-    void update();
 
     // evict oldest cached prompts until host RAM stays above the reserve, assuming `extra`
     // more bytes are about to be allocated. No-op when the reserve is disabled/unknown.

@@ -11,13 +11,13 @@
 #include <condition_variable>
 #include <thread>
 #include <functional>
-#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <vector>
+
+#include "fork/server-models-fork.h"
 
 /**
  * state diagram:
@@ -123,10 +123,12 @@ private:
         std::shared_ptr<server_subproc> subproc; // shared with the monitor thread
         server_model_meta meta;
         int req_count = 0; // number of active proxy requests
-        bool alone = false; // no other instance was running when this one was spawned
 
         // ask the child to exit (it handles the command on its stdin, see server_child::setup)
         void request_exit() const;
+
+        // fork: no other instance was running when this one was spawned
+        bool alone = false;
     };
 
     std::mutex mutex;
@@ -213,15 +215,6 @@ private:
 
     // if true, add some delay to simulate works (useful for testing)
     bool debug_fake_timing = false;
-
-    // memory per device reported by the last child that was spawned alone, see server_child::mem_report
-    json mem_last = json::object();
-    // time of the last child exit, the driver can release the memory of that child some time later
-    int64_t t_last_exit = 0;
-
-    // LLAMA_SERVER_MEM_WAIT value for a child spawned alone, empty if it has nothing to wait for
-    // not thread-safe, caller must hold mutex
-    std::string mem_wait_env() const;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
@@ -318,11 +311,23 @@ public:
     // called from the monitor thread
     // payload per state:
     //     state = loading     -> payload = {} (TODO: add progress info)
-    //     state = ready       -> payload = model_info (json) with "mem" from server_child::mem_report, or {} if wakeup from sleeping
+    //     state = ready       -> payload = model_info (json), or {} if wakeup from sleeping
     //     state = sleeping    -> payload = {}
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
 private:
+    // fork: memory wait of a child spawned alone, see fork/server-models-fork.cpp. The ready payload
+    // of a child also carries "mem" from server_child::mem_report
+
+    // memory per device reported by the last child that was spawned alone, see server_child::mem_report
+    json mem_last = json::object();
+    // time of the last child exit, the driver can release the memory of that child some time later
+    int64_t t_last_exit = 0;
+
+    // LLAMA_SERVER_MEM_WAIT value for a child spawned alone, empty if it has nothing to wait for
+    // not thread-safe, caller must hold mutex
+    std::string mem_wait_env() const;
+
     // one thread watching every child; keep last, the destructor joins the thread
     std::unique_ptr<server_monitor> monitor;
 };
@@ -337,17 +342,20 @@ struct server_child {
     server_child_mode get_mode();
     int run_download(common_params & params);
 
-    // register the shutdown_handler to be called by the router; EOF on stdin (router gone) calls exit_now()
-    // return the monitoring thread (to be joined by the caller), it ends after the exit command.
-    // EOF after the exit command ends the process when the router's stop timeout is over
+    // register the shutdown_handler to be called by the router
+    // return the monitoring thread (to be joined by the caller)
     std::thread setup(const std::function<void(int)> & shutdown_handler);
-
-    // end the process at once, without destructors or atexit handlers, as the router's force-kill does
-    [[noreturn]] static void exit_now();
 
     // notify router server for status changes (e.g. loading, downloading, sleeping, etc.)
     // message will be handled by server_models::handle_child_state() on the router side
     void notify_to_router(const std::string & state_name, const json & payload);
+
+    // fork: router watch and memory wait, defined in fork/server-models-fork.cpp
+    // EOF on stdin (router gone) calls exit_now(); the monitoring thread of setup() ends after the exit
+    // command, and EOF after it ends the process when the router's stop timeout is over
+
+    // end the process at once, without destructors or atexit handlers, as the router's force-kill does
+    [[noreturn]] static void exit_now();
 
     // call before the model is loaded: if the router set LLAMA_SERVER_MEM_WAIT, wait until the previous
     // instance released its memory, then record the free memory per device
