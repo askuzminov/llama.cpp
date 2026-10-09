@@ -137,8 +137,9 @@ static bool ggml_vk_can_fuse_mm_relu(ggml_backend_vk_context * ctx, const struct
 // mul_mm.comp (MUL_MAT_HEADSUM) multiplies A by all rows of q and sums the rectified heads of a token at the store
 static constexpr int HEADSUM_HEADS = 4;
 
-static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_headsum_pipelines(const ggml_backend_vk_context * ctx) {
-    auto it = ctx->device->pipeline_matmul.find(vk_matmul_pipeline_key{GGML_TYPE_F32, GGML_TYPE_F32, false, false, false, true});
+// the key pool of QSA is f16 by default, f32 with LLAMA_QSA_POOL_F32 (src/fork/llama-memory-hybrid-idx-fork.cpp)
+static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_headsum_pipelines(const ggml_backend_vk_context * ctx, ggml_type type_a) {
+    auto it = ctx->device->pipeline_matmul.find(vk_matmul_pipeline_key{type_a, GGML_TYPE_F32, false, false, false, true});
     return it == ctx->device->pipeline_matmul.end() || it->second.empty() ? nullptr : &it->second;
 }
 
@@ -146,7 +147,8 @@ static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_headsum_pipelines(co
 // them in this order: the matmul and relu of each head, the adds of the sum, the bias add. returns the node count
 static int ggml_vk_find_headsum(const ggml_cgraph * cgraph, int start, int end, const std::vector<uint8_t> * skip, int * idxs) {
     const ggml_tensor * mm0 = cgraph->nodes[start];
-    if (mm0->op != GGML_OP_MUL_MAT || mm0->src[0]->type != GGML_TYPE_F32 || mm0->src[1]->type != GGML_TYPE_F32 ||
+    if (mm0->op != GGML_OP_MUL_MAT || (mm0->src[0]->type != GGML_TYPE_F32 && mm0->src[0]->type != GGML_TYPE_F16) ||
+        mm0->src[1]->type != GGML_TYPE_F32 ||
         mm0->src[1]->view_src == nullptr) {
         return 0;
     }
@@ -216,7 +218,8 @@ static int ggml_vk_can_fuse_mul_mat_headsum(ggml_backend_vk_context * ctx, const
         const char * env = getenv("GGML_VK_HEADSUM_MIN_TOKENS");
         return env ? (int64_t) atoi(env) : 0;
     }();
-    if (disabled || ctx->device->coopmat2 || cgraph->nodes[node_idx]->op != GGML_OP_MUL_MAT || !ggml_vk_headsum_pipelines(ctx)) {
+    if (disabled || ctx->device->coopmat2 || cgraph->nodes[node_idx]->op != GGML_OP_MUL_MAT ||
+        !ggml_vk_headsum_pipelines(ctx, cgraph->nodes[node_idx]->src[0]->type)) {
         return 0;
     }
     if (cgraph->nodes[node_idx]->src[1]->ne[1] < min_tokens) {
@@ -259,8 +262,8 @@ static int ggml_vk_can_fuse_mul_mat_headsum(ggml_backend_vk_context * ctx, const
         }
     }
     // A: one matrix of contiguous rows; q: the heads of a token are adjacent rows, one matrix
-    if (a->type != GGML_TYPE_F32 || q0->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
-        a->nb[0] != sizeof(float) || a->nb[1] % sizeof(float) != 0 || a->ne[2] != 1 || a->ne[3] != 1 ||
+    if ((a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) || q0->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        a->nb[0] != ggml_type_size(a->type) || a->nb[1] % ggml_type_size(a->type) != 0 || a->ne[2] != 1 || a->ne[3] != 1 ||
         q0->nb[0] != sizeof(float) || q0->nb[1] != HEADSUM_HEADS * q0->ne[0] * sizeof(float) || q0->ne[2] != 1 || q0->ne[3] != 1 ||
         q0->view_offs + q0->ne[1] * q0->nb[1] > ggml_nbytes(q0->view_src)) {
         return 0;
@@ -295,10 +298,10 @@ void ggml_vk_mul_mat_headsum(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t m        = (uint32_t) a->ne[1];
     const uint32_t k        = (uint32_t) a->ne[0];
     const uint32_t n        = (uint32_t) q0->ne[1] * HEADSUM_HEADS;
-    const uint32_t stride_a = (uint32_t) (a->nb[1] / sizeof(float));
+    const uint32_t stride_a = (uint32_t) (a->nb[1] / ggml_type_size(a->type));
     const uint32_t stride_d = (uint32_t) (dst->nb[1] / sizeof(float));
 
-    const std::vector<vk_matmul_pipeline_pair> & mmp = *ggml_vk_headsum_pipelines(ctx);
+    const std::vector<vk_matmul_pipeline_pair> & mmp = *ggml_vk_headsum_pipelines(ctx, a->type);
     const uint32_t kpad = ggml_vk_align_size(k, ggml_vk_guess_matmul_pipeline_align_map(ctx, mmp, m, n, false));
     // the aligned variant loads rows of A in vectors of up to 8
     const bool aligned = k == kpad && stride_a % 8 == 0 && m > 8 && n > 8;
@@ -520,7 +523,7 @@ std::vector<uint8_t> ggml_vk_fork_headsum_nodes(ggml_backend_vk_context * ctx, c
     // the nodes of a MUL_MAT_HEADSUM pattern (ggml_vk_find_headsum) are not pulled forward one by one: when its first
     // matmul comes up, ggml_vk_fork_keep_headsum puts all of them in a row
     std::vector<uint8_t> headsum_node(graph->n_nodes, false);
-    if (!ctx->device->disable_fusion && ggml_vk_headsum_pipelines(ctx)) {
+    if (!ctx->device->disable_fusion && (ggml_vk_headsum_pipelines(ctx, GGML_TYPE_F32) || ggml_vk_headsum_pipelines(ctx, GGML_TYPE_F16))) {
         int idxs[3*HEADSUM_HEADS];
         for (int i = 0; i < graph->n_nodes; ++i) {
             if (graph->nodes[i]->op == GGML_OP_MUL_MAT && !headsum_node[i]) {

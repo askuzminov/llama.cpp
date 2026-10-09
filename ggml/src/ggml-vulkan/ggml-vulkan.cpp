@@ -2466,17 +2466,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32",     matmul_f32_f32_cm1_len,     matmul_f32_f32_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         {
-            // MUL_MAT_HEADSUM: the staged store sums whole tokens of a TN wide tile
-            std::vector<vk_tile_config> tc;
-            for (const auto & c : filter_tc(tc_mm, GGML_TYPE_F32, false)) {
-                if (c.warptile[8] % 4 == 0) {
-                    tc.push_back(c);
+            // MUL_MAT_HEADSUM: the staged store sums whole tokens of a TN wide tile. fork: over an f32 or f16 key pool
+            auto cm1_create_headsum = [&](ggml_type type_a, const std::string & name, size_t len, const void * data) {
+                std::vector<vk_tile_config> tc;
+                for (const auto & c : filter_tc(tc_mm, type_a, false)) {
+                    if (c.warptile[8] % 4 == 0) {
+                        tc.push_back(c);
+                    }
                 }
-            }
-            if (!tc.empty()) {
-                create_mm_pipelines({GGML_TYPE_F32, GGML_TYPE_F32, false, false, false, true}, tc, "matmul_headsum_f32_f32", matmul_headsum_f32_f32_cm1_len, matmul_headsum_f32_f32_cm1_data,
-                                    sizeof(vk_mat_mat_push_constants), 4, cm1_spec, false, true, 0, true, cm1_pin);
-            }
+                if (!tc.empty()) {
+                    create_mm_pipelines({type_a, GGML_TYPE_F32, false, false, false, true}, tc, name, len, data,
+                                        sizeof(vk_mat_mat_push_constants), 4, cm1_spec, false, true, 0, true, cm1_pin);
+                }
+            };
+            cm1_create_headsum(GGML_TYPE_F32, "matmul_headsum_f32_f32", matmul_headsum_f32_f32_cm1_len, matmul_headsum_f32_f32_cm1_data);
+            cm1_create_headsum(GGML_TYPE_F16, "matmul_headsum_f16_f32", matmul_headsum_f16_f32_cm1_len, matmul_headsum_f16_f32_cm1_data);
         }
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16",     matmul_f32_f16_cm1_len,     matmul_f32_f16_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         if (device->coopmat_acc_f16_support) {
@@ -2656,9 +2660,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         };
         // MUL_MAT_HEADSUM: a thread sums the heads of a token in its registers, so the TN columns of a thread (and the
         // WN / WNITER columns of a warp step) hold whole tokens of 4 heads. a tile with TN 2 takes TN 4 and TM 2
-        auto sg_create_headsum = [&](size_t len, const void* data) {
+        auto sg_create_headsum = [&](size_t len, const void* data, ggml_type type_a = GGML_TYPE_F32) {
             std::vector<vk_tile_config> tc;
-            for (auto c : filter_tc(tc_mm, GGML_TYPE_F32, false)) {
+            for (auto c : filter_tc(tc_mm, type_a, false)) {
                 auto & wt = c.warptile;
                 if (wt[8] % 4 != 0) {
                     wt[7] = std::max(2u, wt[7] * wt[8] / 4);
@@ -2674,7 +2678,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 }
             }
             if (!tc.empty()) {
-                create_mm_pipelines({GGML_TYPE_F32, GGML_TYPE_F32, false, false, false, true}, tc, "matmul_headsum_f32_f32", len, data,
+                create_mm_pipelines({type_a, GGML_TYPE_F32, false, false, false, true}, tc,
+                    type_a == GGML_TYPE_F16 ? "matmul_headsum_f16_f32" : "matmul_headsum_f32_f32", len, data,
                     sizeof(vk_mat_mat_push_constants), 4, [&](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec(wt, a); });
             }
         };
@@ -2700,6 +2705,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             sg_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32", SPV_DOT2(matmul_f32_f32), sizeof(vk_mat_mat_push_constants), 3);
             sg_create_headsum(matmul_headsum_f32_f32_len, matmul_headsum_f32_f32_data);
+            sg_create_headsum(matmul_headsum_f16_f32_len, matmul_headsum_f16_f32_data, GGML_TYPE_F16);
             sg_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16", SPV_DOT2(matmul_f32_f16), sizeof(vk_mat_mat_push_constants), 3);
             sg_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true},  tc_mm, "matmul_f16_f16acc",     SPV_DOT2_F16ACC(matmul_f16),     sizeof(vk_mat_mat_push_constants), 3);
             sg_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f16",            SPV_DOT2(matmul_f16),            sizeof(vk_mat_mat_push_constants), 3);
@@ -2820,6 +2826,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // FP32-only fallback path
             sg_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
             sg_create_headsum(matmul_headsum_f32_f32_fp32_len, matmul_headsum_f32_f32_fp32_data);
+            sg_create_headsum(matmul_headsum_f16_f32_fp32_len, matmul_headsum_f16_f32_fp32_data, GGML_TYPE_F16);
             sg_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16", matmul_f32_f16_fp32_len, matmul_f32_f16_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
             sg_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f16",     matmul_f16_fp32_len,     matmul_f16_fp32_data,     sizeof(vk_mat_mat_push_constants), 3);
             sg_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f16_f32", matmul_f16_f32_fp32_len, matmul_f16_f32_fp32_data, sizeof(vk_mat_mat_push_constants), 3);

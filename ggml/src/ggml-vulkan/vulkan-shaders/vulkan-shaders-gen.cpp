@@ -613,9 +613,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             if (!coopmat2) {
                 string_to_spv(shader_name + "_" + tname + "_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
 
-                // the 4 heads of the qwen4exp indexer in one matmul (MUL_MAT_HEADSUM)
-                if (tname == "f32" && matmul_id_type == MatMulIdType::NONE && !f16acc && !dot2) {
-                    string_to_spv(shader_name + "_headsum_f32_f32", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"MUL_MAT_HEADSUM", "4"}}), fp16, coopmat, coopmat2, f16acc);
+                // the 4 heads of the qwen4exp indexer in one matmul (MUL_MAT_HEADSUM), over an f32 or f16 key pool
+                if ((tname == "f32" || tname == "f16") && matmul_id_type == MatMulIdType::NONE && !f16acc && !dot2) {
+                    string_to_spv(shader_name + "_headsum_" + tname + "_f32", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"MUL_MAT_HEADSUM", "4"}}), fp16, coopmat, coopmat2, f16acc);
                 }
             }
             continue;

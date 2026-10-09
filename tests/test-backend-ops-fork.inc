@@ -106,9 +106,10 @@ struct test_mul_mat_headsum : public test_case {
     const int64_t k;
     const int64_t heads;
     const bool bias;
+    const ggml_type type_a; // the key pool: f16 by default since 09.10, f32 with LLAMA_QSA_POOL_F32
 
     std::string vars() override {
-        return VARS_TO_STR5(m, n, k, heads, bias);
+        return VARS_TO_STR6(type_a, m, n, k, heads, bias);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -122,11 +123,12 @@ struct test_mul_mat_headsum : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    test_mul_mat_headsum(int64_t m = 64, int64_t n = 32, int64_t k = 128, int64_t heads = 4, bool bias = true)
-        : m(m), n(n), k(k), heads(heads), bias(bias) {}
+    test_mul_mat_headsum(int64_t m = 64, int64_t n = 32, int64_t k = 128, int64_t heads = 4, bool bias = true,
+                         ggml_type type_a = GGML_TYPE_F32)
+        : m(m), n(n), k(k), heads(heads), bias(bias), type_a(type_a) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
         ggml_set_name(a, "a");
 
         ggml_tensor * q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, heads*n);
@@ -197,12 +199,14 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         }
     }
     // the qwen4exp indexer has 4 heads; 1 token is a decode step, 3 a draft check, 2 and 8 heads are not fused
-    for (bool bias : {false, true}) {
-        for (auto mn : std::vector<std::array<int64_t, 2>>{{64, 32}, {1000, 300}, {513, 77}, {1000, 1}, {1000, 3}}) {
-            test_cases.emplace_back(new test_mul_mat_headsum(mn[0], mn[1], 128, 4, bias));
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool bias : {false, true}) {
+            for (auto mn : std::vector<std::array<int64_t, 2>>{{64, 32}, {1000, 300}, {513, 77}, {1000, 1}, {1000, 3}}) {
+                test_cases.emplace_back(new test_mul_mat_headsum(mn[0], mn[1], 128, 4, bias, type_a));
+            }
+            test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 2, bias, type_a));
+            test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 8, bias, type_a));
         }
-        test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 2, bias));
-        test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 8, bias));
     }
 
     // MoE cache: 37 slots and the zero slot, n_used 10 uses the templated ids helper and n_used 5 the generic one

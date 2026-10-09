@@ -148,7 +148,13 @@ llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
             it = ctx_map.emplace(buft, ctx).first;
         }
 
-        ggml_tensor * t = ggml_new_tensor_3d(it->second.get(), GGML_TYPE_F32, idx_dim, (n_cells + r - 1)/r, n_stream);
+        // f16: the source keys in the indexer cache are f16 too, and the Vulkan lightning indexer rounds k to f16;
+        // half the bytes for every score pass. LLAMA_QSA_POOL_F32=1: f32, as before 09.10
+        static const bool pool_f32 = [] {
+            const char * env = getenv("LLAMA_QSA_POOL_F32");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        ggml_tensor * t = ggml_new_tensor_3d(it->second.get(), pool_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, idx_dim, (n_cells + r - 1)/r, n_stream);
 
         ggml_format_name(t, "qsa_pool_l%d", il);
 

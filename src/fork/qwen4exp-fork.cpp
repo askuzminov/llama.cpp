@@ -920,13 +920,24 @@ public:
     const bool causal_attn;
 };
 
-// the lightning indexer for the block scores (LLAMA_QSA_LID=0: off). its CUDA and Vulkan kernels take a head size of 128
-static bool qsa_use_lid(int64_t idx_dim) {
-    static const bool enabled = [] {
+// the lightning indexer for the block scores. its CUDA and Vulkan kernels take a head size of 128.
+// 08.10, 395 (Vulkan): a decode step at 122880 0.77 ms faster than MUL_MAT_HEADSUM, a 4096-token prompt 6 percent
+// slower there; 3090 (CUDA): the prompt the same, TG +1.7 percent. so Vulkan takes it up to LLAMA_QSA_LID_TOKENS
+// tokens per stream (default 64: decode and draft checks), every other backend always.
+// LLAMA_QSA_LID=1: always, 0: never
+static bool qsa_use_lid(int64_t idx_dim, int64_t n_tps, bool is_vulkan) {
+    static const int mode = [] {
         const char * env = std::getenv("LLAMA_QSA_LID");
-        return env == nullptr || std::atoi(env) != 0;
+        return env == nullptr ? -1 : std::atoi(env) != 0;
     }();
-    return enabled && idx_dim == 128;
+    static const int64_t vk_tokens = [] {
+        const char * env = std::getenv("LLAMA_QSA_LID_TOKENS");
+        return env == nullptr ? (int64_t) 64 : (int64_t) std::atoll(env);
+    }();
+    if (idx_dim != 128 || mode == 0) {
+        return false;
+    }
+    return mode == 1 || !is_vulkan || n_tps <= vk_tokens;
 }
 
 ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
@@ -998,7 +1009,9 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
             }
 
             // the lightning indexer takes the per-block bias as its f16 mask, see the scores below
-            qsa->bias = ggml_new_tensor_3d(ctx0, blk_bias && qsa_use_lid(idx_dim) ? GGML_TYPE_F16 : GGML_TYPE_F32,
+            ggml_backend_dev_t dev_l = model.dev_layer(il);
+            const bool vk_l = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev_l)), "Vulkan") == 0;
+            qsa->bias = ggml_new_tensor_3d(ctx0, blk_bias && qsa_use_lid(idx_dim, n_tps, vk_l) ? GGML_TYPE_F16 : GGML_TYPE_F32,
                     blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
             ggml_set_input(qsa->bias);
