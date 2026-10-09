@@ -1000,6 +1000,7 @@ struct ggml_backend_sched {
     int     prof_last;   // bucket of the previous graph, -1 before the first graph
     int64_t prof_t_last; // start of the previous graph
     ggml_backend_dev_t prof_devs[GGML_SCHED_MAX_BACKENDS]; // the backends can go before the scheduler
+    ggml_backend_timing_take_fork_t prof_gpu[GGML_SCHED_MAX_BACKENDS]; // [GGML_SCHED_PROF_GPU]
     struct ggml_backend_sched_prof prof[GGML_SCHED_PROF_BUCKETS];
 };
 
@@ -1901,6 +1902,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->prof_last >= 0) {
             sched->prof[sched->prof_last].t_wall += t_now - sched->prof_t_last;
             sched->prof[sched->prof_last].n_wall++;
+            ggml_backend_sched_prof_gpu_take(sched, sched->prof_last);
         }
         for (int i = 0; i < GGML_SCHED_PROF_BUCKETS && bucket < 0; i++) {
             if (sched->prof[i].n_splits == sched->n_splits) {
@@ -2149,6 +2151,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
             }
         }
     }
+
+    ggml_backend_sched_prof_gpu_init(sched);
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;

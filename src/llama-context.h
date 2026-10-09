@@ -467,11 +467,11 @@ private:
     void phase_gen();
     void phase_prompt(uint32_t n_tokens);
 
-    // KV cells used after n_tokens more tokens
-    uint32_t phase_kv_end(uint32_t n_tokens) const;
+    // KV cells used after n_tokens more tokens, plus n_pad cells of headroom
+    uint32_t phase_kv_end(uint32_t n_tokens, uint32_t n_pad = 0) const;
 
-    // add the compute buffer size of each device for ubatches of n_ub tokens after n_tokens more tokens, return the graph splits
-    int  phase_size(uint32_t n_ub, uint32_t n_tokens, std::map<ggml_backend_dev_t, size_t> & sizes);
+    // add the compute buffer size of each device for ubatches of n_ub tokens after n_tokens (+ n_pad) more tokens, return the graph splits
+    int  phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, std::map<ggml_backend_dev_t, size_t> & sizes);
 
     // replace the scheduler with one that has no compute buffers
     void sched_free();

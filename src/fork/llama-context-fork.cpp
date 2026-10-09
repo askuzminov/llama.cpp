@@ -47,16 +47,16 @@ void llama_context::sched_free() {
     sched_need_reserve = true;
 }
 
-uint32_t llama_context::phase_kv_end(uint32_t n_tokens) const {
-    return memory ? GGML_PAD(memory->get_n_kv_used() + n_tokens, 256) : 0;
+uint32_t llama_context::phase_kv_end(uint32_t n_tokens, uint32_t n_pad) const {
+    return memory ? std::min(cparams.n_ctx, GGML_PAD(memory->get_n_kv_used() + n_tokens, 256) + n_pad) : 0;
 }
 
-int llama_context::phase_size(uint32_t n_ub, uint32_t n_tokens, std::map<ggml_backend_dev_t, size_t> & sizes) {
+int llama_context::phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, std::map<ggml_backend_dev_t, size_t> & sizes) {
     if (!memory) {
         return 0;
     }
 
-    memory->set_n_kv_full(phase_kv_end(n_tokens));
+    memory->set_n_kv_full(phase_kv_end(n_tokens, n_pad));
     const auto mctx = memory->init_full();
     memory->set_n_kv_full(0);
 
@@ -171,6 +171,8 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
     }
     sched_free();
 
+    const int64_t t_free_us = ggml_time_us();
+
     // free memory of each device that runs the graphs
     std::map<ggml_backend_dev_t, size_t> budget;
     size_t free_all = 0;
@@ -199,6 +201,15 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
     const uint32_t n_step = 256;
     const uint32_t n_max  = std::min(cparams.n_ctx, cparams.n_ubatch);
 
+    // KV headroom of the plan: the next batches of a long prompt fit it and keep the buffers, without a new plan per
+    // batch (on the 3090, 09.10: 0.19 s at 25K cells to 0.48 s at 120K per 4096-token batch, about 10 s of a 118K
+    // prompt). taken only when it leaves the ubatch as large. LLAMA_PHASE_KV_STEP=<cells>, 0 (default): no headroom
+    static const uint32_t kv_step = [] {
+        const char * s = getenv("LLAMA_PHASE_KV_STEP");
+        return s ? (uint32_t) std::max(0, atoi(s)) : 0u;
+    }();
+    uint32_t n_pad = kv_step;
+
     int n_query = 0;
 
     int64_t e_last = 0; // bytes over the budget on the worst device
@@ -208,9 +219,9 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
 
     auto query = [&](uint32_t n_ub) {
         std::map<ggml_backend_dev_t, size_t> sizes;
-        s_last = phase_size(n_ub, n_tokens, sizes);
+        s_last = phase_size(n_ub, n_tokens, n_pad, sizes);
         for (auto * f : phase_followers) {
-            s_last += f->phase_size(n_ub, n_tokens, sizes);
+            s_last += f->phase_size(n_ub, n_tokens, n_pad, sizes);
         }
         e_last = std::numeric_limits<int64_t>::min();
         for (const auto & [dev, b] : budget) {
@@ -234,6 +245,11 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
 
     uint32_t n_lo = n_max;
     bool     ok   = fits(n_max);
+
+    if (!ok && n_pad > 0) {
+        n_pad = 0;
+        ok    = fits(n_max);
+    }
 
     if (!ok && n_max > n_step) {
         uint32_t n_hi = n_max;
@@ -264,19 +280,21 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
                 __func__, n_lo, e_last/1024.0/1024.0, s_last, s_max);
     }
 
+    const int64_t t_query_us = ggml_time_us();
+
     // the allocation can fail although the sizes fit, e.g. when a driver refuses a large buffer
     while (true) {
         try {
             for (auto * f : phase_followers) {
                 f->phase          = LLAMA_PHASE_PROMPT;
                 f->phase_n_tokens = n_lo;
-                f->phase_n_kv     = f->phase_kv_end(n_tokens);
+                f->phase_n_kv     = f->phase_kv_end(n_tokens, n_pad);
                 f->sched_reserve();
             }
 
             phase          = LLAMA_PHASE_PROMPT;
             phase_n_tokens = n_lo;
-            phase_n_kv     = phase_kv_end(n_tokens);
+            phase_n_kv     = phase_kv_end(n_tokens, n_pad);
             sched_reserve();
             break;
         } catch (const std::exception & err) {
@@ -308,9 +326,11 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
         size_f += dev_size(f);
     }
 
-    LLAMA_LOG_INFO("%s: phase_mem: prompt, batch %u tokens, KV cells %u, ubatch %u of %u, compute %.0f + %.0f MiB (drafts), %.0f MiB were free, %d queries, %.2f s\n",
+    const int64_t t_end_us = ggml_time_us();
+
+    LLAMA_LOG_INFO("%s: phase_mem: prompt, batch %u tokens, KV cells %u, ubatch %u of %u, compute %.0f + %.0f MiB (drafts), %.0f MiB were free, %d queries, %.2f s (free %.2f, queries %.2f, reserve %.2f)\n",
             __func__, n_tokens, phase_n_kv, n_lo, n_max, dev_size(this)/1024.0/1024.0, size_f/1024.0/1024.0, free_all/1024.0/1024.0,
-            n_query, 1e-6*(ggml_time_us() - t_start_us));
+            n_query, 1e-6*(t_end_us - t_start_us), 1e-6*(t_free_us - t_start_us), 1e-6*(t_query_us - t_free_us), 1e-6*(t_end_us - t_query_us));
 }
 
 llm_graph_result * llama_context::get_gf_res_reuse(const llm_graph_params & gparams) {

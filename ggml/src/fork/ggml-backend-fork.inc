@@ -16,6 +16,39 @@ static void ggml_backend_sched_log_splits(ggml_backend_sched_t sched, const char
     }
 }
 
+// GGML_SCHED_PROF_GPU=1 with GGML_SCHED_PROF: the device time of the compute calls of each backend that reports it
+// (CUDA: timing events around each call), "device busy" per graph next to the host times
+static void ggml_backend_sched_prof_gpu_init(ggml_backend_sched_t sched) {
+    const char * env = getenv("GGML_SCHED_PROF_GPU");
+    if (sched->prof_period <= 0 || env == nullptr || atoi(env) == 0) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(sched->prof_devs[b]);
+        if (reg == nullptr) {
+            continue;
+        }
+        auto enable = (ggml_backend_timing_enable_fork_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_timing_enable_fork");
+        auto take   = (ggml_backend_timing_take_fork_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_timing_take_fork");
+        if (enable != nullptr && take != nullptr) {
+            enable(sched->backends[b], true);
+            sched->prof_gpu[b] = take;
+        }
+    }
+}
+
+// at the start of a graph: the calls that ended since the last take, those of the previous graph once it synced
+static void ggml_backend_sched_prof_gpu_take(ggml_backend_sched_t sched, int bucket) {
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->prof_gpu[b] != nullptr) {
+            double  busy_us = 0.0;
+            int64_t n_calls = 0;
+            sched->prof_gpu[b](sched->backends[b], &busy_us, &n_calls);
+            sched->prof[bucket].t_gpu[b] += busy_us;
+        }
+    }
+}
+
 static void ggml_backend_sched_prof_print(ggml_backend_sched_t sched, int bucket) {
     struct ggml_backend_sched_prof * p = &sched->prof[bucket];
 
@@ -34,6 +67,9 @@ static void ggml_backend_sched_prof_print(ggml_backend_sched_t sched, int bucket
         busy += t_in + t_run;
         len += snprintf(buf + len, sizeof(buf) - len, "%s %s %.0f splits, wait %.2f, copy %.2f, run %.2f ms",
                 len > 0 ? ";" : "", ggml_backend_dev_name(sched->prof_devs[b]), (double) p->n_split[b]/n, t_wait, t_in - t_wait, t_run);
+        if (sched->prof_gpu[b] != nullptr && p->n_wall > 0 && len >= 0 && len < (int) sizeof(buf)) {
+            len += snprintf(buf + len, sizeof(buf) - len, ", device busy %.2f ms", 1e-3*p->t_gpu[b]/(double) p->n_wall);
+        }
         if (p->n_overlap[b] > 0 && len >= 0 && len < (int) sizeof(buf)) {
             len += snprintf(buf + len, sizeof(buf) - len, ", %.0f CPU waits avoided", (double) p->n_overlap[b]/n);
         }

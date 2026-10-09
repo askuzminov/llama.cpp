@@ -693,9 +693,14 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// fork: GPU time of the compute calls for GGML_SCHED_PROF_GPU
+#include "fork/ggml-cuda-timing-fork.inc"
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    ggml_cuda_timing_fork_free(this);
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -4575,6 +4580,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    ggml_cuda_timing_fork_begin(cuda_ctx);
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4625,6 +4632,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_timing_fork_end(cuda_ctx);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5964,6 +5973,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#ifdef GGML_CUDA_TIMING_FORK
+    if (strcmp(name, "ggml_backend_timing_enable_fork") == 0) {
+        return (void *)ggml_backend_cuda_timing_enable_fork;
+    }
+    if (strcmp(name, "ggml_backend_timing_take_fork") == 0) {
+        return (void *)ggml_backend_cuda_timing_take_fork;
+    }
+#endif
     return nullptr;
 }
 

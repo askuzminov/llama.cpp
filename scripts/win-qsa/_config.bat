@@ -105,9 +105,9 @@ rem graph). 07.10: one decode step every 36.45 ms, the gpu busy for 35.13 of the
 rem 09.10, mtp3qsa (LLAMA_MTP_QSA=1, the MTP block as a QSA layer) against the dense mtp3: the same drafts at prefix 0;
 rem at a 500000-character prefix (118K tokens) acceptance 0.388 against 0.440, TG 27.61 against 29.41, the prompt
 rem 175 s against 210 s. the arm is off. since 09.10 the draft context attends for its output rows only while it
-rem catches up over a prompt (LLAMA_MTP_ROWS_ALL=1: every row), mtp3 at the prefix shows what that gives
-if not defined DECARMS    set "DECARMS=stable @stable @p=0;none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0,500000"
-if not defined DECPREFIX  set "DECPREFIX=0 500000"
+rem catches up over a prompt (LLAMA_MTP_ROWS_ALL=1: every row): mtp3 at the prefix 705 t/s against 560, the 118K
+rem prompt 165.5 s against 210, TG 29.34 against 29.41. the prefix pass is off (about 30 minutes per arm)
+if not defined DECARMS    set "DECARMS=stable @stable @p=0;none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -162,17 +162,31 @@ rem 08.10: nolid (no lightning indexer) TG 26.75 against 27.20, the same moe-cac
 rem same. n2qsa (LLAMA_MTP_QSA=1): at a 500000-character prefix TG 25.40 against 26.93 of n2, acceptance 0.509
 rem against 0.543 (texts diverge; at the same acceptance 3-5 percent slower), at prefix 0 about 4 percent slower:
 rem the dense MTP block stays the default. the arms are off
-rem prof: GGML_SCHED_PROF, host time per decode step by backend (wait, copy, run) and outside the scheduler: where
-rem the 37 ms of a step go between the 48 GPU/CPU switches. stats: LLAMA_MOE_CACHE_STATS, the cache policies replayed
-rem on the real routing, with PLRU / PLFU (one pool of slots for all layers, as upstream's cache) next to the
-rem per-layer LRU / LFU (09.10); the table is in stats-p0.log
-rem n2 also at a 500000-character prefix (118K tokens): the prompt with MTP after the draft context attends for its
-rem output rows only (09.10); 08.10: 514.6 t/s
-if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;prof GGML_SCHED_PROF=128 @p=0;stats LLAMA_MOE_CACHE_STATS=2048 @p=0"
+rem 09.10, prof (GGML_SCHED_PROF=128), a decode step of 34-37 ms after the first 128 steps of a request (49-52 ms
+rem while the moe-cache fills): 194 splits (97 CUDA, 97 CPU, 48 CPU splits without inputs run next to the GPU); the CPU
+rem waits for the GPU 15.6-16.5 ms (the same at every hit rate), runs its experts 9-15 ms (440 MiB of host experts
+rem per step, 30-45 GB/s), copies 2.6-3.3 ms (both ways), queues the CUDA splits 2 ms; 3 ms outside the scheduler,
+rem 1.7 of them the moe-cache update (upload submission, table). TG of prof 26.72 against 26.79 of base.
+rem prof now adds GGML_SCHED_PROF_GPU=1: the device time of the CUDA compute calls per step ("device busy"), which
+rem tells the GPU work in the 16 ms of waits from the latency of the 49 switches
+rem 09.10, stats (LLAMA_MOE_CACHE_STATS=2048, 8192 steps): at the real 68-69 slots and 1 upload per layer per step the
+rem pooled caches lose: PLRU 62.5, PLFU 67.1 against LFU 68.0 and LRU 68.1 percent (the moe-cache measured 68.3).
+rem the pool catches up only at 4-8 uploads per layer per step, PLRU 69.2 at 350 MiB of uploads per step against
+rem 36 MiB of LFU. one pool for all layers (as upstream's --moe-cache-mib) is not taken; the arm is off
+rem 09.10, n2 at a 500000-character prefix (118K tokens) with the MTP catch-up for the output rows only: PP 525.8 t/s
+rem against 514.6 on 08.10, TG 27.58 against 26.93
+rem n2ub8k: the same with -b 8192 -ub 8192 (bench 09.10: +10.6 percent PP at depth 0, +14 at 65536); --phase-mem
+rem takes a smaller ubatch where 8192 does not fit (at 120K cells the 4096 one takes 3386 + 1620 MiB of 8670 free).
+rem n2kv16k: LLAMA_PHASE_KV_STEP=16384, the prompt plan of --phase-mem with 16K cells of KV headroom: a new plan every
+rem 16K cells instead of every batch (n2 09.10: 0.19 s at 25K cells to 0.48 s at 120K per 4096-token batch, about
+rem 10 s of the 118K prompt; the phase_mem line now splits it into free, queries and reserve; free holds the wait
+rem for the previous batch)
+if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;prof GGML_SCHED_PROF=128 GGML_SCHED_PROF_GPU=1 @p=0;n2ub8k @draft --spec-type draft-mtp --spec-draft-n-max 2 -b 8192 -ub 8192 @p=500000;n2kv16k LLAMA_PHASE_KV_STEP=16384 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=500000"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
-rem pp8k / ub8k (09.10): a prompt of 8192 tokens in two ubatches of 4096 against one of 8192. with the experts on the
-rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;pp8k @pp=8192 @d=0,65536;ub8k @pp=8192 @ub=8192 @d=0,65536"
+rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
+rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
+rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are off, n2ub8k checks the server
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined KERNARMS   set "KERNARMS=default"
