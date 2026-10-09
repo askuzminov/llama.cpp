@@ -92,8 +92,9 @@ rem loads the PLE table whole if that version does not read it lazily, a FAIL on
 rem 08.10: nolid (no lightning indexer) mean KLD 0.01575 against 0.01594, inside the spread of nofusion; since 09.10
 rem the default takes the indexer for up to 64 tokens only, so at -ub 2048 it is the nolid path
 rem 08.10: accurate (no int8 coopmat, f32 acc) mean KLD 0.01404 against 0.01594: the known price of the int8 path, the
-rem arm is off. pool32: the QSA key pool in f32 as before 09.10 (f16 since then, LLAMA_QSA_POOL_F32)
-if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;pool32 LLAMA_QSA_POOL_F32=1"
+rem arm is off. 09.10: pool32 (QSA key pool in f32, LLAMA_QSA_POOL_F32) KLD 0.01572 against 0.01575 of the f16 default,
+rem the arm is off
+if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
 rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. 07.10: a short
@@ -101,11 +102,11 @@ rem prompt 0.66 s instead of 1.8 s once the host read of the context checkpoints
 rem 1.7 s), the 2541-token prompt 697 t/s against 443 of stable, TG 27.2 against 26.7, with --spec-auto 37.6
 rem none logs the gpu time of the graphs and the gpu idle time between them (GGML_VK_GRAPH_TIMING, two timestamps per
 rem graph). 07.10: one decode step every 36.45 ms, the gpu busy for 35.13 of them, idle 4 percent: TG is gpu time
-rem mtp3 / mtp3qsa (08.10): the MTP block dense over a plain KV cache (the default) against a QSA layer over its own
-rem indexer cache, as upstream and the reference have it (LLAMA_MTP_QSA=1). below about 2K tokens of context the
-rem two compute the same, so they also run after a 500000-character prefix (about 110K tokens): draft acceptance
-rem and TG there
-if not defined DECARMS    set "DECARMS=stable @stable @p=0;none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0,500000;mtp3qsa @draft --spec-type draft-mtp --spec-draft-n-max 3 LLAMA_MTP_QSA=1 @p=0,500000"
+rem 09.10, mtp3qsa (LLAMA_MTP_QSA=1, the MTP block as a QSA layer) against the dense mtp3: the same drafts at prefix 0;
+rem at a 500000-character prefix (118K tokens) acceptance 0.388 against 0.440, TG 27.61 against 29.41, the prompt
+rem 175 s against 210 s. the arm is off. since 09.10 the draft context attends for its output rows only while it
+rem catches up over a prompt (LLAMA_MTP_ROWS_ALL=1: every row), mtp3 at the prefix shows what that gives
+if not defined DECARMS    set "DECARMS=stable @stable @p=0;none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0,500000"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
@@ -120,8 +121,9 @@ rem 08.10, the upstream variants: GGML_VK_MMID_TILE_UPSTREAM=1 (mul_mat_id tile 
 rem GGML_VK_FA_SPARSE_UPSTREAM=1 (no prefill fold, no tile-row union) PP 88.9 against 661.1 at 122880. both stay as
 rem switches, the arms are off
 rem gt (graph timing) is off: 08.10 at 122880 graph build 0.00 ms (QSA carry), inputs 0.90, gpu idle 2.44 ms (6 percent).
-rem pool32: the QSA key pool in f32 (before 09.10) against the f16 default
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;pool32 LLAMA_QSA_POOL_F32=1;nolid LLAMA_QSA_LID=0;lid1 LLAMA_QSA_LID=1"
+rem 09.10, the arms are off: pool32 (f32 key pool) PP the same, TG 25.21 against 25.35 at 122880; nolid PP the same as
+rem the routed default, TG 25.38 against 25.35; lid1 (indexer at every size) PP 633 against 704, TG 24.40 at 122880
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default"
@@ -142,7 +144,9 @@ goto :defaults_done
 rem ---- 3090 / cuda: the experts of the first layers on the cpu, -ncmoe depends on the card ----
 if not defined EXTRA      set "EXTRA=-ngl 99 -ncmoe 30"
 if not defined CHECKARMS  set "CHECKARMS=default"
-if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1;pool32 LLAMA_QSA_POOL_F32=1"
+rem 09.10: pool32 (QSA key pool in f32) mean KLD 0.01768 against 0.01783 of the f16 default (repeat 0.010); PP at 122880
+rem 605.5 against 616.5, TG the same, moe-cache slots +1-2 with f16. the arm is off
+if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 4096 -ub 4096"
 rem since 05.10 the cpu experts run while the gpu runs the cached ones (06.10: TG +2 percent, +4.6 with MTP n2;
@@ -158,8 +162,17 @@ rem 08.10: nolid (no lightning indexer) TG 26.75 against 27.20, the same moe-cac
 rem same. n2qsa (LLAMA_MTP_QSA=1): at a 500000-character prefix TG 25.40 against 26.93 of n2, acceptance 0.509
 rem against 0.543 (texts diverge; at the same acceptance 3-5 percent slower), at prefix 0 about 4 percent slower:
 rem the dense MTP block stays the default. the arms are off
-if not defined DECARMS    set "DECARMS=base;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2;auto @draft --spec-auto"
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;pool32 LLAMA_QSA_POOL_F32=1"
+rem prof: GGML_SCHED_PROF, host time per decode step by backend (wait, copy, run) and outside the scheduler: where
+rem the 37 ms of a step go between the 48 GPU/CPU switches. stats: LLAMA_MOE_CACHE_STATS, the cache policies replayed
+rem on the real routing, with PLRU / PLFU (one pool of slots for all layers, as upstream's cache) next to the
+rem per-layer LRU / LFU (09.10); the table is in stats-p0.log
+rem n2 also at a 500000-character prefix (118K tokens): the prompt with MTP after the draft context attends for its
+rem output rows only (09.10); 08.10: 514.6 t/s
+if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;prof GGML_SCHED_PROF=128 @p=0;stats LLAMA_MOE_CACHE_STATS=2048 @p=0"
+if not defined DECPREFIX  set "DECPREFIX=0 500000"
+rem pp8k / ub8k (09.10): a prompt of 8192 tokens in two ubatches of 4096 against one of 8192. with the experts on the
+rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;pp8k @pp=8192 @d=0,65536;ub8k @pp=8192 @ub=8192 @d=0,65536"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined KERNARMS   set "KERNARMS=default"
@@ -196,7 +209,7 @@ if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
-if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|phase_mem:|sched_prof|buffer size|QSA KV in RAM"
+if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM"
 rem 1: the warmup run of llama-bench, llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds
 rem load time and memory pressure, -lm dio reads the weights at load and the median of 02 drops a cold first rep
 if not defined WARMUP      set "WARMUP=0"

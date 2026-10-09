@@ -250,6 +250,27 @@ void llama_moe_stats_fork::sim_layer::evict(int32_t e, int32_t step) {
 }
 
 void llama_moe_stats_fork::sim_init(sim & s) const {
+    // a pooled policy keeps one list over (host layer, expert)
+    if (s.pol == POLICY_PLRU || s.pol == POLICY_PLFU) {
+        if (s.layers.empty()) {
+            int n_host = 0;
+            for (const auto & ml : mlayers) {
+                n_host += ml.on_host;
+            }
+            const size_t n = (size_t) n_host * (size_t) n_expert;
+            sim_layer l;
+            l.ready.assign(n, -1);
+            l.gone.assign(n, -1);
+            l.prev.assign(n, -1);
+            l.next.assign(n, -1);
+            l.list.assign(n, LIST_NONE);
+            if (s.pol == POLICY_PLFU) {
+                l.freq.assign(n, 0);
+            }
+            s.layers.push_back(std::move(l));
+        }
+        return;
+    }
     while (s.layers.size() < mlayers.size()) {
         sim_layer l;
         l.ready.assign(n_expert, -1);
@@ -356,6 +377,87 @@ void llama_moe_stats_fork::replay_layer(sim & s, int idx) const {
             l.ready[e] = g + s.delay;
             l.n_ins++;
             s.b_ins += ml.bytes;
+        }
+    }
+}
+
+// one pool for all host layers: n_slots x layers slots and max_ins x layers uploads per step, shared. the layers of a
+// step go in graph order, as the step reads them. PLRU admits every miss (upstream's llama_moe_cache, which also
+// uploads at once; here with the delay of the other policies), PLFU uses the frequency admission of LFU
+void llama_moe_stats_fork::replay_pooled(sim & s) const {
+    sim_layer & l = s.layers[0];
+
+    std::vector<int> host;
+    for (int idx = 0; idx < (int) mlayers.size(); ++idx) {
+        if (mlayers[idx].on_host) {
+            host.push_back(idx);
+        }
+    }
+    if (host.empty()) {
+        return;
+    }
+
+    const int32_t n_slots = s.n_slots * (int32_t) host.size();
+    const int32_t max_ins = s.max_ins * (int32_t) host.size();
+    const bool    lfu     = s.pol == POLICY_PLFU;
+
+    const size_t n_win = mlayers[host[0]].tr_off.size() - 1;
+
+    for (size_t k = 0; k < n_win; ++k) {
+        const int32_t g = (int32_t) (tr_step0 + k);
+
+        l.n_ins = 0;
+
+        for (size_t h = 0; h < host.size(); ++h) {
+            const moe_layer & ml = mlayers[host[h]];
+            const int32_t base = (int32_t) (h * n_expert);
+
+            for (uint32_t j = ml.tr_off[k]; j < ml.tr_off[k + 1]; ++j) {
+                const int32_t e = base + ml.tr_ids[j];
+
+                const bool hit = (l.ready[e] >= 0 && l.ready[e] <= g) || l.gone[e] == g;
+
+                s.n_acc++;
+                s.n_hit  += hit;
+                s.b_host += !hit && ml.tr_first[j] ? ml.bytes : 0;
+
+                if (lfu) {
+                    l.freq[e] += l.freq[e] < UINT16_MAX;
+                    if (++l.n_seen >= MOE_STATS_LFU_WINDOW*n_slots) {
+                        l.n_seen = 0;
+                        for (auto & f : l.freq) {
+                            f /= 2;
+                        }
+                    }
+                }
+
+                if (l.ready[e] >= 0) {
+                    l.unlink(e);
+                    l.push(LIST_MAIN, e);
+                    continue;
+                }
+
+                if (l.n_ins >= max_ins) {
+                    continue;
+                }
+
+                if (l.size[LIST_MAIN] >= n_slots) {
+                    const int32_t v = l.tail[LIST_MAIN];
+                    if (lfu && l.freq[e] <= l.freq[v]) {
+                        continue;
+                    }
+                    if (l.ready[v] > g) {
+                        l.n_ins++;
+                        continue;
+                    }
+                    l.evict(v, g);
+                }
+
+                l.push(LIST_MAIN, e);
+                l.ready[e] = g + s.delay;
+                l.n_ins++;
+                s.b_ins += ml.bytes;
+            }
         }
     }
 }
@@ -521,6 +623,10 @@ void llama_moe_stats_fork::replay() {
         for (size_t i = next++; i < sims.size(); i = next++) {
             sim & s = sims[i];
             sim_init(s);
+            if (s.pol == POLICY_PLRU || s.pol == POLICY_PLFU) {
+                replay_pooled(s);
+                continue;
+            }
             for (int idx = 0; idx < (int) mlayers.size(); ++idx) {
                 if (!mlayers[idx].on_host) {
                     continue;
@@ -646,15 +752,17 @@ void llama_moe_stats_fork::report() {
     LLAMA_LOG_WARN(MOE_LOG ":   LFU   LRU that takes a new expert only if it has more accesses than the LRU tail, the counts halve every %d x slots accesses (TinyLFU)\n",
             MOE_STATS_LFU_WINDOW);
     LLAMA_LOG_WARN(MOE_LOG ":   OPT   Belady with the future of the replayed steps, a limit for the other policies\n");
+    LLAMA_LOG_WARN(MOE_LOG ":   PLRU  one pool of slots x layers slots for all layers (ins x layers uploads per step), LRU over (layer, expert), as upstream's --moe-cache-mib\n");
+    LLAMA_LOG_WARN(MOE_LOG ":   PLFU  the same pool with the frequency admission of LFU\n");
     LLAMA_LOG_WARN(MOE_LOG ": each cell: decode hit, upload MiB per step, host read MiB per step\n");
     if (cache_slots > 0) {
         LLAMA_LOG_WARN(MOE_LOG ": * the slots and the upload limit of --moe-cache, its %s cell must match the moe_cache line with the same steps\n", cache_lfu ? "LFU" : "LRU");
     }
-    LLAMA_LOG_WARN(MOE_LOG ":  slots | VRAM total | ins |         LRU         |        LRU/1        |         2Q          |         LFU         |         OPT\n");
+    LLAMA_LOG_WARN(MOE_LOG ":  slots | VRAM total | ins |         LRU         |        LRU/1        |         2Q          |         LFU         |         OPT         |        PLRU         |        PLFU\n");
 
     for (size_t i = 0; i + POLICY_COUNT <= sims.size(); i += POLICY_COUNT) {
         const bool is_cache = sims[i].n_slots == cache_slots && sims[i].max_ins == cache_ins;
-        char line[512];
+        char line[768];
         int  n = snprintf(line, sizeof(line), "%5d%c | %7.2f GiB | %3d",
                 sims[i].n_slots, is_cache ? '*' : ' ', (double) sims[i].n_slots * (double) b_host / gib, sims[i].max_ins);
         for (int p = 0; p < POLICY_COUNT && n > 0 && n < (int) sizeof(line); ++p) {

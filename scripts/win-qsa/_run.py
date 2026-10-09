@@ -113,8 +113,8 @@ class Arm:
     """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [@d=depth,...] [tool
     arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
     @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @p= to these prefixes of 04
-    (DECPREFIX), @c= and @ub= set the -c and the -ub of 02 and 05 for this arm, @o=OP,... limits it to these ops of
-    01 and 06, the rest goes to the tool."""
+    (DECPREFIX), @c= and @ub= set the -c and the -ub of 02 and 05 for this arm, @pp= the prompt of 02, @o=OP,... limits
+    it to these ops of 01 and 06, the rest goes to the tool."""
 
     def __init__(self, text):
         tokens = split_args(text)
@@ -130,6 +130,7 @@ class Arm:
         self.prefixes = None
         self.ctx = None
         self.ub = None
+        self.pp = None
         self.ops = None
         for t in tokens[1:]:
             if t == "@draft":
@@ -141,6 +142,11 @@ class Arm:
                     self.ub = int(t[4:])
                 except ValueError:
                     raise Fail(f"arm {self.name}: {t} must be a ubatch size, as @ub=2048")
+            elif t.startswith("@pp="):
+                try:
+                    self.pp = int(t[4:])
+                except ValueError:
+                    raise Fail(f"arm {self.name}: {t} must be a prompt size, as @pp=8192")
             elif t.startswith("@c="):
                 try:
                     self.ctx = int(t[3:])
@@ -569,9 +575,10 @@ def cmd_bench():
             except Skip as e:
                 results[arm.name, depth] = f"skip: {e}"
                 continue
-            c = arm.ctx or (-(-(depth + max(pp, tg)) // 256) * 256 if auto else ctx)
+            p = arm.pp or pp
+            c = arm.ctx or (-(-(depth + max(p, tg)) // 256) * 256 if auto else ctx)
             u = arm.ub or ub
-            cmd = [exe, *model_args(model), "-c", c, "-b", max(pp, u), "-ub", u, "-p", pp, "-n", tg, "-d", depth,
+            cmd = [exe, *model_args(model), "-c", c, "-b", max(p, u), "-ub", u, "-p", p, "-n", tg, "-d", depth,
                    "-r", reps, "-o", "json", *arm.args]
             run_env = arm_env(arm, {"GGML_SCHED_LOG_REALLOC": "1"})
             identity = {"v": BENCH_VERSION, "kind": "bench", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
@@ -599,6 +606,9 @@ def cmd_bench():
                 results[arm.name, depth] = f"FAIL {e}"
     run.add(f"bench: llama-bench pp{pp} tg{tg} -ub {ub} -c {'depth + pp' if auto else ctx}, median of {reps} reps "
             f"(min-max), {model.name}, build {current_build()}")
+    own = [f"{a.name} pp{a.pp or pp} -ub {a.ub or ub}" for a in arms if a.pp or a.ub]
+    if own:
+        run.add("arms with their own prompt or ubatch: " + ", ".join(own))
     for kind in [k for k, n in (("pp", pp), ("tg", tg)) if n]:
         rows = []
         for depth in depths:
@@ -839,26 +849,41 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
     url = f"http://127.0.0.1:{port}"
     run_env = dict(run_env, LLAMA_SPEC_TRACE=str(log.with_suffix(".trace.csv")))
     no_server_running()
-    settle()
-    with log.open("w", encoding="utf-8") as f:
-        f.write(json.dumps({"command": [str(exe), *args], "env": env_identity(run_env)}) + "\n")
-        f.flush()
-        proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
-    rows = []
-    try:
+    first = log
+    # a server that fails on memory while loading gets two more tries after longer waits, as in execute(): the driver
+    # frees the memory of the previous server lazily (09.10, 395: the arm right after none failed in two runs)
+    for attempt in (1, 2, 3):
+        settle()
+        with log.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({"command": [str(exe), *args], "env": env_identity(run_env)}) + "\n")
+            f.flush()
+            proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
         start = time.time()
-        while True:
+        while proc.poll() is None:
             time.sleep(3)
-            if proc.poll() is not None:
-                raise Fail(f"llama-server {exit_text(proc.returncode)} while loading: "
-                           f"{last_error(read_log(log))} ({log.name})")
             try:
                 if http(url + "/health")[0] == 200:
                     break
             except (urllib.error.URLError, OSError):
                 pass
             if time.time() - start > wait:
+                proc.kill()
+                proc.wait()
+                mark_end()
                 raise Fail(f"no answer from /health in {wait} s ({log.name})")
+        if proc.poll() is None:
+            break
+        mark_end()
+        text = read_log(log)
+        if attempt < 3 and retryable(proc.returncode, text):
+            pause = float(env("SETTLE", "30")) * attempt
+            print(f"{log.name}: {exit_text(proc.returncode)} while loading, {last_error(text)}; one more try in {pause:.0f} s", flush=True)
+            time.sleep(pause)
+            log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
+            continue
+        raise Fail(f"llama-server {exit_text(proc.returncode)} while loading: {last_error(text)} ({log.name}, try {attempt})")
+    rows = []
+    try:
         temp, top_k, top_p = sampling
         warm = [("warmup", WARMUP, 0, 256)] + ([("rows", rows_text, 0, 1)] if rows_text else [])
         for name, text, seed, n in [*warm, *requests]:

@@ -652,6 +652,7 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
     const bool mtp_qsa = hparams.dsv4_compress_ratios[il] > 0;
 
     llm_graph_input_attn_kv *                    inp_attn = nullptr;
+    bool                                         rows_only = false; // the attention ran for the output rows only
     llm_graph_input_mem_hybrid *                 inp_hyb  = nullptr;
     const llama_memory_hybrid_idx_fork_context * mctx_hyb = nullptr;
     if (mtp_qsa) {
@@ -742,9 +743,48 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         const float kq_scale = hparams.f_attention_scale == 0.0f
                 ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-        cur = build_attn(inp_attn,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        // the K and V of a row depend on the target's hidden state and the next token only, not on the attention
+        // output, so a batch that needs fewer outputs than rows (the catch-up over a prompt: none, or the last row)
+        // stores K and V of every row and attends for the output rows alone; the MoE and the head already run on
+        // those. at a 118K prompt on the 395 the draft context took 55 s of attention for all rows (09.10).
+        // LLAMA_MTP_ROWS_ALL=1: attend for every row, as before
+        static const bool rows_all = [] {
+            const char * env = std::getenv("LLAMA_MTP_ROWS_ALL");
+            return env != nullptr && std::atoi(env) != 0;
+        }();
+        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+        rows_only = !rows_all && !cparams.training && inp_out_ids != nullptr && inp_out_ids->ne[0] < n_tokens &&
+            inp_attn->self_k_rot == nullptr && inp_attn->self_v_rot == nullptr &&
+            kq_mask != nullptr && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 && ggml_is_contiguous(kq_mask);
+
+        if (rows_only) {
+            ggml_build_forward_expand(gf, Vcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+
+            const int64_t n_out = inp_out_ids->ne[0];
+
+            ggml_tensor * q_out = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, Qcur, n_embd_head*n_head, n_tokens), inp_out_ids);
+            gate = ggml_get_rows(ctx0, gate, inp_out_ids);
+
+            if (n_out > 0) {
+                // the mask rows of the output tokens; get_rows of an f16 source gives f32, the attention reads f16
+                ggml_tensor * mask_out = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1]), inp_out_ids);
+                mask_out = ggml_cast(ctx0, mask_out, GGML_TYPE_F16);
+
+                cur = build_attn_mha(ggml_reshape_3d(ctx0, q_out, n_embd_head, n_head, n_out),
+                        inp_attn->mctx->get_k(ctx0, il), inp_attn->mctx->get_v(ctx0, il),
+                        nullptr, mask_out, nullptr, nullptr, 0, kq_scale, il);
+            } else {
+                // no output row: the rows below are empty and nothing reads the attention
+                cur = q_out;
+            }
+        } else {
+            cur = build_attn(inp_attn,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        }
         cb(cur, "mtp_attn_pregate", il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
@@ -755,7 +795,9 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
     }
 
     if (inp_out_ids) {
-        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+        if (!rows_only) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
         inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
         res_hc = ggml_reshape_2d(ctx0, res_hc, hc_dim, res_hc->ne[2]);

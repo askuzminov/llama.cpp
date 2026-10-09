@@ -39,6 +39,8 @@ private:
         POLICY_2Q,
         POLICY_LFU,  // LRU with frequency admission
         POLICY_OPT,  // Belady with the future of the replayed trace
+        POLICY_PLRU, // one pool of n_slots x layers slots for all layers, LRU over (layer, expert), as upstream's cache
+        POLICY_PLFU, // the same pool with the frequency admission of POLICY_LFU
         POLICY_COUNT,
     };
 
@@ -107,6 +109,7 @@ private:
     void sim_init(sim & s) const;
     void replay_layer    (sim & s, int idx) const;
     void replay_layer_opt(sim & s, int idx) const;
+    void replay_pooled   (sim & s) const;
     void replay();
 
     const llama_model & model;
