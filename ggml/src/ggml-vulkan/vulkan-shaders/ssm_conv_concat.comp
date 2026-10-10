@@ -1,0 +1,61 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// fork: SSM_CONV over CONCAT(state, x), optionally followed by SILU, without the concat. ssm_conv.comp reads the
+// concat output, rows of time per channel; the concat of a GDN layer transposes the projection output into it, a full
+// pass of the conv input (qwen4exp at -ub 4096: 2.7 ms per GDN layer, 101 ms of a 4.7 s ubatch). here an output
+// column t reads input columns t .. t+nc-1, those below ncs from the state and the rest from x, through the strides
+// of the concat sources: x is read across the channels of one token, so the reads of a workgroup row are contiguous
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
+layout(constant_id = 2) const bool APPLY_SILU = false;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer S { float data_s[]; };
+layout(binding = 1) readonly  buffer X { float data_x[]; };
+layout(binding = 2) readonly  buffer W { float data_w[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+// strides in elements: s (state) and x as the concat sources [time, channel, seq], w [nc, channel], d [channel, time, seq]
+layout(push_constant) uniform parameter {
+    uint s_nb0; uint s_nb1; uint s_nb2;
+    uint x_nb0; uint x_nb1; uint x_nb2;
+    uint w_nb1;
+    uint d_nb1; uint d_nb2;
+    uint s_off; uint x_off; uint w_off; uint d_off;
+    uint nc;
+    uint ncs;
+    uint nr;
+    uint n_t;
+    uint n_s;
+} p;
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x;
+    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
+    const uint i3 = gl_WorkGroupID.z;
+
+    if (i1 >= p.nr || i2 >= p.n_t || i3 >= p.n_s) {
+        return;
+    }
+
+    const uint s_base = p.s_off + i3*p.s_nb2 + i1*p.s_nb1;
+    const uint x_base = p.x_off + i3*p.x_nb2 + i1*p.x_nb1;
+    const uint w_base = p.w_off + i1*p.w_nb1;
+
+    float sum = 0.0f;
+    for (uint k = 0; k < p.nc; ++k) {
+        const uint j = i2 + k;
+        const float v = j < p.ncs ? data_s[s_base + j*p.s_nb0] : data_x[x_base + (j - p.ncs)*p.x_nb0];
+        sum += v * data_w[w_base + k];
+    }
+
+    if (APPLY_SILU) {
+        sum = sum / (1.0f + exp(-sum));
+    }
+
+    data_d[p.d_off + i3*p.d_nb2 + i2*p.d_nb1 + i1] = sum;
+}

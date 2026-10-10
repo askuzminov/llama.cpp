@@ -3,9 +3,11 @@
 
 Each result is kept in cache/ with the identity of what made it: the source of the build (00-build.bat records it),
 the arguments, the GGML_/LLAMA_/CUDA_ environment, the model files, the inputs and the machine. When that identity
-did not change, the script prints the kept result and does not run the measurement again. FORCE=1 runs it again."""
+did not change, the script prints the kept result and does not run the measurement again. FORCE=1 runs it again.
+Each new result also goes to history.csv in the logs folder, one row per number (Run.record)."""
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -121,6 +123,7 @@ class Arm:
         if not tokens:
             raise Fail("empty arm")
         self.name = tokens[0]
+        self.text = text.strip()
         self.env = {}
         self.args = []
         self.build = None
@@ -260,7 +263,8 @@ def arm_env(arm, extra=None):
 
 def source_id(backend):
     """Hash of the sources of this backend's build: HEAD, the uncommitted changes and the untracked files. The
-    directories of the other backends are left out, so a change there keeps the results of this machine."""
+    directories of the other backends are left out, so a change there keeps the results of this machine. Returns the
+    id and whether there were uncommitted changes or untracked files in those sources."""
     entries = ["CMakeLists.txt", "cmake", "common", "include", "src", "tools", "vendor", "tests/test-backend-ops.cpp",
                "ggml/CMakeLists.txt", "ggml/cmake", "ggml/include"]
     own = {"ggml-cpu", "ggml-" + backend}
@@ -272,10 +276,12 @@ def source_id(backend):
         entries.append(path)
     h = hashlib.sha256(f"{backend}\n{env('CMAKE_BACKEND')}\n".encode())
     h.update(git("ls-tree", "HEAD", "--", *entries))
-    h.update(git("diff", "HEAD", "--binary", "--", *entries))
-    for path in git("ls-files", "--others", "--exclude-standard", "--", *entries).decode().splitlines():
+    diff = git("diff", "HEAD", "--binary", "--", *entries)
+    h.update(diff)
+    untracked = git("ls-files", "--others", "--exclude-standard", "--", *entries).decode().splitlines()
+    for path in untracked:
         h.update(f"{path} {digest(ROOT / path)}\n".encode())
-    return "src-" + h.hexdigest()[:16]
+    return "src-" + h.hexdigest()[:16], bool(diff or untracked)
 
 
 def is_binary(path):
@@ -309,6 +315,16 @@ def build_id(folder):
             result = "bin-" + h.hexdigest()[:16]
         _build_ids[folder] = result
     return _build_ids[folder]
+
+
+def build_head(folder):
+    """The commit of the build and whether it had uncommitted changes, as 00-build.bat recorded them; empty when
+    unknown (an older record, a build made another way)."""
+    try:
+        record = json.loads((Path(folder).resolve() / BUILD_RECORD).read_text(encoding="utf-8"))
+        return record.get("head", ""), record.get("dirty", "")
+    except (OSError, ValueError):
+        return "", ""
 
 
 def current_build():
@@ -423,12 +439,98 @@ def execute(cmd, log, run_env, stdout=None, model=True, check=True):
         raise Fail(f"{exit_text(code)}: {last_error(text)} ({log.name}, try {attempt})")
 
 
+# history.csv: one row per number of a new result
+HISTORY_FIELDS = ["time", "host", "backend", "test", "arm", "point", "metric", "value", "build", "head", "dirty", "spec"]
+
+
+def decode_metrics(rs):
+    """TG, the accepted share of the drafts and PP of the short (<= 512 tokens) and long prompts of a decode result."""
+    n, ms = sum(x["n"] for x in rs), sum(x["ms"] for x in rs)
+    dn, da = sum(x["draft_n"] for x in rs), sum(x["draft_acc"] for x in rs)
+    pp = []
+    for part in ([x for x in rs if x["prompt_n"] <= 512], [x for x in rs if x["prompt_n"] > 512]):
+        pp.append(rate(sum(x["prompt_n"] for x in part), sum(x["prompt_ms"] for x in part)) if part else None)
+    return {"tg": rate(n, ms), "accept": da / dn if dn else None, "pp_short": pp[0], "pp_long": pp[1]}
+
+
+def history_from_cache(path):
+    """Starts history.csv with the kept results of cache/results: the arm and the point come from the log name of the
+    run that measured them, the head, dirty flag and spec of those builds are unknown."""
+    rows = []
+    for f in sorted((CACHE / "results").glob("*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+            ident, res = rec["identity"], rec["result"]
+        except (OSError, ValueError, KeyError):
+            continue
+        kind = ident.get("kind")
+        # the speed results of 02 from before BENCH_VERSION were measured another way
+        if kind in ("bench", "bench-small") and ident.get("v") != BENCH_VERSION:
+            continue
+        stem = re.split(r"[\\/]", rec.get("log", ""))[-1]
+        stem = stem[:-4] if stem.endswith(".log") else stem
+        arm, point, metrics = None, None, {}
+        try:
+            if kind == "bench" and (m := re.fullmatch(r"(.+)-d(\d+)", stem)):
+                arm, point = m[1], f"d{m[2]}"
+                metrics["replans"] = res.get("replans")
+                for k in ("pp", "tg"):
+                    if k in res:
+                        metrics.update({k: res[k][2], k + "_min": res[k][3], k + "_max": res[k][4]})
+            elif kind == "bench-small" and stem.endswith("-small"):
+                arm, point = stem[:-6], "small"
+                metrics = {f"pp{n}": v[0] for n, v in res.items()}
+            elif kind == "quality" and "_vs_" in stem:
+                arm, ref = stem.split("_vs_", 1)
+                point = f"vs {ref}"
+                metrics = {"ppl_ratio": res["ratio"][0], "ppl_ratio_err": res["ratio"][1], "kld": res["kld"],
+                           "kld999": res["kld999"], "same_top": res["top"]}
+            elif kind == "decode" and (m := re.fullmatch(r"(.+)-p(\d+)", stem)):
+                arm, point = m[1], f"p{m[2]}"
+                metrics = decode_metrics(res["rows"])
+            elif kind == "profile" and (m := re.fullmatch(r"(pp\d*|tg)-d(\d+)-(.+)", stem)):
+                arm, point = m[3], f"{m[1]}@{m[2]}"
+                host = res.get("host")
+                if host:
+                    metrics = {"host_graph": host[0], "host_inputs": host[1], "host_compute": host[2]}
+                if "ops" in res:
+                    metrics["gpu_ms"] = sum(o[2] for o in res["ops"])
+            elif kind == "check" and "-o" in ident.get("args", []):
+                args = ident["args"]
+                op = args[args.index("-o") + 1] + (" " + args[args.index("-p") + 1] if "-p" in args else "")
+                prefix = re.sub(r"[^\w.-]+", "_", op + " ")
+                arm, point = (stem[len(prefix):] if stem.startswith(prefix) else stem), op
+                metrics = {"passed": res["passed"], "total": res["total"]}
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if arm is None:
+            continue
+        mach = ident.get("machine") or {}
+        # the time of a kept result has no year (now())
+        t = rec.get("time", "")
+        if re.fullmatch(r"\d\d-\d\d \d\d:\d\d", t):
+            t = f"{datetime.now().year}-{t}:00"
+        for metric, value in metrics.items():
+            if value is not None:
+                rows.append([t, mach.get("host", ""), mach.get("backend", ""), kind.split("-")[0], arm, point,
+                             metric, f"{value:.6g}" if isinstance(value, float) else value, ident.get("build", ""), "", "", ""])
+    rows.sort(key=lambda r: r[0])
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(HISTORY_FIELDS)
+        w.writerows(rows)
+    print(f"{path.name}: started with {len(rows)} numbers of the kept results", flush=True)
+
+
 class Run:
     """One call of a script: its log folder, its summary and the counts of new and kept results."""
 
     def __init__(self, name):
-        self.dir = Path(env("LOGS", str(HERE / "logs"))) / f"{name}-{datetime.now():%Y%m%d-%H%M%S}"
+        self.start = datetime.now()
+        self.dir = Path(env("LOGS", str(HERE / "logs"))) / f"{name}-{self.start:%Y%m%d-%H%M%S}"
         self.dir.mkdir(parents=True, exist_ok=True)
+        if not (self.dir.parent / "history.csv").is_file():
+            history_from_cache(self.dir.parent / "history.csv")
         self.lines = []
         self.failed = False
         self.new = 0
@@ -452,6 +554,25 @@ class Run:
         cache_put(identity, result, log)
         self.new += 1
         return result, False
+
+    def record(self, test, arm, point, metrics, kept, folder):
+        """A new result into history.csv next to the run folders, one row per metric (None is left out). A kept
+        result is there from the run that measured it."""
+        if kept:
+            return
+        path = self.dir.parent / "history.csv"
+        head, dirty = build_head(folder)
+        bid = build_id(folder)
+        new_file = not path.is_file()
+        with path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(HISTORY_FIELDS)
+            for metric, value in metrics.items():
+                if value is None:
+                    continue
+                w.writerow([f"{self.start:%Y-%m-%d %H:%M:%S}", platform.node(), env("BACKEND"), test, arm.name, point, metric,
+                            f"{value:.6g}" if isinstance(value, float) else value, bid, head, dirty, arm.text])
 
     def finish(self):
         if self.new or self.kept:
@@ -511,6 +632,7 @@ def cmd_check():
                 run.failed = True
                 rows.append([" ".join(op), arm.name, f"FAIL {e}"])
                 continue
+            run.record("check", arm, " ".join(op), {"passed": r["passed"], "total": r["total"]}, kept, exe.parent)
             ok = r["passed"] == r["total"]
             run.failed |= not ok
             # 0/0: the backend supports none of the cases
@@ -604,6 +726,13 @@ def cmd_bench():
             except Fail as e:
                 run.failed = True
                 results[arm.name, depth] = f"FAIL {e}"
+                continue
+            r, kept = results[arm.name, depth]
+            metrics = {"replans": r["replans"]}
+            for kind in ("pp", "tg"):
+                if kind in r:
+                    metrics.update({kind: r[kind][2], kind + "_min": r[kind][3], kind + "_max": r[kind][4]})
+            run.record("bench", arm, f"d{depth}", metrics, kept, exe.parent)
     run.add(f"bench: llama-bench pp{pp} tg{tg} -ub {ub} -c {'depth + pp' if auto else ctx}, median of {reps} reps "
             f"(min-max), {model.name}, build {current_build()}")
     own = [f"{a.name} pp{a.pp or pp} -ub {a.ub or ub}" for a in arms if a.pp or a.ub]
@@ -659,6 +788,9 @@ def cmd_bench():
             except Fail as e:
                 run.failed = True
                 small_res[arm.name] = f"FAIL {e}"
+                continue
+            r, kept = small_res[arm.name]
+            run.record("bench", arm, "small", {f"pp{n}": r[str(n)][0] for n in small}, kept, exe.parent)
         rows = []
         for n in small:
             row = [n]
@@ -797,6 +929,8 @@ def cmd_quality():
             rows.append([arm.name, f"FAIL {e}"])
             continue
         (ratio, err) = r["ratio"]
+        run.record("quality", arm, f"vs {ref.name}", {"ppl_ratio": ratio, "ppl_ratio_err": err, "kld": r["kld"],
+                   "kld999": r["kld999"], "same_top": r["top"]}, kept, exe.parent)
         far = abs(ratio - 1) > 2 * err
         rows.append([arm.name, f"{ratio:.6f} +-{err:.6f}" + (" *" if far else ""), f"{r['kld']:.6f}",
                      f"{r['kld999']:.5f}", f"{r['top']:.3f}%" + (" k" if kept else "")])
@@ -969,6 +1103,7 @@ def cmd_decode():
     prefixes = env_ints("DECPREFIX", "0")
     corpus = Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace") if max(prefixes) > 0 else ""
     results = {}
+    folders = {}
     for prefix in prefixes:
         head = corpus[:prefix] + "\n\n" if prefix else ""
         requests = [(name, head + text, seed, ngen) for name, text in prompts for seed in seeds]
@@ -984,6 +1119,7 @@ def cmd_decode():
             except Skip as e:
                 results[arm.name, prefix] = f"skip: {e}"
                 continue
+            folders[arm.name] = exe.parent
             args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1,
                     "-fa", "on", "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")),
                     *warmup_args(), *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
@@ -1021,6 +1157,7 @@ def cmd_decode():
             for part in ([x for x in rs if x["prompt_n"] <= 512], [x for x in rs if x["prompt_n"] > 512]):
                 pn, pms = sum(x["prompt_n"] for x in part), sum(x["prompt_ms"] for x in part)
                 pp.append(f"{rate(pn, pms):.1f} ({pn})" if part else "-")
+            run.record("decode", arm, f"p{prefix}", decode_metrics(rs), kept, folders[arm.name])
             rows.append([arm.name, f"{rate(n, ms):.2f}", f"{da / dn:.3f} ({da}/{dn})" if dn else "-", *pp]
                         + (["k"] if kept else []))
             details += ["", f"{arm.name}, prefix {prefix} chars:"]
@@ -1128,6 +1265,11 @@ def cmd_profile():
                 run.add("", f"{label}: FAIL {e}")
                 continue
             done[arm.name] = r
+            host = r.get("host")
+            metrics = {"host_graph": host[0], "host_inputs": host[1], "host_compute": host[2]} if host else {}
+            if vulkan:
+                metrics["gpu_ms"] = sum(o[2] for o in r["ops"])
+            run.record("profile", arm, f"{kind}@{depth}", metrics, kept, exe.parent)
             title = f"{label}: {'prompt ' + str(n_pp) if kind != 'tg' else 'decode step'} at depth {depth}" + (" k" if kept else "")
             host = r.get("host")
             host_line = (f"  host: graph build {host[0]:.2f} ms, inputs {host[1]:.2f} ms, compute call {host[2]:.2f} ms"
@@ -1230,12 +1372,12 @@ def cmd_build_begin():
     for folder in (build / "bin" / "Release", build / "bin"):
         (folder / BUILD_RECORD).unlink(missing_ok=True)
     try:
-        sid = source_id(env("BACKEND", "cpu"))
+        sid, dirty = source_id(env("BACKEND", "cpu"))
     except (OSError, subprocess.CalledProcessError) as e:
         print(f"no source id ({e}): the results of this build are kept under the hash of its binaries")
         return 0
     head = git("rev-parse", "--short", "HEAD").decode().strip()
-    (build / "qsa-build.pending.json").write_text(json.dumps({"id": sid, "head": head}) + "\n", encoding="utf-8")
+    (build / "qsa-build.pending.json").write_text(json.dumps({"id": sid, "head": head, "dirty": dirty}) + "\n", encoding="utf-8")
     print(f"source id {sid}")
     return 0
 

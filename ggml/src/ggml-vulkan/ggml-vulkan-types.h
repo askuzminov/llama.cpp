@@ -1051,6 +1051,14 @@ struct vk_device_struct {
     vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_concat_transpose_16, pipeline_concat_transpose_32;
     vk_pipeline pipeline_dsv4_hc_post_norm_f32;
+    // RMS norm of rows up to 512 columns, several rows per workgroup: [weight][sigmoid gate]
+    vk_pipeline pipeline_rms_norm_rows_f32[2][2];
+    // SSM_CONV (+ SILU) over CONCAT(state, x) without the concat: [silu]
+    vk_pipeline pipeline_ssm_conv_concat_f32[2];
+    // MUL_MAT_ID with the codes decoded into f16 A fragments (mul_mmid_f16reg.comp): 0 off, 1 coopmat, 2 emulated
+    int mmid_f16reg_mode;
+    // [q4_K, q5_K, q5_1, q8_0][fused gate/up]
+    vk_pipeline pipeline_mmid_f16reg[4][2];
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
     ggml_backend_buffer_type buffer_type_shared;
     ggml_backend_buffer_type_t extra_bufts[2] = {};
@@ -1345,6 +1353,10 @@ struct ggml_backend_vk_context {
     const ggml_tensor * fused_mm_headsum_bias {};
     // gated_delta_net + the cpy of its state into the recurrent cache: the cache view the op writes to
     const ggml_tensor * fused_gdn_cache {};
+    // RMS_NORM by rms_norm_rows.comp: 0 not fused beyond upstream's modes, 1 + SCALE, 2 + MUL, SIGMOID, MUL
+    int fused_rms_norm_rows {};
+    // CONCAT, SSM_CONV (+ SILU) by ssm_conv_concat.comp
+    bool fused_concat_ssm_conv {};
     // for GGML_VK_GRAPH_TIMING: a timestamp at the start and one at the end of each graph, read at the next graph
     vk::QueryPool gt_pool;
     bool gt_recording {};

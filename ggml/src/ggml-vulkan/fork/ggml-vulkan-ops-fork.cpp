@@ -84,3 +84,45 @@ bool ggml_vk_set_tensor_mapped(vk_context & cpy_ctx, const ggml_tensor * tensor,
     }
     return false;
 }
+
+// MUL_MAT_ID on mul_mmid_f16reg.comp (GGML_VK_MMID_F16REG): q4_K, q5_K (also the fused gate/up), q5_1 and q8_0 experts
+// with f32 activations read in place, the hoisted row ids of count_experts.comp, rows in whole 128-row tiles and K in
+// whole 64-column stages of whole blocks, 32-bit offsets. from GGML_VK_MMID_F16REG_MIN_ROWS rows per expert on average
+// (16): decode batches take the mat-vec path before they get here
+vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
+                                     bool hoist_row_ids, bool y_f32_kernel, uint64_t n_per_expert) {
+    if (ctx->device->mmid_f16reg_mode == 0 || !hoist_row_ids || !y_f32_kernel || src1->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    static const uint64_t min_rows = [] { const char * env = getenv("GGML_VK_MMID_F16REG_MIN_ROWS"); return env ? (uint64_t) atoi(env) : 16u; }();
+    if (n_per_expert < min_rows) {
+        return nullptr;
+    }
+    int t = -1;
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K: t = 0; break;
+        case GGML_TYPE_Q5_K: t = 1; break;
+        case GGML_TYPE_Q5_1: t = 2; break;
+        case GGML_TYPE_Q8_0: t = 3; break;
+        default: return nullptr;
+    }
+    const int64_t qk = ggml_blck_size(src0->type);
+    const uint64_t range = ctx->device->properties.limits.maxStorageBufferRange;
+    if (src0->ne[1] % 128 != 0 || src0->ne[0] % 64 != 0 || src0->ne[0] % qk != 0 || !ggml_vk_dim01_contiguous(src0) ||
+        ggml_nbytes(src0) > range || ggml_nbytes(src1) > range) {
+        return nullptr;
+    }
+    if (glu_up != nullptr && (glu_up->type != src0->type || !ggml_are_same_shape(glu_up, src0) || ggml_nbytes(glu_up) > range)) {
+        return nullptr;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_mmid_f16reg[t][glu_up != nullptr ? 1 : 0];
+    // GGML_VK_MMID_F16REG_LOG=1: every choice, else the first
+    static const bool log_all = getenv("GGML_VK_MMID_F16REG_LOG") != nullptr;
+    static bool logged = false;
+    if (pipeline && (!logged || log_all)) {
+        logged = true;
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID %s on %s (%s, %ld rows per expert)\n", ggml_type_name(src0->type), pipeline->name.c_str(),
+                      glu_up ? "fused gate/up" : "single", (long) n_per_expert);
+    }
+    return pipeline;
+}

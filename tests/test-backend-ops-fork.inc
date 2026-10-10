@@ -152,6 +152,119 @@ struct test_mul_mat_headsum : public test_case {
     }
 };
 
+// the gated norm of the qwen4exp GDN output: RMS_NORM over rows of ne[0], MUL by a weight row, SIGMOID of the gate, MUL.
+// pad > 0 reads a through a view with longer rows. backends may run it as one shader (Vulkan: RMS_NORM_MUL_SIGMOID_MUL)
+struct test_rms_norm_gated : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int64_t pad;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, pad);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_SIGMOID_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_rms_norm_gated(std::array<int64_t, 4> ne = {128, 48, 33, 1}, int64_t pad = 0) : ne(ne), pad(pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] + pad, ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "a");
+        if (pad > 0) {
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view of a");
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+        ggml_tensor * z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(z, "z");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), w), ggml_sigmoid(ctx, z));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// the l2 norm of the qwen4exp GDN q and k (build_gdn_l2_norm): RMS_NORM with eps/n, then SCALE by 1/sqrt(n), over heads
+// of ne[0] read from rows of row_len (a view of the conv output). backends may fuse the scale (Vulkan: RMS_NORM_SCALE)
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 3> ne;
+    const int64_t row_len;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, row_len);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_rms_norm_scale(std::array<int64_t, 3> ne = {128, 16, 33}, int64_t row_len = 10240) : ne(ne), row_len(row_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_len, ne[2]);
+        ggml_set_name(src, "src");
+        ggml_tensor * a = ggml_view_3d(ctx, src, ne[0], ne[1], ne[2], ne[0]*ggml_element_size(src), src->nb[1], ne[0]*ggml_element_size(src));
+        ggml_set_name(a, "a");
+
+        const float n = (float) ne[0];
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, a, 1e-6f/n), 1.0f/sqrtf(n));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// the conv of a GDN layer: CONCAT of the conv state [ncs, nr, ns] and the transposed projection x [nr, nt, ns] along
+// time, SSM_CONV with a [ncs + 1, nr] kernel, SILU. backends may read the state and x in the conv (Vulkan:
+// CONCAT_SSM_CONV_SILU)
+struct test_concat_ssm_conv : public test_case {
+    const int64_t nr;
+    const int64_t nt;
+    const int64_t ns;
+    const int64_t ncs;
+    const bool silu;
+
+    std::string vars() override {
+        return VARS_TO_STR5(nr, nt, ns, ncs, silu);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_SSM_CONV";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_concat_ssm_conv(int64_t nr = 1024, int64_t nt = 33, int64_t ns = 1, int64_t ncs = 3, bool silu = true)
+        : nr(nr), nt(nt), ns(ns), ncs(ncs), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * st = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncs, nr, ns);
+        ggml_set_name(st, "state");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, nt, ns);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncs + 1, nr);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, ggml_concat(ctx, st, ggml_transpose(ctx, x), 0), w);
+        if (silu) {
+            out = ggml_silu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
     // Vulkan fuses the norm from 32 tokens on (GGML_VK_HC_POST_NORM_MIN_TOKENS)
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1, true, true, true));
@@ -286,6 +399,35 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
 
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2, 2));
+
+    // rms_norm_rows.comp on Vulkan: rows up to 512 columns, a row count that does not fill the last workgroup
+    for (int64_t n : {1, 7, 33}) {
+        test_cases.emplace_back(new test_rms_norm_gated({128, 48, n, 1}, 0));
+        test_cases.emplace_back(new test_rms_norm_gated({128, 48, n, 1}, 64));
+        test_cases.emplace_back(new test_rms_norm_scale({128, 16, n}, 10240));
+    }
+    test_cases.emplace_back(new test_rms_norm_gated({256, 3, 5, 2}, 0));
+    test_cases.emplace_back(new test_rms_norm_gated({512, 4, 3, 1}, 0));
+    test_cases.emplace_back(new test_rms_norm_gated({100, 5, 3, 1}, 7));
+    test_cases.emplace_back(new test_rms_norm_scale({64, 4, 9}, 1000));
+    test_cases.emplace_back(new test_rms_norm_scale({513, 2, 3}, 2000));
+    for (int64_t nt : {1, 4, 33, 512}) {
+        test_cases.emplace_back(new test_concat_ssm_conv(1024, nt, 1, 3, true));
+    }
+    test_cases.emplace_back(new test_concat_ssm_conv(100, 17, 2, 3, true));
+    test_cases.emplace_back(new test_concat_ssm_conv(64, 9, 1, 3, false));
+
+    // mul_mmid_f16reg.comp on Vulkan (GGML_VK_MMID_F16REG): rows in 128-row tiles, K in 64-column stages, from 16 rows per
+    // expert on average; an expert with more rows than a 64-token tile, the router weight scale, the fused gate/up
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 256, 64, 512));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 384, 200, 768));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 16, 4, false, 256, 64, 512, 1, true));
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 200, 256, 512,
+            true, 8, 4, true, false, true, false, {1, 1}));
+    }
 }
 
 static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
@@ -349,6 +491,10 @@ static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & 
 
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3,  3328, 1, 1},  512, 0, 32)); // prefill conv input: state + transposed x
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 32)); // same, qwen4exp with a 2048 ubatch
+    // qwen4exp GDN at a 4096-token ubatch: the conv over the concat sources, the gated output norm, the q/k l2 norm
+    test_cases.emplace_back(new test_concat_ssm_conv(10240, 4096, 1, 3, true));
+    test_cases.emplace_back(new test_rms_norm_gated({128, 48, 4096, 1}, 0));
+    test_cases.emplace_back(new test_rms_norm_scale({128, 16, 4096}, 10240));
 
     // qwen4exp sparse attention gathers at a 4096-token ubatch: the KQ mask value of each selected cell
     // (one-element rows) and the cells of each selected 4-cell block

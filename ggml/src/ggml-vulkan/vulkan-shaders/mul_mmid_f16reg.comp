@@ -1,0 +1,488 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#ifdef EMULATE
+#extension GL_KHR_shader_subgroup_shuffle : require
+#else
+#extension GL_KHR_cooperative_matrix : require
+#endif
+
+// fork: MUL_MAT_ID of the MoE experts on f16 WMMA with the quantized A decoded in registers (as gufo's routed expert
+// GEMM): the 4/5/8-bit codes of a 128-row by 64-column A tile go to shared memory as they are, each subgroup decodes the
+// 16 values of its A fragment straight into the fragment, with the block scale and offset folded in, and accumulates in
+// f32 over the whole K. the int8 path pays a float epilogue and a min correction per 32-column block of every output
+// fragment, and quantizes the activations to 8 bits; here B is the f16 activations.
+//
+// A fragment layout taken (RDNA3, subgroup 32): element e of invocation l is row l % 16, column e, the two halves of
+// the subgroup holding the same rows; coopmat_a_probe.comp checks it at device init. EMULATE runs the same algorithm with
+// subgroup shuffles instead of coopmat (no matrix cores needed), for the tests of devices without them.
+//
+// q4_K, q5_K: a 64-column stage is the 32-byte qs chunk of two sub-blocks (low and high nibbles), q5_1: two blocks
+// repacked to that layout, q8_0: two blocks of bytes. FUSED_GLU: binding 6 is the up projection, the result silu(A x) *
+// (A2 x). fusion_flags bit 0: the router weight of each (slot, token) scales the result (MUL_MAT_ID + MUL)
+
+#if defined(DATA_A_Q4_K)
+#define A_BLOCK_WORDS 36   // 144 bytes
+#define A_QK 256
+#elif defined(DATA_A_Q5_K)
+#define A_BLOCK_WORDS 44   // 176 bytes
+#define A_QK 256
+#define A_HIGH_BIT 1
+#elif defined(DATA_A_Q5_1)
+#define A_BLOCK_WORDS 6    // 24 bytes
+#define A_QK 32
+#define A_HIGH_BIT 1
+#elif defined(DATA_A_Q8_0)
+#define A_BLOCK_HALFS 17   // 34 bytes
+#define A_QK 32
+#define A_BYTES 1
+#else
+#error mul_mmid_f16reg.comp: no A type
+#endif
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint BN = 64;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef A_BYTES
+layout(binding = 0) readonly buffer A { uint16_t data_a[]; };
+#ifdef FUSED_GLU
+layout(binding = 6) readonly buffer A2 { uint16_t data_a2[]; };
+#endif
+#else
+layout(binding = 0) readonly buffer A { uint data_a[]; };
+#ifdef FUSED_GLU
+layout(binding = 6) readonly buffer A2 { uint data_a2[]; };
+#endif
+#endif
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+layout(binding = 3) readonly buffer IDS { int data_ids[]; };
+layout(binding = 4) readonly buffer Counts { int data_expert_count[]; };
+layout(binding = 5) readonly buffer FusedScale { float data_fscale[]; };
+
+layout(push_constant) uniform parameter {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint nei0;
+    uint nei1;
+    uint nbi1;
+    uint ne11;
+    uint n_experts;
+    uint hoist_row_ids;
+    uint fusion_flags;
+} p;
+
+const uint BM   = 128;          // 8 subgroups of 16 rows
+const uint BK   = 64;           // columns per stage
+const uint BKP  = BK + 8;       // B column pitch in halves
+const uint NC   = BN / 16;      // B fragments per subgroup
+const uint WARP = 32;
+
+#ifdef A_BYTES
+const uint QSW = 17;            // words of codes per row (16) + 1 against bank conflicts
+#else
+const uint QSW = 9;             // words of nibbles per row (8) + 1
+#endif
+
+shared uint      sh_qs[BM * QSW];
+shared f16vec2   sh_so[BM * 2];             // (scale, offset) of the two 32-column sub-blocks: x = q * scale - offset
+#ifdef A_HIGH_BIT
+shared uint      sh_qh[BM * 2];             // bit e: the fifth bit of column e of a sub-block
+#endif
+#ifdef FUSED_GLU
+shared uint      sh_qs2[BM * QSW];
+shared f16vec2   sh_so2[BM * 2];
+#ifdef A_HIGH_BIT
+shared uint      sh_qh2[BM * 2];
+#endif
+#endif
+shared float16_t sh_b[BN * BKP];            // B tile, column n at n * BKP
+shared float     sh_c[(BLOCK_SIZE / WARP) * 256]; // a 16x16 output fragment per subgroup
+shared u16vec2   row_ids[BN];
+
+// ---- A tile: the codes of 128 rows x 64 columns, two invocations per row
+
+#ifndef A_BYTES
+uint a_word(const bool second, uint i) {
+#ifdef FUSED_GLU
+    return second ? data_a2[i] : data_a[i];
+#else
+    return data_a[i];
+#endif
+}
+#else
+uint a_half(const bool second, uint i) {
+#ifdef FUSED_GLU
+    return uint(second ? data_a2[i] : data_a[i]);
+#else
+    return uint(data_a[i]);
+#endif
+}
+#endif
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+// 6-bit scale and min of sub-block j from the 12 scale bytes (get_scale_min_k4)
+uvec2 scale_min_k4(uint j, uint sw0, uint sw1, uint sw2) {
+    const uint sc[3] = { sw0, sw1, sw2 };
+    uint d, m;
+    if (j < 4) {
+        d = (sc[j / 4] >> (8 * (j % 4))) & 63u;
+        m = (sc[(j + 4) / 4] >> (8 * ((j + 4) % 4))) & 63u;
+    } else {
+        const uint q  = (sc[(j + 4) / 4] >> (8 * ((j + 4) % 4))) & 0xFFu;
+        const uint lo = (sc[(j - 4) / 4] >> (8 * ((j - 4) % 4))) & 0xFFu;
+        const uint hi = (sc[j / 4] >> (8 * (j % 4))) & 0xFFu;
+        d = (q & 0xFu) | ((lo >> 6) << 4);
+        m = (q >> 4)   | ((hi >> 6) << 4);
+    }
+    return uvec2(d, m);
+}
+#endif
+
+void store_a_tile(const bool second, const uint expert, const uint ir, const uint k0) {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row  = tid >> 1;
+    const uint h    = tid & 1;
+    const uint grow = ir * BM + row;
+
+    uint qs[4];
+    f16vec2 so;
+#ifdef A_HIGH_BIT
+    uint qh;
+#endif
+#ifdef A_BYTES
+    uint qb[8];
+#endif
+
+    // first element of the row in blocks
+    const uint row_blk = (expert * p.batch_stride_a + grow * p.stride_a) / A_QK;
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+    const uint j  = (k0 % 256) / 64;       // the 64-column chunk of the super-block
+    const uint bw = (row_blk + k0 / 256) * A_BLOCK_WORDS;
+    const vec2 dm = vec2(unpackHalf2x16(a_word(second, bw)));
+    const uvec2 sm = scale_min_k4(2 * j + h, a_word(second, bw + 1), a_word(second, bw + 2), a_word(second, bw + 3));
+    so = f16vec2(dm.x * float(sm.x), dm.y * float(sm.y));
+#if defined(DATA_A_Q4_K)
+    const uint qsw = bw + 4 + j * 8 + h * 4;
+#else
+    const uint qsw = bw + 12 + j * 8 + h * 4;
+    // bit 2j + h of qh[l], l = 0..31, as bit l
+    const uint sbit = 2 * j + h;
+    qh = 0;
+    [[unroll]] for (uint w = 0; w < 8; ++w) {
+        const uint x = a_word(second, bw + 4 + w) >> sbit;
+        qh |= ((x & 1u) | ((x >> 7) & 2u) | ((x >> 14) & 4u) | ((x >> 21) & 8u)) << (4 * w);
+    }
+#endif
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        qs[i] = a_word(second, qsw + i);
+    }
+#elif defined(DATA_A_Q5_1)
+    // blocks k0 / 32 and k0 / 32 + 1: byte e of the chunk holds column e of the first block in its low nibble and of the
+    // second in its high nibble, as a K-quant chunk; invocation h makes bytes 16h .. 16h + 15
+    const uint bw0 = (row_blk + k0 / 32) * A_BLOCK_WORDS;
+    const uint bw1 = bw0 + A_BLOCK_WORDS;
+    const uint bwh = h == 0 ? bw0 : bw1;
+    const vec2 dm = vec2(unpackHalf2x16(a_word(second, bwh)));
+    so = f16vec2(dm.x, -dm.y);
+    qh = a_word(second, bwh + 1);
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint q0 = a_word(second, bw0 + 2 + i);
+        const uint q1 = a_word(second, bw1 + 2 + i);
+        qs[i] = h == 0 ? ((q0 & 0x0F0F0F0Fu) | ((q1 & 0x0F0F0F0Fu) << 4)) : (((q0 >> 4) & 0x0F0F0F0Fu) | (q1 & 0xF0F0F0F0u));
+    }
+#elif defined(DATA_A_Q8_0)
+    // block k0 / 32 + h: its 32 bytes
+    const uint bh = (row_blk + k0 / 32 + h) * A_BLOCK_HALFS;
+    so = f16vec2(unpackHalf2x16(a_half(second, bh)).x, 0.0);
+    [[unroll]] for (uint i = 0; i < 8; ++i) {
+        qb[i] = a_half(second, bh + 1 + 2 * i) | (a_half(second, bh + 2 + 2 * i) << 16);
+    }
+#endif
+
+#ifdef FUSED_GLU
+    if (second) {
+#ifdef A_BYTES
+        [[unroll]] for (uint i = 0; i < 8; ++i) { sh_qs2[row * QSW + h * 8 + i] = qb[i]; }
+#else
+        [[unroll]] for (uint i = 0; i < 4; ++i) { sh_qs2[row * QSW + h * 4 + i] = qs[i]; }
+#endif
+        sh_so2[row * 2 + h] = so;
+#ifdef A_HIGH_BIT
+        sh_qh2[row * 2 + h] = qh;
+#endif
+        return;
+    }
+#endif
+#ifdef A_BYTES
+    [[unroll]] for (uint i = 0; i < 8; ++i) { sh_qs[row * QSW + h * 8 + i] = qb[i]; }
+#else
+    [[unroll]] for (uint i = 0; i < 4; ++i) { sh_qs[row * QSW + h * 4 + i] = qs[i]; }
+#endif
+    sh_so[row * 2 + h] = so;
+#ifdef A_HIGH_BIT
+    sh_qh[row * 2 + h] = qh;
+#endif
+}
+
+// ---- B tile: BN tokens x 64 columns of f32 activations as f16, four invocations per token
+
+void store_b_tile(const uint k0, const uint tile_count) {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint t = tid; t < BN * 4; t += BLOCK_SIZE) {
+        const uint n = t >> 2;
+        const uint q = t & 3;
+        if (n < tile_count) {
+            const u16vec2 ri = row_ids[n];
+            const uint base = uint(ri.y) * p.batch_stride_b + (uint(ri.x) % p.ne11) * p.stride_b + k0 + q * 16;
+            [[unroll]] for (uint i = 0; i < 16; ++i) {
+                sh_b[n * BKP + q * 16 + i] = float16_t(data_b[base + i]);
+            }
+        } else {
+            [[unroll]] for (uint i = 0; i < 16; ++i) {
+                sh_b[n * BKP + q * 16 + i] = float16_t(0.0);
+            }
+        }
+    }
+}
+
+// ---- A fragment: 16 columns of the row of this invocation, fragment f (0..3) of the stage
+
+// the f16 values of the four bytes of x (each below 256 and above -1024 after the bias): bytes 0, 2 and 1, 3
+f16vec2 bytes02(uint x) { return unpackFloat2x16((x & 0x00FF00FFu) | 0x64006400u) - f16vec2(1024.0); }
+f16vec2 bytes13(uint x) { return unpackFloat2x16(((x >> 8) & 0x00FF00FFu) | 0x64006400u) - f16vec2(1024.0); }
+
+void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[16]) {
+#ifdef FUSED_GLU
+    const f16vec2 so = second ? sh_so2[lrow * 2 + (f >> 1)] : sh_so[lrow * 2 + (f >> 1)];
+#else
+    const f16vec2 so = sh_so[lrow * 2 + (f >> 1)];
+#endif
+#ifdef A_BYTES
+    // q8_0: block f >> 1, bytes 16 (f & 1) .. + 15, signed: biased by 128
+    const uint base = lrow * QSW + (f >> 1) * 8 + (f & 1) * 4;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+#ifdef FUSED_GLU
+        const uint x = (second ? sh_qs2[base + i] : sh_qs[base + i]) ^ 0x80808080u;
+#else
+        const uint x = sh_qs[base + i] ^ 0x80808080u;
+#endif
+        const f16vec2 v02 = (bytes02(x) - f16vec2(128.0)) * so.x;
+        const f16vec2 v13 = (bytes13(x) - f16vec2(128.0)) * so.x;
+        v[4 * i + 0] = v02.x; v[4 * i + 2] = v02.y;
+        v[4 * i + 1] = v13.x; v[4 * i + 3] = v13.y;
+    }
+#else
+    // nibbles: bytes 16 (f & 1) .. + 15 of the chunk, low nibble for sub-block 0 (f < 2), high for sub-block 1
+    const uint base  = lrow * QSW + (f & 1) * 4;
+    const uint shift = (f >> 1) * 4;
+#ifdef A_HIGH_BIT
+#ifdef FUSED_GLU
+    const uint hb = (second ? sh_qh2[lrow * 2 + (f >> 1)] : sh_qh[lrow * 2 + (f >> 1)]) >> ((f & 1) * 16);
+#else
+    const uint hb = sh_qh[lrow * 2 + (f >> 1)] >> ((f & 1) * 16);
+#endif
+#endif
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+#ifdef FUSED_GLU
+        uint x = ((second ? sh_qs2[base + i] : sh_qs[base + i]) >> shift) & 0x0F0F0F0Fu;
+#else
+        uint x = (sh_qs[base + i] >> shift) & 0x0F0F0F0Fu;
+#endif
+#ifdef A_HIGH_BIT
+        const uint b = hb >> (4 * i);
+        x |= ((b & 1u) << 4) | ((b & 2u) << 11) | ((b & 4u) << 18) | ((b & 8u) << 25);
+#endif
+        const f16vec2 v02 = bytes02(x) * so.x - so.y;
+        const f16vec2 v13 = bytes13(x) * so.x - so.y;
+        v[4 * i + 0] = v02.x; v[4 * i + 2] = v02.y;
+        v[4 * i + 1] = v13.x; v[4 * i + 3] = v13.y;
+    }
+#endif
+}
+
+// ---- fragments and their multiply: coopmat, or the same layout emulated with shuffles
+
+#ifdef EMULATE
+#define AFRAG float16_t[16]
+#define ACCFRAG float[8]
+
+void frag_mul_add(const float16_t a[16], const uint b_off, inout float acc[8]) {
+    const uint lane = gl_SubgroupInvocationID;
+    float16_t b[16];
+    [[unroll]] for (uint k = 0; k < 16; ++k) {
+        b[k] = sh_b[b_off + (lane & 15) * BKP + k];
+    }
+    [[unroll]] for (uint e = 0; e < 8; ++e) {
+        const uint row = (lane >> 4) + 2 * e;
+        float s = 0.0;
+        [[unroll]] for (uint k = 0; k < 16; ++k) {
+            s += subgroupShuffle(float(a[k]), row) * float(b[k]);
+        }
+        acc[e] += s;
+    }
+}
+
+void frag_store(const float acc[8], const uint off) {
+    const uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint e = 0; e < 8; ++e) {
+        sh_c[off + (lane & 15) * 16 + (lane >> 4) + 2 * e] = acc[e];
+    }
+}
+#endif
+
+void main() {
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint ir     = gl_WorkGroupID.x;
+    const uint ic     = gl_WorkGroupID.y;
+    const uint expert = gl_WorkGroupID.z;
+    const uint wave   = gl_SubgroupID;
+    const uint lane   = gl_SubgroupInvocationID;
+
+    // the rows of this expert in this tile, from the hoisted list of count_experts.comp
+    const uint count = uint(data_expert_count[expert]);
+    if (ic * BN >= count) {
+        return;
+    }
+    const uint tile_count = min(BN, count - ic * BN);
+    const uint ids_base = 2 * p.n_experts + 1 + uint(data_expert_count[p.n_experts + expert]) + ic * BN;
+    for (uint i = tid; i < tile_count; i += BLOCK_SIZE) {
+        const uint packed = uint(data_expert_count[ids_base + i]);
+        row_ids[i] = u16vec2(packed & 0xFFFFu, packed >> 16);
+    }
+
+    const uint lrow = wave * 16 + (lane & 15);
+    const uint nc_used = (tile_count + 15) / 16;
+
+#ifdef EMULATE
+    float acc[NC][8];
+#ifdef FUSED_GLU
+    float acc2[NC][8];
+#endif
+    [[unroll]] for (uint c = 0; c < NC; ++c) {
+        [[unroll]] for (uint e = 0; e < 8; ++e) {
+            acc[c][e] = 0.0;
+#ifdef FUSED_GLU
+            acc2[c][e] = 0.0;
+#endif
+        }
+    }
+#else
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NC];
+#ifdef FUSED_GLU
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2[NC];
+#endif
+    [[unroll]] for (uint c = 0; c < NC; ++c) {
+        acc[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+#ifdef FUSED_GLU
+        acc2[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+#endif
+    }
+#endif
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        barrier();
+        store_a_tile(false, expert, ir, k0);
+#ifdef FUSED_GLU
+        store_a_tile(true, expert, ir, k0);
+#endif
+        store_b_tile(k0, tile_count);
+        barrier();
+
+        [[unroll]] for (uint f = 0; f < BK / 16; ++f) {
+            float16_t va[16];
+            decode_a(false, lrow, f, va);
+#ifdef FUSED_GLU
+            float16_t va2[16];
+            decode_a(true, lrow, f, va2);
+#endif
+#ifndef EMULATE
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+            [[unroll]] for (uint e = 0; e < 16; ++e) { ma[e] = va[e]; }
+#ifdef FUSED_GLU
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma2;
+            [[unroll]] for (uint e = 0; e < 16; ++e) { ma2[e] = va2[e]; }
+#endif
+#endif
+            [[unroll]] for (uint c = 0; c < NC; ++c) {
+                if (c < nc_used) {
+                    const uint b_off = c * 16 * BKP + f * 16;
+#ifdef EMULATE
+                    frag_mul_add(va, b_off, acc[c]);
+#ifdef FUSED_GLU
+                    frag_mul_add(va2, b_off, acc2[c]);
+#endif
+#else
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+                    coopMatLoad(mb, sh_b, b_off, BKP, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc[c] = coopMatMulAdd(ma, mb, acc[c]);
+#ifdef FUSED_GLU
+                    acc2[c] = coopMatMulAdd(ma2, mb, acc2[c]);
+#endif
+#endif
+                }
+            }
+        }
+    }
+
+    // each subgroup stores its 16 rows x 16 tokens through its part of sh_c, element (r, n) at n * 16 + r
+    const uint c_off = wave * 256;
+    const uint grow0 = ir * BM + wave * 16;
+    [[unroll]] for (uint c = 0; c < NC; ++c) {
+        if (c >= nc_used) {
+            continue;
+        }
+#ifdef EMULATE
+        frag_store(acc[c], c_off);
+#else
+        coopMatStore(acc[c], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+        float v[8];
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            v[i] = sh_c[c_off + lane + i * WARP];
+        }
+#ifdef FUSED_GLU
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+#ifdef EMULATE
+        frag_store(acc2[c], c_off);
+#else
+        coopMatStore(acc2[c], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const float g = v[i];
+            v[i] = g / (1.0 + exp(-g)) * sh_c[c_off + lane + i * WARP];
+        }
+#endif
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint idx = lane + i * WARP;
+            const uint r   = idx % 16;
+            const uint n   = c * 16 + idx / 16;
+            if (n < tile_count && grow0 + r < p.M) {
+                const u16vec2 ri = row_ids[n];
+                float val = v[i];
+                if ((p.fusion_flags & 1u) != 0) {
+                    val *= data_fscale[uint(ri.y) * p.nei0 + uint(ri.x)];
+                }
+                data_d[uint(ri.y) * p.batch_stride_d + uint(ri.x) * p.stride_d + grow0 + r] = val;
+            }
+        }
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    }
+}

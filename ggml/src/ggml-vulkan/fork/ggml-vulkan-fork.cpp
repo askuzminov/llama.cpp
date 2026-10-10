@@ -2,13 +2,13 @@
 
 #include "ggml-vulkan-fork.h"
 
-// runs shmem_probe.comp with `bytes` of shared memory per workgroup. true when the driver takes the shader and
-// every workgroup reads back its own data. plain Vulkan calls: it runs before the device has its pipelines
-static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
+// runs a probe shader with one storage buffer of `words` 32-bit words, zeroed, on n_wg workgroups and copies the
+// buffer to `out`. spec: the specialization constants 0.., subgroup_size: a required subgroup size or 0. false when
+// the driver refuses the shader or it does not complete. plain Vulkan calls: it runs before the device has its pipelines
+static bool ggml_vk_fork_run_probe(vk_device & device, const char * what, const void * spv, size_t spv_len, const std::vector<uint32_t> & spec,
+                                   uint32_t n_wg, uint32_t words, uint32_t subgroup_size, std::vector<uint32_t> & out) {
     vk::Device d = device->device;
-    const uint32_t words = bytes / (uint32_t) sizeof(uint32_t);
-    const uint32_t n_wg = 512;
-    const vk::DeviceSize size = n_wg * sizeof(uint32_t);
+    const vk::DeviceSize size = (vk::DeviceSize) words * sizeof(uint32_t);
 
     vk::ShaderModule shader;
     vk::DescriptorSetLayout dsl;
@@ -19,18 +19,30 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
     vk::DescriptorPool pool;
     vk::CommandPool cmd_pool;
     vk::Fence fence;
-    uint32_t * errors = nullptr;
+    uint32_t * data = nullptr;
     bool submitted = false;
     bool ok = false;
 
     try {
-        shader = d.createShaderModule({ {}, shmem_probe_len, reinterpret_cast<const uint32_t *>(shmem_probe_data) });
+        shader = d.createShaderModule({ {}, spv_len, reinterpret_cast<const uint32_t *>(spv) });
         const vk::DescriptorSetLayoutBinding binding { 0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute };
         dsl = d.createDescriptorSetLayout({ {}, binding });
         layout = d.createPipelineLayout({ {}, dsl });
-        const vk::SpecializationMapEntry entry { 0, 0, sizeof(uint32_t) };
-        const vk::SpecializationInfo spec { 1, &entry, sizeof(uint32_t), &words };
-        const vk::PipelineShaderStageCreateInfo stage { {}, vk::ShaderStageFlagBits::eCompute, shader, "main", &spec };
+        std::vector<vk::SpecializationMapEntry> entries;
+        for (uint32_t i = 0; i < (uint32_t) spec.size(); i++) {
+            entries.push_back({ i, i * (uint32_t) sizeof(uint32_t), sizeof(uint32_t) });
+        }
+        const vk::SpecializationInfo spec_info { (uint32_t) entries.size(), entries.data(), spec.size() * sizeof(uint32_t), spec.data() };
+        vk::PipelineShaderStageCreateInfo stage { {}, vk::ShaderStageFlagBits::eCompute, shader, "main", spec.empty() ? nullptr : &spec_info };
+        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_info;
+        subgroup_info.requiredSubgroupSize = subgroup_size;
+        if (subgroup_size != 0) {
+            if (!device->subgroup_size_control || subgroup_size < device->subgroup_min_size || subgroup_size > device->subgroup_max_size) {
+                throw std::runtime_error("the subgroup size is not available");
+            }
+            stage.setPNext(&subgroup_info);
+            stage.flags |= vk::PipelineShaderStageCreateFlagBits::eRequireFullSubgroupsEXT;
+        }
         pipeline = d.createComputePipeline(nullptr, vk::ComputePipelineCreateInfo { {}, stage, layout }).value;
 
         buffer = d.createBuffer({ {}, size, vk::BufferUsageFlagBits::eStorageBuffer, vk::SharingMode::eExclusive });
@@ -48,8 +60,8 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
         }
         memory = d.allocateMemory({ req.size, type_idx });
         d.bindBufferMemory(buffer, memory, 0);
-        errors = static_cast<uint32_t *>(d.mapMemory(memory, 0, size));
-        memset(errors, 0, size);
+        data = static_cast<uint32_t *>(d.mapMemory(memory, 0, size));
+        memset(data, 0, size);
 
         const vk::DescriptorPoolSize pool_size { vk::DescriptorType::eStorageBuffer, 1 };
         pool = d.createDescriptorPool({ {}, 1, pool_size });
@@ -77,24 +89,17 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
         }
         submitted = false;
 
-        uint64_t bad = 0;
-        for (uint32_t i = 0; i < n_wg; i++) {
-            bad += errors[i];
-        }
-        ok = bad == 0;
-        if (!ok) {
-            GGML_LOG_WARN("ggml_vulkan: shared memory probe of %u bytes: %llu words of %llu read back wrong\n", bytes,
-                (unsigned long long) bad, (unsigned long long) 4 * n_wg * words);
-        }
+        out.assign(data, data + words);
+        ok = true;
     } catch (const std::exception & e) {
-        GGML_LOG_WARN("ggml_vulkan: shared memory probe of %u bytes failed: %s\n", bytes, e.what());
+        GGML_LOG_WARN("ggml_vulkan: %s probe failed: %s\n", what, e.what());
         if (submitted) {
             d.waitIdle();
         }
         ok = false;
     }
 
-    if (errors) d.unmapMemory(memory);
+    if (data) d.unmapMemory(memory);
     if (fence) d.destroyFence(fence);
     if (cmd_pool) d.destroyCommandPool(cmd_pool);
     if (pool) d.destroyDescriptorPool(pool);
@@ -105,6 +110,86 @@ static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
     if (dsl) d.destroyDescriptorSetLayout(dsl);
     if (shader) d.destroyShaderModule(shader);
     return ok;
+}
+
+// runs shmem_probe.comp with `bytes` of shared memory per workgroup. true when the driver takes the shader and
+// every workgroup reads back its own data
+static bool ggml_vk_shmem_probe(vk_device & device, uint32_t bytes) {
+    const uint32_t words = bytes / (uint32_t) sizeof(uint32_t);
+    const uint32_t n_wg = 512;
+    std::vector<uint32_t> errors;
+    if (!ggml_vk_fork_run_probe(device, "shared memory", shmem_probe_data, shmem_probe_len, { words }, n_wg, n_wg, 0, errors)) {
+        return false;
+    }
+    uint64_t bad = 0;
+    for (uint32_t i = 0; i < n_wg; i++) {
+        bad += errors[i];
+    }
+    if (bad != 0) {
+        GGML_LOG_WARN("ggml_vulkan: shared memory probe of %u bytes: %llu words of %llu read back wrong\n", bytes,
+            (unsigned long long) bad, (unsigned long long) 4 * n_wg * words);
+    }
+    return bad == 0;
+}
+
+bool ggml_vk_fork_coopmat_a_probe(vk_device & device) {
+#if !(defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT))
+    GGML_UNUSED(device);
+    return false;
+#else
+    // coopmat_a_probe.comp: element e of an f16 16x16 A fragment of invocation l is row l % 16, column e (wave32)
+    std::vector<uint32_t> d;
+    if (!ggml_vk_fork_run_probe(device, "coopmat A layout", coopmat_a_probe_cm1_data, coopmat_a_probe_cm1_len, {}, 1, 257, 32, d)) {
+        return false;
+    }
+    float v[257];
+    memcpy(v, d.data(), sizeof(v));
+    int bad = 0;
+    for (int i = 0; i < 256; i++) {
+        bad += v[i] != (float) i;
+    }
+    if (bad != 0 || v[256] != 16.0f) {
+        GGML_LOG_INFO("ggml_vulkan: coopmat A layout probe: %d of 256 elements elsewhere, fragment length %g\n", bad, (double) v[256]);
+        return false;
+    }
+    return true;
+#endif
+}
+
+void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
+    // GGML_VK_MMID_F16REG=1: the experts' prefill matmuls on mul_mmid_f16reg.comp (f16 coopmat, the codes decoded into
+    // the A fragments) where coopmat_a_probe.comp finds the A layout it takes; =emulate: the same algorithm with
+    // subgroup shuffles on any device with 32-invocation subgroups (tests). unset or 0: off
+    device->mmid_f16reg_mode = 0;
+    const char * env = getenv("GGML_VK_MMID_F16REG");
+    if (env == nullptr || strcmp(env, "0") == 0) {
+        return;
+    }
+    const bool sg32 = device->subgroup_size_control ? (device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size)
+                                                     : device->subgroup_size == 32;
+    if (!device->fp16 || !sg32) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG needs fp16 and 32-invocation subgroups\n");
+        return;
+    }
+    if (strcmp(env, "emulate") == 0) {
+        device->mmid_f16reg_mode = 2;
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16reg emulated with subgroup shuffles\n");
+        return;
+    }
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    if (!device->coopmat_support || !device->subgroup_size_control) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG needs KHR coopmat and the subgroup size control\n");
+        return;
+    }
+    if (!ggml_vk_fork_coopmat_a_probe(device)) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG off: the coopmat A layout is not the one the shader takes\n");
+        return;
+    }
+    device->mmid_f16reg_mode = 1;
+    GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16reg on (coopmat A layout probe passed)\n");
+#else
+    GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG needs a build with coopmat shaders\n");
+#endif
 }
 
 void ggml_vk_fork_shmem_limit(vk_device & device) {

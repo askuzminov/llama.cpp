@@ -1112,6 +1112,28 @@ void process_shaders() {
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("shmem_probe", "shmem_probe.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("coopmat_a_probe", "coopmat_a_probe.comp", {}, true, true);
+#endif
+    // fork: MUL_MAT_ID with the codes decoded into f16 A fragments; _emu: the same with subgroup shuffles
+    for (const std::string t : {"q4_k", "q5_k", "q5_1", "q8_0"}) {
+        std::string def = "DATA_A_" + t;
+        std::transform(def.begin(), def.end(), def.begin(), ::toupper);
+        for (bool glu : {false, true}) {
+            if (glu && t != "q4_k" && t != "q5_k") {
+                continue;
+            }
+            std::map<std::string, std::string> d = {{def, "1"}};
+            if (glu) {
+                d["FUSED_GLU"] = "1";
+            }
+            const std::string name = "mul_mmid_f16reg_" + t + (glu ? "_glu" : "");
+            string_to_spv(name + "_emu", "mul_mmid_f16reg.comp", merge_maps(d, {{"EMULATE", "1"}}));
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            string_to_spv(name, "mul_mmid_f16reg.comp", d, true, true);
+#endif
+        }
+    }
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1122,6 +1144,9 @@ void process_shaders() {
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
+    // fork: short-row RMS norm and the conv over the concat sources
+    string_to_spv("rms_norm_rows_f32", "rms_norm_rows.comp", {});
+    string_to_spv("ssm_conv_concat_f32", "ssm_conv_concat.comp", {});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

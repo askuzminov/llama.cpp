@@ -85,7 +85,11 @@ rem notile: the medium int8 tile on the dense matmuls, as before 07.10 (the 64x1
 rem glu0 also covers the 32x64 tile of the fused gate/up (the default since 07.10): its 200-token cases take it
 rem 09.10: accurate, glu0 and notile passed every op on 08.10 and their defaults are settled (07.10); only default
 rem runs. GGML_VK_INT_COOPMAT=0 GGML_VK_F16ACC=0 / GGML_VK_MMID_GLU_MIN_TOKENS=0 / GGML_VK_INT_LARGE_TILE=0 still work
-if not defined CHECKARMS  set "CHECKARMS=default"
+rem f16reg (10.10): the experts' prefill matmuls on mul_mmid_f16reg.comp (GGML_VK_MMID_F16REG=1, off by default): f16
+rem coopmat with the 4/5/8-bit codes decoded into the A fragments, after coopmat_a_probe.comp at device init. the Mac
+rem ran it only emulated (no matrix cores there), so 01 checks the coopmat path on the matmul_id ops (the fused gate/up
+rem at any size, GGML_VK_MMID_GLU_MIN_TOKENS=0, so the small cases take it too)
+if not defined CHECKARMS  set "CHECKARMS=default;f16reg GGML_VK_MMID_F16REG=1 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
 rem loads the PLE table whole if that version does not read it lazily, a FAIL on memory is then expected
@@ -94,10 +98,11 @@ rem the default takes the indexer for up to 64 tokens only, so at -ub 2048 it is
 rem 08.10: accurate (no int8 coopmat, f32 acc) mean KLD 0.01404 against 0.01594: the known price of the int8 path, the
 rem arm is off. 09.10: pool32 (QSA key pool in f32, LLAMA_QSA_POOL_F32) KLD 0.01572 against 0.01575 of the f16 default,
 rem the arm is off
-if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp"
+rem f16reg: the experts on f16 activations instead of the 8-bit ones of the int8 path, see CHECKARMS
+if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;f16reg GGML_VK_MMID_F16REG=1"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
-rem stable: the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. 07.10: a short
+rem stable (off since 10.10): the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. 07.10: a short
 rem prompt 0.66 s instead of 1.8 s once the host read of the context checkpoints went through cached memory (stable:
 rem 1.7 s), the 2541-token prompt 697 t/s against 443 of stable, TG 27.2 against 26.7, with --spec-auto 37.6
 rem none logs the gpu time of the graphs and the gpu idle time between them (GGML_VK_GRAPH_TIMING, two timestamps per
@@ -107,7 +112,7 @@ rem at a 500000-character prefix (118K tokens) acceptance 0.388 against 0.440, T
 rem 175 s against 210 s. the arm is off. since 09.10 the draft context attends for its output rows only while it
 rem catches up over a prompt (LLAMA_MTP_ROWS_ALL=1: every row): mtp3 at the prefix 705 t/s against 560, the 118K
 rem prompt 165.5 s against 210, TG 29.34 against 29.41. the prefix pass is off (about 30 minutes per arm)
-if not defined DECARMS    set "DECARMS=stable @stable @p=0;none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
+if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -123,22 +128,29 @@ rem switches, the arms are off
 rem gt (graph timing) is off: 08.10 at 122880 graph build 0.00 ms (QSA carry), inputs 0.90, gpu idle 2.44 ms (6 percent).
 rem 09.10, the arms are off: pool32 (f32 key pool) PP the same, TG 25.21 against 25.35 at 122880; nolid PP the same as
 rem the routed default, TG 25.38 against 25.35; lid1 (indexer at every size) PP 633 against 704, TG 24.40 at 122880
-rem 09.10: PP at 122880 676 and 671 in two runs against 704 at 12:59 with the same trunk code and the same gpu time of a
-rem decode step in 05; stable is cached from 07.10, so run once with FORCE=stable-d122880 (stable again in this run),
-rem best after a reboot
-rem hostpad (GGML_VK_HOST_PAD_UPSTREAM=1): the pinned host buffer padded by 32 bytes as upstream. the f16 KQ mask of a
-rem 4096-token ubatch at 262144 cells is 2 GiB, the pad took its chunk over the 2 GiB buffer limit of the driver and
-rem the host compute buffer fell back to pageable memory ("Failed to allocate pinned memory" at each reserve of the
-rem server, target and MTP draft context). since 10.10 a buffer that only the pad takes over the limit is not padded
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;hostpad GGML_VK_HOST_PAD_UPSTREAM=1 @d=65536,122880"
+rem 10.10, hostpad (GGML_VK_HOST_PAD_UPSTREAM=1, the pinned host buffer padded by 32 bytes as upstream): the 2 GiB f16
+rem KQ mask chunk of a 4096-token ubatch at 262144 cells went over the 2 GiB buffer limit of the driver and fell back to
+rem pageable memory. in one run PP at 122880 674.8 against 706.4 of the default without the pad (+4.7 percent), TG
+rem 24.78 against 25.33, the same at 65536: the 671 and 676 of the two runs of 09.10 were this fallback. the server
+rem shows no "Failed to allocate pinned memory" any more. the arm is off
+rem noelt (10.10): the non-matmul work of the GDN layers as before: GGML_VK_RMS_NORM_ROWS=0 (a 512-invocation workgroup
+rem per row of rms_norm.comp, no RMS_NORM_SCALE and RMS_NORM_MUL_SIGMOID_MUL) and GGML_VK_SSM_CONV_CONCAT=0 (the concat
+rem of the conv input as its own pass). the graph changes of the same day stay (the gate of the GDN output norm before
+rem the GDN, the conv state tails read from x, the attention gate sigmoid on the q projection without a copy)
+rem 10.10: stable is off in 02, 04 and 05 (its results were kept from 07.10 and said nothing of the machine state of a
+rem run); each run compares the default with the arms of its switches, the numbers go to history.csv. 03 keeps stable as
+rem the KLD reference, so the KLD values since 07.10 stay comparable
+if not defined BENCHARMS  set "BENCHARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0 @d=0,122880;f16reg GGML_VK_MMID_F16REG=1 @d=0,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
-if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default"
-rem the prompt at depth 0 and a decode step at 122880, stable and default side by side. 07.10: the tile of the fused
+if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
+rem the prompt at depth 0 and a decode step at 122880, the default and the arms of its switches side by side. 07.10: the tile of the fused
 rem gate/up, gpu ms of a 4096-token prompt: 32x64 884, medium 64x64 933, 32x128 922, 16x64 1024, 32x32 1011, 64x32,
 rem 128x32 and 128x64 above 1000. a decode step at 122880: 42.60 ms of gpu time against 42.89 of stable
 if not defined PROFKINDS  set "PROFKINDS=pp@0 tg@122880"
-if not defined PROFARMS   set "PROFARMS=stable @stable;default"
+rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the attention gate before 10.10
+rem f16reg: the MUL_MAT_ID time per op on mul_mmid_f16reg.comp (see CHECKARMS)
+if not defined PROFARMS   set "PROFARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0;f16reg GGML_VK_MMID_F16REG=1"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -155,7 +167,9 @@ rem 09.10: pool32 (QSA key pool in f32) mean KLD 0.01768 against 0.01783 of the 
 rem 605.5 against 616.5, TG the same, moe-cache slots +1-2 with f16. the arm is off
 if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
-if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 4096 -ub 4096"
+rem 10.10: -b 8192 -ub 8192 (n2ub8k): the 118K prompt at 607.0 t/s against 527.6 with 4096, --phase-mem took ubatch
+rem 6656 at 106K cells and 5888 at 120K (the memory); TG 26.86 against 27.40, acceptance 0.512 against 0.523 (text)
+if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 8192 -ub 8192"
 rem since 05.10 the cpu experts run while the gpu runs the cached ones (06.10: TG +2 percent, +4.6 with MTP n2;
 rem GGML_SCHED_PARALLEL_CPU=0 turns it off) and a prompt of up to 192 tokens takes the generation layout with the
 rem moe-cache kept (06.10: an 82-token prompt 1.6 s instead of 2.7 s, no 0.73 s refill after it;
@@ -174,26 +188,29 @@ rem while the moe-cache fills): 194 splits (97 CUDA, 97 CPU, 48 CPU splits witho
 rem waits for the GPU 15.6-16.5 ms (the same at every hit rate), runs its experts 9-15 ms (440 MiB of host experts
 rem per step, 30-45 GB/s), copies 2.6-3.3 ms (both ways), queues the CUDA splits 2 ms; 3 ms outside the scheduler,
 rem 1.7 of them the moe-cache update (upload submission, table). TG of prof 26.72 against 26.79 of base.
-rem prof now adds GGML_SCHED_PROF_GPU=1: the device time of the CUDA compute calls per step ("device busy"), which
-rem tells the GPU work in the 16 ms of waits from the latency of the 49 switches
+rem 10.10, prof with GGML_SCHED_PROF_GPU=1: device busy 21.0-22.5 ms per step (the CUDA compute calls, with their host
+rem launch, up to 3 ms), the CPU waits 16 ms: about 5 GB of weights a step would take 6 ms at 936 GB/s, so the GPU part
+rem is the many small kernels of 97 compute calls, not the bandwidth. the timing events cost 3 percent (25.97 against
+rem 26.73 of base). the arm is off, the switch stays
 rem 09.10, stats (LLAMA_MOE_CACHE_STATS=2048, 8192 steps): at the real 68-69 slots and 1 upload per layer per step the
 rem pooled caches lose: PLRU 62.5, PLFU 67.1 against LFU 68.0 and LRU 68.1 percent (the moe-cache measured 68.3).
 rem the pool catches up only at 4-8 uploads per layer per step, PLRU 69.2 at 350 MiB of uploads per step against
 rem 36 MiB of LFU. one pool for all layers (as upstream's --moe-cache-mib) is not taken; the arm is off
 rem 09.10, n2 at a 500000-character prefix (118K tokens) with the MTP catch-up for the output rows only: PP 525.8 t/s
 rem against 514.6 on 08.10, TG 27.58 against 26.93
-rem n2ub8k: the same with -b 8192 -ub 8192 (bench 09.10: +10.6 percent PP at depth 0, +14 at 65536); --phase-mem
-rem takes a smaller ubatch where 8192 does not fit (at 120K cells the 4096 one takes 3386 + 1620 MiB of 8670 free).
-rem n2kv16k: LLAMA_PHASE_KV_STEP=16384, the prompt plan of --phase-mem with 16K cells of KV headroom: a new plan every
-rem 16K cells instead of every batch (n2 09.10: 0.19 s at 25K cells to 0.48 s at 120K per 4096-token batch, about
-rem 10 s of the 118K prompt; the phase_mem line now splits it into free, queries and reserve; free holds the wait
-rem for the previous batch)
-if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;prof GGML_SCHED_PROF=128 GGML_SCHED_PROF_GPU=1 @p=0;n2ub8k @draft --spec-type draft-mtp --spec-draft-n-max 2 -b 8192 -ub 8192 @p=500000;n2kv16k LLAMA_PHASE_KV_STEP=16384 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=500000"
+rem 10.10, n2kv16k (LLAMA_PHASE_KV_STEP=16384, ubatch 4096): PP 540.1 against 527.6 of n2, 6 plans of the 118K prompt
+rem instead of 29; a plan takes 0.19 s at 21K cells to 0.51 s at 123K, nearly all of it free (0.06-0.12 s, with the wait
+rem for the previous batch) and reserve (0.11-0.38 s, the buffer allocation), the queries 0.01 s. at ubatch 8192 a plan
+rem takes 0.66 s (7 queries of the ubatch search). n2kv32k: LLAMA_PHASE_KV_STEP=32768 on top of the 8192 ubatch
+rem 10.10: auto 27.73 against 30.44 on 09.10, the online gate kept drafts off (length 0 in 2455 of 4645 cycles, verify
+rem fitted at 28.6 ms + 18.5 ms per token), below base on the os prompts; n2 28.90 against 28.91. auto varies run to run
+rem here, n2 does not
+if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;n2kv32k LLAMA_PHASE_KV_STEP=32768 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=500000"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
-rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are off, n2ub8k checks the server
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
+rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are off; the server takes -b/-ub 8192 since 10.10
+if not defined BENCHARMS  set "BENCHARMS=default"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined KERNARMS   set "KERNARMS=default"
@@ -206,7 +223,7 @@ if not defined BENCHCTX   set "BENCHCTX=auto"
 :defaults_done
 rem ---- the same on both ----
 rem 01-check: test-backend-ops ops, "OP [regex of the case parameters]", separated by ;
-if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;FLASH_ATTN_EXT n_kv_max=[1-9]"
+if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
 rem 02-bench: llama-bench, one run per arm and depth
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,32768,65536,122880"
 if not defined BENCHPP     set "BENCHPP=4096"

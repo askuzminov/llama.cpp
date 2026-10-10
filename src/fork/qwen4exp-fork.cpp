@@ -1510,11 +1510,12 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn(
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
+    // the gate stays a view of the q projection: the sigmoid reads it in place (no copy of n_embd_head * n_head floats
+    // per token) and the MUL below takes the attention output in the same [n_embd_head, n_head, n_tokens] shape
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
         ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -1550,7 +1551,12 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn(
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
 
-    cur = ggml_mul(ctx0, cur, gate_sigmoid);
+    if (ggml_is_contiguous(cur)) {
+        cur = ggml_mul(ctx0, ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, n_tokens), gate_sigmoid);
+        cur = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
+    } else {
+        cur = ggml_mul(ctx0, cur, ggml_reshape_2d(ctx0, gate_sigmoid, n_embd_head * n_head, n_tokens));
+    }
     cb(cur, "attn_gated", il);
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
@@ -1581,6 +1587,11 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn_linear(
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
+
+    // the gate of the output norm, in the graph before the GDN: its matmul and reshape would otherwise land between
+    // the norm and the sigmoid (Vulkan runs RMS_NORM, MUL, SIGMOID, MUL as one shader when they are adjacent)
+    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_build_forward_expand(gf, z_2d);
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
@@ -1669,8 +1680,6 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
-
-    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
@@ -1886,13 +1895,26 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_conv_state_at(
 
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
+    // when every slot ends inside x, the tails are read from x: the conv is then the only reader of the concat, which
+    // Vulkan runs inside the conv (CONCAT_SSM_CONV, the conv reads the state and x where they are)
+    const int64_t n_seq_tokens = x->ne[1];
+    const bool tail_from_x = n_seq_tokens >= state_cols + n_slots - 1;
+
     for (int64_t slot = 0; slot < n_slots; ++slot) {
         const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-                state_cols, channels, n_seqs,
-                conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * tail = nullptr;
+        if (tail_from_x) {
+            // columns s_idx - state_cols .. s_idx - 1 of x, the same as columns s_idx .. of the concat
+            tail = ggml_view_3d(ctx0, x, channels, state_cols, n_seqs, x->nb[1], x->nb[2],
+                    (s_idx - state_cols) * x->nb[1]);
+            tail = ggml_transpose(ctx0, tail);
+        } else {
+            tail = ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, s_idx));
+        }
 
         ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                 state_cols * channels, n_seqs,

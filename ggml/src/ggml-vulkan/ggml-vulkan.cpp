@@ -3708,6 +3708,44 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f32,  "dsv4_hc_post_norm_f32",  dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
+    // fork: short-row RMS norm (32 x 8 invocations, a row per 32) and the conv over the concat sources
+    for (uint32_t w = 0; w < 2; ++w) {
+        for (uint32_t g = 0; g < 2; ++g) {
+            const std::string name = std::string("rms_norm_rows_f32") + (w ? "_mul" : "") + (g ? "_gate" : "");
+            ggml_vk_create_pipeline(device, device->pipeline_rms_norm_rows_f32[w][g], name.c_str(), rms_norm_rows_f32_len, rms_norm_rows_f32_data, "main", 4, sizeof(vk_op_rms_norm_rows_push_constants), {1, 1, 1}, { 32, 8, w, g }, 1);
+        }
+    }
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_concat_f32[0], "ssm_conv_concat_f32",      ssm_conv_concat_f32_len, ssm_conv_concat_f32_data, "main", 4, sizeof(vk_op_ssm_conv_concat_push_constants), {32, 16, 1}, { 32, 16, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_concat_f32[1], "ssm_conv_concat_silu_f32", ssm_conv_concat_f32_len, ssm_conv_concat_f32_data, "main", 4, sizeof(vk_op_ssm_conv_concat_push_constants), {32, 16, 1}, { 32, 16, 1 }, 1);
+    // fork: MUL_MAT_ID with the codes decoded into f16 A fragments, 128 rows x 64 tokens per workgroup of 8 subgroups of 32
+    if (device->mmid_f16reg_mode != 0) {
+        struct f16reg_shader { const char * name; size_t len; const void * data; };
+        const bool emu = device->mmid_f16reg_mode == 2;
+#define F16REG(t) (emu ? f16reg_shader { "mul_mmid_f16reg_" #t "_emu", mul_mmid_f16reg_##t##_emu_len, mul_mmid_f16reg_##t##_emu_data } : F16REG_CM1(t))
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+#define F16REG_CM1(t) f16reg_shader { "mul_mmid_f16reg_" #t, mul_mmid_f16reg_##t##_cm1_len, mul_mmid_f16reg_##t##_cm1_data }
+#else
+#define F16REG_CM1(t) f16reg_shader { "mul_mmid_f16reg_" #t "_emu", mul_mmid_f16reg_##t##_emu_len, mul_mmid_f16reg_##t##_emu_data }
+#endif
+        const f16reg_shader shaders[4][2] = {
+            { F16REG(q4_k), F16REG(q4_k_glu) },
+            { F16REG(q5_k), F16REG(q5_k_glu) },
+            { F16REG(q5_1), { nullptr, 0, nullptr } },
+            { F16REG(q8_0), { nullptr, 0, nullptr } },
+        };
+#undef F16REG
+#undef F16REG_CM1
+        const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
+        for (int t = 0; t < 4; ++t) {
+            for (int g = 0; g < 2; ++g) {
+                if (shaders[t][g].data == nullptr) {
+                    continue;
+                }
+                ggml_vk_create_pipeline(device, device->pipeline_mmid_f16reg[t][g], shaders[t][g].name, shaders[t][g].len, shaders[t][g].data, "main",
+                                        g ? 7 : 6, sizeof(vk_mat_mat_id_push_constants), {128, 64, 1}, {256, 64}, 1, false, sg != 0, sg);
+            }
+        }
+    }
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
@@ -4889,6 +4927,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
 
         ggml_vk_fork_shmem_limit(device);
+        ggml_vk_fork_mmid_f16reg_init(device);
 
         bool int_large_tile, int_large_tile_id;
         ggml_vk_fork_int_large_tile(device, int_large_tile, int_large_tile_id);
@@ -7590,10 +7629,17 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         quantize_y = false;
     }
 
+    // fork: mul_mmid_f16reg.comp (GGML_VK_MMID_F16REG) reads the f32 activations, B is not quantized
+    const vk_pipeline f16reg = ggml_vk_fork_mmid_f16reg(ctx, src0, src1, glu_up, hoist_row_ids, y_f32_kernel, CEIL_DIV(nei0 * nei1, n_as));
+    if (f16reg) {
+        quantize_y = false;
+    }
+
     // Check for mmq first
     const std::vector<vk_matmul_pipeline_pair>* mmp_map = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0], true, glu_up != nullptr) : nullptr;
-    // the fused gate/up shader exists on the int8 path only; ggml_vk_can_fuse_mmid_glu made sure it is taken
-    GGML_ASSERT(glu_up == nullptr || mmp_map != nullptr);
+    // the fused gate/up shader exists on the int8 path and in mul_mmid_f16reg.comp; ggml_vk_can_fuse_mmid_glu made sure
+    // one of them is taken
+    GGML_ASSERT(glu_up == nullptr || mmp_map != nullptr || f16reg);
 
     if (mmp_map == nullptr) {
         // Fall back to f16 dequant mul mat
@@ -7634,6 +7680,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
+    }
+
+    // fork: f16 coopmat with the codes decoded into the A fragments (GGML_VK_MMID_F16REG), B read as f32
+    if (f16reg) {
+        pipeline = f16reg;
     }
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = (uint64_t)y_staged_row_stride * ne11 * ne12 * ne13;
@@ -11070,6 +11121,12 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
 
+    // fork: rows up to 512 columns, several per workgroup, and the RMS_NORM_SCALE / RMS_NORM_MUL_SIGMOID_MUL fusions
+    if (ggml_vk_fork_rms_norm_rows(ctx, subctx, cgraph, node_idx)) {
+        ggml_vk_rms_norm_finish(ctx, src0);
+        return;
+    }
+
     if (ctx->fused_rms_norm_mode == RMS_NORM_VIEW_SET_ROWS) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 2);
         ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
@@ -12698,7 +12755,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
-        ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        if (ctx->fused_concat_ssm_conv) {
+            ggml_vk_fork_ssm_conv_concat(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        }
 
         break;
     case GGML_OP_UPSCALE:
@@ -14772,6 +14833,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_fork_fuse_rms_norm_rows(ctx, cgraph, i, op_srcs_fused_elementwise, fusion_string)) {
+                // fork: RMS_NORM_MUL_SIGMOID_MUL, RMS_NORM_SCALE
+            } else if (ggml_vk_fork_fuse_concat_ssm_conv(ctx, cgraph, i, op_srcs_fused_elementwise, fusion_string)) {
+                // fork: CONCAT_SSM_CONV(_SILU)
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL;
@@ -15149,6 +15214,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         &rope_view_set_rows_pattern,
         &hc_post_norm_pattern,
         &hc_post_gate_pattern,
+        &rms_norm_mul_sigmoid_mul_pattern,
+        &rms_norm_scale_pattern,
+        &concat_ssm_conv_pattern,
     };
 
     auto const &ops_match = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
@@ -15181,6 +15249,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     // fork: the nodes of MUL_MAT_HEADSUM patterns, and is_src_of for ggml_vk_fork_pull_nodes
     const std::vector<uint8_t> headsum_node = ggml_vk_fork_headsum_nodes(ctx, graph);
+    const std::vector<uint8_t> fork_protected = ggml_vk_fork_protected_nodes(graph);
     const std::function<bool(int, int)> is_src_of_fn = is_src_of;
 
     std::vector<ggml_tensor *> new_order;
@@ -15287,6 +15356,30 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        // fork: the gated norm and the l2 norm of the qwen4exp GDN layers (rms_norm_rows.comp) stay in a row
+        if (match_pattern(rms_norm_mul_sigmoid_mul_pattern, first_unused)) {
+            add_pattern_alloc_deps(rms_norm_mul_sigmoid_mul_pattern, first_unused + (int) rms_norm_mul_sigmoid_mul_pattern.size() - 1);
+            keep_pattern(rms_norm_mul_sigmoid_mul_pattern);
+            continue;
+        }
+        if (match_pattern(rms_norm_scale_pattern, first_unused)) {
+            add_pattern_alloc_deps(rms_norm_scale_pattern, first_unused + (int) rms_norm_scale_pattern.size() - 1);
+            keep_pattern(rms_norm_scale_pattern);
+            continue;
+        }
+        // the conv reads the concat sources while it writes its output
+        if (match_pattern(concat_ssm_conv_silu_pattern, first_unused) && graph->nodes[first_unused + 1]->src[0] == graph->nodes[first_unused] &&
+            graph->nodes[first_unused + 2]->src[0] == graph->nodes[first_unused + 1]) {
+            add_pattern_alloc_deps(concat_ssm_conv_silu_pattern, first_unused + (int) concat_ssm_conv_silu_pattern.size() - 1);
+            keep_pattern(concat_ssm_conv_silu_pattern);
+            continue;
+        }
+        if (match_pattern(concat_ssm_conv_pattern, first_unused) && graph->nodes[first_unused + 1]->src[0] == graph->nodes[first_unused]) {
+            add_pattern_alloc_deps(concat_ssm_conv_pattern, first_unused + (int) concat_ssm_conv_pattern.size() - 1);
+            keep_pattern(concat_ssm_conv_pattern);
+            continue;
+        }
+
         if (keep_pattern(rms_norm_mul_add_mul_pattern)) {
             continue;
         }
@@ -15316,8 +15409,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
 
-        // fork: the cache cpy of GATED_DELTA_NET, the MoE gate/up and swiglu
-        ggml_vk_fork_pull_nodes(ctx, graph, first_unused, NUM_TO_CHECK, used, current_set, is_src_of_fn);
+        // fork: the cache cpy of GATED_DELTA_NET, the MoE gate/up and swiglu, the SSM_CONV of a CONCAT
+        ggml_vk_fork_pull_nodes(ctx, graph, first_unused, NUM_TO_CHECK, used, current_set, is_src_of_fn, params);
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
@@ -15333,6 +15426,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 continue;
             }
             if (headsum_node[j]) {
+                continue;
+            }
+            if (fork_protected[j]) {
                 continue;
             }
             // Protect every interior QSA node (not just the start): the mask branch is

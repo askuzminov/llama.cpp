@@ -477,6 +477,8 @@
 
 ## Vulkan
 
+- MUL_MAT_ID экспертов на f16 coopmat с распаковкой кодов прямо в A-фрагмент (10.10, `GGML_VK_MMID_F16REG=1`, по умолчанию выключено): `mul_mmid_f16reg.comp` для q4_K, q5_K (и слитый gate/up), q5_1, q8_0, активации f32 читаются на месте; раскладку фрагмента проверяет `coopmat_a_probe.comp` при старте устройства (`ggml_vk_fork_run_probe` - общий запуск проб в `fork/ggml-vulkan-fork.cpp`). `GGML_VK_MMID_F16REG=emulate` - тот же алгоритм через перестановки в подгруппе, для тестов на устройствах без матричных ядер.
+- Неумножающие операции слоёв GDN (10.10): `rms_norm_rows.comp` для строк до 512 столбцов (8 строк на рабочую группу) со слияниями RMS_NORM_SCALE и RMS_NORM_MUL_SIGMOID_MUL, `GGML_VK_RMS_NORM_ROWS=0` - upstream; CONCAT_SSM_CONV(_SILU) - свёртка читает состояние и x без конкатенации, `GGML_VK_SSM_CONV_CONCAT=0` - upstream. graph_optimize держит эти шаблоны подряд и не утаскивает их внутренние узлы, свёртке добавлена зависимость аллокатора на источники конкатенации. Код в `fork/ggml-vulkan-fusion-fork.cpp`.
 - Пинованный хостовый буфер (`Vulkan_Host`) не получает upstream-запас в 32 байта, если только этот запас выводит его за предел драйвера на один буфер. На 395 (драйвер AMD, 2 ГиБ) маска KQ для ubatch 4096 при 262144 ячейках занимает ровно 2 ГиБ, и с запасом хостовый буфер вычислений уходил в обычную память (`Failed to allocate pinned memory`). `GGML_VK_HOST_PAD_UPSTREAM=1` возвращает upstream, код в `fork/ggml-vulkan-fork.cpp` (`ggml_vk_fork_host_buffer_pad`).
 - Разреженный flash attention на префиле: апстримовский путь (`flash_attn_sparse_compact.comp`)
   строит точный список ячеек KV на строку маски, но включается только на декоде, потому что
