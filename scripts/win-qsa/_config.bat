@@ -123,7 +123,14 @@ rem switches, the arms are off
 rem gt (graph timing) is off: 08.10 at 122880 graph build 0.00 ms (QSA carry), inputs 0.90, gpu idle 2.44 ms (6 percent).
 rem 09.10, the arms are off: pool32 (f32 key pool) PP the same, TG 25.21 against 25.35 at 122880; nolid PP the same as
 rem the routed default, TG 25.38 against 25.35; lid1 (indexer at every size) PP 633 against 704, TG 24.40 at 122880
-if not defined BENCHARMS  set "BENCHARMS=stable @stable;default"
+rem 09.10: PP at 122880 676 and 671 in two runs against 704 at 12:59 with the same trunk code and the same gpu time of a
+rem decode step in 05; stable is cached from 07.10, so run once with FORCE=stable-d122880 (stable again in this run),
+rem best after a reboot
+rem hostpad (GGML_VK_HOST_PAD_UPSTREAM=1): the pinned host buffer padded by 32 bytes as upstream. the f16 KQ mask of a
+rem 4096-token ubatch at 262144 cells is 2 GiB, the pad took its chunk over the 2 GiB buffer limit of the driver and
+rem the host compute buffer fell back to pageable memory ("Failed to allocate pinned memory" at each reserve of the
+rem server, target and MTP draft context). since 10.10 a buffer that only the pad takes over the limit is not padded
+if not defined BENCHARMS  set "BENCHARMS=stable @stable;default;hostpad GGML_VK_HOST_PAD_UPSTREAM=1 @d=65536,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=stable @stable;default"

@@ -161,6 +161,28 @@ void ggml_vk_fork_log_limits(const vk_device & device) {
     }
 }
 
+size_t ggml_vk_fork_host_buffer_pad(const vk_device & device, size_t size) {
+    // upstream adds 32 bytes to every pinned host buffer, as the CPU buffer type once did (it no longer pads). a buffer
+    // of exactly the device limit then goes over it and falls back to pageable memory with "Failed to allocate pinned
+    // memory": on the 395 (AMD driver, 2 GiB per buffer) the f16 KQ mask of a 4096-token ubatch planned at 262144
+    // cells is 2 GiB and takes a chunk of its own in the host compute buffer, of the target and of the MTP draft
+    // context (09.10). the mapping is aligned to minMemoryMapAlignment and the chunk holds its tensors without slack.
+    // GGML_VK_HOST_PAD_UPSTREAM=1: always pad
+    static const bool upstream = [] {
+        const char * env = getenv("GGML_VK_HOST_PAD_UPSTREAM");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const size_t pad   = 32;
+    const size_t limit = (size_t) std::min<uint64_t>(device->max_buffer_size, device->max_memory_allocation_size);
+    if (upstream || size > limit || size + pad <= limit) {
+        return pad;
+    }
+    if (getenv("GGML_SCHED_LOG_REALLOC")) {
+        fprintf(stderr, "ggml_vulkan: pinned host buffer of %zu bytes without the %zu-byte pad (device limit %zu)\n", size, pad, limit);
+    }
+    return 0;
+}
+
 bool ggml_vk_fork_int_coopmat(vk_device & device, int & mode) {
     // GGML_VK_INT_COOPMAT: 0 int8 coopmat off, 1 on for MUL_MAT and MUL_MAT_ID, 2 for MUL_MAT only, 3 for
     // MUL_MAT_ID only, on any driver (see below); unset keeps the default

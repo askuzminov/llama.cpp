@@ -71,6 +71,9 @@ bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int node_i
 // ggml_vk_get_device
 // GGML_SCHED_LOG_REALLOC: the buffer limits of the device
 void ggml_vk_fork_log_limits(const vk_device & device);
+// ggml_backend_vk_host_buffer_type_alloc_buffer: the slack added to a pinned host buffer of `size` bytes, 0 where the
+// slack alone would take it over the device limit (GGML_VK_HOST_PAD_UPSTREAM=1: always 32, as upstream)
+size_t ggml_vk_fork_host_buffer_pad(const vk_device & device, size_t size);
 // GGML_VK_INT_COOPMAT: sets coopmat_int_ops and returns whether int8 coopmat may be enabled; mode gets the env value
 // (-1 when unset)
 bool ggml_vk_fork_int_coopmat(vk_device & device, int & mode);
