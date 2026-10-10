@@ -115,14 +115,21 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
     if (glu_up != nullptr && (glu_up->type != src0->type || !ggml_are_same_shape(glu_up, src0) || ggml_nbytes(glu_up) > range)) {
         return nullptr;
     }
-    vk_pipeline pipeline = ctx->device->pipeline_mmid_f16reg[t][glu_up != nullptr ? 1 : 0];
-    // GGML_VK_MMID_F16REG_LOG=1: every choice, else the first
+    const int g = glu_up != nullptr ? 1 : 0;
+    vk_pipeline pipeline = ctx->device->pipeline_mmid_f16reg[t][g];
+    // the first choice of each pipeline, every one with GGML_VK_MMID_F16REG_LOG=1; on stderr as well with
+    // GGML_SCHED_LOG_REALLOC, which 02 sets (llama-bench drops the ggml log)
     static const bool log_all = getenv("GGML_VK_MMID_F16REG_LOG") != nullptr;
-    static bool logged = false;
-    if (pipeline && (!logged || log_all)) {
-        logged = true;
+    static const bool log_stderr = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
+    static bool logged[4][2] = {};
+    if (pipeline && (!logged[t][g] || log_all)) {
+        logged[t][g] = true;
         GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID %s on %s (%s, %ld rows per expert)\n", ggml_type_name(src0->type), pipeline->name.c_str(),
-                      glu_up ? "fused gate/up" : "single", (long) n_per_expert);
+                      g ? "fused gate/up" : "single", (long) n_per_expert);
+        if (log_stderr) {
+            fprintf(stderr, "ggml_vulkan: MUL_MAT_ID %s on %s (%s, %ld rows per expert)\n", ggml_type_name(src0->type), pipeline->name.c_str(),
+                    g ? "fused gate/up" : "single", (long) n_per_expert);
+        }
     }
     return pipeline;
 }

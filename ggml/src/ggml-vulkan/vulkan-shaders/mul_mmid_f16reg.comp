@@ -61,7 +61,7 @@ layout(binding = 0) readonly buffer A { uint data_a[]; };
 layout(binding = 6) readonly buffer A2 { uint data_a2[]; };
 #endif
 #endif
-layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 1) readonly buffer B4 { vec4 data_b4[]; };
 layout(binding = 2) writeonly buffer D { float data_d[]; };
 layout(binding = 3) readonly buffer IDS { int data_ids[]; };
 layout(binding = 4) readonly buffer Counts { int data_expert_count[]; };
@@ -153,20 +153,24 @@ uvec2 scale_min_k4(uint j, uint sw0, uint sw1, uint sw2) {
 }
 #endif
 
-void store_a_tile(const bool second, const uint expert, const uint ir, const uint k0) {
+// the next stage of this invocation in registers: its loads are in flight while the current stage computes
+#ifdef A_BYTES
+#define QREG 8
+#else
+#define QREG 4
+#endif
+uint    ra_qs[2][QREG];     // [binding 0, binding 6]
+f16vec2 ra_so[2];
+#ifdef A_HIGH_BIT
+uint    ra_qh[2];
+#endif
+
+void load_a_tile(const uint m, const uint expert, const uint ir, const uint k0) {
+    const bool second = m != 0;
     const uint tid  = gl_LocalInvocationID.x;
     const uint row  = tid >> 1;
     const uint h    = tid & 1;
     const uint grow = ir * BM + row;
-
-    uint qs[4];
-    f16vec2 so;
-#ifdef A_HIGH_BIT
-    uint qh;
-#endif
-#ifdef A_BYTES
-    uint qb[8];
-#endif
 
     // first element of the row in blocks
     const uint row_blk = (expert * p.batch_stride_a + grow * p.stride_a) / A_QK;
@@ -176,21 +180,22 @@ void store_a_tile(const bool second, const uint expert, const uint ir, const uin
     const uint bw = (row_blk + k0 / 256) * A_BLOCK_WORDS;
     const vec2 dm = vec2(unpackHalf2x16(a_word(second, bw)));
     const uvec2 sm = scale_min_k4(2 * j + h, a_word(second, bw + 1), a_word(second, bw + 2), a_word(second, bw + 3));
-    so = f16vec2(dm.x * float(sm.x), dm.y * float(sm.y));
+    ra_so[m] = f16vec2(dm.x * float(sm.x), dm.y * float(sm.y));
 #if defined(DATA_A_Q4_K)
     const uint qsw = bw + 4 + j * 8 + h * 4;
 #else
     const uint qsw = bw + 12 + j * 8 + h * 4;
     // bit 2j + h of qh[l], l = 0..31, as bit l
     const uint sbit = 2 * j + h;
-    qh = 0;
+    uint qh = 0;
     [[unroll]] for (uint w = 0; w < 8; ++w) {
         const uint x = a_word(second, bw + 4 + w) >> sbit;
         qh |= ((x & 1u) | ((x >> 7) & 2u) | ((x >> 14) & 4u) | ((x >> 21) & 8u)) << (4 * w);
     }
+    ra_qh[m] = qh;
 #endif
     [[unroll]] for (uint i = 0; i < 4; ++i) {
-        qs[i] = a_word(second, qsw + i);
+        ra_qs[m][i] = a_word(second, qsw + i);
     }
 #elif defined(DATA_A_Q5_1)
     // blocks k0 / 32 and k0 / 32 + 1: byte e of the chunk holds column e of the first block in its low nibble and of the
@@ -199,64 +204,86 @@ void store_a_tile(const bool second, const uint expert, const uint ir, const uin
     const uint bw1 = bw0 + A_BLOCK_WORDS;
     const uint bwh = h == 0 ? bw0 : bw1;
     const vec2 dm = vec2(unpackHalf2x16(a_word(second, bwh)));
-    so = f16vec2(dm.x, -dm.y);
-    qh = a_word(second, bwh + 1);
+    ra_so[m] = f16vec2(dm.x, -dm.y);
+    ra_qh[m] = a_word(second, bwh + 1);
     [[unroll]] for (uint i = 0; i < 4; ++i) {
         const uint q0 = a_word(second, bw0 + 2 + i);
         const uint q1 = a_word(second, bw1 + 2 + i);
-        qs[i] = h == 0 ? ((q0 & 0x0F0F0F0Fu) | ((q1 & 0x0F0F0F0Fu) << 4)) : (((q0 >> 4) & 0x0F0F0F0Fu) | (q1 & 0xF0F0F0F0u));
+        ra_qs[m][i] = h == 0 ? ((q0 & 0x0F0F0F0Fu) | ((q1 & 0x0F0F0F0Fu) << 4)) : (((q0 >> 4) & 0x0F0F0F0Fu) | (q1 & 0xF0F0F0F0u));
     }
 #elif defined(DATA_A_Q8_0)
     // block k0 / 32 + h: its 32 bytes
     const uint bh = (row_blk + k0 / 32 + h) * A_BLOCK_HALFS;
-    so = f16vec2(unpackHalf2x16(a_half(second, bh)).x, 0.0);
+    ra_so[m] = f16vec2(unpackHalf2x16(a_half(second, bh)).x, 0.0);
     [[unroll]] for (uint i = 0; i < 8; ++i) {
-        qb[i] = a_half(second, bh + 1 + 2 * i) | (a_half(second, bh + 2 + 2 * i) << 16);
+        ra_qs[m][i] = a_half(second, bh + 1 + 2 * i) | (a_half(second, bh + 2 + 2 * i) << 16);
     }
 #endif
+}
 
+void write_a_tile(const uint m) {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = tid >> 1;
+    const uint h   = tid & 1;
 #ifdef FUSED_GLU
-    if (second) {
-#ifdef A_BYTES
-        [[unroll]] for (uint i = 0; i < 8; ++i) { sh_qs2[row * QSW + h * 8 + i] = qb[i]; }
-#else
-        [[unroll]] for (uint i = 0; i < 4; ++i) { sh_qs2[row * QSW + h * 4 + i] = qs[i]; }
-#endif
-        sh_so2[row * 2 + h] = so;
+    if (m != 0) {
+        [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs2[row * QSW + h * QREG + i] = ra_qs[1][i]; }
+        sh_so2[row * 2 + h] = ra_so[1];
 #ifdef A_HIGH_BIT
-        sh_qh2[row * 2 + h] = qh;
+        sh_qh2[row * 2 + h] = ra_qh[1];
 #endif
         return;
     }
 #endif
-#ifdef A_BYTES
-    [[unroll]] for (uint i = 0; i < 8; ++i) { sh_qs[row * QSW + h * 8 + i] = qb[i]; }
-#else
-    [[unroll]] for (uint i = 0; i < 4; ++i) { sh_qs[row * QSW + h * 4 + i] = qs[i]; }
-#endif
-    sh_so[row * 2 + h] = so;
+    [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs[row * QSW + h * QREG + i] = ra_qs[0][i]; }
+    sh_so[row * 2 + h] = ra_so[0];
 #ifdef A_HIGH_BIT
-    sh_qh[row * 2 + h] = qh;
+    sh_qh[row * 2 + h] = ra_qh[0];
 #endif
 }
 
-// ---- B tile: BN tokens x 64 columns of f32 activations as f16, four invocations per token
+// ---- B tile: BN tokens x 64 columns of f32 activations as f16, four invocations per token, 16 columns each
 
-void store_b_tile(const uint k0, const uint tile_count) {
+const uint B_ITERS = (BN * 4 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+vec4 rb[2][4];   // B_ITERS <= 2 (BN <= 128)
+
+void load_b_tile(const uint k0, const uint tile_count) {
     const uint tid = gl_LocalInvocationID.x;
-    for (uint t = tid; t < BN * 4; t += BLOCK_SIZE) {
+    [[unroll]] for (uint it = 0; it < 2; ++it) {
+        const uint t = tid + it * BLOCK_SIZE;
+        if (it >= B_ITERS || t >= BN * 4) {
+            continue;
+        }
         const uint n = t >> 2;
         const uint q = t & 3;
         if (n < tile_count) {
             const u16vec2 ri = row_ids[n];
-            const uint base = uint(ri.y) * p.batch_stride_b + (uint(ri.x) % p.ne11) * p.stride_b + k0 + q * 16;
-            [[unroll]] for (uint i = 0; i < 16; ++i) {
-                sh_b[n * BKP + q * 16 + i] = float16_t(data_b[base + i]);
+            // a multiple of 4: K, the strides and k0 are
+            const uint base = (uint(ri.y) * p.batch_stride_b + (uint(ri.x) % p.ne11) * p.stride_b + k0 + q * 16) / 4;
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                rb[it][i] = data_b4[base + i];
             }
         } else {
-            [[unroll]] for (uint i = 0; i < 16; ++i) {
-                sh_b[n * BKP + q * 16 + i] = float16_t(0.0);
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                rb[it][i] = vec4(0.0);
             }
+        }
+    }
+}
+
+void write_b_tile() {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint it = 0; it < 2; ++it) {
+        const uint t = tid + it * BLOCK_SIZE;
+        if (it >= B_ITERS || t >= BN * 4) {
+            continue;
+        }
+        const uint n = t >> 2;
+        const uint q = t & 3;
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            const f16vec4 v = f16vec4(rb[it][i]);
+            const uint o = n * BKP + q * 16 + i * 4;
+            sh_b[o + 0] = v.x; sh_b[o + 1] = v.y; sh_b[o + 2] = v.z; sh_b[o + 3] = v.w;
         }
     }
 }
@@ -395,14 +422,31 @@ void main() {
     }
 #endif
 
+    // the row ids before the first B loads
+    barrier();
+    load_a_tile(0, expert, ir, 0);
+#ifdef FUSED_GLU
+    load_a_tile(1, expert, ir, 0);
+#endif
+    load_b_tile(0, tile_count);
+
     for (uint k0 = 0; k0 < p.K; k0 += BK) {
         barrier();
-        store_a_tile(false, expert, ir, k0);
+        write_a_tile(0);
 #ifdef FUSED_GLU
-        store_a_tile(true, expert, ir, k0);
+        write_a_tile(1);
 #endif
-        store_b_tile(k0, tile_count);
+        write_b_tile();
         barrier();
+
+        // the next stage's loads run while this one computes
+        if (k0 + BK < p.K) {
+            load_a_tile(0, expert, ir, k0 + BK);
+#ifdef FUSED_GLU
+            load_a_tile(1, expert, ir, k0 + BK);
+#endif
+            load_b_tile(k0 + BK, tile_count);
+        }
 
         [[unroll]] for (uint f = 0; f < BK / 16; ++f) {
             float16_t va[16];

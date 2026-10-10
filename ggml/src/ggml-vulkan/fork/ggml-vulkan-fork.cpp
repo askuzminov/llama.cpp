@@ -183,10 +183,16 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
     }
     if (!ggml_vk_fork_coopmat_a_probe(device)) {
         GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG off: the coopmat A layout is not the one the shader takes\n");
+        if (getenv("GGML_SCHED_LOG_REALLOC")) {
+            fprintf(stderr, "ggml_vulkan: GGML_VK_MMID_F16REG off: the coopmat A layout is not the one the shader takes\n");
+        }
         return;
     }
     device->mmid_f16reg_mode = 1;
     GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16reg on (coopmat A layout probe passed)\n");
+    if (getenv("GGML_SCHED_LOG_REALLOC")) {
+        fprintf(stderr, "ggml_vulkan: MUL_MAT_ID f16reg on (coopmat A layout probe passed)\n");
+    }
 #else
     GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG needs a build with coopmat shaders\n");
 #endif

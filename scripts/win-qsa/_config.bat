@@ -98,7 +98,8 @@ rem the default takes the indexer for up to 64 tokens only, so at -ub 2048 it is
 rem 08.10: accurate (no int8 coopmat, f32 acc) mean KLD 0.01404 against 0.01594: the known price of the int8 path, the
 rem arm is off. 09.10: pool32 (QSA key pool in f32, LLAMA_QSA_POOL_F32) KLD 0.01572 against 0.01575 of the f16 default,
 rem the arm is off
-rem f16reg: the experts on f16 activations instead of the 8-bit ones of the int8 path, see CHECKARMS
+rem f16reg: the experts on f16 activations instead of the 8-bit ones of the int8 path, see CHECKARMS. 10.10 evening:
+rem KLD 0.015735 against 0.016057 of the default (nofusion 0.016073), same top 96.06 against 95.97 percent
 if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;f16reg GGML_VK_MMID_F16REG=1"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
@@ -133,6 +134,12 @@ rem KQ mask chunk of a 4096-token ubatch at 262144 cells went over the 2 GiB buf
 rem pageable memory. in one run PP at 122880 674.8 against 706.4 of the default without the pad (+4.7 percent), TG
 rem 24.78 against 25.33, the same at 65536: the 671 and 676 of the two runs of 09.10 were this fallback. the server
 rem shows no "Failed to allocate pinned memory" any more. the arm is off
+rem 10.10 evening (88f10c91f), PP / TG: default 891.6 / 27.63 at 0, 738.0 / 25.20 at 122880 (841.8 and 706.4 the run
+rem before); noelt 850.5 and 709.0 (the shaders give +4.8 and +4.1 percent, the graph changes the rest); f16reg 948.6
+rem (+6.4) and 740.3 (+0.3, unexplained: 05 profiles the prompt at 122880 now, and 02 logs "MUL_MAT_ID ... on
+rem mul_mmid_f16reg" lines with GGML_SCHED_LOG_REALLOC). gpu time of a 4096-token prompt at 0: default 4379, noelt
+rem 4591, f16reg 4094 ms; a decode step at 122880 40.5-40.7 ms in all three. f16reg is v2 since then: the next stage
+rem loaded into registers while the current one computes, B read as vec4
 rem noelt (10.10): the non-matmul work of the GDN layers as before: GGML_VK_RMS_NORM_ROWS=0 (a 512-invocation workgroup
 rem per row of rms_norm.comp, no RMS_NORM_SCALE and RMS_NORM_MUL_SIGMOID_MUL) and GGML_VK_SSM_CONV_CONCAT=0 (the concat
 rem of the conv input as its own pass). the graph changes of the same day stay (the gate of the GDN output norm before
@@ -147,7 +154,9 @@ if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
 rem the prompt at depth 0 and a decode step at 122880, the default and the arms of its switches side by side. 07.10: the tile of the fused
 rem gate/up, gpu ms of a 4096-token prompt: 32x64 884, medium 64x64 933, 32x128 922, 16x64 1024, 32x32 1011, 64x32,
 rem 128x32 and 128x64 above 1000. a decode step at 122880: 42.60 ms of gpu time against 42.89 of stable
-if not defined PROFKINDS  set "PROFKINDS=pp@0 tg@122880"
+rem 10.10 evening (88f10c91f): f16reg cut the prompt at 0 from 4379 to 4094 ms of gpu time (gate/up 882 -> 630, down
+rem 531 -> 505), 02 PP +6.4 percent at 0 but +0.3 at 122880: the prompt at 122880 shows where that goes
+if not defined PROFKINDS  set "PROFKINDS=pp@0,122880 tg@122880"
 rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the attention gate before 10.10
 rem f16reg: the MUL_MAT_ID time per op on mul_mmid_f16reg.comp (see CHECKARMS)
 if not defined PROFARMS   set "PROFARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0;f16reg GGML_VK_MMID_F16REG=1"
