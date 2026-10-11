@@ -363,14 +363,98 @@ def cache_put(identity, result, log):
 LAST_RUN = CACHE / "last-model-run.txt"
 
 
-def settle():
+DEVICE_LINE = re.compile(r"^\s*(\S+): .*\((\d+) MiB, (\d+) MiB free\)\s*$")
+IDLE_USED = CACHE / "idle-used.json"
+# the GPU memory counters of Windows (Task Manager shows them): the memory of all processes on all adapters, also the
+# memory the driver has not released yet. The Vulkan memory budget the 395 reports does not see it, it stays at
+# 108782 MiB free also in the runs that failed on memory
+GPU_COUNTERS = ("Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | "
+                "ForEach-Object { [string]$_.DedicatedUsage + ' ' + [string]$_.SharedUsage }")
+SHOWN_USED = []
+
+
+def device_used():
+    """MiB of GPU memory in use, None without a reading: on Windows the dedicated and shared usage of all adapters,
+    elsewhere total - free of the device of the runs (llama-server --list-devices)."""
     try:
-        wait = float(env("SETTLE", "30")) - (time.time() - float(LAST_RUN.read_text()))
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", GPU_COUNTERS],
+                                 capture_output=True, text=True, timeout=60).stdout
+            values = [int(x) for x in out.split() if x.isdigit()]
+            return sum(values) >> 20 if values else None
+        exe = Path(env("BIN")) / ("llama-server" + EXE)
+        dev = env("CHECKDEVICE", DEVICES.get(env("BACKEND"), ""))
+        if not exe.is_file() or not dev:
+            return None
+        out = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        m = DEVICE_LINE.match(line)
+        if m and m[1] == dev:
+            return int(m[2]) - int(m[3])
+    return None
+
+
+def gib(mib):
+    return f"{mib / 1024:.1f}"
+
+
+def settle():
+    """Before a model run: wait until the GPU memory of the last one is free again. The driver releases the memory of
+    a finished process lazily: on the 395 a run right after another failed on memory or hung while loading
+    (08.10-11.10). Done at once when the memory in use is within SETTLE_MARGIN MiB (2048) of the least seen on this
+    machine (cache/idle-used.json), else the memory is read every SETTLE_STEP seconds (3) until it stops going down,
+    SETTLE_MAX seconds (180) at most. Without a reading the old rule: SETTLE seconds (30) after the last model run."""
+    try:
+        since = time.time() - float(LAST_RUN.read_text())
     except (OSError, ValueError):
+        since = None
+    max_wait, step = env_int("SETTLE_MAX", 180), env_int("SETTLE_STEP", 3)
+    if since is not None and since > max_wait:
         return
-    if wait > 0:
-        print(f"waiting {wait:.0f} s for the driver to release the memory of the last model run", flush=True)
-        time.sleep(wait)
+    used = device_used()
+    if used is None:
+        wait = float(env("SETTLE", "30")) - (since if since is not None else 1e9)
+        if wait > 0:
+            print(f"waiting {wait:.0f} s for the driver to release the memory of the last model run", flush=True)
+            time.sleep(wait)
+        return
+    key = platform.node()
+    try:
+        idle = json.loads(IDLE_USED.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        idle = {}
+    margin = env_int("SETTLE_MARGIN", 2048)
+    known = key in idle
+    start, seen, flat = time.time(), [used], 0
+    while True:
+        if used < idle.get(key, used + 1):
+            idle[key] = used
+            CACHE.mkdir(parents=True, exist_ok=True)
+            IDLE_USED.write_text(json.dumps(idle) + "\n", encoding="utf-8")
+        if known and used <= idle[key] + margin or flat >= 2 or time.time() - start > max_wait:
+            break
+        time.sleep(step)
+        prev, used = used, device_used()
+        if used is None:
+            used = prev
+            break
+        seen.append(used)
+        flat = 0 if used < prev - 256 else flat + 1
+    if not SHOWN_USED:
+        SHOWN_USED.append(used)
+        print(f"GPU memory in use: {gib(used)} GiB, least seen {gib(idle[key])} GiB", flush=True)
+    if len(seen) > 1:
+        trail = " -> ".join(gib(x) for x in seen[-8:])
+        note = "" if used <= idle[key] + margin else f", {gib(idle[key])} GiB when idle: something else holds memory"
+        print(f"GPU memory in use {trail} GiB in {time.time() - start:.0f} s{note}", flush=True)
+
+
+def retry_wait(attempt):
+    """Seconds before another try of a model run that failed on memory: none when the GPU memory can be read (settle()
+    waits until it stops going down), else SETTLE x attempt."""
+    return 0 if device_used() is not None else float(env("SETTLE", "30")) * attempt
 
 
 def mark_end():
@@ -431,8 +515,8 @@ def execute(cmd, log, run_env, stdout=None, model=True, check=True):
         if code == 0 or not check:
             return code, text
         if attempt < 3 and model and retryable(code, text):
-            wait = float(env("SETTLE", "30")) * attempt
-            print(f"{log.name}: {exit_text(code)}, {last_error(text)}; one more try in {wait:.0f} s", flush=True)
+            wait = retry_wait(attempt)
+            print(f"{log.name}: {exit_text(code)}, {last_error(text)}; one more try" + (f" in {wait:.0f} s" if wait else ""), flush=True)
             time.sleep(wait)
             log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue
@@ -1000,6 +1084,10 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
             f.flush()
             proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
         start = time.time()
+        # a load that stops writing its log hangs: 11.10, 395: mtp3 right after auto stopped in the load of the MTP head
+        # (as on 08.10) and the arm failed after DECWAIT; a normal load is silent for 20 s at most
+        stall = env_int("DECSTALL", 240)
+        last_size, last_growth, stalled = -1, time.time(), False
         while proc.poll() is None:
             time.sleep(3)
             try:
@@ -1007,18 +1095,31 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
                     break
             except (urllib.error.URLError, OSError):
                 pass
-            if time.time() - start > wait:
+            size = log.stat().st_size if log.exists() else 0
+            if size != last_size:
+                last_size, last_growth = size, time.time()
+            stalled = time.time() - last_growth > stall
+            if stalled or time.time() - start > wait:
                 proc.kill()
                 proc.wait()
                 mark_end()
-                raise Fail(f"no answer from /health in {wait} s ({log.name})")
+                if stalled and attempt < 3:
+                    break
+                raise Fail(f"no answer from /health in {int(time.time() - start)} s" + (f", no log output for {stall} s" if stalled else "")
+                           + f" ({log.name}, try {attempt})")
         if proc.poll() is None:
             break
         mark_end()
         text = read_log(log)
+        if stalled:
+            pause = retry_wait(attempt + 1)
+            print(f"{log.name}: no log output for {stall} s while loading; one more try" + (f" in {pause:.0f} s" if pause else ""), flush=True)
+            time.sleep(pause)
+            log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
+            continue
         if attempt < 3 and retryable(proc.returncode, text):
-            pause = float(env("SETTLE", "30")) * attempt
-            print(f"{log.name}: {exit_text(proc.returncode)} while loading, {last_error(text)}; one more try in {pause:.0f} s", flush=True)
+            pause = retry_wait(attempt)
+            print(f"{log.name}: {exit_text(proc.returncode)} while loading, {last_error(text)}; one more try" + (f" in {pause:.0f} s" if pause else ""), flush=True)
             time.sleep(pause)
             log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue

@@ -1510,13 +1510,19 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn(
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
-    // the gate stays a view of the q projection: the sigmoid reads it in place (no copy of n_embd_head * n_head floats
-    // per token) and the MUL below takes the attention output in the same [n_embd_head, n_head, n_tokens] shape
+    // the sigmoid reads the gate in place from the q projection (no copy of n_embd_head * n_head floats per token) and
+    // goes into the graph here, before the attention: the projection (twice the gate) can then be freed after the q
+    // norm instead of living through the attention (11.10: the 395 compute buffer 7905 -> 8121 MiB with the sigmoid at
+    // the end). the MUL below takes the attention output in the same [n_embd_head, n_head, n_tokens] shape
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
         ggml_element_size(Qcur_full) * n_embd_head);
     cb(gate, "gate_reshaped", il);
+
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    cb(gate_sigmoid, "gate_sigmoid", il);
+    ggml_build_forward_expand(gf, gate_sigmoid);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
@@ -1547,9 +1553,6 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn(
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     }
     cb(cur, "attn_pregate", il);
-
-    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
-    cb(gate_sigmoid, "gate_sigmoid", il);
 
     if (ggml_is_contiguous(cur)) {
         cur = ggml_mul(ctx0, ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, n_tokens), gate_sigmoid);
@@ -1588,10 +1591,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    // the gate of the output norm, in the graph before the GDN: its matmul and reshape would otherwise land between
-    // the norm and the sigmoid (Vulkan runs RMS_NORM, MUL, SIGMOID, MUL as one shader when they are adjacent)
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-    ggml_build_forward_expand(gf, z_2d);
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
@@ -1680,6 +1680,11 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+
+    // the gate of the output norm goes into the graph here, after the GDN and before the norm: its matmul and reshape
+    // would otherwise land between the norm and the sigmoid (Vulkan runs RMS_NORM, MUL, SIGMOID, MUL as one shader when
+    // they are adjacent), and through the GDN only the layer input stays alive (n_embd floats a token, not d_inner)
+    ggml_build_forward_expand(gf, z_2d);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);

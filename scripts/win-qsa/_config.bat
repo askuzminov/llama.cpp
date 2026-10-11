@@ -40,8 +40,10 @@ set "GENERATOR=auto"
 rem how every model run loads the model
 set "LOADMODE=-lm dio -lzm dio"
 
-rem seconds from the end of one model run to the start of the next: the driver frees the memory of a
-rem process lazily, and a model load right after one can fail
+rem the driver frees the GPU memory of a process lazily, and a model load right after one can fail:
+rem before a model run the scripts wait until the GPU memory in use stops going down (SETTLE_MARGIN,
+rem SETTLE_STEP, SETTLE_MAX in README). SETTLE: seconds from the end of one model run to the start of
+rem the next when the memory cannot be read
 set "SETTLE=30"
 
 if exist "%~dp0_local.bat" call "%~dp0_local.bat"
@@ -115,6 +117,11 @@ rem at a 500000-character prefix (118K tokens) acceptance 0.388 against 0.440, T
 rem 175 s against 210 s. the arm is off. since 09.10 the draft context attends for its output rows only while it
 rem catches up over a prompt (LLAMA_MTP_ROWS_ALL=1: every row): mtp3 at the prefix 705 t/s against 560, the 118K
 rem prompt 165.5 s against 210, TG 29.34 against 29.41. the prefix pass is off (about 30 minutes per arm)
+rem 11.10: none 27.28 (the 2541-token prompt 826.6 t/s against 753.6), auto 38.44, mtp3 FAIL: its load stopped in the
+rem MTP head right after auto (as on 08.10, the driver frees the memory of the server before lazily). serve() now
+rem tries again when the log stops growing for DECSTALL seconds (240). the compute buffer went 7905 -> 8121 MiB with
+rem the non-matmul work of 10.10: the attention gate sigmoid and the GDN norm gate go into the graph earlier and later
+rem now, so that the q projection and the gate live shorter (check the buffer size lines)
 if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
@@ -142,6 +149,9 @@ rem (+6.4) and 740.3 (+0.3, unexplained: 05 profiles the prompt at 122880 now, a
 rem mul_mmid_f16reg" lines with GGML_SCHED_LOG_REALLOC). gpu time of a 4096-token prompt at 0: default 4379, noelt
 rem 4591, f16reg 4094 ms; a decode step at 122880 40.5-40.7 ms in all three. f16reg is v2 since then: the next stage
 rem loaded into registers while the current one computes, B read as vec4
+rem 11.10 (0f8c95acb, f16reg the default, warmup auto), PP: default 950.0 / 852.4 / 818.0 / 780.5, int8 895.3 and
+rem 740.8 (+6.1 and +5.4 percent at 0 and 122880), noelt 903.8 and 748.0; TG 28.10 / 26.32 / 25.80 / 25.14 in all
+rem three. against the build before the non-matmul work (841.8 / 706.4): +12.9 and +10.5 percent
 rem noelt (10.10): the non-matmul work of the GDN layers as before: GGML_VK_RMS_NORM_ROWS=0 (a 512-invocation workgroup
 rem per row of rms_norm.comp, no RMS_NORM_SCALE and RMS_NORM_MUL_SIGMOID_MUL) and GGML_VK_SSM_CONV_CONCAT=0 (the concat
 rem of the conv input as its own pass). the graph changes of the same day stay (the gate of the GDN output norm before
