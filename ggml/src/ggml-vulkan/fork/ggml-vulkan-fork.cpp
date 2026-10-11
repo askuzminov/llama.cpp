@@ -157,13 +157,22 @@ bool ggml_vk_fork_coopmat_a_probe(vk_device & device) {
 }
 
 void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
-    // GGML_VK_MMID_F16REG=1: the experts' prefill matmuls on mul_mmid_f16reg.comp (f16 coopmat, the codes decoded into
-    // the A fragments) where coopmat_a_probe.comp finds the A layout it takes; =emulate: the same algorithm with
-    // subgroup shuffles on any device with 32-invocation subgroups (tests). unset or 0: off
+    // the experts' prefill matmuls on mul_mmid_f16reg.comp (f16 coopmat, the codes decoded into the A fragments) where
+    // coopmat_a_probe.comp finds the A layout it takes. the default on RDNA3 since 11.10: on the 395 a 4096-token prompt
+    // 4367 -> 4060 ms of gpu time at depth 0 and 5182 -> 4908 at 122880 (fused gate/up 877 -> 601), 02 PP +6.6 percent
+    // at 0, KLD 0.015735 against 0.016057 (f16 activations instead of the 8-bit ones of the int8 path).
+    // GGML_VK_MMID_F16REG=0: the int8 path, =1: on any device that passes the probe, =emulate: the same algorithm with
+    // subgroup shuffles on any device with 32-invocation subgroups (tests)
     device->mmid_f16reg_mode = 0;
     const char * env = getenv("GGML_VK_MMID_F16REG");
-    if (env == nullptr || strcmp(env, "0") == 0) {
+    if (env != nullptr && strcmp(env, "0") == 0) {
         return;
+    }
+    if (env == nullptr) {
+        if (!(device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3)) {
+            return;
+        }
+        env = "1";
     }
     const bool sg32 = device->subgroup_size_control ? (device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size)
                                                      : device->subgroup_size == 32;

@@ -142,6 +142,179 @@ static void ggml_backend_cuda_timing_take_fork(ggml_backend_t backend, double * 
     t->n_calls = 0;
 }
 
+// ---- GGML_CUDA_OP_TIMING=<report period in compute calls>: the GPU time of every op (a fused group counts as one), a
+// pair of timing events around each, read once passed. the CUDA graphs are off meanwhile (a capture cannot hold the
+// events), so the time between the ops is not the one of a normal run; the time of each kernel is. every period the
+// log gets the ops by total time, with their count and mean, labelled by op, type and shape
+
+#include <map>
+#include <string>
+#include <algorithm>
+
+struct ggml_cuda_op_timing_fork {
+    struct span {
+        cudaEvent_t start;
+        cudaEvent_t end;
+        std::string label;
+    };
+    std::deque<span>         pending;
+    std::vector<cudaEvent_t> free_events;
+    std::map<std::string, std::pair<int64_t, double>> agg; // label -> (count, us)
+    int64_t n_calls = 0;
+    int64_t n_ops   = 0;
+    double  op_us   = 0.0;
+};
+
+static int ggml_cuda_op_timing_fork_period() {
+    static const int period = [] { const char * env = getenv("GGML_CUDA_OP_TIMING"); return env ? atoi(env) : 0; }();
+    return period;
+}
+
+static std::unordered_map<const ggml_backend_cuda_context *, std::unique_ptr<ggml_cuda_op_timing_fork>> ggml_cuda_op_timing_fork_ctx;
+
+static ggml_cuda_op_timing_fork * ggml_cuda_op_timing_fork_get(const ggml_backend_cuda_context * ctx) {
+    if (ggml_cuda_op_timing_fork_period() <= 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_timing_fork_mutex);
+    auto & t = ggml_cuda_op_timing_fork_ctx[ctx];
+    if (!t) {
+        t = std::make_unique<ggml_cuda_op_timing_fork>();
+    }
+    return t.get();
+}
+
+static cudaEvent_t ggml_cuda_op_timing_fork_event(ggml_cuda_op_timing_fork * t) {
+    if (!t->free_events.empty()) {
+        cudaEvent_t e = t->free_events.back();
+        t->free_events.pop_back();
+        return e;
+    }
+    cudaEvent_t e;
+    CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDefault));
+    return e;
+}
+
+static bool ggml_cuda_op_timing_fork_on() {
+    return ggml_cuda_op_timing_fork_period() > 0;
+}
+
+// before the op (or the fused group) at node i
+static void ggml_cuda_op_timing_fork_begin(ggml_backend_cuda_context * ctx) {
+    ggml_cuda_op_timing_fork * t = ggml_cuda_op_timing_fork_get(ctx);
+    if (t == nullptr) {
+        return;
+    }
+    ggml_cuda_op_timing_fork::span s { ggml_cuda_op_timing_fork_event(t), ggml_cuda_op_timing_fork_event(t), {} };
+    CUDA_CHECK(cudaEventRecord(s.start, ctx->stream()));
+    t->pending.push_back(std::move(s));
+}
+
+static bool ggml_cuda_op_timing_fork_empty_node(const ggml_tensor * x) {
+    return ggml_is_empty(x) || x->op == GGML_OP_NONE || x->op == GGML_OP_RESHAPE || x->op == GGML_OP_VIEW ||
+           x->op == GGML_OP_PERMUTE || x->op == GGML_OP_TRANSPOSE;
+}
+
+// after it: skip > 0 when nodes i .. i + skip ran as one fused group
+static void ggml_cuda_op_timing_fork_end(ggml_backend_cuda_context * ctx, const ggml_cgraph * g, int i, int skip) {
+    ggml_cuda_op_timing_fork * t = ggml_cuda_op_timing_fork_get(ctx);
+    if (t == nullptr || t->pending.empty()) {
+        return;
+    }
+    ggml_cuda_op_timing_fork::span & s = t->pending.back();
+    CUDA_CHECK(cudaEventRecord(s.end, ctx->stream()));
+
+    const ggml_tensor * n = g->nodes[i];
+    std::string label;
+    if (skip > 0) {
+        label = "FUSED";
+        for (int k = 0; k <= skip; ++k) {
+            const ggml_tensor * x = g->nodes[i + k];
+            if (!ggml_cuda_op_timing_fork_empty_node(x)) {
+                label += (label.size() == 5 ? " " : "+");
+                label += ggml_op_desc(x);
+            }
+        }
+    } else {
+        label = ggml_op_desc(n);
+    }
+    char buf[192];
+    const ggml_tensor * a = n->src[0];
+    const ggml_tensor * b = n->src[1];
+    if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && a != nullptr && b != nullptr) {
+        snprintf(buf, sizeof(buf), " %s m=%lld k=%lld n=%lld%s", ggml_type_name(a->type), (long long) a->ne[1], (long long) a->ne[0],
+                 (long long) (b->ne[1] * b->ne[2]), n->op == GGML_OP_MUL_MAT_ID ? " (id)" : "");
+    } else {
+        const ggml_tensor * d = g->nodes[i + skip];
+        snprintf(buf, sizeof(buf), " [%lld,%lld,%lld,%lld]", (long long) d->ne[0], (long long) d->ne[1], (long long) d->ne[2], (long long) d->ne[3]);
+    }
+    s.label = label + buf;
+}
+
+// at the start of a compute call: the spans that ended, and the report every period
+static void ggml_cuda_op_timing_fork_call(ggml_backend_cuda_context * ctx) {
+    ggml_cuda_op_timing_fork * t = ggml_cuda_op_timing_fork_get(ctx);
+    if (t == nullptr) {
+        return;
+    }
+    while (!t->pending.empty()) {
+        ggml_cuda_op_timing_fork::span & s = t->pending.front();
+        const cudaError_t err = cudaEventQuery(s.end);
+        if (err == cudaErrorNotReady) {
+            if (cudaPeekAtLastError() == cudaErrorNotReady) {
+                (void) cudaGetLastError();
+            }
+            break;
+        }
+        CUDA_CHECK(err);
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, s.start, s.end));
+        auto & a = t->agg[s.label];
+        a.first++;
+        a.second += 1e3 * (double) ms;
+        t->n_ops++;
+        t->op_us += 1e3 * (double) ms;
+        t->free_events.push_back(s.start);
+        t->free_events.push_back(s.end);
+        t->pending.pop_front();
+    }
+    if (++t->n_calls < ggml_cuda_op_timing_fork_period()) {
+        return;
+    }
+    std::vector<std::pair<std::string, std::pair<int64_t, double>>> rows(t->agg.begin(), t->agg.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.second > y.second.second; });
+    GGML_LOG_INFO("cuda_op_timing %s: %lld compute calls, %lld ops, %.2f ms of kernels: %.1f ops and %.3f ms per call\n",
+                  ctx->name.c_str(), (long long) t->n_calls, (long long) t->n_ops, 1e-3 * t->op_us,
+                  (double) t->n_ops / (double) t->n_calls, 1e-3 * t->op_us / (double) t->n_calls);
+    for (size_t r = 0; r < rows.size() && r < 40; ++r) {
+        GGML_LOG_INFO("cuda_op_timing %s: %9.3f ms %8lld x %8.2f us  %s\n", ctx->name.c_str(), 1e-3 * rows[r].second.second,
+                      (long long) rows[r].second.first, rows[r].second.second / (double) rows[r].second.first, rows[r].first.c_str());
+    }
+    t->agg.clear();
+    t->n_calls = 0;
+    t->n_ops   = 0;
+    t->op_us   = 0.0;
+}
+
+static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx) {
+    if (ggml_cuda_op_timing_fork_period() <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_timing_fork_mutex);
+    auto it = ggml_cuda_op_timing_fork_ctx.find(ctx);
+    if (it == ggml_cuda_op_timing_fork_ctx.end()) {
+        return;
+    }
+    for (const auto & s : it->second->pending) {
+        CUDA_CHECK(cudaEventDestroy(s.start));
+        CUDA_CHECK(cudaEventDestroy(s.end));
+    }
+    for (cudaEvent_t e : it->second->free_events) {
+        CUDA_CHECK(cudaEventDestroy(e));
+    }
+    ggml_cuda_op_timing_fork_ctx.erase(it);
+}
+
 #define GGML_CUDA_TIMING_FORK 1
 
 #else
@@ -149,5 +322,12 @@ static void ggml_backend_cuda_timing_take_fork(ggml_backend_t backend, double * 
 static void ggml_cuda_timing_fork_begin(ggml_backend_cuda_context * ctx) { GGML_UNUSED(ctx); }
 static void ggml_cuda_timing_fork_end(ggml_backend_cuda_context * ctx) { GGML_UNUSED(ctx); }
 static void ggml_cuda_timing_fork_free(const ggml_backend_cuda_context * ctx) { GGML_UNUSED(ctx); }
+static bool ggml_cuda_op_timing_fork_on() { return false; }
+static void ggml_cuda_op_timing_fork_begin(ggml_backend_cuda_context * ctx) { GGML_UNUSED(ctx); }
+static void ggml_cuda_op_timing_fork_end(ggml_backend_cuda_context * ctx, const ggml_cgraph * g, int i, int skip) {
+    GGML_UNUSED(ctx); GGML_UNUSED(g); GGML_UNUSED(i); GGML_UNUSED(skip);
+}
+static void ggml_cuda_op_timing_fork_call(ggml_backend_cuda_context * ctx) { GGML_UNUSED(ctx); }
+static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx) { GGML_UNUSED(ctx); }
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

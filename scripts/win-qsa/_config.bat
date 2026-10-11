@@ -89,7 +89,9 @@ rem f16reg (10.10): the experts' prefill matmuls on mul_mmid_f16reg.comp (GGML_V
 rem coopmat with the 4/5/8-bit codes decoded into the A fragments, after coopmat_a_probe.comp at device init. the Mac
 rem ran it only emulated (no matrix cores there), so 01 checks the coopmat path on the matmul_id ops (the fused gate/up
 rem at any size, GGML_VK_MMID_GLU_MIN_TOKENS=0, so the small cases take it too)
-if not defined CHECKARMS  set "CHECKARMS=default;f16reg GGML_VK_MMID_F16REG=1 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
+rem 11.10: f16reg passed every matmul_id op on the 395 and is the default on RDNA3 since then; glu0 runs the fused
+rem gate/up at any size (its small cases take it too), int8 the int8 path (GGML_VK_MMID_F16REG=0)
+if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
 rem loads the PLE table whole if that version does not read it lazily, a FAIL on memory is then expected
@@ -98,9 +100,9 @@ rem the default takes the indexer for up to 64 tokens only, so at -ub 2048 it is
 rem 08.10: accurate (no int8 coopmat, f32 acc) mean KLD 0.01404 against 0.01594: the known price of the int8 path, the
 rem arm is off. 09.10: pool32 (QSA key pool in f32, LLAMA_QSA_POOL_F32) KLD 0.01572 against 0.01575 of the f16 default,
 rem the arm is off
-rem f16reg: the experts on f16 activations instead of the 8-bit ones of the int8 path, see CHECKARMS. 10.10 evening:
-rem KLD 0.015735 against 0.016057 of the default (nofusion 0.016073), same top 96.06 against 95.97 percent
-if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;f16reg GGML_VK_MMID_F16REG=1"
+rem 10.10 evening: f16reg (the experts on f16 activations, the default since 11.10) KLD 0.015735 against 0.016057 of
+rem the int8 path (nofusion 0.016073), same top 96.06 against 95.97 percent. int8: the int8 path (GGML_VK_MMID_F16REG=0)
+if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;int8 GGML_VK_MMID_F16REG=0"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
 rem stable (off since 10.10): the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. 07.10: a short
@@ -147,7 +149,7 @@ rem the GDN, the conv state tails read from x, the attention gate sigmoid on the
 rem 10.10: stable is off in 02, 04 and 05 (its results were kept from 07.10 and said nothing of the machine state of a
 rem run); each run compares the default with the arms of its switches, the numbers go to history.csv. 03 keeps stable as
 rem the KLD reference, so the KLD values since 07.10 stay comparable
-if not defined BENCHARMS  set "BENCHARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0 @d=0,122880;f16reg GGML_VK_MMID_F16REG=1 @d=0,122880"
+if not defined BENCHARMS  set "BENCHARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0 @d=0,122880;int8 GGML_VK_MMID_F16REG=0 @d=0,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -155,11 +157,13 @@ rem the prompt at depth 0 and a decode step at 122880, the default and the arms 
 rem gate/up, gpu ms of a 4096-token prompt: 32x64 884, medium 64x64 933, 32x128 922, 16x64 1024, 32x32 1011, 64x32,
 rem 128x32 and 128x64 above 1000. a decode step at 122880: 42.60 ms of gpu time against 42.89 of stable
 rem 10.10 evening (88f10c91f): f16reg cut the prompt at 0 from 4379 to 4094 ms of gpu time (gate/up 882 -> 630, down
-rem 531 -> 505), 02 PP +6.4 percent at 0 but +0.3 at 122880: the prompt at 122880 shows where that goes
+rem 531 -> 505), 02 PP +6.4 percent at 0 but +0.3 at 122880. 11.10 (d01bba7a3, f16reg v2): at 122880 too, 5182 -> 4908
+rem ms (gate/up 883 -> 613), the wall time of the compute call 5218 -> 4940; 02 lost it to the cold PLE rows of the
+rem first arm at 122880 (BENCHWARMTOKENS). at 0 4367 / 4584 (noelt) / 4060 ms; a decode step at 122880 40.4-40.9 ms
 if not defined PROFKINDS  set "PROFKINDS=pp@0,122880 tg@122880"
 rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the attention gate before 10.10
-rem f16reg: the MUL_MAT_ID time per op on mul_mmid_f16reg.comp (see CHECKARMS)
-if not defined PROFARMS   set "PROFARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0;f16reg GGML_VK_MMID_F16REG=1"
+rem int8: the MUL_MAT_ID time per op on the int8 path, f16reg is the default since 11.10 (see CHECKARMS)
+if not defined PROFARMS   set "PROFARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0;int8 GGML_VK_MMID_F16REG=0"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -214,7 +218,10 @@ rem takes 0.66 s (7 queries of the ubatch search). n2kv32k: LLAMA_PHASE_KV_STEP=
 rem 10.10: auto 27.73 against 30.44 on 09.10, the online gate kept drafts off (length 0 in 2455 of 4645 cycles, verify
 rem fitted at 28.6 ms + 18.5 ms per token), below base on the os prompts; n2 28.90 against 28.91. auto varies run to run
 rem here, n2 does not
-if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;n2kv32k LLAMA_PHASE_KV_STEP=32768 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=500000"
+rem optime (11.10): GGML_CUDA_OP_TIMING=50000, the GPU time of every op of the decode (about 500 steps of 97 compute
+rem calls per report in the server log, cuda_op_timing lines): where the 21 ms of device time of a step go against the
+rem 6-7 ms its weights take at 936 GB/s. the CUDA graphs are off in this arm, its TG is not comparable
+if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;n2kv32k LLAMA_PHASE_KV_STEP=32768 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=500000;optime GGML_CUDA_OP_TIMING=50000 @p=0"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
@@ -240,8 +247,11 @@ if not defined BENCHTG     set "BENCHTG=64"
 if not defined BENCHUB     set "BENCHUB=4096"
 if not defined BENCHREPS   set "BENCHREPS=3"
 rem tokens of the warmup process of 02 and 05: llama-bench draws the same ones in every process, below 32768 with
-rem msvc, and 98304 draws read 95 percent of their PLE rows into the page cache (warm_page_cache in _run.py)
-if not defined BENCHWARMTOKENS set "BENCHWARMTOKENS=98304"
+rem msvc, and the warmup reads the PLE rows of those draws into the page cache (warm_page_cache in _run.py). auto: as
+rem many as the deepest measured process draws (its depth, then every rep of its prompt and generation: 135360 at
+rem 122880). 10.10: with 98304 the arm that went first to 122880 read the rest cold (452 against 212 ms of inputs)
+rem and lost 5 percent PP: f16reg at 122880 in two runs
+if not defined BENCHWARMTOKENS set "BENCHWARMTOKENS=auto"
 rem 03-quality: llama-perplexity, KLD of each arm against QREF (empty: stable when built, else default).
 rem a run holds the logits of half a chunk and the reference of a chunk in ram, 12 GB at 16384. at 32768
 rem (24 GB) the 395 failed with bad allocation and row cache read errors on 05.10: the model takes the rest

@@ -647,18 +647,23 @@ def cmd_check():
 
 # ---------------------------------------------------------------- bench
 
-def warm_page_cache(run, model, ub, done):
+def warm_page_cache(run, model, ub, done, draws):
     """One llama-bench process that is not measured, before the first measured one of a step. llama-bench draws its
     tokens with std::rand(): the same tokens in every process, below 32768 with msvc. The PLE rows of those tokens
     (llama_row_cache, a 26.8 GiB table on disk) come from the page cache once read, from the drive before. 07.10: the
     arm that ran first read them cold, 530 against 170 ms of inputs per 4096-token ubatch, PP 786 against 840 t/s at
     depth 0 on the 395, TG -6 percent at 32768 on the 3090. BENCHWARMTOKENS draws (98304: 24 prompts of 4096) read
-    95 percent of those rows, and the gpu clocks are up after it."""
+    95 percent of those rows, and the gpu clocks are up after it.
+    draws: the tokens the deepest measured process draws (its depth once, the state is kept for the later reps and
+    tests, then every rep of its prompt and generation). 10.10: with 98304 the first arm at 122880 (135360 draws) read
+    the rows past them cold, 452 against 212 ms of inputs, and lost 5 percent PP to the arm after it.
+    BENCHWARMTOKENS=auto (default) warms that many, a number sets it."""
     if done or env("BENCHWARMUP", "1") != "1":
         return
     done.append(True)
     exe = Arm("warmup").binary("llama-bench")
-    reps = max(1, -(-env_int("BENCHWARMTOKENS", 98304) // ub))
+    tokens = draws if env("BENCHWARMTOKENS", "auto") == "auto" else env_int("BENCHWARMTOKENS", draws)
+    reps = max(1, -(-tokens // ub))
     print(f"warmup: one llama-bench process of {reps} prompts of {ub} tokens, not measured", flush=True)
     try:
         execute([exe, *model_args(model), "-c", 16384, "-b", ub, "-ub", ub, "-p", ub, "-n", 0, "-r", reps, "-o", "json"],
@@ -682,9 +687,11 @@ def cmd_bench():
         raise Fail("the deepest BENCHDEPTHS plus the prompt does not fit BENCHCTX")
 
     warmed = []
+    # the tokens of the deepest process (warm_page_cache): its depth, then every rep of its prompt and generation
+    draws = max(d + reps * (max([a.pp or pp for a in arms]) + tg) for d in depths)
 
     def warm_up():
-        warm_page_cache(run, model, ub, warmed)
+        warm_page_cache(run, model, ub, warmed, draws)
     results = {}
     for i, depth in enumerate(depths):
         # the order turns at each depth, so that no arm always runs right after the same one
@@ -1211,6 +1218,8 @@ def cmd_profile():
             raise Fail(f"PROFKINDS: {k} is not pp, ppN or tg")
         plan += [(name, d) for d in ([int(x) for x in at.split(",") if x] if at else depths)]
     warmed = []
+    # two reps of each process (cmd below): the deepest one draws its depth and two prompts or generations
+    draws = max(d + 2 * (max(int(k[2:]) if k.startswith("pp") and len(k) > 2 else pp, tg) if k != "tg" else tg) for k, d in plan)
     for kind, depth in plan:
         n_pp = int(kind[2:]) if kind.startswith("pp") and len(kind) > 2 else pp
         done = {}
@@ -1237,7 +1246,7 @@ def cmd_profile():
 
             def go(log):
                 # the host time of the inputs depends on the PLE rows in the page cache (warm_page_cache)
-                warm_page_cache(run, model, ub, warmed)
+                warm_page_cache(run, model, ub, warmed, draws)
                 _, text = execute(cmd, log, run_env)
                 lines = text.splitlines()
                 # host time of the last ubatches of the measured size; a build without LLAMA_INPUT_TIMING has none
