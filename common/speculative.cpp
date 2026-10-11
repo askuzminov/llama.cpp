@@ -2684,6 +2684,8 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        // fork: a smaller ubatch, see common_speculative_fork_mtp_ubatch
+        cparams.n_ubatch = common_speculative_fork_mtp_ubatch(cparams.n_ubatch);
     }
 
     // the draft context holds as many tokens per sequence as the target context

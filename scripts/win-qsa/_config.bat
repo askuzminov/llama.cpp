@@ -127,8 +127,15 @@ rem over 06.10-11.10 the MTP head load stopped right after its buffer allocation
 rem 43 on the 3090), also 30 s after the previous server and on the first try: not the memory of the previous process.
 rem the load is all or nothing (0.56-0.83 s or never). the loader now logs the step it stopped in ("no progress for
 rem 15 s in ...", src/fork/llama-load-watch-fork.h), 04 puts it into the FAIL line
-rem swap0: LLAMA_HC_INJECT_SWAP_MIN=0, the hc injection matmul swapped also for 1-4 tokens (before 11.10 evening)
-if not defined DECARMS    set "DECARMS=none @p=0;swap0 LLAMA_HC_INJECT_SWAP_MIN=0 @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
+rem 11.10 evening (5ed5cfe1a): none 27.53, swap0 27.63, auto 36.90, mtp3 33.16 (third try). both mtp3 stops: "no
+rem progress for 16 s in upload of blk.48.ffn_down_exps.weight, chunk 0", the first write into the freshly allocated
+rem buffer of the head. with MTP the device buffers came to 98757 MiB, over the 96 GiB of dedicated memory (114507 MiB
+rem = 98304 dedicated + 16203 shared), and the MTP context held its dense KQ mask (n_ctx x n_ubatch f16, 2 GiB) both in
+rem its device compute buffer (2800 MiB) and pinned on the host (2248 MiB). the MTP context takes -ub 1024 now
+rem (LLAMA_MTP_UBATCH, 0 = the target's): on the test model 580/532 -> 145/133 MiB at -c 65536, the draft head
+rem probabilities the same in all cycles; here about 700/560 MiB expected, 96.7 GB of device buffers.
+rem mtpub0: the MTP context with the -ub of the target (before 11.10 evening), the buffer lines and the speed
+if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0;mtpub0 LLAMA_MTP_UBATCH=0 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -168,9 +175,10 @@ rem the KLD reference, so the KLD values since 07.10 stay comparable
 rem 11.10 afternoon (3c980c064, the gate placement): PP 929.3 / 850.0 / 821.1 / 780.3, noelt 890.3 / 746.4, int8
 rem 884.3 / 740.8; TG 28.00 / 26.26 / 25.77 / 25.16, the same in all three; KLD 0.015735, int8 0.016073. the noelt and
 rem int8 arms are off
-rem swap0: see DECARMS. the decode of 1-4 tokens takes the hc injection as 4 rows of 1 column now, before as 1 row of
-rem 4 columns (one workgroup per matmul, 9.7 us here, 96 per token)
-if not defined BENCHARMS  set "BENCHARMS=default;swap0 LLAMA_HC_INJECT_SWAP_MIN=0 @d=0,122880"
+rem swap0 (11.10 evening, LLAMA_HC_INJECT_SWAP_MIN=0: the hc injection as 1 row of 4 columns for 1-4 tokens, as before):
+rem TG 28.18 / 25.16 against 28.44 / 25.47 of the default (4 rows of 1 column), +0.9 and +1.2 percent; PP the same
+rem (948.5 / 779.6). the arm is off
+if not defined BENCHARMS  set "BENCHARMS=default"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -252,13 +260,19 @@ rem of 1 column for 1-4 tokens now (swap0 = before). about 24 of the 58 ops of a
 rem scale, silu, up, pre, injection; combine: scale, sigmoid, scale, post), the next fusion candidates. the prompt:
 rem TOP_K of the block selection 96 ms per call (12 per ubatch, 1.15 s of the 2.6K prompt): CCCL 3.4.3+ runs cub
 rem DeviceTopK once per row; from 8 rows the radix select of top-k.cu now (GGML_CUDA_TOPK_RADIX=0 = upstream)
-if not defined DECARMS    set "DECARMS=base @p=0;swap0 LLAMA_HC_INJECT_SWAP_MIN=0 @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0"
+rem 11.10 evening (403e1429b): base 30.40 against 26.66 of swap0 (+14 percent, os/db/code/repeat 31.09 / 31.59 / 30.09
+rem / 29.00); n2 29.31 (26.69 / 26.46 / 30.80 / 35.12), auto 28.88; n2 at the prefix PP 817.4 against 607.8 (the radix
+rem top-k), TG 26.73. MTP pays only on code and repeated text now: the fit of auto puts a verified token at 19.4 ms
+rem (its cpu experts) against a decode step of about 32 ms, and with the head on, prose runs 14-16 percent below base
+if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
 rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are off; the server takes -b/-ub 8192 since 10.10
-rem topkcub: GGML_CUDA_TOPK_RADIX=0, the top-k of a prompt ubatch row by row with cub (before 11.10 evening)
-if not defined BENCHARMS  set "BENCHARMS=default;topkcub GGML_CUDA_TOPK_RADIX=0 @d=0,122880"
+rem topkcub (11.10 evening, GGML_CUDA_TOPK_RADIX=0: the top-k of a prompt ubatch row by row with cub, as before): PP
+rem 696.8 / 623.7 against 1016.5 / 854.0 with the radix select (+46 and +37 percent at 0 and 122880), TG the same;
+rem 01 TOP_K 531/531. the arm is off
+if not defined BENCHARMS  set "BENCHARMS=default"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined KERNARMS   set "KERNARMS=default"

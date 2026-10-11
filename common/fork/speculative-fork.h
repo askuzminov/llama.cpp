@@ -18,6 +18,12 @@ struct common_speculative_impl;
 // the type of an implementation (defined in speculative.cpp, where the struct is)
 common_speculative_type common_speculative_impl_type(const common_speculative_impl * impl);
 
+// the ubatch of an MTP draft context. it holds as many cells as the target, and its dense KQ mask is n_ctx x n_ubatch
+// f16 both in the host compute buffer and on the device: 2 GiB each at 262144 x 4096 (the 395 11.10: compute buffers
+// of the MTP context 2800 MiB on the device and 2248 MiB pinned on the host). the catch-up over a prompt goes in
+// chunks of this size, llama_decode splits the target ubatch. LLAMA_MTP_UBATCH: tokens (default 1024), 0 = the target's
+uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
+
 // cost-aware draft length (--spec-auto) and the per-cycle trace (LLAMA_SPEC_TRACE=<file>)
 //
 // one more draft position pays off while the chance that it and all positions before it are accepted

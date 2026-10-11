@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -497,4 +498,10 @@ void common_speculative_auto::print() const {
         }
         SPC_INF("auto: acceptance by position (0, 1, 2, 3+), %s:%s\n", common_speculative_type_to_str((common_speculative_type) t).c_str(), str.c_str());
     }
+}
+
+uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch) {
+    const char * env = std::getenv("LLAMA_MTP_UBATCH");
+    const long   cap = env ? std::strtol(env, nullptr, 10) : 1024;
+    return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
 }
