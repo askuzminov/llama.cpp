@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "fork/llama-load-watch-fork.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1614,6 +1615,9 @@ bool llama_model_loader::load_all_data(
         ~range_guard() { if (q) { q->leave(); } }
     } guard { ranges };
 
+    // fork: names the step a stopped load stopped in (fork/llama-load-watch-fork.h)
+    llama_load_watch_fork watch;
+
     if (ranges) {
         ranges->enter();
     }
@@ -1712,6 +1716,7 @@ bool llama_model_loader::load_all_data(
 
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
+            watch.step("staging buffer allocation");
             auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
 
             if (!buf) {
@@ -1723,6 +1728,7 @@ bool llama_model_loader::load_all_data(
             host_buffers.emplace_back(buf);
             host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
 
+            watch.step("upload event creation");
             auto * event = ggml_backend_event_new(dev);
             if (!event) {
                 LLAMA_LOG_DEBUG("%s: failed to create event for async uploads for device %s\n", func,
@@ -1733,6 +1739,7 @@ bool llama_model_loader::load_all_data(
             events.emplace_back(event);
         }
 
+        watch.step("upload backend init");
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             LLAMA_LOG_DEBUG("%s: failed to initialize backend for device %s for async uploads\n", func,
@@ -1781,7 +1788,7 @@ bool llama_model_loader::load_all_data(
 
     std::vector<ggml_tensor *> tensors;
 
-    for (; have_range; have_range = ranges && ranges->pop(range)) {
+    for (; have_range; have_range = ranges && (watch.step("waiting for the next buffer"), ranges->pop(range))) {
         tensors.clear();
         for (struct ggml_tensor * cur = range.first; cur != range.last; cur = ggml_get_next_tensor(ctx, cur)) {
             tensors.push_back(cur);
@@ -1832,6 +1839,7 @@ bool llama_model_loader::load_all_data(
                 }
 
                 GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
+                watch.step("set from the mapping", ggml_get_name(cur));
                 if (buf_mmap && cur->data == nullptr) {
                     ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
@@ -1851,6 +1859,7 @@ bool llama_model_loader::load_all_data(
                 const auto & file = files.at(weight->idx);
 
                 if (ggml_backend_buffer_is_host(cur->buffer)) {
+                    watch.step("read", ggml_get_name(cur));
                     const int64_t t_start = ggml_time_us();
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(cur->data, n_size);
@@ -1884,11 +1893,13 @@ bool llama_model_loader::load_all_data(
                             uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
 
                             // Wait for previous upload to complete before reusing buffer
+                            watch.step("upload wait", ggml_get_name(cur), (int64_t) (bytes_read / chunk_size));
                             int64_t t_start = ggml_time_us();
                             ggml_backend_event_synchronize(events[buffer_idx]);
                             t_upload_us += ggml_time_us() - t_start;
 
                             // Read aligned chunk from file
+                            watch.step("read", ggml_get_name(cur), (int64_t) (bytes_read / chunk_size));
                             t_start = ggml_time_us();
                             file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
                             t_read_us += ggml_time_us() - t_start;
@@ -1910,6 +1921,7 @@ bool llama_model_loader::load_all_data(
                             }
 
                             // Async upload actual data to GPU
+                            watch.step("upload", ggml_get_name(cur), (int64_t) (bytes_read / chunk_size));
                             ggml_backend_tensor_set_async(upload_backend, cur,
                                                           reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
                             ggml_backend_event_record(events[buffer_idx], upload_backend);
@@ -1922,12 +1934,14 @@ bool llama_model_loader::load_all_data(
                         }
                     } else {
                         // scoped to one tensor so only one staging buffer is alive at a time
+                        watch.step("read", ggml_get_name(cur));
                         std::vector<no_init<uint8_t>> read_buf(n_size);
                         const int64_t t_start = ggml_time_us();
                         file->seek(weight->offs, SEEK_SET);
                         file->read_raw(read_buf.data(), n_size);
                         t_read_us += ggml_time_us() - t_start;
                         n_read    += n_size;
+                        watch.step("set", ggml_get_name(cur));
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                         if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                             throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
@@ -1947,7 +1961,9 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
+    watch.step("upload release");
     uploads.release();
+    watch.step("validation");
 
     // check validation results
     bool validation_failed = false;

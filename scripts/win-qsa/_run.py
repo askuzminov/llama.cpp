@@ -474,6 +474,15 @@ def last_error(text):
     return "no error message, the log ends with: " + (lines or [""])[-1][:160]
 
 
+def load_watch(log):
+    """The step a stopped model load stopped in, from the watchdog of load_all_data (src/fork/llama-load-watch-fork.h)."""
+    try:
+        hits = [s for s in read_log(log).splitlines() if "load_all_data: no progress" in s]
+    except OSError:
+        return ""
+    return ", " + hits[-1].split("load_all_data: ", 1)[1].strip()[:160] if hits else ""
+
+
 def read_log(path):
     # a windows error text comes in the ansi code page, the rest is utf-8
     out = []
@@ -1106,14 +1115,14 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
                 if stalled and attempt < 3:
                     break
                 raise Fail(f"no answer from /health in {int(time.time() - start)} s" + (f", no log output for {stall} s" if stalled else "")
-                           + f" ({log.name}, try {attempt})")
+                           + f"{load_watch(log)} ({log.name}, try {attempt})")
         if proc.poll() is None:
             break
         mark_end()
         text = read_log(log)
         if stalled:
             pause = retry_wait(attempt + 1)
-            print(f"{log.name}: no log output for {stall} s while loading; one more try" + (f" in {pause:.0f} s" if pause else ""), flush=True)
+            print(f"{log.name}: no log output for {stall} s while loading{load_watch(log)}; one more try" + (f" in {pause:.0f} s" if pause else ""), flush=True)
             time.sleep(pause)
             log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue

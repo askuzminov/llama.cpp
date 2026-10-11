@@ -410,8 +410,16 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
         // Swapped it is [nt, hc], which backends can run as a mat-vec over nt rows; the transpose
         // back is a few KiB. No lora support here, the hc weights are not adapter targets.
         // swapping puts the weight in the src1 slot, which the backends read as f32 only, so a
-        // quantized gamma (the MTP head carries one) keeps the plain order
-        if (w_inject->type == GGML_TYPE_F32) {
+        // quantized gamma (the MTP head carries one) keeps the plain order.
+        // a few tokens keep it too: swapped, a decode step is a mat-vec over 1 row with 4 columns, one
+        // block for 10240 x 4 products. CUDA on the 3090 takes its f32 mat-vec only up to 3 columns and
+        // ran it at 67 us, 96 times per token (cuda_op_timing 11.10); plain it is 4 rows of 1 column.
+        // LLAMA_HC_INJECT_SWAP_MIN: tokens from which the order is swapped (5, 0 = always)
+        static const int64_t swap_min = [] {
+            const char * env = std::getenv("LLAMA_HC_INJECT_SWAP_MIN");
+            return env ? (int64_t) atoi(env) : (int64_t) 5;
+        }();
+        if (w_inject->type == GGML_TYPE_F32 && nt >= swap_min) {
             ggml_tensor * inj = ggml_mul_mat(ctx0, xn, w_inject);
             *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj));
         } else {

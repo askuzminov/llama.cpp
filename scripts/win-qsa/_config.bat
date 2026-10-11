@@ -122,7 +122,13 @@ rem MTP head right after auto (as on 08.10, the driver frees the memory of the s
 rem tries again when the log stops growing for DECSTALL seconds (240). the compute buffer went 7905 -> 8121 MiB with
 rem the non-matmul work of 10.10: the attention gate sigmoid and the GDN norm gate go into the graph earlier and later
 rem now, so that the q projection and the gate live shorter (check the buffer size lines)
-if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
+rem 11.10 (3c980c064): compute buffer 8121 -> 8025 MiB; none 27.33, mtp3 32.43 (third try), auto FAIL (three tries).
+rem over 06.10-11.10 the MTP head load stopped right after its buffer allocation in 12 of 43 server starts here (0 of
+rem 43 on the 3090), also 30 s after the previous server and on the first try: not the memory of the previous process.
+rem the load is all or nothing (0.56-0.83 s or never). the loader now logs the step it stopped in ("no progress for
+rem 15 s in ...", src/fork/llama-load-watch-fork.h), 04 puts it into the FAIL line
+rem swap0: LLAMA_HC_INJECT_SWAP_MIN=0, the hc injection matmul swapped also for 1-4 tokens (before 11.10 evening)
+if not defined DECARMS    set "DECARMS=none @p=0;swap0 LLAMA_HC_INJECT_SWAP_MIN=0 @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -159,7 +165,12 @@ rem the GDN, the conv state tails read from x, the attention gate sigmoid on the
 rem 10.10: stable is off in 02, 04 and 05 (its results were kept from 07.10 and said nothing of the machine state of a
 rem run); each run compares the default with the arms of its switches, the numbers go to history.csv. 03 keeps stable as
 rem the KLD reference, so the KLD values since 07.10 stay comparable
-if not defined BENCHARMS  set "BENCHARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0 @d=0,122880;int8 GGML_VK_MMID_F16REG=0 @d=0,122880"
+rem 11.10 afternoon (3c980c064, the gate placement): PP 929.3 / 850.0 / 821.1 / 780.3, noelt 890.3 / 746.4, int8
+rem 884.3 / 740.8; TG 28.00 / 26.26 / 25.77 / 25.16, the same in all three; KLD 0.015735, int8 0.016073. the noelt and
+rem int8 arms are off
+rem swap0: see DECARMS. the decode of 1-4 tokens takes the hc injection as 4 rows of 1 column now, before as 1 row of
+rem 4 columns (one workgroup per matmul, 9.7 us here, 96 per token)
+if not defined BENCHARMS  set "BENCHARMS=default;swap0 LLAMA_HC_INJECT_SWAP_MIN=0 @d=0,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -173,7 +184,7 @@ rem first arm at 122880 (BENCHWARMTOKENS). at 0 4367 / 4584 (noelt) / 4060 ms; a
 if not defined PROFKINDS  set "PROFKINDS=pp@0,122880 tg@122880"
 rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the attention gate before 10.10
 rem int8: the MUL_MAT_ID time per op on the int8 path, f16reg is the default since 11.10 (see CHECKARMS)
-if not defined PROFARMS   set "PROFARMS=default;noelt GGML_VK_RMS_NORM_ROWS=0 GGML_VK_SSM_CONV_CONCAT=0;int8 GGML_VK_MMID_F16REG=0"
+if not defined PROFARMS   set "PROFARMS=default"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -231,12 +242,23 @@ rem here, n2 does not
 rem optime (11.10): GGML_CUDA_OP_TIMING=50000, the GPU time of every op of the decode (about 500 steps of 97 compute
 rem calls per report in the server log, cuda_op_timing lines): where the 21 ms of device time of a step go against the
 rem 6-7 ms its weights take at 936 GB/s. the CUDA graphs are off in this arm, its TG is not comparable
-if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0;n2kv32k LLAMA_PHASE_KV_STEP=32768 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=500000;optime GGML_CUDA_OP_TIMING=50000 @p=0"
+rem 11.10 (3afe15be7): base 26.39, n2 28.93, auto 29.12; n2 at the prefix PP 607.8 (the 120K prompt), TG 27.36.
+rem n2kv32k 617.6 and 27.06: 63 plans of the prompt instead of 135 (40.9 s against 72.5 in all), but a smaller ubatch
+rem deep in the prompt (6912-7680); not the default, the arm is off.
+rem optime: about 2800 ops per decode step (97 compute calls), so 7.5 us per op of the 21 ms of device time; the
+rem timing events add 10-15 us to each op (61 ms per step in all). the largest: the hc injection matmul (f32, 1 row
+rem of 10240 x 4 columns) 67 us x 96 per step: CUDA takes its f32 mat-vec on Ampere only up to 3 columns. it is 4 rows
+rem of 1 column for 1-4 tokens now (swap0 = before). about 24 of the 58 ops of a layer are hc work (mix: norm, down,
+rem scale, silu, up, pre, injection; combine: scale, sigmoid, scale, post), the next fusion candidates. the prompt:
+rem TOP_K of the block selection 96 ms per call (12 per ubatch, 1.15 s of the 2.6K prompt): CCCL 3.4.3+ runs cub
+rem DeviceTopK once per row; from 8 rows the radix select of top-k.cu now (GGML_CUDA_TOPK_RADIX=0 = upstream)
+if not defined DECARMS    set "DECARMS=base @p=0;swap0 LLAMA_HC_INJECT_SWAP_MIN=0 @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
 rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are off; the server takes -b/-ub 8192 since 10.10
-if not defined BENCHARMS  set "BENCHARMS=default"
+rem topkcub: GGML_CUDA_TOPK_RADIX=0, the top-k of a prompt ubatch row by row with cub (before 11.10 evening)
+if not defined BENCHARMS  set "BENCHARMS=default;topkcub GGML_CUDA_TOPK_RADIX=0 @d=0,122880"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined KERNARMS   set "KERNARMS=default"

@@ -69,6 +69,7 @@ set(LLAMA_FORK_SOURCES
     fork/llama-fork.cpp
     fork/llama-context-fork.cpp
     fork/llama-impl-fork.cpp
+    fork/llama-load-watch-fork.cpp
     fork/llama-state-delta-fork.cpp
     fork/llama-graph-fork.cpp
     fork/llama-moecache-fork.cpp

@@ -52,7 +52,8 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+// fork: the radix select also with cub (CUDA), see fork/top-k-fork.inc
+#if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -212,7 +213,11 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+
+#if defined(GGML_CUDA_USE_CUB)
+#include "fork/top-k-fork.inc"
+#endif // defined(GGML_CUDA_USE_CUB)
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -229,6 +234,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+#if defined(GGML_CUDA_USE_CUB)
+    if (ggml_cuda_fork_topk_radix(nrows)) {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+#endif // defined(GGML_CUDA_USE_CUB)
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
