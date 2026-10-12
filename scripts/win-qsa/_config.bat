@@ -365,8 +365,11 @@ rem everything. more threads do not help the CPU experts (the RAM, not the cores
 rem the next run is the per-op profile only (see PROFARMS)
 if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=0"
 if not defined RUN_DECODE  set "RUN_DECODE=0"
-if not defined RUN_BENCH   set "RUN_BENCH=0"
-if not defined RUN_CHECK   set "RUN_CHECK=0"
+rem the run after the profile of 12.10 night: 01 GET_ROWS for the flat gather of short rows (fork/getrows-fork.inc,
+rem new eval cases of the qwen4exp shapes), 02 default / maskdense / rowsup (GGML_CUDA_GET_ROWS_FLAT=0, upstream), 05
+rem optime / optimemd again
+if not defined RUN_CHECK   set "RUN_CHECK=1"
+if not defined CHECKOPS    set "CHECKOPS=GET_ROWS"
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
 if not defined BENCHSMALL  set "BENCHSMALL=0"
@@ -381,11 +384,16 @@ rem 01 TOP_K 531/531. the arm is off
 rem 12.10 night (f4a7d3ee): maskdense (the dense KQ mask instead of the one from positions) PP 1015.9 / 858.6 against
 rem 969.2 / 828.6 of the default at 0 / 122880, +4.8 / +3.6 percent, about 190 ms per 4096 ubatch at both depths, so
 rem not the size of the mask; TG the same. no alloc peak lines: llama-bench drops the log (they go to stderr since)
-if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880"
+if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880;rowsup GGML_CUDA_GET_ROWS_FLAT=0 @d=0,122880"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090. optime / optimemd:
 rem GGML_CUDA_OP_TIMING with a period above the compute calls of the run, so the report comes once, when the context
 rem goes: the GPU time of every op of the warmup and the two prompts of 4096 at depth 0, for the 190 ms that the mask
 rem from positions costs (the table is of the whole run, three prompts, not of one ubatch)
+rem 12.10 night (56b699a3): 5006 against 4382 ms of gpu time for the run (two prompts of 4096 at 0), GET_ROWS 904 against
+rem 490 ms: the positions of the selected cells, GET_ROWS [1,8404992] of rows of 1 element, 30 ms per call (727 ms);
+rem maskdense gathers its mask values per token, [1,2052,4096], 13 ms per call; the cells of the blocks [4,2101248]
+rem 7.4 ms in both. upstream gives every row a block of 256 threads, 1 of them busy here: about 450 ms of GET_ROWS per
+rem 4096 prompt with the mask from positions, 245 with maskdense. one thread per element since then (fork/getrows-fork.inc)
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 if not defined PROFKINDS   set "PROFKINDS=pp@0"
 if not defined PROFARMS    set "PROFARMS=optime GGML_CUDA_OP_TIMING=1000000000;optimemd GGML_CUDA_OP_TIMING=1000000000 LLAMA_QSA_MASK_POS=0"

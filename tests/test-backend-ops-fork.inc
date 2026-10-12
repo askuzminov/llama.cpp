@@ -389,6 +389,15 @@ struct test_concat_ssm_conv : public test_case {
 };
 
 static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // GET_ROWS of short rows (CUDA: one thread per element, fork/getrows-fork.inc): the qwen4exp attention gathers of
+    // a 64-token ubatch, the positions of the selected cells (rows of 1, flat), the mask values (rows of 1, per token)
+    // and the cells of the selected blocks (rows of 4); a viewed source and index with a column offset
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 4096, 2052*64, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 1, 4096, 2052, 64, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 1024, 513*64, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 100, 30, 70, 3, 2, true, true, 2));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 128, 30, 70, 3, 2, true, true, 1));
+
     // Vulkan fuses the norm from 32 tokens on (GGML_VK_HC_POST_NORM_MIN_TOKENS)
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1, true, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true, true));
