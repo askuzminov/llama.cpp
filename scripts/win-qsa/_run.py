@@ -1339,7 +1339,9 @@ def cmd_decode():
 # ---------------------------------------------------------------- profile
 
 def op_group(name):
-    return re.split(r"[ (]", name, 1)[0]
+    # the op without its shape; a fused group of GGML_CUDA_OP_TIMING keeps its ops ("FUSED SCALE+SILU")
+    parts = re.split(r"[ (]", name)
+    return " ".join(parts[:2]) if parts[0] == "FUSED" and len(parts) > 1 else parts[0]
 
 
 def cmd_profile():
@@ -1401,7 +1403,16 @@ def cmd_profile():
                          for x in lines) if m and int(m[1]) == n_tokens][-3:]
                 host = [statistics.median(h[i] for h in host) for i in range(3)] if host else None
                 if not vulkan:
-                    return {"lines": [x.strip() for x in lines if "sched_prof" in x][-4:], "host": host}
+                    # GGML_CUDA_OP_TIMING (an arm sets it): the ops of the run by GPU time, from its last report (the
+                    # flush when the context goes, all of a run with a period above its compute calls)
+                    heads = [i for i, x in enumerate(lines) if re.match(r"cuda_op_timing \S+: \d+ compute calls", x)]
+                    ops = []
+                    for x in lines[heads[-1] + 1:] if heads else []:
+                        m = re.match(r"cuda_op_timing \S+:\s+([\d.]+) ms\s+(\d+) x\s+[\d.]+ us\s+(.+)", x)
+                        if m:
+                            ops.append([m[3].strip(), int(m[2]), float(m[1])])
+                    return {"lines": [x.strip() for x in lines if "sched_prof" in x][-4:], "host": host,
+                            **({"ops": sorted(ops, key=lambda o: -o[2])} if ops else {})}
                 # the last graph is the measured one: the ubatch of the prompt or the last decode step at the depth
                 starts = [i for i, x in enumerate(lines) if x.startswith("Vulkan Timings:")]
                 if not starts:
@@ -1422,20 +1433,20 @@ def cmd_profile():
             done[arm.name] = r
             host = r.get("host")
             metrics = {"host_graph": host[0], "host_inputs": host[1], "host_compute": host[2]} if host else {}
-            if vulkan:
+            if r.get("ops"):
                 metrics["gpu_ms"] = sum(o[2] for o in r["ops"])
             run.record("profile", arm, f"{kind}@{depth}", metrics, kept, exe.parent)
             title = f"{label}: {'prompt ' + str(n_pp) if kind != 'tg' else 'decode step'} at depth {depth}" + (" k" if kept else "")
             host = r.get("host")
             host_line = (f"  host: graph build {host[0]:.2f} ms, inputs {host[1]:.2f} ms, compute call {host[2]:.2f} ms"
                          if host else "  host: no LLAMA_INPUT_TIMING in this build")
-            if not vulkan:
+            if not vulkan and not r.get("ops"):
                 run.add("", title, host_line, *[f"  {x}" for x in r["lines"]])
                 continue
             total = sum(o[2] for o in r["ops"]) or 1
             run.add("", f"{title}, {total:.2f} ms of gpu time", host_line,
                     *table(["  ms", "count", "op"], [[f"  {ms:.2f}", count, name] for name, count, ms in r["ops"][:25]]))
-        if vulkan and len(done) > 1:
+        if len(done) > 1 and all(r.get("ops") for r in done.values()):
             # gpu time per kind of op, side by side: where one arm loses against the other
             groups = {}
             for name, r in done.items():

@@ -252,13 +252,13 @@ static void ggml_cuda_op_timing_fork_end(ggml_backend_cuda_context * ctx, const 
 }
 
 // at the start of a compute call: the spans that ended, and the report every period
-static void ggml_cuda_op_timing_fork_call(ggml_backend_cuda_context * ctx) {
-    ggml_cuda_op_timing_fork * t = ggml_cuda_op_timing_fork_get(ctx);
-    if (t == nullptr) {
-        return;
-    }
+// reads the spans that have passed (all of them with wait)
+static void ggml_cuda_op_timing_fork_drain(ggml_cuda_op_timing_fork * t, bool wait) {
     while (!t->pending.empty()) {
         ggml_cuda_op_timing_fork::span & s = t->pending.front();
+        if (wait) {
+            CUDA_CHECK(cudaEventSynchronize(s.end));
+        }
         const cudaError_t err = cudaEventQuery(s.end);
         if (err == cudaErrorNotReady) {
             if (cudaPeekAtLastError() == cudaErrorNotReady) {
@@ -278,22 +278,36 @@ static void ggml_cuda_op_timing_fork_call(ggml_backend_cuda_context * ctx) {
         t->free_events.push_back(s.end);
         t->pending.pop_front();
     }
-    if (++t->n_calls < ggml_cuda_op_timing_fork_period()) {
-        return;
-    }
+}
+
+// the ops by total time; to stderr, as llama-bench (05) drops the log
+static void ggml_cuda_op_timing_fork_report(const char * name, ggml_cuda_op_timing_fork * t) {
     std::vector<std::pair<std::string, std::pair<int64_t, double>>> rows(t->agg.begin(), t->agg.end());
     std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.second > y.second.second; });
-    GGML_LOG_INFO("cuda_op_timing %s: %lld compute calls, %lld ops, %.2f ms of kernels: %.1f ops and %.3f ms per call\n",
-                  ctx->name.c_str(), (long long) t->n_calls, (long long) t->n_ops, 1e-3 * t->op_us,
-                  (double) t->n_ops / (double) t->n_calls, 1e-3 * t->op_us / (double) t->n_calls);
+    const double n_calls = (double) std::max<int64_t>(t->n_calls, 1);
+    fprintf(stderr, "cuda_op_timing %s: %lld compute calls, %lld ops, %.2f ms of kernels: %.1f ops and %.3f ms per call\n",
+            name, (long long) t->n_calls, (long long) t->n_ops, 1e-3 * t->op_us, (double) t->n_ops / n_calls, 1e-3 * t->op_us / n_calls);
     for (size_t r = 0; r < rows.size() && r < 40; ++r) {
-        GGML_LOG_INFO("cuda_op_timing %s: %9.3f ms %8lld x %8.2f us  %s\n", ctx->name.c_str(), 1e-3 * rows[r].second.second,
-                      (long long) rows[r].second.first, rows[r].second.second / (double) rows[r].second.first, rows[r].first.c_str());
+        fprintf(stderr, "cuda_op_timing %s: %9.3f ms %8lld x %8.2f us  %s\n", name, 1e-3 * rows[r].second.second,
+                (long long) rows[r].second.first, rows[r].second.second / (double) rows[r].second.first, rows[r].first.c_str());
     }
+    fflush(stderr);
     t->agg.clear();
     t->n_calls = 0;
     t->n_ops   = 0;
     t->op_us   = 0.0;
+}
+
+static void ggml_cuda_op_timing_fork_call(ggml_backend_cuda_context * ctx) {
+    ggml_cuda_op_timing_fork * t = ggml_cuda_op_timing_fork_get(ctx);
+    if (t == nullptr) {
+        return;
+    }
+    ggml_cuda_op_timing_fork_drain(t, false);
+    if (++t->n_calls < ggml_cuda_op_timing_fork_period()) {
+        return;
+    }
+    ggml_cuda_op_timing_fork_report(ctx->name.c_str(), t);
 }
 
 static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx) {
@@ -304,6 +318,11 @@ static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx)
     auto it = ggml_cuda_op_timing_fork_ctx.find(ctx);
     if (it == ggml_cuda_op_timing_fork_ctx.end()) {
         return;
+    }
+    // what the last period did not report yet (all of a llama-bench run with a period above its compute calls)
+    ggml_cuda_op_timing_fork_drain(it->second.get(), true);
+    if (it->second->n_ops > 0) {
+        ggml_cuda_op_timing_fork_report(ctx->name.c_str(), it->second.get());
     }
     for (const auto & s : it->second->pending) {
         CUDA_CHECK(cudaEventDestroy(s.start));

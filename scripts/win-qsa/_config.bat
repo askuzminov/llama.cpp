@@ -276,7 +276,11 @@ if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 rem 10.10: -b 8192 -ub 8192 (n2ub8k): the 118K prompt at 607.0 t/s against 527.6 with 4096, --phase-mem took ubatch
 rem 6656 at 106K cells and 5888 at 120K (the memory); TG 26.86 against 27.40, acceptance 0.512 against 0.523 (text)
-if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 8192 -ub 8192"
+rem 12.10 night (f4a7d3ee): -b 16384 (b16k) took the 118K prompt at 903.9 t/s against 875.1 with -b 8192: --phase-mem plans
+rem the buffers at every llama_decode call of a prompt (0.15-0.25 s each, 15 calls of the 118K prompt at -b 8192, 8 at
+rem 16384), and the PLE rows of the second ubatch of a call are gathered while the first computes (the log line is
+rem there). the default since then; prompts up to 8192 tokens are one ubatch either way
+if not defined DECARGS    set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 16384 -ub 8192"
 rem since 05.10 the cpu experts run while the gpu runs the cached ones (06.10: TG +2 percent, +4.6 with MTP n2;
 rem GGML_SCHED_PARALLEL_CPU=0 turns it off) and a prompt of up to 192 tokens takes the generation layout with the
 rem moe-cache kept (06.10: an 82-token prompt 1.6 s instead of 2.7 s, no 0.73 s refill after it;
@@ -355,7 +359,13 @@ rem the 120K prompt 875.1 t/s (868.4 before), TG 28.11. b16k: see the 395 (-b 16
 rem the run of 12.10 night is a short one: no 01/03 (CUDA kernels unchanged since the evening check), bench at 0 and
 rem 122880 for the alloc peak lines of default and maskdense, decode: auto against t20/t24 and b16k at the 118K prompt
 rem (auto there: 875.1 on 12.10 evening)
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=0;t20 @draft --spec-auto -t 20 @p=0;t24 @draft --spec-auto -t 24 @p=0;b16k @draft --spec-auto -b 16384 @p=500000"
+rem 12.10 night (f4a7d3ee): auto 31.56, t20 31.80, t24 29.54 t/s, but the mean hides the text: on the six os/db/code runs
+rem auto 31.17, t20 30.12 (-3.4 percent), t24 29.35 (-5.8), t20 wins only on repeat, where the acceptance moves
+rem everything. more threads do not help the CPU experts (the RAM, not the cores), the default stays; b16k: see DECARGS
+rem the next run is the per-op profile only (see PROFARMS)
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=0"
+if not defined RUN_DECODE  set "RUN_DECODE=0"
+if not defined RUN_BENCH   set "RUN_BENCH=0"
 if not defined RUN_CHECK   set "RUN_CHECK=0"
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
@@ -368,9 +378,17 @@ rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are o
 rem topkcub (11.10 evening, GGML_CUDA_TOPK_RADIX=0: the top-k of a prompt ubatch row by row with cub, as before): PP
 rem 696.8 / 623.7 against 1016.5 / 854.0 with the radix select (+46 and +37 percent at 0 and 122880), TG the same;
 rem 01 TOP_K 531/531. the arm is off
+rem 12.10 night (f4a7d3ee): maskdense (the dense KQ mask instead of the one from positions) PP 1015.9 / 858.6 against
+rem 969.2 / 828.6 of the default at 0 / 122880, +4.8 / +3.6 percent, about 190 ms per 4096 ubatch at both depths, so
+rem not the size of the mask; TG the same. no alloc peak lines: llama-bench drops the log (they go to stderr since)
 if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880"
-rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
-if not defined RUN_PROFILE set "RUN_PROFILE=0"
+rem llama-bench has no expert cache: a profile of it says little about the server of the 3090. optime / optimemd:
+rem GGML_CUDA_OP_TIMING with a period above the compute calls of the run, so the report comes once, when the context
+rem goes: the GPU time of every op of the warmup and the two prompts of 4096 at depth 0, for the 190 ms that the mask
+rem from positions costs (the table is of the whole run, three prompts, not of one ubatch)
+if not defined RUN_PROFILE set "RUN_PROFILE=1"
+if not defined PROFKINDS   set "PROFKINDS=pp@0"
+if not defined PROFARMS    set "PROFARMS=optime GGML_CUDA_OP_TIMING=1000000000;optimemd GGML_CUDA_OP_TIMING=1000000000 LLAMA_QSA_MASK_POS=0"
 if not defined KERNARMS   set "KERNARMS=default"
 if not defined RUN_KERNELS set "RUN_KERNELS=0"
 rem auto: -c of each depth is depth + prompt, as --phase-mem sizes the buffers in the server. at a fixed -c 262144

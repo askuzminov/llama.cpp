@@ -132,5 +132,7 @@ static void ggml_alloc_peak_report(struct ggml_alloc_peak_fork * p, const char *
     for (int i = 0; i < p->n_top && len < (int) sizeof(line) - 160; ++i) {
         len += snprintf(line + len, sizeof(line) - len, " %s %.1f;", p->top_names[i], p->top[i].size/1048576.0);
     }
-    GGML_LOG_INFO("%s\n", line);
+    // stderr directly: llama-bench drops the log, and 02 runs it
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
 }
