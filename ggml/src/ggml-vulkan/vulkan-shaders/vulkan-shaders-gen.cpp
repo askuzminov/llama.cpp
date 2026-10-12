@@ -945,6 +945,11 @@ void process_shaders() {
 
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
+    // fork: the sparse prompt attention over the union of neighbouring tokens, coopmat and emulated
+    string_to_spv("flash_attn_union_emu", "flash_attn_union.comp", {{"EMULATE", "1"}});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("flash_attn_union", "flash_attn_union.comp", {}, true, true);
+#endif
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});

@@ -166,7 +166,7 @@ set "BENCHDEPTHS=0,65536,122880"
 | `DECSAMP` | `1.0 20 0.95` | temperature, top-k, top-p; `0 20 0.95` даёт жадную выборку |
 | `DECPREFIX` | 0 | столько символов `PPLFILE` перед каждым промптом; список даёт отдельный проход на каждое значение |
 | `DECSAME` | пусто | пары `a:b`: совпадают ли ответы плеч (при жадной выборке) |
-| `DECGREP` | `moe_cache:.*slots\|moe_cache: policy\|phase_mem:\|sched_prof\|buffer size\|QSA KV in RAM` | строки лога сервера в сводке (без нового замера), последние 20 |
+| `DECGREP` | `moe_cache:.*slots\|moe_cache: policy\|...\|phase_mem:\|sched_prof\|buffer size\|QSA KV in RAM\|alloc peak\|PLE rows of a ubatch` | строки лога сервера в сводке (без нового замера), последние 20 |
 | `PROFPP`, `PROFTG`, `PROFUB`, `PROFCTX` | 4096, 4, 4096, `auto` | `PROFKINDS`: `pp` - ubatch промпта, `ppN` - промпт из N токенов, `tg` - шаг генерации; `@0,122880` после вида - свои глубины вместо `PROFDEPTH` (32768). `PROFCTX auto`: `-c` = глубина + промпт |
 | `BENCHSMALLCTX` | 16384 | `-c` замера коротких промптов на глубине 0 |
 | `KERNOPS` | MoE и q8_0 при n=4096 | случаи test-backend-ops perf, как `CHECKOPS` |

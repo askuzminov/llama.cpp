@@ -1060,6 +1060,10 @@ struct vk_device_struct {
     int mmid_f16reg_mode;
     // [q4_K, q5_K, q5_1, q8_0][fused gate/up]
     vk_pipeline pipeline_mmid_f16reg[4][2];
+    // the sparse prompt attention over the union of neighbouring tokens (flash_attn_union.comp, GGML_VK_FA_UNION): 0 off,
+    // 1 coopmat, 2 emulated; pipelines per (head size, list slots per step)
+    int fa_union_mode;
+    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_union;
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
     ggml_backend_buffer_type buffer_type_shared;
     ggml_backend_buffer_type_t extra_bufts[2] = {};

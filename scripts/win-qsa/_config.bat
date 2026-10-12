@@ -93,6 +93,12 @@ rem ran it only emulated (no matrix cores there), so 01 checks the coopmat path 
 rem at any size, GGML_VK_MMID_GLU_MIN_TOKENS=0, so the small cases take it too)
 rem 11.10: f16reg passed every matmul_id op on the 395 and is the default on RDNA3 since then; glu0 runs the fused
 rem gate/up at any size (its small cases take it too), int8 the int8 path (GGML_VK_MMID_F16REG=0)
+rem 01 of the run of 12.10 night: only the sparse attention, with the new paths. union (GGML_VK_FA_UNION=1, off by default): a tile of
+rem 4 tokens x 12 heads over the union of their selections (flash_attn_union.comp); the Mac ran it only emulated (53/53,
+rem 12 cases on the path, Bc 64 and 32), so 01 checks the coopmat path here; union32 with 32 list slots per step
+if not defined RUN_CHECK   set "RUN_CHECK=1"
+if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_EXT n_kv_max=[1-9]"
+if not defined CHECKARMS   set "CHECKARMS=default;spl8 GGML_VK_FA_SPARSE_SPLIT=8;union GGML_VK_FA_UNION=1;union32 GGML_VK_FA_UNION=1 GGML_VK_FA_UNION_BC=32"
 if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
@@ -165,7 +171,28 @@ rem nopf: LLAMA_PLE_PREFETCH=0, the PLE rows of each ubatch gathered when its in
 rem graphs (170-178 ms of a 4096-token ubatch here). the default gathers the next ubatch's rows while the current one
 rem computes, so only a prompt longer than a ubatch shows it: the 500000-character prefix (118K tokens, ~30 minutes
 rem per arm). maskdense is off
-if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0,500000;nopf LLAMA_PLE_PREFETCH=0 @draft --spec-auto @p=500000;lid64 LLAMA_QSA_LID_TOKENS=64 @draft --spec-auto @p=0"
+rem 12.10 evening (a15): auto compute buffer still 10495 MiB against 5979 of lid64 (the order fix did not reach the
+rem real model, the test model shows no such growth), and lid64 faster: bench PP 949.8 / 784.7 against 925.6 / 746.8,
+rem TG 28.47 / 25.43 against 27.32 / 24.54, server auto 36.48 against 38.70. the GPU time is the same in the profile
+rem (prompt at 122880 4931 ms, the REPEAT fill 52 ms now against 192), so likely the device memory: model 78056 + KV
+rem 7024 + compute 10495 is at the 96 GiB of dedicated memory. GGML_ALLOC_PEAK=1 logs what fills each compute buffer at
+rem its peak (ggml/src/fork/ggml-alloc-peak-fork.inc). nopf: the 120K prompt 770.3 against 772.1 of auto, no gain: the
+rem server calls decode per -b batch, and with -b = -ub there is no next ubatch inside a call to gather ahead for.
+rem b16k: -b 16384, four ubatches per call. the indexer default is back to 64 tokens on Vulkan (lid64 above);
+rem lidall: LLAMA_QSA_LID_TOKENS=1000000, the lightning indexer at every size, for its alloc peak line.
+rem the +4.5 GiB with the lightning indexer in the prompt (08.10 12522 against 7945, 12.10 10495 against 5979) followed
+rem the upstream merge that brought the op, and is fragmentation: ggml-alloc plans the compute buffer in chunks of the
+rem Vulkan suballocation block (1 GiB) and the chunks peak one by one, around a 2 GiB mask and 1 GiB scores. the 4-head
+rem test model at 262144 x 4096: 5312 MiB for 2074 MiB alive with 1 GiB chunks, 3264 with 2 GiB (the 395 allows 2 GiB
+rem per allocation). the fork takes the device limit since 12.10 night; sub1g: GGML_VK_SUBALLOC_UPSTREAM=1, 1 GiB
+rem the run of 12.10 night is a short one (the user: only what is needed, the focus is the depth): no 01/03 (kernels
+rem and numbers unchanged), bench at 0 and 122880, profile at 122880, decode: the buffers (none, auto with MTP, lidall,
+rem sub1g) and b16k at the 118K prompt
+if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;b16k @draft --spec-auto -b 16384 @p=500000;lidall LLAMA_QSA_LID_TOKENS=1000000 @draft --spec-auto @p=0;sub1g GGML_VK_SUBALLOC_UPSTREAM=1 @draft --spec-auto @p=0"
+if not defined RUN_QUALITY set "RUN_QUALITY=0"
+if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
+if not defined BENCHSMALL  set "BENCHSMALL=0"
+if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
@@ -209,8 +236,11 @@ rem int8 arms are off
 rem swap0 (11.10 evening, LLAMA_HC_INJECT_SWAP_MIN=0: the hc injection as 1 row of 4 columns for 1-4 tokens, as before):
 rem TG 28.18 / 25.16 against 28.44 / 25.47 of the default (4 rows of 1 column), +0.9 and +1.2 percent; PP the same
 rem (948.5 / 779.6). the arm is off
-rem maskdense, lid64: see DECARMS
-if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880;lid64 LLAMA_QSA_LID_TOKENS=64 @d=0,122880"
+rem maskdense, lid64: see DECARMS. maskdense is off (12.10 evening: 932.5 / 751.6 against default 925.6 / 746.8)
+rem spl4, spl8 (12.10 night): the sparse attention of a prompt in 4 / 8 parts, all tokens of part 0 first
+rem (GGML_VK_FA_SPARSE_SPLIT, off by default): at 122880 the 12 layers took 896 ms against 302 at 0, the K/V gather
+rem at the DRAM rate, see FORK.md. union, union32: see CHECKARMS (KV under 4104 keeps the dense path, so 122880 only)
+if not defined BENCHARMS  set "BENCHARMS=default;lidall LLAMA_QSA_LID_TOKENS=1000000 @d=0,122880;sub1g GGML_VK_SUBALLOC_UPSTREAM=1 @d=0,122880;spl4 GGML_VK_FA_SPARSE_SPLIT=4 @d=122880;spl8 GGML_VK_FA_SPARSE_SPLIT=8 @d=122880;union GGML_VK_FA_UNION=1 @d=122880;union32 GGML_VK_FA_UNION=1 GGML_VK_FA_UNION_BC=32 @d=122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -221,10 +251,13 @@ rem 10.10 evening (88f10c91f): f16reg cut the prompt at 0 from 4379 to 4094 ms o
 rem 531 -> 505), 02 PP +6.4 percent at 0 but +0.3 at 122880. 11.10 (d01bba7a3, f16reg v2): at 122880 too, 5182 -> 4908
 rem ms (gate/up 883 -> 613), the wall time of the compute call 5218 -> 4940; 02 lost it to the cold PLE rows of the
 rem first arm at 122880 (BENCHWARMTOKENS). at 0 4367 / 4584 (noelt) / 4060 ms; a decode step at 122880 40.4-40.9 ms
-if not defined PROFKINDS  set "PROFKINDS=pp@0,122880 tg@122880"
+rem tg@0 next to tg@122880: which ops of a decode step grow with the depth (28.5 -> 25.4 t/s)
+if not defined PROFKINDS  set "PROFKINDS=pp@122880 tg@0,122880"
 rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the attention gate before 10.10
 rem int8: the MUL_MAT_ID time per op on the int8 path, f16reg is the default since 11.10 (see CHECKARMS)
-if not defined PROFARMS   set "PROFARMS=default"
+rem lidall: the lightning indexer at every size next to the default (64 tokens again since 12.10 evening)
+rem spl8: see BENCHARMS, the attention and the split_k reduce per op
+if not defined PROFARMS   set "PROFARMS=default;lidall LLAMA_QSA_LID_TOKENS=1000000 @d=122880;spl8 GGML_VK_FA_SPARSE_SPLIT=8 @d=122880;union GGML_VK_FA_UNION=1 @d=122880"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -316,7 +349,18 @@ rem and the slowest expert thread decides a layer. Strata moved its non-pool thr
 rem decode on a Linux Xeon
 rem auto at the prefix: the long prompt after the mask order fix, the one-element REPEAT as a fill and the PLE rows
 rem gathered ahead (868.4 t/s on 12.10 afternoon)
-if not defined DECARMS    set "DECARMS=base @p=0;auto @draft --spec-auto @p=0,500000;t8p @draft --spec-auto -t 8 -C 0x5555 --cpu-strict 1 @p=0;t16p @draft --spec-auto -t 16 -C 0xFFFF --cpu-strict 1 @p=0"
+rem 12.10 evening (49f): base 30.28, auto 32.09 (the HC fusions of 12.10 within the noise), t8p 28.45, t16p 29.97: the
+rem P-cores alone lose, the E-cores help the CPU experts, so the CPU part matters here. t20 / t24: more threads, no pin.
+rem the 120K prompt 875.1 t/s (868.4 before), TG 28.11. b16k: see the 395 (-b 16384 with -ub 8192: two per call)
+rem the run of 12.10 night is a short one: no 01/03 (CUDA kernels unchanged since the evening check), bench at 0 and
+rem 122880 for the alloc peak lines of default and maskdense, decode: auto against t20/t24 and b16k at the 118K prompt
+rem (auto there: 875.1 on 12.10 evening)
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=0;t20 @draft --spec-auto -t 20 @p=0;t24 @draft --spec-auto -t 24 @p=0;b16k @draft --spec-auto -b 16384 @p=500000"
+if not defined RUN_CHECK   set "RUN_CHECK=0"
+if not defined RUN_QUALITY set "RUN_QUALITY=0"
+if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
+if not defined BENCHSMALL  set "BENCHSMALL=0"
+if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
@@ -364,7 +408,7 @@ if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
-if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM"
+if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch"
 rem 1: the warmup run of llama-bench, llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds
 rem load time and memory pressure, -lm dio reads the weights at load and the median of 02 drops a cold first rep
 if not defined WARMUP      set "WARMUP=0"

@@ -75,6 +75,8 @@ layout (push_constant) uniform parameter {
 } p;
 
 #define SINK_ENABLE_BIT (1<<24)
+// fork: split_k index is the slow part of gl_WorkGroupID.x, see init_indices
+#define SPLIT_MAJOR_BIT (1<<25)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -156,7 +158,14 @@ void init_indices()
     KV = p.KV;
 
     if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+        if (p.gqa_ratio > 1 && (p.mask_n_head_log2 & SPLIT_MAJOR_BIT) != 0) {
+            // fork: the workgroups that run at the same time take the same split of neighbouring rows, so their
+            // sparse lists cover the same stretch of KV and the cache serves the gather
+            i = 0;
+            const uint32_t n_rows_wg = gl_NumWorkGroups.x / p.k_num;
+            gqa_iq1 = gl_WorkGroupID.x % n_rows_wg;
+            split_k_index = gl_WorkGroupID.x / n_rows_wg;
+        } else if (p.gqa_ratio > 1) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
             gqa_iq1 = gl_WorkGroupID.x / p.k_num;

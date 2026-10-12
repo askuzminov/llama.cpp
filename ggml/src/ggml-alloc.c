@@ -118,11 +118,14 @@ struct tallocr_chunk {
     size_t max_size;
 };
 
+struct ggml_alloc_peak_fork;
+
 struct ggml_dyn_tallocr {
     size_t alignment;
     size_t max_chunk_size;
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
+    struct ggml_alloc_peak_fork * peak_fork; // fork: GGML_ALLOC_PEAK, see fork/ggml-alloc-peak-fork.inc
 
 #ifdef GGML_ALLOCATOR_DEBUG
     struct {
@@ -131,6 +134,8 @@ struct ggml_dyn_tallocr {
     } allocated_tensors[1024];
 #endif
 };
+
+#include "fork/ggml-alloc-peak-fork.inc"
 
 static void ggml_dyn_tallocr_insert_block(struct tallocr_chunk * chunk, size_t offset, size_t size) {
     GGML_ASSERT(chunk->n_free_blocks < MAX_FREE_BLOCKS && "out of free blocks");
@@ -301,6 +306,15 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     }
 #endif
 
+    // fork: the tensors alive at the peak, the chunks before this one counted at their size
+    if (alloc->peak_fork) {
+        size_t base = 0;
+        for (int c = 0; c < addr.chunk; ++c) {
+            base += alloc->chunks[c]->max_size;
+        }
+        ggml_alloc_peak_on_alloc(alloc->peak_fork, tensor, addr.chunk, addr.offset, size, chunk->max_size, base);
+    }
+
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
 
     return addr;
@@ -311,6 +325,8 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 // this is a very naive implementation, but for our case the number of free blocks should be very small
 static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size) {
     size = aligned_offset(NULL, size, alloc->alignment);
+
+    ggml_alloc_peak_on_free(alloc->peak_fork, addr.chunk, addr.offset); // fork
 
     struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
 
@@ -355,6 +371,7 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
         alloc->chunks[i] = NULL;
     }
     alloc->n_chunks = 0;
+    ggml_alloc_peak_reset(alloc->peak_fork); // fork
 
 #ifdef GGML_ALLOCATOR_DEBUG
     for (int i = 0; i < 1024; i++) {
@@ -371,6 +388,7 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
+        /*.peak_fork      = */ ggml_alloc_peak_new(),
 #ifdef GGML_ALLOCATOR_DEBUG
         /*.allocated_tensors = */ {{0}},
 #endif
@@ -385,6 +403,7 @@ static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
     for (int i = 0; i < alloc->n_chunks; ++i) {
         free(alloc->chunks[i]);
     }
+    ggml_alloc_peak_free(alloc->peak_fork); // fork
     free(alloc);
 }
 
@@ -851,6 +870,11 @@ static bool ggml_gallocr_reserve_n_impl(
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+
+    // fork: GGML_ALLOC_PEAK
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        ggml_alloc_peak_report(galloc->buf_tallocs[i]->peak_fork, ggml_backend_buft_name(galloc->bufts[i]));
+    }
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {

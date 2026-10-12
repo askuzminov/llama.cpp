@@ -1050,27 +1050,28 @@ public:
 
 // the lightning indexer for the block scores. its CUDA and Vulkan kernels take a head size of 128.
 // 08.10, 395 (Vulkan): a decode step at 122880 0.77 ms faster than MUL_MAT_HEADSUM, a 4096-token prompt 6 percent
-// slower there; 3090 (CUDA): the prompt the same, TG +1.7 percent. so Vulkan took it up to 64 tokens per stream.
-// since 12.10 Vulkan runs a prompt of 4 heads in one stream on the fused head matmul inside the op
-// (ggml_vk_fork_lid_headsum), so it takes the op there too: one score and an f16 bias instead of the head scores and
-// an f32 bias. LLAMA_QSA_LID_TOKENS=<n>: Vulkan takes the op up to n tokens per stream only (64 = before 12.10),
-// every other backend always. LLAMA_QSA_LID=1: always, 0: never
+// slower there; 3090 (CUDA): the prompt the same, TG +1.7 percent. so Vulkan takes it up to LLAMA_QSA_LID_TOKENS
+// tokens per stream (default 64: decode and draft checks), every other backend always.
+// 12.10: Vulkan runs a prompt of 4 heads in one stream on the fused head matmul inside the op (ggml_vk_fork_lid_headsum),
+// with one score and an f16 bias instead of the head scores and an f32 bias. on the test model that took less memory,
+// on the 395 the compute buffer of the real model went 5979 -> 10495 MiB and the prompt and decode got slower, cause
+// not found yet (GGML_ALLOC_PEAK); so the default stays 64, LLAMA_QSA_LID_TOKENS=1000000 takes the op at every size.
+// LLAMA_QSA_LID=1: always, 0: never
 static bool qsa_use_lid(int64_t idx_dim, int64_t n_idx_h, int64_t n_tps, int64_t n_stream, bool is_vulkan) {
+    GGML_UNUSED(n_idx_h);
+    GGML_UNUSED(n_stream);
     static const int mode = [] {
         const char * env = std::getenv("LLAMA_QSA_LID");
         return env == nullptr ? -1 : std::atoi(env) != 0;
     }();
     static const int64_t vk_tokens = [] {
         const char * env = std::getenv("LLAMA_QSA_LID_TOKENS");
-        return env == nullptr ? (int64_t) -1 : (int64_t) std::atoll(env);
+        return env == nullptr ? (int64_t) 64 : (int64_t) std::atoll(env);
     }();
     if (idx_dim != 128 || mode == 0) {
         return false;
     }
-    if (mode == 1 || !is_vulkan || n_tps <= (vk_tokens < 0 ? 64 : vk_tokens)) {
-        return true;
-    }
-    return vk_tokens < 0 && n_idx_h == 4 && n_stream == 1;
+    return mode == 1 || !is_vulkan || n_tps <= vk_tokens;
 }
 
 ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
@@ -2107,7 +2108,10 @@ bool llama_model_qwen4exp_fork::ple_prefetch_take(const std::vector<int32_t> & i
     }
     pf.finish();
     pf.active = false;
-    pf.n_used++;
+    if (pf.n_used++ == 0) {
+        // the server kills its process at the end, so the count at unload rarely makes it to the log
+        LLAMA_LOG_INFO("%s: the PLE rows of a ubatch were gathered while the one before computed\n", __func__);
+    }
     std::swap(dst, pf.rows);
     return true;
 }

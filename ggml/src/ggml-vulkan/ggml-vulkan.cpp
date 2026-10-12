@@ -3749,6 +3749,26 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
     }
+    // fork: the sparse prompt attention over the union of neighbouring tokens, 3 subgroups per workgroup
+    for (auto & fa : device->pipeline_fa_union) {
+        const uint32_t sg = device->subgroup_size;
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        const bool cm1 = device->fa_union_mode == 1;
+#else
+        const bool cm1 = false;
+#endif
+        const char * name = cm1 ? "flash_attn_union_cm1" : "flash_attn_union_emu";
+        size_t len = flash_attn_union_emu_len;
+        const void * data = flash_attn_union_emu_data;
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        if (cm1) {
+            len = flash_attn_union_cm1_len;
+            data = flash_attn_union_cm1_data;
+        }
+#endif
+        ggml_vk_create_pipeline(device, fa.second, name, len, data, "main", 6, sizeof(vk_op_fa_union_push_constants), {1, 1, 1},
+                                {3 * sg, sg, fa.first.first, fa.first.second}, 1, true, true, sg);
+    }
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
@@ -4357,6 +4377,12 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         if (GGML_VK_SUBALLOCATION_BLOCK_SIZE != nullptr) {
             device->suballocation_block_size = std::stoull(GGML_VK_SUBALLOCATION_BLOCK_SIZE);
+        } else if (getenv("GGML_VK_SUBALLOC_UPSTREAM") == nullptr) {
+            // fork: the device limit of one allocation. the block size is the largest buffer ggml-alloc plans a compute
+            // buffer in, and its chunks peak one by one: on the 395 (2 GiB per allocation) 1 GiB chunks around the 2 GiB
+            // QSA mask and the 1 GiB indexer scores of a 4096-token ubatch at 262144 cells left holes, the 4-head test
+            // model at that size took 5312 MiB for 2074 alive (3264 with 2 GiB). GGML_VK_SUBALLOC_UPSTREAM=1: 1 GiB
+            device->suballocation_block_size = device->max_memory_allocation_size;
         } else {
             // Limit batching of allocations to 1GB by default to avoid fragmentation issues
             device->suballocation_block_size = 1024*1024*1024;
@@ -4931,6 +4957,7 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         ggml_vk_fork_shmem_limit(device);
         ggml_vk_fork_mmid_f16reg_init(device);
+        ggml_vk_fork_fa_union_init(device);
 
         bool int_large_tile, int_large_tile_id;
         ggml_vk_fork_int_large_tile(device, int_large_tile, int_large_tile_id);
@@ -8363,6 +8390,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
+
+    // fork: the sparse prompt attention over the union of neighbouring tokens, see ggml_vk_fork_fa_union
+    if (ggml_vk_fork_fa_union(ctx, subctx, q, k, v, mask, sinks, dst)) {
+        return;
+    }
+
     uint32_t gqa_ratio = 1;
     uint32_t qk_ratio = neq2 / nek2;
     uint32_t workgroups_x = (uint32_t)neq1;
@@ -8588,12 +8621,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // Try to use split_k when KV is large enough to be worth the overhead.
     // Sparse: split_kv carries the list capacity, split_k partitions its blocks for occupancy.
+    bool split_major = false;
     if (use_sparse) {
         split_kv = sparse_capacity;
         const uint32_t total_blocks = CEIL_DIV(sparse_capacity, Bc);
         const uint32_t base_wgs = (gqa_ratio > 1 ? workgroups_x : Tr) * workgroups_y * workgroups_z;
         if (base_wgs < shader_core_count * 2) {
             split_k = shader_core_count * 2 / base_wgs;
+        }
+        // fork: the parts of the lists in the split-major order, see ggml_vk_fork_fa_sparse_split
+        const uint32_t major_parts = gqa_ratio > 1 ? ggml_vk_fork_fa_sparse_split(base_wgs, shader_core_count) : 0;
+        if (major_parts > split_k) {
+            split_k = major_parts;
+            split_major = true;
         }
         split_k = std::max(1u, std::min(split_k, total_blocks));
         // Match the shader's per-split block count so no split is empty.
@@ -8758,6 +8798,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+    if (split_major && split_k > 1) {
+        mask_n_head_log2 |= 1u << 25; // fork: SPLIT_MAJOR_BIT of flash_attn_base.glsl
+    }
 
     if (use_mask_opt)
     {

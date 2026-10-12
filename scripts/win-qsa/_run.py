@@ -889,7 +889,7 @@ def cmd_bench():
         run.add("", f"{kind.upper()} t/s", *table(["depth", *[a.name for a in arms]], rows))
     # prompts of an agent turn at depth 0: one llama-bench run per arm over the sizes of BENCHSMALL. a small -c is
     # enough here, the graph of a short prompt at depth 0 does not depend on it
-    small = env_ints("BENCHSMALL", "") if env("BENCHSMALL") else []
+    small = env_ints("BENCHSMALL", "") if env("BENCHSMALL") not in ("", "0") else []  # 0: no short prompts
     if small:
         small_arms = parse_arms("BENCHSMALLARMS", "default")
         small_ctx = env_int("BENCHSMALLCTX", 16384)

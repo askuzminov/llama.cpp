@@ -87,6 +87,24 @@ struct vk_op_ssm_conv_concat_push_constants {
     uint32_t n_s;
 };
 
+// flash_attn_union.comp, strides in elements
+struct vk_op_fa_union_push_constants {
+    uint32_t N;
+    uint32_t KV;
+    uint32_t n_head;
+    uint32_t G;
+    uint32_t R;
+    uint32_t q_nb1, q_nb2, q_nb3;
+    uint32_t k_nb1, k_nb2, k_nb3;
+    uint32_t v_nb1, v_nb2, v_nb3;
+    uint32_t m_nb1, m_nb3;
+    uint32_t nem3;
+    uint32_t rk3, rv3;
+    uint32_t capacity;
+    uint32_t n_groups;
+    float    scale;
+};
+
 // the large int8 coopmat tiles that GGML_VK_MMQ_INT_TILE, _ID and _GLU set, read by ggml_vk_load_shaders
 struct vk_fork_int_tiles {
     // GGML_VK_MMQ_INT_TILE: the large int8 coopmat tile with its own workgroup size
@@ -123,6 +141,8 @@ size_t ggml_vk_fork_host_buffer_pad(const vk_device & device, size_t size);
 // queue exists
 void ggml_vk_fork_mmid_f16reg_init(vk_device & device);
 bool ggml_vk_fork_coopmat_a_probe(vk_device & device);
+// GGML_VK_FA_UNION: sets fa_union_mode (1 coopmat, 2 emulated), once the compute queue exists
+void ggml_vk_fork_fa_union_init(vk_device & device);
 // GGML_VK_INT_COOPMAT: sets coopmat_int_ops and returns whether int8 coopmat may be enabled; mode gets the env value
 // (-1 when unset)
 bool ggml_vk_fork_int_coopmat(vk_device & device, int & mode);
@@ -166,6 +186,13 @@ vk_pipeline ggml_vk_get_rows_flat_pipeline(ggml_backend_vk_context * ctx, const 
 vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1);
 // TOP_K: radix-select instead of the tournament (GGML_VK_TOPK_RADIX)
 bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows);
+// FLASH_ATTN_EXT, sparse with the heads folded: the split count of the split-major order (GGML_VK_FA_SPARSE_SPLIT),
+// 0 for the upstream order and split count
+uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_count);
+// FLASH_ATTN_EXT: the sparse prompt attention over the union of neighbouring tokens (flash_attn_union.comp) where it
+// applies, false for the upstream path
+bool ggml_vk_fork_fa_union(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * q, const ggml_tensor * k,
+                           const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst);
 // MUL_MAT_ID: the mul_mmid_f16reg.comp pipeline for these operands, or nullptr for the upstream choice
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
                                      bool hoist_row_ids, bool y_f32_kernel, uint64_t n_per_expert);
