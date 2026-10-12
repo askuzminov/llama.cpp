@@ -152,6 +152,62 @@ struct test_mul_mat_headsum : public test_case {
     }
 };
 
+// LIGHTNING_INDEXER as the qwen4exp graph builds it: unit head weights made by a FILL of 1, which lets a backend run a
+// prompt on its fused head matmul (Vulkan: ggml_vk_fork_lid_headsum, 4 heads, one stream, from 65 tokens)
+struct test_lightning_indexer_unit : public test_case {
+    const int64_t nh;
+    const int64_t kv;
+    const int64_t nb;
+    const ggml_type type_K;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_K, nh, kv, nb);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LIGHTNING_INDEXER_UNIT";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_lightning_indexer_unit(int64_t nh = 4, int64_t kv = 1000, int64_t nb = 300, ggml_type type_K = GGML_TYPE_F16)
+        : nh(nh), kv(kv), nb(nb), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, nh, nb, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, 128, 1, kv, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * w = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, 1), 1.0f);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // the gated norm of the qwen4exp GDN output: RMS_NORM over rows of ne[0], MUL by a weight row, SIGMOID of the gate, MUL.
 // pad > 0 reads a through a view with longer rows. backends may run it as one shader (Vulkan: RMS_NORM_MUL_SIGMOID_MUL)
 struct test_rms_norm_gated : public test_case {
@@ -320,6 +376,13 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
             test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 2, bias, type_a));
             test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 8, bias, type_a));
         }
+    }
+    // the prompt sizes take the fused head matmul on Vulkan, 3 tokens and 64 heads the indexer shader
+    for (ggml_type type_k : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (auto kn : std::vector<std::array<int64_t, 2>>{{1000, 65}, {1000, 300}, {4097, 512}, {513, 77}, {1000, 3}}) {
+            test_cases.emplace_back(new test_lightning_indexer_unit(4, kn[0], kn[1], type_k));
+        }
+        test_cases.emplace_back(new test_lightning_indexer_unit(64, 1000, 300, type_k));
     }
 
     // MoE cache: 37 slots and the zero slot, n_used 10 uses the templated ids helper and n_used 5 the generic one

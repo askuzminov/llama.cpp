@@ -970,24 +970,77 @@ public:
     const bool causal_attn;
 };
 
+// the ubatches the QSA mask values can come from positions for: tokens only. the KQ mask of an M-RoPE model applies its
+// 2D rule (is_pos_2d is true for every ubatch of such a model) only where a cell and the token share the temporal
+// position; a text token shares it with its own cell alone (its x and y equal it), which the rule keeps visible, while
+// the tokens of an image share one temporal position
+// and one sequence per stream: every stream of a split cache holds one, a unified one only while the ubatch has one
+// (the reserve ubatch of a unified cache has one, a ubatch of two server slots at once takes the dense mask)
+static bool qsa_mask_pos_ubatch(const llama_cparams & cparams, const llama_ubatch & ubatch) {
+    return ubatch.token != nullptr && ubatch.embd == nullptr && !ubatch.is_mixed() &&
+        (!cparams.kv_unified || ubatch.n_seqs_unq == 1);
+}
+
+// the mask values of the cells QSA picks, from positions instead of the dense KQ mask (see build_attn_qsa): the position
+// of every attention cell of a stream's sequence (+inf for the rest), the position of every token, and the -inf that
+// fills the mask before the picked cells get their values
+class llama_model_qwen4exp_fork::llm_graph_input_qsa_pos : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_qsa_pos(const llama_memory_hybrid_idx_fork_context * mctx) : mctx(mctx) {}
+    virtual ~llm_graph_input_qsa_pos() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        mctx->set_input_qsa_pos(cell_pos, tok_pos, ubatch);
+
+        const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+        ggml_backend_tensor_set(neg_inf, &drop, 0, sizeof(drop));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_fork_context *>(params.mctx);
+
+        const int64_t n_stream = mctx->get_n_stream();
+
+        bool res = qsa_mask_pos_ubatch(params.cparams, params.ubatch); // an image ubatch needs the dense mask
+
+        res &= params.ubatch.n_tokens % n_stream == 0;
+        res &= cell_pos->ne[1] == (int64_t) mctx->get_attn()->get_n_kv();
+        res &= cell_pos->ne[3] == n_stream;
+        res &= tok_pos->ne[2] == params.ubatch.n_tokens/n_stream;
+
+        return res;
+    }
+
+    ggml_tensor * cell_pos = nullptr; // F32 [1, n_kv, 1, n_stream]
+    ggml_tensor * tok_pos  = nullptr; // F32 [1, 1, n_tokens/n_stream, n_stream]
+    ggml_tensor * neg_inf  = nullptr; // F16 [1, 1, 1, 1]
+
+    const llama_memory_hybrid_idx_fork_context * mctx;
+};
+
 // the lightning indexer for the block scores. its CUDA and Vulkan kernels take a head size of 128.
 // 08.10, 395 (Vulkan): a decode step at 122880 0.77 ms faster than MUL_MAT_HEADSUM, a 4096-token prompt 6 percent
-// slower there; 3090 (CUDA): the prompt the same, TG +1.7 percent. so Vulkan takes it up to LLAMA_QSA_LID_TOKENS
-// tokens per stream (default 64: decode and draft checks), every other backend always.
-// LLAMA_QSA_LID=1: always, 0: never
-static bool qsa_use_lid(int64_t idx_dim, int64_t n_tps, bool is_vulkan) {
+// slower there; 3090 (CUDA): the prompt the same, TG +1.7 percent. so Vulkan took it up to 64 tokens per stream.
+// since 12.10 Vulkan runs a prompt of 4 heads in one stream on the fused head matmul inside the op
+// (ggml_vk_fork_lid_headsum), so it takes the op there too: one score and an f16 bias instead of the head scores and
+// an f32 bias. LLAMA_QSA_LID_TOKENS=<n>: Vulkan takes the op up to n tokens per stream only (64 = before 12.10),
+// every other backend always. LLAMA_QSA_LID=1: always, 0: never
+static bool qsa_use_lid(int64_t idx_dim, int64_t n_idx_h, int64_t n_tps, int64_t n_stream, bool is_vulkan) {
     static const int mode = [] {
         const char * env = std::getenv("LLAMA_QSA_LID");
         return env == nullptr ? -1 : std::atoi(env) != 0;
     }();
     static const int64_t vk_tokens = [] {
         const char * env = std::getenv("LLAMA_QSA_LID_TOKENS");
-        return env == nullptr ? (int64_t) 64 : (int64_t) std::atoll(env);
+        return env == nullptr ? (int64_t) -1 : (int64_t) std::atoll(env);
     }();
     if (idx_dim != 128 || mode == 0) {
         return false;
     }
-    return mode == 1 || !is_vulkan || n_tps <= vk_tokens;
+    if (mode == 1 || !is_vulkan || n_tps <= (vk_tokens < 0 ? 64 : vk_tokens)) {
+        return true;
+    }
+    return vk_tokens < 0 && n_idx_h == 4 && n_stream == 1;
 }
 
 ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
@@ -1061,7 +1114,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
             // the lightning indexer takes the per-block bias as its f16 mask, see the scores below
             ggml_backend_dev_t dev_l = model.dev_layer(il);
             const bool vk_l = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev_l)), "Vulkan") == 0;
-            qsa->bias = ggml_new_tensor_3d(ctx0, blk_bias && qsa_use_lid(idx_dim, n_tps, vk_l) ? GGML_TYPE_F16 : GGML_TYPE_F32,
+            qsa->bias = ggml_new_tensor_3d(ctx0, blk_bias && qsa_use_lid(idx_dim, n_idx_h, n_tps, n_stream, vk_l) ? GGML_TYPE_F16 : GGML_TYPE_F32,
                     blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
             ggml_set_input(qsa->bias);
@@ -1353,6 +1406,7 @@ static void qsa_pack_kv(ggml_tensor * dst, int ith, int nth, void *) {
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
+        const llama_memory_hybrid_idx_fork_context * mctx_hyb,
         ggml_tensor *             q_cur,
         ggml_tensor *             k_cur,
         ggml_tensor *             v_cur,
@@ -1431,29 +1485,82 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         return cur;
     }
 
-    // view of the mask with rows of size 1, to read the selected rows out of:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream].
-    // built once for all QSA layers: the mask sits on the CPU, so a view per layer makes the
-    // scheduler copy the whole mask to the backend per layer, n_kv*n_batch*2 bytes each time
-    if (!qsa_kq_mask_rows) {
-        ggml_tensor * kq_mask = inp->get_kq_mask();
-
-        qsa_kq_mask_rows = ggml_view_4d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3], kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
-    }
-
-    ggml_tensor * kq_mask_rows = qsa_kq_mask_rows;
-
-    // prepare new kq mask - starts filled with -INFINITY. fill the row view and not the mask, so
-    // that both readers take the same copy
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask_rows, -INFINITY);
-
     // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    // gather the mask value of each selected cell: [1, n_top_k, n_batch, n_stream]
-    // scattering these back beats unmasking with zeros and adding the whole mask afterwards,
-    // which reads and writes n_kv values per token where only n_top_k of them can change
-    ggml_tensor * kept = ggml_get_rows(ctx0, kq_mask_rows, top_k_3d);
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+    const int64_t n_kv_m  = kq_mask->ne[0];
+    const int64_t n_tps_m = kq_mask->ne[1];
+    const int64_t n_str_m = kq_mask->ne[3];
+
+    // the mask values of the selected cells. from positions (LLAMA_QSA_MASK_POS, default 1): a cell is visible to a token
+    // when the stream's sequence holds it and its position is not above the token's, which is what the KQ mask says
+    // for a ubatch of tokens (qsa_mask_pos_ubatch), causal, without ALiBi or SWA, with one sequence per stream. the dense mask then is never
+    // built: it took n_kv x n_batch f16 twice, pinned on the host and as its copy on the device (2 GiB each at
+    // 262144 x 4096, the 395 11.10), and as much host time to fill and copy per ubatch. otherwise, and with 0, the
+    // values are read out of the KQ mask
+    static const bool pos_mode = [] {
+        const char * env = std::getenv("LLAMA_QSA_MASK_POS");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    const bool from_pos = pos_mode && cparams.causal_attn && !hparams.use_alibi && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
+        qsa_mask_pos_ubatch(cparams, ubatch);
+
+    ggml_tensor * kq_mask_all = nullptr;
+    ggml_tensor * kept        = nullptr;
+
+    if (from_pos) {
+        if (!qsa_pos_inp) {
+            auto pos_inp = std::make_unique<llm_graph_input_qsa_pos>(mctx_hyb);
+
+            pos_inp->cell_pos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_kv_m, 1, n_str_m);
+            pos_inp->tok_pos  = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, n_tps_m, n_str_m);
+            pos_inp->neg_inf  = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
+
+            ggml_set_input(pos_inp->cell_pos);
+            ggml_set_input(pos_inp->tok_pos);
+            ggml_set_input(pos_inp->neg_inf);
+
+            qsa_pos_inp = pos_inp.get();
+            res->add_input(std::move(pos_inp));
+        }
+
+        // positions of the selected cells: [1, n_top_k*n_batch, 1, n_stream] -> [1, n_top_k, n_batch, n_stream]
+        ggml_tensor * idx = ggml_is_contiguous(top_k) ? top_k : ggml_cont(ctx0, top_k);
+        idx = ggml_reshape_3d(ctx0, idx, top_k->ne[0]*top_k->ne[1], 1, top_k->ne[3]);
+
+        ggml_tensor * cell_pos = ggml_get_rows(ctx0, qsa_pos_inp->cell_pos, idx);
+        cell_pos = ggml_reshape_4d(ctx0, cell_pos, 1, top_k->ne[0], top_k->ne[1], top_k->ne[3]);
+
+        // 0 where the cell is not after the token, -inf where it is (or holds another sequence, or nothing):
+        // log(1 - step(cell - token))
+        kept = ggml_sub(ctx0, cell_pos, qsa_pos_inp->tok_pos);
+        kept = ggml_step(ctx0, kept);
+        kept = ggml_scale_bias(ctx0, kept, -1.0f, 1.0f);
+        kept = ggml_log(ctx0, kept);
+
+        // a node, so that the allocator frees it after the attention as it did the fill of the mask view
+        kq_mask_all = ggml_repeat_4d(ctx0, qsa_pos_inp->neg_inf, 1, n_kv_m, n_tps_m, n_str_m);
+    } else {
+        // view of the mask with rows of size 1, to read the selected rows out of:
+        // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream].
+        // built once for all QSA layers: the mask sits on the CPU, so a view per layer makes the
+        // scheduler copy the whole mask to the backend per layer, n_kv*n_batch*2 bytes each time
+        if (!qsa_kq_mask_rows) {
+            qsa_kq_mask_rows = ggml_view_4d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3], kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
+        }
+
+        ggml_tensor * kq_mask_rows = qsa_kq_mask_rows;
+
+        // prepare new kq mask - starts filled with -INFINITY. fill the row view and not the mask, so
+        // that both readers take the same copy
+        kq_mask_all = ggml_fill(ctx0, kq_mask_rows, -INFINITY);
+
+        // gather the mask value of each selected cell: [1, n_top_k, n_batch, n_stream]
+        // scattering these back beats unmasking with zeros and adding the whole mask afterwards,
+        // which reads and writes n_kv values per token where only n_top_k of them can change
+        kept = ggml_get_rows(ctx0, kq_mask_rows, top_k_3d);
+    }
 
     // modify KQ mask by restoring the elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
@@ -1554,7 +1661,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (top_k) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, mctx_hyb->is_kv_host(), il);
+        cur = build_attn_qsa(inp, mctx_hyb, Qcur, Kcur, Vcur, top_k, kq_scale, mctx_hyb->is_kv_host(), il);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,

@@ -1033,6 +1033,42 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
     return { st.n_dirty, st.warm };
 }
 
+void llama_memory_hybrid_idx_fork::set_input_qsa_pos(
+        ggml_tensor * cell_pos,
+        ggml_tensor * tok_pos,
+        const llama_ubatch * ubatch,
+        uint32_t n_kv) const {
+    GGML_ASSERT(cell_pos->buffer && ggml_backend_buffer_is_host(cell_pos->buffer));
+    GGML_ASSERT(tok_pos->buffer && ggml_backend_buffer_is_host(tok_pos->buffer));
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_F32 && tok_pos->type == GGML_TYPE_F32);
+
+    const int64_t n_ns     = cell_pos->ne[3];
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(cell_pos->ne[1] == (int64_t) n_kv && n_tokens % n_ns == 0);
+    GGML_ASSERT(tok_pos->ne[2] == n_tokens/n_ns && tok_pos->ne[3] == n_ns);
+
+    const int64_t n_tps = n_tokens/n_ns;
+
+    float * dst_cell = (float *) cell_pos->data;
+    float * dst_tok  = (float *) tok_pos->data;
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
+        const auto & cells = get_mem_attn()->get_cells(seq_id);
+
+        float * cur = dst_cell + s*n_kv;
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            cur[j] = !cells.is_empty(j) && cells.seq_has(j, seq_id) ? (float) cells.pos_get(j) : INFINITY;
+        }
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            GGML_ASSERT(ubatch->seq_id[s*n_tps + ii][0] == seq_id && "qsa: one sequence per stream");
+            dst_tok[s*n_tps + ii] = (float) ubatch->pos[s*n_tps + ii];
+        }
+    }
+}
+
 void llama_memory_hybrid_idx_fork::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -1429,6 +1465,12 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork_context::qsa
     }
 
     return mem->qsa_prepare(ubatch, n_kv, ratio, blk_bias, get_idx()->get_s0(), get_n_stream(), get_idx()->get_sinfo());
+}
+
+void llama_memory_hybrid_idx_fork_context::set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(mem != nullptr);
+
+    mem->set_input_qsa_pos(cell_pos, tok_pos, ubatch, get_attn()->get_n_kv());
 }
 
 void llama_memory_hybrid_idx_fork_context::set_input_qsa_dirty(

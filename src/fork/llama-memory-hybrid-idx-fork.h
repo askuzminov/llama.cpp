@@ -99,6 +99,14 @@ public:
                        const llama_ubatch * ubatch, uint32_t n_kv, uint32_t ratio, bool blk_bias,
                        bool causal_attn) const;
 
+    // the attention mask of QSA at the cells top_k picks, computed on the device from positions instead of read out
+    // of the dense KQ mask (LLAMA_QSA_MASK_POS): for a ubatch of tokens, causal, without ALiBi or SWA and with one
+    // sequence per stream, cell j is visible to a token when the stream's sequence holds it and its temporal position
+    // is not above the token's, as set_input_kq_mask decides
+    //   cell_pos F32 [1, n_kv, 1, ns]          position of each attention cell of the stream's sequence, +inf otherwise
+    //   tok_pos  F32 [1, 1, n_tokens/ns, ns]   position of each token
+    void set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, const llama_ubatch * ubatch, uint32_t n_kv) const;
+
     // what one pass has to rebuild of the pooled block keys
     struct qsa_plan {
         uint32_t n_dirty = 0;   // rows the graph writes; the list is padded to this size
@@ -263,6 +271,9 @@ public:
 
     void set_input_qsa_dirty(ggml_tensor * dirty_cells, ggml_tensor * dirty_pos, ggml_tensor * dirty_rows,
                              uint32_t ratio) const;
+
+    // see llama_memory_hybrid_idx_fork::set_input_qsa_pos, over the attention cells of this ubatch
+    void set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, const llama_ubatch * ubatch) const;
 
     // this ubatch's streams of the stored block keys: F32 [indexer_head_size, kv_size/ratio, ns]
     ggml_tensor * get_pool(ggml_context * ctx, int32_t il) const;

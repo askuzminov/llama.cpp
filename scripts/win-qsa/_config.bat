@@ -135,9 +135,24 @@ rem its device compute buffer (2800 MiB) and pinned on the host (2248 MiB). the 
 rem (LLAMA_MTP_UBATCH, 0 = the target's): on the test model 580/532 -> 145/133 MiB at -c 65536, the draft head
 rem probabilities the same in all cycles; here about 700/560 MiB expected, 96.7 GB of device buffers.
 rem mtpub0: the MTP context with the -ub of the target (before 11.10 evening), the buffer lines and the speed
-rem auto is MTP + ngram-mod (added when --spec-type is not given) with the draft cap 6. automtp: the same without
-rem ngram-mod, automtp3: without ngram-mod and with the cap 3 (the server setup the user found best on the 3090)
-if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;automtp @draft --spec-auto --spec-type draft-mtp @p=0;automtp3 @draft --spec-auto --spec-type draft-mtp --spec-draft-n-max 3 @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0;mtpub0 LLAMA_MTP_UBATCH=0 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
+rem 12.10 (TG of the summary, then os / db / code / repeat): none 27.56; auto (MTP + ngram-mod, cap 6) 36.87, 30.8 /
+rem 36.1 / 35.0 / 51.8; automtp (MTP, cap 6) 35.87, 30.8 / 32.4 / 38.7 / 44.8; automtp3 (MTP, cap 3) 37.43, 32.2 / 32.4 /
+rem 39.7 / 50.5; mtp3 33.43; mtpub0 33.45 with the MTP context at 2800/2248 MiB against 700/562 (no head stop in 5
+rem starts, the first auto try stopped in the main model allocation, no watchdog line). the cap 6 loses to 3 (verify
+rem 7.7 against 6.5 ms per token, recurrent state 788 against 450 MiB): --spec-auto takes the cap 3 since 12.10.
+rem ngram-mod: +16 percent on the repeated text at the cap 6, the rest within the text noise (texts diverge at 1.0).
+rem since 12.10 --spec-auto adds no ngram-mod (the user's call after the 3090 run): auto is MTP at the cap 3, as
+rem automtp3 was
+rem maskdense (12.10): LLAMA_QSA_MASK_POS=0, the QSA mask values read out of the dense KQ mask as before. the default
+rem takes them from the cell and token positions (log(1 - step(cell - token))) and never builds the dense mask,
+rem n_kv x ubatch f16 pinned on the host plus its copy on the device (2 GiB each at 262144 x 4096; test model at
+rem -c 16384 -ub 4096: both compute buffers -128 MiB, logits and server output the same). needs -np 1 or one sequence
+rem per ubatch: the reserve of a unified cache with several slots keeps the dense mask
+rem lid64 (12.10): LLAMA_QSA_LID_TOKENS=64, a prompt scores the indexer blocks with a matmul per head (fused into
+rem MUL_MAT_HEADSUM, but the graph still reserved the head scores, two of 1 GiB) and an f32 bias, as before. the default
+rem takes LIGHTNING_INDEXER at every size, Vulkan runs a prompt of it on the same fused matmul with the f16 mask as the
+rem bias (ggml_vk_fork_lid_headsum; 4-head test model: compute buffers -4 MiB each side at -c 4096 -ub 2048, KLD 0)
+if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;maskdense LLAMA_QSA_MASK_POS=0 @draft --spec-auto @p=0;lid64 LLAMA_QSA_LID_TOKENS=64 @draft --spec-auto @p=0"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -180,7 +195,8 @@ rem int8 arms are off
 rem swap0 (11.10 evening, LLAMA_HC_INJECT_SWAP_MIN=0: the hc injection as 1 row of 4 columns for 1-4 tokens, as before):
 rem TG 28.18 / 25.16 against 28.44 / 25.47 of the default (4 rows of 1 column), +0.9 and +1.2 percent; PP the same
 rem (948.5 / 779.6). the arm is off
-if not defined BENCHARMS  set "BENCHARMS=default"
+rem maskdense, lid64: see DECARMS
+if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880;lid64 LLAMA_QSA_LID_TOKENS=64 @d=0,122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -266,9 +282,17 @@ rem 11.10 evening (403e1429b): base 30.40 against 26.66 of swap0 (+14 percent, o
 rem / 29.00); n2 29.31 (26.69 / 26.46 / 30.80 / 35.12), auto 28.88; n2 at the prefix PP 817.4 against 607.8 (the radix
 rem top-k), TG 26.73. MTP pays only on code and repeated text now: the fit of auto puts a verified token at 19.4 ms
 rem (its cpu experts) against a decode step of about 32 ms, and with the head on, prose runs 14-16 percent below base.
-rem auto is MTP + ngram-mod with the cap 6; automtp: without ngram-mod, automtp3: without ngram-mod and with the cap 3
-rem (the user's server setup, best in the user's own test). the prefix pass of n2 is off this time (PP measured above)
-if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0;auto @draft --spec-auto @p=0;automtp @draft --spec-auto --spec-type draft-mtp @p=0;automtp3 @draft --spec-auto --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
+rem 12.10 (2e5, before the cap change; TG of the summary, then os / db / code / repeat): base 30.55, 31.4 / 31.7 /
+rem 30.1 / 29.2; n2 29.22; auto (MTP + ngram-mod, cap 6) 28.21, 26.4 / 27.6 / 30.4 / 29.3; automtp (MTP, cap 6) 29.80,
+rem 26.9 / 28.0 / 30.7 / 35.2; automtp3 (MTP, cap 3, the user's setup) 31.74, 29.5 / 30.4 / 31.1 / 37.1, the best: +4
+rem percent over base, prose still 4-6 percent below it. ngram-mod costs 17 percent on the repeated text here (auto
+rem against automtp; on the 395 it gave +16): auto fitted 34.2 ms fixed per verify against 26.0, and gated 63 percent
+rem of the cycles to no draft against 56. verify per token: 13.7 ms at the cap 3, 19.0 at 6 (recurrent state 450
+rem against 788 MiB). since 12.10 --spec-auto takes the cap 3 and adds no ngram-mod: auto is the user's setup now
+rem (MTP at the cap 3, as automtp3). n2 and the cap 6 are off.
+rem maskdense: see the 395; here the mask was n_kv x 8192 f16 on both sides (about 1.9 GB each at the 120K prompt),
+rem so the expert cache should get more slots, and the prompt loses the fill and the PCIe copy of it per ubatch
+if not defined DECARMS    set "DECARMS=base @p=0;auto @draft --spec-auto @p=0,500000;maskdense LLAMA_QSA_MASK_POS=0 @draft --spec-auto @p=0,500000"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
@@ -276,7 +300,7 @@ rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are o
 rem topkcub (11.10 evening, GGML_CUDA_TOPK_RADIX=0: the top-k of a prompt ubatch row by row with cub, as before): PP
 rem 696.8 / 623.7 against 1016.5 / 854.0 with the radix select (+46 and +37 percent at 0 and 122880), TG the same;
 rem 01 TOP_K 531/531. the arm is off
-if not defined BENCHARMS  set "BENCHARMS=default"
+if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined KERNARMS   set "KERNARMS=default"
@@ -289,7 +313,7 @@ if not defined BENCHCTX   set "BENCHCTX=auto"
 :defaults_done
 rem ---- the same on both ----
 rem 01-check: test-backend-ops ops, "OP [regex of the case parameters]", separated by ;
-if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
+if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
 rem 02-bench: llama-bench, one run per arm and depth
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,32768,65536,122880"
 if not defined BENCHPP     set "BENCHPP=4096"

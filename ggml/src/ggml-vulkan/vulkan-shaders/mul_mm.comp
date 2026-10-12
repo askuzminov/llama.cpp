@@ -125,8 +125,10 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_HEADSUM
 // MUL_MAT_HEADSUM heads per token (the qwen4exp indexer): B holds the heads of a token in adjacent columns, and D has one
 // column per token. the store rectifies each head, sums the heads of a token and adds the bias (fusion_flags bit 1, the
-// layout of D). the host takes only tiles whose TN holds whole tokens
+// layout of D). the host takes only tiles whose TN holds whole tokens. fusion_flags bit 2: the bias is f16 (the mask of
+// LIGHTNING_INDEXER, see ggml_vk_fork_lid_headsum), read as words so that no 16-bit arithmetic types are needed
 layout (binding = 3) readonly buffer Bias {float data_bias[];};
+layout (binding = 3) readonly buffer BiasH {uint data_bias_h[];};
 #endif
 
 #ifdef MUL_MAT_ID
@@ -184,7 +186,9 @@ float fused_store(float v) {
 
 #ifdef MUL_MAT_HEADSUM
 void headsum_store(uint idx, float v) {
-    if ((p.fusion_flags & 2u) != 0) {
+    if ((p.fusion_flags & 4u) != 0) {
+        v += unpackHalf2x16(data_bias_h[idx >> 1])[idx & 1];
+    } else if ((p.fusion_flags & 2u) != 0) {
         v += data_bias[idx];
     }
     data_d[idx] = D_TYPE(v);

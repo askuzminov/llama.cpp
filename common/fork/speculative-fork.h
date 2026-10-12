@@ -10,8 +10,11 @@
 #include <cstdio>
 #include <vector>
 
-// draft length cap of --spec-auto when --spec-draft-n-max is not given
-#define COMMON_SPECULATIVE_AUTO_N_MAX 6
+// draft length cap of --spec-auto when --spec-draft-n-max is not given. 3 since 12.10: on the 395 the cap 6 ran 35.87
+// t/s against 37.43 with 3 (MTP without ngram-mod, the same prompts), its verify cost 7.7 ms per token against 6.5 and
+// its recurrent state 788 MiB against 450; the user's own test on the 3090 also had 3 ahead. ngram-mod drafts are not
+// bound by it
+#define COMMON_SPECULATIVE_AUTO_N_MAX 3
 
 struct common_speculative_impl;
 

@@ -10518,6 +10518,11 @@ void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 }
 
 void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    // fork: a prompt on the fused head matmul
+    if (ggml_vk_fork_lid_headsum(ctx, subctx, dst)) {
+        return;
+    }
+
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2];

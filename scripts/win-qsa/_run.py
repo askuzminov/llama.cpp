@@ -615,6 +615,38 @@ def history_from_cache(path):
     print(f"{path.name}: started with {len(rows)} numbers of the kept results", flush=True)
 
 
+class Tee:
+    """A console stream that also writes into the console.txt of the current run: why a try was repeated (a stall
+    while loading, an exit code) is printed only, and the run folder kept no trace of it."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.file = None
+
+    def write(self, text):
+        self.stream.write(text)
+        if self.file:
+            self.file.write(text)
+            self.file.flush()
+        return len(text)
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def console_to(path):
+    out = path.open("a", encoding="utf-8", errors="backslashreplace")
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if not isinstance(stream, Tee):
+            stream = Tee(stream)
+            setattr(sys, name, stream)
+        stream.file = out
+
+
 class Run:
     """One call of a script: its log folder, its summary and the counts of new and kept results."""
 
@@ -622,6 +654,7 @@ class Run:
         self.start = datetime.now()
         self.dir = Path(env("LOGS", str(HERE / "logs"))) / f"{name}-{self.start:%Y%m%d-%H%M%S}"
         self.dir.mkdir(parents=True, exist_ok=True)
+        console_to(self.dir / "console.txt")
         if not (self.dir.parent / "history.csv").is_file():
             history_from_cache(self.dir.parent / "history.csv")
         self.lines = []

@@ -101,7 +101,7 @@ static void common_params_add_args_spec_synth_rates(const common_params & params
         {"--spec-auto"},
         {"--no-spec-auto"},
         string_format("pick the draft length per cycle from the measured verify cost and the calibrated draft acceptance. --spec-draft-n-max is the cap, %d when not given; "
-                      "without --spec-type, ngram-mod is added next to the inferred draft type (default: %s)",
+                      "the draft types are those of --spec-type or the inferred one (default: %s)",
                       COMMON_SPECULATIVE_AUTO_N_MAX, params.speculative.auto_n ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.speculative.auto_n = value;
@@ -123,17 +123,17 @@ void common_fork_add_args(common_arg_fork_at at, const common_params & params, c
 //
 
 void common_fork_spec_auto_apply(common_params & params, bool spec_types_given, bool spec_types_default) {
-    // --spec-auto without an explicit --spec-draft-n-max raises the cap. without an explicit --spec-type,
-    // ngram-mod joins the inferred model draft: it drafts only on a long match and costs nearly nothing when it finds none
+    // --spec-auto without an explicit --spec-draft-n-max takes COMMON_SPECULATIVE_AUTO_N_MAX as the cap.
+    // until 12.10 it also added ngram-mod next to an inferred model draft. on the 3090 that cost 17 percent on the
+    // repeated text (a larger fitted verify cost, more cycles without a draft) and 28.21 against 29.80 t/s over all
+    // prompts; on the 395 it gave +16 percent on the repeated text only. ngram-mod now comes only with --spec-type
+    (void) spec_types_given;
+    (void) spec_types_default;
     if (params.speculative.auto_n) {
         auto & spec = params.speculative;
 
         if (!spec.draft.n_max_set) {
             spec.draft.n_max = std::max(spec.draft.n_max, COMMON_SPECULATIVE_AUTO_N_MAX);
-        }
-
-        if (!spec_types_given && !spec_types_default) {
-            spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         }
     }
 }

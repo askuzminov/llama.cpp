@@ -186,6 +186,8 @@ void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx
 bool ggml_vk_fork_rms_norm_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 // CONCAT, SSM_CONV (+ SILU)
 void ggml_vk_fork_ssm_conv_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
+// LIGHTNING_INDEXER of a prompt on the MUL_MAT_HEADSUM matmul, false when it does not fit (ggml-vulkan-fusion-fork.cpp)
+bool ggml_vk_fork_lid_headsum(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * dst);
 void ggml_vk_mul_mat_headsum(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 
 // the fusion chain of graph_compute: each sets num_additional_fused_ops, the ctx flags, op_srcs_fused_elementwise and

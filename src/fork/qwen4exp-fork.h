@@ -14,6 +14,7 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
     ~llama_model_qwen4exp_fork() override;
 
     class llm_graph_input_qsa;
+    class llm_graph_input_qsa_pos;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -58,6 +59,7 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
+  const llama_memory_hybrid_idx_fork_context * mctx_hyb,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
@@ -72,6 +74,9 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
 
         // row view of the KQ mask input, shared by the QSA layers - see build_attn_qsa
         ggml_tensor * qsa_kq_mask_rows = nullptr;
+
+        // the positions the QSA layers take their mask values from instead of the KQ mask - see build_attn_qsa
+        llm_graph_input_qsa_pos * qsa_pos_inp = nullptr;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
