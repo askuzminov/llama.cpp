@@ -135,7 +135,9 @@ rem its device compute buffer (2800 MiB) and pinned on the host (2248 MiB). the 
 rem (LLAMA_MTP_UBATCH, 0 = the target's): on the test model 580/532 -> 145/133 MiB at -c 65536, the draft head
 rem probabilities the same in all cycles; here about 700/560 MiB expected, 96.7 GB of device buffers.
 rem mtpub0: the MTP context with the -ub of the target (before 11.10 evening), the buffer lines and the speed
-if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0;mtpub0 LLAMA_MTP_UBATCH=0 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
+rem auto is MTP + ngram-mod (added when --spec-type is not given) with the draft cap 6. automtp: the same without
+rem ngram-mod, automtp3: without ngram-mod and with the cap 3 (the server setup the user found best on the 3090)
+if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;automtp @draft --spec-auto --spec-type draft-mtp @p=0;automtp3 @draft --spec-auto --spec-type draft-mtp --spec-draft-n-max 3 @p=0;mtp3 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0;mtpub0 LLAMA_MTP_UBATCH=0 @draft --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -263,8 +265,10 @@ rem DeviceTopK once per row; from 8 rows the radix select of top-k.cu now (GGML_
 rem 11.10 evening (403e1429b): base 30.40 against 26.66 of swap0 (+14 percent, os/db/code/repeat 31.09 / 31.59 / 30.09
 rem / 29.00); n2 29.31 (26.69 / 26.46 / 30.80 / 35.12), auto 28.88; n2 at the prefix PP 817.4 against 607.8 (the radix
 rem top-k), TG 26.73. MTP pays only on code and repeated text now: the fit of auto puts a verified token at 19.4 ms
-rem (its cpu experts) against a decode step of about 32 ms, and with the head on, prose runs 14-16 percent below base
-if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0,500000;auto @draft --spec-auto @p=0"
+rem (its cpu experts) against a decode step of about 32 ms, and with the head on, prose runs 14-16 percent below base.
+rem auto is MTP + ngram-mod with the cap 6; automtp: without ngram-mod, automtp3: without ngram-mod and with the cap 3
+rem (the user's server setup, best in the user's own test). the prefix pass of n2 is off this time (PP measured above)
+if not defined DECARMS    set "DECARMS=base @p=0;n2 @draft --spec-type draft-mtp --spec-draft-n-max 2 @p=0;auto @draft --spec-auto @p=0;automtp @draft --spec-auto --spec-type draft-mtp @p=0;automtp3 @draft --spec-auto --spec-type draft-mtp --spec-draft-n-max 3 @p=0"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
