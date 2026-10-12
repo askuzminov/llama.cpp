@@ -72,6 +72,43 @@ uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_co
     return base_wgs >= shader_core_count * 2 && parts > 1 ? parts : 0u;
 }
 
+bool ggml_vk_fork_fa_sparse_wide(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv,
+                                 bool f32acc, ggml_type k_type, ggml_type v_type) {
+    // the sparse folded tile of flash_attn_cm1.comp stages K 16 dims at a time, with two barriers and a lookup of the
+    // cell in the list per staged element: 32 barriers per block of 64 cells at head size 256. on the 395 (12.10 night)
+    // it computes the attention of a 4096 prompt at 122880 in 898 ms against 302 for the dense one at depth 0, about the
+    // same work, and neither the split-major order nor the union tile gained (the reads are not what holds it).
+    // SPARSE_WIDE: the cells of the block go to shared memory once, K in chunks of 64 dims (8 barriers per block).
+    // GGML_VK_FA_SPARSE_WIDE: 1 = on, unset or 0 = off (until measured)
+    static const int mode = [] {
+        const char * env = getenv("GGML_VK_FA_SPARSE_WIDE");
+        return env ? atoi(env) : 0;
+    }();
+    if (mode != 1 || params.path != FA_COOPMAT1 || params.shmem_staging || hsk % 64 != 0 ||
+        k_type != GGML_TYPE_F16 || v_type != GGML_TYPE_F16) {
+        return false;
+    }
+    // the shared memory of the coopmat1 tile as ggml_vk_flash_attn_coopmat_shmem_support counts it (kept in step with
+    // it), with the wider K rows and the cells
+    const uint32_t Br = params.block_rows;
+    const uint32_t Bc = params.block_cols;
+    const uint32_t row_split = Bc / 16;
+    const uint32_t hsk_pad = (hsk + 15) & ~15u;
+    const uint32_t acctype = f32acc ? 4 : 2;
+    const uint32_t f16vec4 = 8;
+    const uint32_t tmpsh = row_split * sizeof(float);
+    const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
+    const uint32_t Qf = Br * (hsk_pad / 4 + 2) * f16vec4;
+    const uint32_t Psh = Bc * (Br / 4 + 2) * f16vec4;
+    const uint32_t sfsh = Bc * ((hsk <= 128) ? (Br + 8) : Br) * acctype;
+    const uint32_t ksh = std::max<uint32_t>(Bc * std::max<uint32_t>(16 / 4 + 2, 16 / 4 * row_split), Bc * (64 / 4 + 2)) * f16vec4;
+    const uint32_t pvsh = 16 * (params.row_split * 16 / 4) * f16vec4;
+    const uint32_t slope = Br * acctype;
+    const uint32_t cellsh = Bc * sizeof(int32_t);
+    GGML_UNUSED(hsv);
+    return tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + cellsh <= device->properties.limits.maxComputeSharedMemorySize;
+}
+
 bool ggml_vk_fork_fa_union(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * q, const ggml_tensor * k,
                            const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     // a tile of R neighbouring tokens x G heads of one KV head walks the union of the token selections, see

@@ -8567,6 +8567,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    // fork: the sparse coopmat1 tile stages K in chunks of 64 dims (SPARSE_WIDE of flash_attn_base.glsl)
+    if (use_sparse && ggml_vk_fork_fa_sparse_wide(ctx->device, tuning_params, HSK, HSV, f32acc, k_type_eff, v_type_eff)) {
+        fa_pipeline_state.flags |= 32;
+    }
 
     vk_pipeline pipeline = nullptr;
 

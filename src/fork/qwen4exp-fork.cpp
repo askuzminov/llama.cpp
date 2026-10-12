@@ -2039,8 +2039,23 @@ void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, co
         const char * env = std::getenv("LLAMA_PLE_PREFETCH");
         return env == nullptr || std::atoi(env) != 0;
     }();
+    // why a prefetch did not start, once per reason: on the 395 (12.10 night, -b 16384 -ub 4096) the take never logged
+    auto skip = [](int reason, const char * what) {
+        static std::atomic<uint32_t> seen { 0 };
+        if (!(seen.fetch_or(1u << reason) & (1u << reason))) {
+            LLAMA_LOG_INFO("ple_prefetch_start: no prefetch: %s\n", what);
+        }
+    };
     // a ubatch of tokens only: an image or a mixed ubatch orders its predecessors by position runs this cannot see
-    if (!enabled || !ple_cached || !ple_cache || mctx == nullptr || next.token == nullptr || next.embd != nullptr || next.is_mixed()) {
+    if (!enabled) {
+        return;
+    }
+    if (!ple_cached || !ple_cache) {
+        skip(0, "the PLE table is loaded, the graph gathers its rows");
+        return;
+    }
+    if (mctx == nullptr || next.token == nullptr || next.embd != nullptr || next.is_mixed()) {
+        skip(1, "the next ubatch is not one of tokens only");
         return;
     }
 
@@ -2056,6 +2071,7 @@ void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, co
     std::unordered_map<llama_seq_id, llama_pos> pos_min;
     for (int64_t i = 0; i < n_tokens; ++i) {
         if (next.n_seq_id[i] != 1) {
+            skip(2, "a token of the next ubatch is in several sequences");
             return;
         }
         const llama_seq_id s = next.seq_id[i][0];
@@ -2074,6 +2090,7 @@ void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, co
             }
             const auto it = own[s].find(p);
             if (it == own[s].end()) {
+                skip(3, "a gap in the positions of the next ubatch");
                 return;
             }
             prev[i*n_prev + j] = it->second;
@@ -2103,7 +2120,15 @@ bool llama_model_qwen4exp_fork::ple_prefetch_take(const std::vector<int32_t> & i
     ple_prefetch & pf = *ple_pf;
 
     std::lock_guard<std::mutex> lock(pf.mutex);
-    if (!pf.active || pf.idx != idx) {
+    if (!pf.active) {
+        return false;
+    }
+    if (pf.idx != idx) {
+        static std::atomic<bool> logged { false };
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_INFO("%s: the PLE rows gathered ahead are not the ones of this ubatch (%zu against %zu rows)\n",
+                    __func__, pf.idx.size(), idx.size());
+        }
         return false;
     }
     pf.finish();

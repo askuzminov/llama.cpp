@@ -96,9 +96,12 @@ rem gate/up at any size (its small cases take it too), int8 the int8 path (GGML_
 rem 01 of the run of 12.10 night: only the sparse attention, with the new paths. union (GGML_VK_FA_UNION=1, off by default): a tile of
 rem 4 tokens x 12 heads over the union of their selections (flash_attn_union.comp); the Mac ran it only emulated (53/53,
 rem 12 cases on the path, Bc 64 and 32), so 01 checks the coopmat path here; union32 with 32 list slots per step
+rem 12.10 night (1b57e3bc): 53/53 in all four arms, the coopmat path of union included. wide (GGML_VK_FA_SPARSE_WIDE=1,
+rem off by default): the sparse coopmat1 tile reads the cells of a block once and stages K in chunks of 64 dims (8
+rem barriers per block instead of 32); the Mac only compiles and validates the coopmat shader, 01 checks it here
 if not defined RUN_CHECK   set "RUN_CHECK=1"
 if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_EXT n_kv_max=[1-9]"
-if not defined CHECKARMS   set "CHECKARMS=default;spl8 GGML_VK_FA_SPARSE_SPLIT=8;union GGML_VK_FA_UNION=1;union32 GGML_VK_FA_UNION=1 GGML_VK_FA_UNION_BC=32"
+if not defined CHECKARMS   set "CHECKARMS=default;wide GGML_VK_FA_SPARSE_WIDE=1"
 if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
@@ -188,7 +191,14 @@ rem per allocation). the fork takes the device limit since 12.10 night; sub1g: G
 rem the run of 12.10 night is a short one (the user: only what is needed, the focus is the depth): no 01/03 (kernels
 rem and numbers unchanged), bench at 0 and 122880, profile at 122880, decode: the buffers (none, auto with MTP, lidall,
 rem sub1g) and b16k at the 118K prompt
-if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;b16k @draft --spec-auto -b 16384 @p=500000;lidall LLAMA_QSA_LID_TOKENS=1000000 @draft --spec-auto @p=0;sub1g GGML_VK_SUBALLOC_UPSTREAM=1 @draft --spec-auto @p=0"
+rem 12.10 night (1b57e3bc): compute buffer 3931 MiB with the 2 GiB blocks against 5979 of sub1g (the 1 GiB of upstream),
+rem lidall 9720 (the lightning indexer for the prompt keeps a 2 GiB REPEAT and the f16 bias copies alive), so it stays
+rem at 64 tokens; TG none 27.86, auto 38.24, lidall 36.47, sub1g 37.44; 5 server starts with the MTP head, no stop in
+rem the load. b16k: the 118K prompt at 816.1 t/s (772.1 with -b 4096 on the build before, not the same build), and no
+rem PLE prefetch line, unlike the 3090: ple_prefetch_start logs its reason since then. the next run: auto against b16k
+rem at the 118K prompt on one build
+rem wide: see CHECKARMS, the prompt of 118K with it
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=500000;b16k @draft --spec-auto -b 16384 @p=500000;wide GGML_VK_FA_SPARSE_WIDE=1 @draft --spec-auto @p=500000"
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
 if not defined BENCHSMALL  set "BENCHSMALL=0"
@@ -240,7 +250,12 @@ rem maskdense, lid64: see DECARMS. maskdense is off (12.10 evening: 932.5 / 751.
 rem spl4, spl8 (12.10 night): the sparse attention of a prompt in 4 / 8 parts, all tokens of part 0 first
 rem (GGML_VK_FA_SPARSE_SPLIT, off by default): at 122880 the 12 layers took 896 ms against 302 at 0, the K/V gather
 rem at the DRAM rate, see FORK.md. union, union32: see CHECKARMS (KV under 4104 keeps the dense path, so 122880 only)
-if not defined BENCHARMS  set "BENCHARMS=default;lidall LLAMA_QSA_LID_TOKENS=1000000 @d=0,122880;sub1g GGML_VK_SUBALLOC_UPSTREAM=1 @d=0,122880;spl4 GGML_VK_FA_SPARSE_SPLIT=4 @d=122880;spl8 GGML_VK_FA_SPARSE_SPLIT=8 @d=122880;union GGML_VK_FA_UNION=1 @d=122880;union32 GGML_VK_FA_UNION=1 GGML_VK_FA_UNION_BC=32 @d=122880"
+rem 12.10 night (1b57e3bc), PP at 122880: default 782.8, spl4 781.9, spl8 777.1, union 673.3, union32 648.3; the
+rem attention of the profile 898 / 933 (spl8) / 1758 ms (union). the order of the parts changes nothing, so the folded
+rem tile is not held up by cache misses between workgroups; the union tile computes 48 rows over the union and loses
+rem twice. both stay off (the switches stay). lidall 775.2 / 948.8, sub1g 782.6 / 945.8 against 782.8 / 946.8
+rem wide: see CHECKARMS, at 122880 only (depth 0 keeps the dense attention)
+if not defined BENCHARMS  set "BENCHARMS=default;wide GGML_VK_FA_SPARSE_WIDE=1 @d=122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -252,12 +267,13 @@ rem 531 -> 505), 02 PP +6.4 percent at 0 but +0.3 at 122880. 11.10 (d01bba7a3, f
 rem ms (gate/up 883 -> 613), the wall time of the compute call 5218 -> 4940; 02 lost it to the cold PLE rows of the
 rem first arm at 122880 (BENCHWARMTOKENS). at 0 4367 / 4584 (noelt) / 4060 ms; a decode step at 122880 40.4-40.9 ms
 rem tg@0 next to tg@122880: which ops of a decode step grow with the depth (28.5 -> 25.4 t/s)
-if not defined PROFKINDS  set "PROFKINDS=pp@122880 tg@0,122880"
+if not defined PROFKINDS  set "PROFKINDS=pp@122880"
 rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the attention gate before 10.10
 rem int8: the MUL_MAT_ID time per op on the int8 path, f16reg is the default since 11.10 (see CHECKARMS)
 rem lidall: the lightning indexer at every size next to the default (64 tokens again since 12.10 evening)
 rem spl8: see BENCHARMS, the attention and the split_k reduce per op
-if not defined PROFARMS   set "PROFARMS=default;lidall LLAMA_QSA_LID_TOKENS=1000000 @d=122880;spl8 GGML_VK_FA_SPARSE_SPLIT=8 @d=122880;union GGML_VK_FA_UNION=1 @d=122880"
+rem wide: the attention per op at 122880 against the 898 ms of the default
+if not defined PROFARMS   set "PROFARMS=default;wide GGML_VK_FA_SPARSE_WIDE=1"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -362,14 +378,15 @@ rem (auto there: 875.1 on 12.10 evening)
 rem 12.10 night (f4a7d3ee): auto 31.56, t20 31.80, t24 29.54 t/s, but the mean hides the text: on the six os/db/code runs
 rem auto 31.17, t20 30.12 (-3.4 percent), t24 29.35 (-5.8), t20 wins only on repeat, where the acceptance moves
 rem everything. more threads do not help the CPU experts (the RAM, not the cores), the default stays; b16k: see DECARGS
-rem the next run is the per-op profile only (see PROFARMS)
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=0"
-if not defined RUN_DECODE  set "RUN_DECODE=0"
+rem the next run (after the GET_ROWS fix, see BENCHARMS): the server with it, short prompts and the 118K prompt
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=0,500000"
+if not defined RUN_BENCH   set "RUN_BENCH=0"
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
 rem the run after the profile of 12.10 night: 01 GET_ROWS for the flat gather of short rows (fork/getrows-fork.inc,
 rem new eval cases of the qwen4exp shapes), 02 default / maskdense / rowsup (GGML_CUDA_GET_ROWS_FLAT=0, upstream), 05
 rem optime / optimemd again
-if not defined RUN_CHECK   set "RUN_CHECK=1"
-if not defined CHECKOPS    set "CHECKOPS=GET_ROWS"
+rem 12.10 night (7c218166): GET_ROWS 224/224 with the new cases
+if not defined RUN_CHECK   set "RUN_CHECK=0"
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
 if not defined BENCHSMALL  set "BENCHSMALL=0"
@@ -384,6 +401,9 @@ rem 01 TOP_K 531/531. the arm is off
 rem 12.10 night (f4a7d3ee): maskdense (the dense KQ mask instead of the one from positions) PP 1015.9 / 858.6 against
 rem 969.2 / 828.6 of the default at 0 / 122880, +4.8 / +3.6 percent, about 190 ms per 4096 ubatch at both depths, so
 rem not the size of the mask; TG the same. no alloc peak lines: llama-bench drops the log (they go to stderr since)
+rem 12.10 night (7c218166), with the flat GET_ROWS: default 1079.6 / 916.8 at 0 / 122880 (+11.4 / +10.6 percent over
+rem 969.2 / 828.6 before), maskdense 1079.4 / 898.6, rowsup (upstream GET_ROWS) 968.6 / 828.8; TG the same. the mask
+rem from positions is ahead again (+2.0 percent at 122880); 05: 3881 ms of gpu time for the run against 5006 before
 if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880;rowsup GGML_CUDA_GET_ROWS_FLAT=0 @d=0,122880"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090. optime / optimemd:
 rem GGML_CUDA_OP_TIMING with a period above the compute calls of the run, so the report comes once, when the context
