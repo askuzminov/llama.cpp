@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "fork/llama-fork.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1627,6 +1628,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const int64_t t_inputs_us = timing ? ggml_time_us() : 0;
+
+    // fork: work for the next ubatch that runs while this graph computes (the PLE rows of qwen4exp)
+    llama_fork_before_compute(model, mctx);
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 

@@ -152,7 +152,21 @@ rem lid64 (12.10): LLAMA_QSA_LID_TOKENS=64, a prompt scores the indexer blocks w
 rem MUL_MAT_HEADSUM, but the graph still reserved the head scores, two of 1 GiB) and an f32 bias, as before. the default
 rem takes LIGHTNING_INDEXER at every size, Vulkan runs a prompt of it on the same fused matmul with the f16 mask as the
 rem bias (ggml_vk_fork_lid_headsum; 4-head test model: compute buffers -4 MiB each side at -c 4096 -ub 2048, KLD 0)
-if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0;maskdense LLAMA_QSA_MASK_POS=0 @draft --spec-auto @p=0;lid64 LLAMA_QSA_LID_TOKENS=64 @draft --spec-auto @p=0"
+rem 12.10 afternoon (9519cec3d), compute buffers (device / pinned host, MiB): lid64 5979 / 1228 (11.10: 8025 / 3275,
+rem the mask from positions took -2 GiB each side), default 10495 / 716, maskdense 12542 / 2763. the lightning indexer
+rem took +4.5 GiB: reached only through the attention, its selection came after the -inf fill of the mask, so the 1
+rem GiB block scores and the 2 GiB mask were alive at once; auto stopped three times in the MTP head load ("upload of
+rem blk.48.ffn_down_exps.weight, chunk 0"). the selection and the mask values go into the graph first now (test model
+rem at -c 65536 -ub 4096: 973 -> 689 MiB, against 813 of lid64; KLD 0). TG: none 27.25, maskdense 35.89, lid64 36.29.
+rem bench: the REPEAT of the -inf took 192 ms at 122880 against 49 of the FILL before (index math per element): a
+rem one-element REPEAT runs as a fill on Vulkan and CUDA now. PP default 933.3 / 750.0, maskdense 926.8 / 747.9,
+rem lid64 948.0 / 763.6 at 0 / 122880
+rem nopf: LLAMA_PLE_PREFETCH=0, the PLE rows of each ubatch gathered when its inputs are set, in series with the
+rem graphs (170-178 ms of a 4096-token ubatch here). the default gathers the next ubatch's rows while the current one
+rem computes, so only a prompt longer than a ubatch shows it: the 500000-character prefix (118K tokens, ~30 minutes
+rem per arm). maskdense is off
+if not defined DECARMS    set "DECARMS=none @p=0;auto @draft --spec-auto @p=0,500000;nopf LLAMA_PLE_PREFETCH=0 @draft --spec-auto @p=500000;lid64 LLAMA_QSA_LID_TOKENS=64 @draft --spec-auto @p=0"
+if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -292,7 +306,17 @@ rem against 788 MiB). since 12.10 --spec-auto takes the cap 3 and adds no ngram-
 rem (MTP at the cap 3, as automtp3). n2 and the cap 6 are off.
 rem maskdense: see the 395; here the mask was n_kv x 8192 f16 on both sides (about 1.9 GB each at the 120K prompt),
 rem so the expert cache should get more slots, and the prompt loses the fill and the PCIe copy of it per ubatch
-if not defined DECARMS    set "DECARMS=base @p=0;auto @draft --spec-auto @p=0,500000;maskdense LLAMA_QSA_MASK_POS=0 @draft --spec-auto @p=0,500000"
+rem 12.10 afternoon (9519cec3d): base 30.60, auto 31.94, maskdense 30.98; the 120K prompt: auto 868.4 t/s against 827.1
+rem of maskdense (the mask no longer copied over PCIe), TG 29.57 / 29.50; expert cache 48-51 slots in both, the prompt
+rem compute 2932 against 2562 MiB (the selection after the mask fill, see the 395). bench: default 971.3 / 822.1,
+rem maskdense 1018.0 / 851.7 at 0 / 122880 (the slow REPEAT of the -inf, see the 395). maskdense is off here
+rem t8p / t16p: the CPU experts on the P-cores of the i9-12900K only (logical CPUs 0-15 are the 8 P-cores with HT, 16-23
+rem the E-cores): one thread per P-core / both threads of each; the default takes 16 threads wherever Windows puts them,
+rem and the slowest expert thread decides a layer. Strata moved its non-pool threads off the pool cores: +10-11 percent
+rem decode on a Linux Xeon
+rem auto at the prefix: the long prompt after the mask order fix, the one-element REPEAT as a fill and the PLE rows
+rem gathered ahead (868.4 t/s on 12.10 afternoon)
+if not defined DECARMS    set "DECARMS=base @p=0;auto @draft --spec-auto @p=0,500000;t8p @draft --spec-auto -t 8 -C 0x5555 --cpu-strict 1 @p=0;t16p @draft --spec-auto -t 16 -C 0xFFFF --cpu-strict 1 @p=0"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
@@ -313,7 +337,7 @@ if not defined BENCHCTX   set "BENCHCTX=auto"
 :defaults_done
 rem ---- the same on both ----
 rem 01-check: test-backend-ops ops, "OP [regex of the case parameters]", separated by ;
-if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
+if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
 rem 02-bench: llama-bench, one run per arm and depth
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,32768,65536,122880"
 if not defined BENCHPP     set "BENCHPP=4096"

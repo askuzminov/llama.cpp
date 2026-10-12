@@ -8,9 +8,12 @@
 #include "llama-row-cache-fork.h"
 
 class llama_memory_hybrid_idx_fork_context;
+class llama_kv_cache_context;
+struct llama_ubatch;
 
 struct llama_model_qwen4exp_fork : public llama_model_base {
-    llama_model_qwen4exp_fork(const struct llama_model_params & params) : llama_model_base(params) {}
+    // out of line: the members hold types complete only in qwen4exp-fork.cpp
+    llama_model_qwen4exp_fork(const struct llama_model_params & params);
     ~llama_model_qwen4exp_fork() override;
 
     class llm_graph_input_qsa;
@@ -23,6 +26,15 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
     // are read from the file on demand instead
     bool                             ple_cached = false;
     std::unique_ptr<llama_row_cache> ple_cache;
+
+    // the PLE rows of the next ubatch of a prompt, gathered from the row cache while the current one computes: the
+    // gather took 170-178 ms of each 4096-token ubatch on the 395 (12.10), in series with the graph. start() is called
+    // before the graph of a ubatch runs, take() by the PLE input of the next one, which uses the rows only when its
+    // row list is the one gathered. LLAMA_PLE_PREFETCH=0: off
+    struct ple_prefetch;
+    mutable std::unique_ptr<ple_prefetch> ple_pf;
+    void ple_prefetch_start(const llama_ubatch & next, const llama_kv_cache_context * mctx) const;
+    bool ple_prefetch_take(const std::vector<int32_t> & idx, std::vector<float> & dst) const;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

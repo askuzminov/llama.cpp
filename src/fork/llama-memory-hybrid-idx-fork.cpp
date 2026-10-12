@@ -1394,7 +1394,8 @@ llama_memory_hybrid_idx_fork_context::llama_memory_hybrid_idx_fork_context(
     mem(mem),
     ns_ubatch(llama_memory_hybrid_idx_fork_ns(sinfos_idx)),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)),
+    ubatches_peek(ubatches) {}
 
 bool llama_memory_hybrid_idx_fork_context::next() {
     if (ctx_idx) {

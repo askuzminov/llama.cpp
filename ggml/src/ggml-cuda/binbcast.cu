@@ -435,7 +435,13 @@ static void ggml_cuda_op_bin_bcast(
     }
 }
 
+#include "fork/repeat-fork.inc"
+
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // fork: one source element as a fill
+    if (ggml_cuda_repeat_scalar_fork(dst->src[0], dst, ctx.stream())) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
 }
 

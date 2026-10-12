@@ -257,6 +257,10 @@ public:
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
+    // the ubatch after the current one, nullptr for the last (the PLE rows of qwen4exp are gathered while the current
+    // one computes, see llama_fork_before_compute)
+    const llama_ubatch * peek_next() const { return i_cur + 1 < ubatches_peek.size() ? &ubatches_peek[i_cur + 1] : nullptr; }
+
     bool is_kv_host() const { return mem && mem->is_kv_host(); }
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
@@ -296,4 +300,7 @@ private:
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
+
+    // the ubatches again, for peek_next(): the base class keeps its copy private
+    const std::vector<llama_ubatch> ubatches_peek;
 };

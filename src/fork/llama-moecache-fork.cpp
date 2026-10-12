@@ -8,8 +8,10 @@
 #include <atomic>
 #include <cinttypes>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <functional>
 #include <queue>
 #include <thread>
@@ -805,6 +807,7 @@ llama_moe_cache_fork::llama_moe_cache_fork(const llama_model & model, int32_t n_
 
 llama_moe_cache_fork::~llama_moe_cache_fork() {
     join_uploads();
+    state_save();
     // the uploads read the host weights and write the slots, finish them before the buffers go away
     if (backend_up != nullptr) {
         ggml_backend_synchronize(backend_up);
@@ -940,6 +943,7 @@ void llama_moe_cache_fork::init(ggml_backend_sched_t sched) {
     }
     hot.resize(sel.size());
     layers = std::move(sel);
+    state_load();
 
     if (n_skip > 0) {
         LLAMA_LOG_WARN("%s: %d MoE layers with host experts are not cached: repacked weights (use --no-repack), biases, scales or another device\n",
@@ -1134,18 +1138,12 @@ void llama_moe_cache_fork::release() {
     }
     ggml_backend_synchronize(backend_up);
 
+    hot = hot_now();
     for (size_t idx = 0; idx < layers.size(); ++idx) {
-        const lru & c = lrus[idx];
-
-        auto & h = hot[idx];
-        h.clear();
-        for (int32_t e = c.head; e >= 0; e = c.next[e]) {
-            h.push_back(e);
-        }
-
         layer & l = layers[idx];
         l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = nullptr;
     }
+    state_save();
 
     table_all = nullptr;
     table_staging = nullptr;
@@ -1160,6 +1158,90 @@ void llama_moe_cache_fork::release() {
     n_slots = 0;
 
     t_alloc_us += ggml_time_us() - t_start_us;
+}
+
+// the experts of each layer, most recent first: from the live LRU, or what the last release() kept
+std::vector<std::vector<int32_t>> llama_moe_cache_fork::hot_now() const {
+    if (!ready() || lrus.size() != layers.size()) {
+        return hot;
+    }
+    std::vector<std::vector<int32_t>> h(layers.size());
+    for (size_t idx = 0; idx < layers.size(); ++idx) {
+        const lru & c = lrus[idx];
+        for (int32_t e = c.head; e >= 0; e = c.next[e]) {
+            h[idx].push_back(e);
+        }
+    }
+    return h;
+}
+
+// file: "LMC1", the layer count, n_expert, then per layer its index in the model, the count and the experts. it is
+// written next to itself and renamed, so a process that dies while saving leaves the last complete one
+void llama_moe_cache_fork::state_save() const {
+    static const char * path = getenv("LLAMA_MOE_CACHE_STATE");
+    if (path == nullptr || *path == '\0' || layers.empty()) {
+        return;
+    }
+    const auto h = hot_now();
+    if (std::all_of(h.begin(), h.end(), [](const std::vector<int32_t> & v) { return v.empty(); })) {
+        return;
+    }
+    const std::string tmp = std::string(path) + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        LLAMA_LOG_WARN("%s: cannot write %s\n", MOE_CACHE_LOG, tmp.c_str());
+        return;
+    }
+    const int32_t head[3] = { 0x31434d4c, (int32_t) layers.size(), (int32_t) n_expert };
+    bool ok = fwrite(head, sizeof(head), 1, f) == 1;
+    for (size_t idx = 0; idx < layers.size() && ok; ++idx) {
+        const int32_t rec[2] = { (int32_t) layers[idx].il, (int32_t) h[idx].size() };
+        ok = fwrite(rec, sizeof(rec), 1, f) == 1 && (h[idx].empty() || fwrite(h[idx].data(), sizeof(int32_t), h[idx].size(), f) == h[idx].size());
+    }
+    ok = fclose(f) == 0 && ok;
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: cannot write %s\n", MOE_CACHE_LOG, tmp.c_str());
+        std::remove(tmp.c_str());
+        return;
+    }
+    std::remove(path); // rename does not replace a file on windows
+    if (std::rename(tmp.c_str(), path) != 0) {
+        LLAMA_LOG_WARN("%s: cannot rename %s to %s\n", MOE_CACHE_LOG, tmp.c_str(), path);
+    }
+}
+
+void llama_moe_cache_fork::state_load() {
+    const char * path = getenv("LLAMA_MOE_CACHE_STATE");
+    if (path == nullptr || *path == '\0') {
+        return;
+    }
+    FILE * f = fopen(path, "rb");
+    if (f == nullptr) {
+        return;
+    }
+    std::vector<std::vector<int32_t>> h(layers.size());
+    int32_t head[3] = { 0, 0, 0 };
+    bool ok = fread(head, sizeof(head), 1, f) == 1 && head[0] == 0x31434d4c && head[1] == (int32_t) layers.size() && head[2] == (int32_t) n_expert;
+    size_t n_total = 0;
+    for (size_t idx = 0; idx < layers.size() && ok; ++idx) {
+        int32_t rec[2] = { 0, 0 };
+        ok = fread(rec, sizeof(rec), 1, f) == 1 && rec[0] == layers[idx].il && rec[1] >= 0 && rec[1] <= n_expert;
+        if (ok) {
+            h[idx].resize(rec[1]);
+            ok = rec[1] == 0 || fread(h[idx].data(), sizeof(int32_t), rec[1], f) == (size_t) rec[1];
+        }
+        for (int32_t e : h[idx]) {
+            ok = ok && e >= 0 && e < n_expert;
+        }
+        n_total += h[idx].size();
+    }
+    fclose(f);
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: %s is not a state of this model and its cache, ignored\n", MOE_CACHE_LOG, path);
+        return;
+    }
+    hot = std::move(h);
+    LLAMA_LOG_INFO("%s: %zu experts of %zu layers from %s\n", MOE_CACHE_LOG, n_total, layers.size(), path);
 }
 
 const llama_moe_cache_fork::layer * llama_moe_cache_fork::get_layer(int il) const {

@@ -22,5 +22,11 @@ void main() {
         return;
     }
 
+#ifdef REPEAT_SCALAR
+    // fork: one source element into a contiguous dst, a fill from a tensor (the -inf of the qwen4exp QSA mask): the
+    // index math of every element made REPEAT 4x slower than FILL there
+    data_d[get_doffset() + idx] = data_a[get_aoffset()];
+#else
     data_d[get_doffset() + dst_idx(idx)] = D_TYPE(data_a[get_aoffset() + src0_idx_mod(idx)]);
+#endif
 }

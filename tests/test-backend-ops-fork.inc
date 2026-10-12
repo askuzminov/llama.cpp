@@ -208,6 +208,73 @@ struct test_lightning_indexer_unit : public test_case {
     }
 };
 
+// the qwen4exp hc combine: SCALE, SIGMOID, SCALE of the injection and DSV4_HC_POST with it as the post weights.
+// Vulkan and CUDA run the four as one HC_POST (HC_POST_GATE)
+struct test_hc_post_gate : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    comb;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, comb);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_POST_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_post_gate(int64_t n_embd = 2560, int64_t n_tokens = 3, bool comb = false)
+        : n_embd(n_embd), n_tokens(n_tokens), comb(comb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "inject");
+        ggml_tensor * c = nullptr;
+        if (comb) {
+            c = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            ggml_set_name(c, "comb");
+        }
+        ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc)), 2.0f);
+        ggml_tensor * out = ggml_dsv4_hc_post(ctx, x, residual, w, c);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the low-rank activation of the qwen4exp hc mix: SCALE, SILU. CUDA runs the two as one kernel
+struct test_scale_silu : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_scale_silu(std::array<int64_t, 4> ne = {320, 3, 1, 1}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_silu(ctx, ggml_scale(ctx, a, 0.25f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // the gated norm of the qwen4exp GDN output: RMS_NORM over rows of ne[0], MUL by a weight row, SIGMOID of the gate, MUL.
 // pad > 0 reads a through a view with longer rows. backends may run it as one shader (Vulkan: RMS_NORM_MUL_SIGMOID_MUL)
 struct test_rms_norm_gated : public test_case {
@@ -383,6 +450,21 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
             test_cases.emplace_back(new test_lightning_indexer_unit(4, kn[0], kn[1], type_k));
         }
         test_cases.emplace_back(new test_lightning_indexer_unit(64, 1000, 300, type_k));
+    }
+    for (int64_t nt : {1, 3, 77}) {
+        for (bool comb : {false, true}) {
+            test_cases.emplace_back(new test_hc_post_gate(2560, nt, comb));
+        }
+        test_cases.emplace_back(new test_scale_silu({320, nt, 1, 1}));
+    }
+    test_cases.emplace_back(new test_scale_silu({1000, 7, 3, 1}));
+
+    // REPEAT of one element (the -inf the qwen4exp QSA mask starts from): Vulkan and CUDA run it as a fill, CUDA 16
+    // bytes a thread, so sizes with a tail past a whole number of 16-byte stores
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I32}) {
+        test_cases.emplace_back(new test_repeat(type, {1, 1, 1, 1}, {1, 4096, 33, 1}));
+        test_cases.emplace_back(new test_repeat(type, {1, 1, 1, 1}, {7, 13, 3, 2}));
+        test_cases.emplace_back(new test_repeat(type, {1, 1, 1, 1}, {1, 1, 1, 1}));
     }
 
     // MoE cache: 37 slots and the zero slot, n_used 10 uses the templated ids helper and n_used 5 the generic one

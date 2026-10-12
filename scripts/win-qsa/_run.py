@@ -495,7 +495,10 @@ def read_log(path):
 
 
 def retryable(code, text):
-    # an exception exit code without a message: the process died before it could print one (a load or an abort)
+    # an exception exit code without a message: the process died before it could print one (a load or an abort).
+    # 75: the load watchdog ended a load that stopped (LLAMA_LOAD_WATCH_EXIT, src/fork/llama-load-watch-fork.h)
+    if code == 75 and "load_all_data: no progress" in text:
+        return True
     return any(s in text for s in MEMORY_ERRORS) or (code & 0xffffffff >= 0xC0000000 and "error" not in text.lower())
 
 

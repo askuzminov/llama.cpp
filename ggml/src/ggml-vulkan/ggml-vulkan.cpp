@@ -3510,6 +3510,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_repeat_back_f32, "repeat_back_f32", repeat_back_f32_len, repeat_back_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_repeat_i16, "repeat_i16", repeat_i16_len, repeat_i16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    // fork: REPEAT of one element as a fill
+    ggml_vk_create_pipeline(device, device->pipeline_repeat_scalar_i16, "repeat_scalar_i16", repeat_scalar_i16_len, repeat_scalar_i16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_repeat_scalar_i32, "repeat_scalar_i32", repeat_scalar_i32_len, repeat_scalar_i32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
 #define CREATE_UNARY(name)  \
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);  \
@@ -9145,6 +9148,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_REPEAT:
+        // fork: one source element into a contiguous dst
+        if (ggml_nelements(src0) == 1 && ggml_is_contiguous(dst) && ggml_type_size(src0->type) == ggml_type_size(dst->type)) {
+            if (ggml_type_size(dst->type) == sizeof(float)) {
+                return ctx->device->pipeline_repeat_scalar_i32;
+            }
+            if (ggml_type_size(dst->type) == 2) {
+                return ctx->device->pipeline_repeat_scalar_i16;
+            }
+        }
         if (ggml_type_size(src0->type) == sizeof(float) && ggml_type_size(dst->type) == sizeof(float)) {
             return ctx->device->pipeline_repeat_i32;
         }

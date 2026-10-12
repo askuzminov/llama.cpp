@@ -9,3 +9,10 @@
 
 // true if LLAMA_UPSTREAM lists the component (or "all")
 bool llama_fork_upstream(const char * component);
+
+struct llama_model;
+struct llama_memory_context_i;
+
+// the fork's step before the graph of a ubatch runs (llama_context::process_ubatch), qwen4exp-fork.cpp: the PLE rows of
+// the next ubatch are gathered while this one computes
+void llama_fork_before_compute(const llama_model & model, llama_memory_context_i * mctx);

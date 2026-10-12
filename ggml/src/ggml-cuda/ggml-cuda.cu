@@ -3562,11 +3562,21 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+#include "fork/fusion-fork.inc"
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
         return 0;
+    }
+
+    // fork: the hyper-connection fusions of qwen4exp
+    {
+        const int n_skip = ggml_cuda_fork_try_fuse(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
     }
 
     ggml_tensor * node = cgraph->nodes[i];

@@ -1,4 +1,5 @@
 #include "qwen4exp-fork.h"
+#include "llama-fork.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx-fork.h"
 #include "llama-memory-recurrent.h"
@@ -7,11 +8,40 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <thread>
+#include <mutex>
 
 // [TAG_QWEN4_REIMPLEMENT]
 // TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
 
+// the PLE rows gathered ahead, see ple_prefetch_start
+struct llama_model_qwen4exp_fork::ple_prefetch {
+    std::mutex           mutex;
+    std::thread          worker;
+    bool                 active = false;
+    std::vector<int32_t> idx;
+    std::vector<float>   rows;
+
+    int64_t n_started = 0;
+    int64_t n_used    = 0;
+
+    void finish() {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    ~ple_prefetch() { finish(); }
+};
+
+llama_model_qwen4exp_fork::llama_model_qwen4exp_fork(const struct llama_model_params & params) : llama_model_base(params) {}
+
 llama_model_qwen4exp_fork::~llama_model_qwen4exp_fork() {
+    if (ple_pf && ple_pf->n_started > 0) {
+        LLAMA_LOG_INFO("%s: PLE rows of %" PRId64 " ubatches gathered ahead, %" PRId64 " of them used\n", __func__,
+                ple_pf->n_started, ple_pf->n_used);
+    }
     if (ple_cache) {
         ple_cache->print_stats("PLE table");
     }
@@ -1151,6 +1181,12 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
 
         cb(top_k, "indexer_top_k", il);
 
+        // into the graph here, so the indexer runs and frees its block scores (n_blocks x n_tps f32, 1 GiB at 262144 x
+        // 4096) before the attention builds its mask. reached only through the attention, the selection came after
+        // the -inf fill of the mask and both were alive at once: the 395 compute buffer took +4.5 GiB with the
+        // lightning indexer (08.10 and 12.10), where the matmul path had its score in the graph already
+        ggml_build_forward_expand(gf, top_k);
+
         return top_k;
     };
 
@@ -1509,6 +1545,8 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     ggml_tensor * kq_mask_all = nullptr;
     ggml_tensor * kept        = nullptr;
 
+    // the values go into the graph before the mask they are scattered into (see the expand below): the -inf mask is
+    // the largest tensor of the layer and should be the last thing allocated before the attention
     if (from_pos) {
         if (!qsa_pos_inp) {
             auto pos_inp = std::make_unique<llm_graph_input_qsa_pos>(mctx_hyb);
@@ -1538,6 +1576,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         kept = ggml_step(ctx0, kept);
         kept = ggml_scale_bias(ctx0, kept, -1.0f, 1.0f);
         kept = ggml_log(ctx0, kept);
+        ggml_build_forward_expand(gf, kept);
 
         // a node, so that the allocator frees it after the attention as it did the fill of the mask view
         kq_mask_all = ggml_repeat_4d(ctx0, qsa_pos_inp->neg_inf, 1, n_kv_m, n_tps_m, n_str_m);
@@ -1552,14 +1591,15 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
 
         ggml_tensor * kq_mask_rows = qsa_kq_mask_rows;
 
-        // prepare new kq mask - starts filled with -INFINITY. fill the row view and not the mask, so
-        // that both readers take the same copy
-        kq_mask_all = ggml_fill(ctx0, kq_mask_rows, -INFINITY);
-
         // gather the mask value of each selected cell: [1, n_top_k, n_batch, n_stream]
         // scattering these back beats unmasking with zeros and adding the whole mask afterwards,
         // which reads and writes n_kv values per token where only n_top_k of them can change
         kept = ggml_get_rows(ctx0, kq_mask_rows, top_k_3d);
+        ggml_build_forward_expand(gf, kept);
+
+        // prepare new kq mask - starts filled with -INFINITY. fill the row view and not the mask, so
+        // that both readers take the same copy
+        kq_mask_all = ggml_fill(ctx0, kq_mask_rows, -INFINITY);
     }
 
     // modify KQ mask by restoring the elements that are in top_k indices
@@ -1897,9 +1937,10 @@ public:
     std::vector<float>       gathered;
 };
 
-void llm_graph_input_ple_fork::set_input(const llama_ubatch * ubatch) {
-    const auto & hp = pmodel.hparams;
-
+// the PLE table rows of a ubatch: n_heads per token, from the token and its n_gram - 1 predecessors (prev, oldest
+// first, LLAMA_TOKEN_NULL where missing)
+static void qwen4exp_ple_rows(const llama_hparams & hp, const llama_ubatch & ub, const std::vector<llama_token> & prev,
+                              std::vector<int32_t> & idx) {
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
     // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
@@ -1908,28 +1949,18 @@ void llm_graph_input_ple_fork::set_input(const llama_ubatch * ubatch) {
         : (llama_token) hp.ple_eos_token_id;
     // a mixed ubatch has token ids and embd rows, its embd rows hold a placeholder token (upstream 0bb496dbd)
     auto tok_of = [&](int64_t k) -> llama_token {
-        const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[k]);
-        return is_embd ? img_tok : ubatch->token[k];
+        const bool is_embd = !ub.token || (ub.is_mixed() && ub.type[k]);
+        return is_embd ? img_tok : ub.token[k];
     };
 
-    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_tokens = ub.n_tokens;
     const int64_t n_gram   = hp.ple_ngram_size;
     const int64_t n_heads  = hp.ple_n_heads;
     const int64_t per_gram = hp.ple_heads_per_ngram;
     const int64_t eos      = hp.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
-
-    GGML_ASSERT(mctx != nullptr);
-
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        // the preceding tokens would be ambiguous, see get_prev_tokens()
-        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
-    }
-
-    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
-    mctx->get_prev_tokens(*ubatch, n_prev, prev);
+    idx.assign(n_heads * n_tokens, 0);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
@@ -1958,6 +1989,27 @@ void llm_graph_input_ple_fork::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+}
+
+void llm_graph_input_ple_fork::set_input(const llama_ubatch * ubatch) {
+    const auto & hp = pmodel.hparams;
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_prev   = hp.ple_ngram_size - 1;
+
+    std::vector<int32_t> idx;
+
+    GGML_ASSERT(mctx != nullptr);
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        // the preceding tokens would be ambiguous, see get_prev_tokens()
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
+    }
+
+    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+    mctx->get_prev_tokens(*ubatch, n_prev, prev);
+
+    qwen4exp_ple_rows(hp, *ubatch, prev, idx);
 
     if (rows) {
         // a lazily mapped table: ask the OS for the rows before the gather reads them (upstream 185103dcf). the
@@ -1972,10 +2024,106 @@ void llm_graph_input_ple_fork::set_input(const llama_ubatch * ubatch) {
     // the table was never loaded: gather the rows here, the graph gets them ready to use
     GGML_ASSERT(pmodel.ple_cache && "PLE row cache is missing");
 
-    gathered.resize(idx.size()*hp.ple_head_dim);
-    pmodel.ple_cache->get_rows(idx.data(), (int64_t) idx.size(), gathered.data());
+    // gathered while the ubatch before ran, when the row list matches (see ple_prefetch_start)
+    if (!pmodel.ple_prefetch_take(idx, gathered)) {
+        gathered.resize(idx.size()*hp.ple_head_dim);
+        pmodel.ple_cache->get_rows(idx.data(), (int64_t) idx.size(), gathered.data());
+    }
 
     ggml_backend_tensor_set(emb, gathered.data(), 0, ggml_nbytes(emb));
+}
+
+void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, const llama_kv_cache_context * mctx) const {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_PLE_PREFETCH");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    // a ubatch of tokens only: an image or a mixed ubatch orders its predecessors by position runs this cannot see
+    if (!enabled || !ple_cached || !ple_cache || mctx == nullptr || next.token == nullptr || next.embd != nullptr || next.is_mixed()) {
+        return;
+    }
+
+    const int64_t n_tokens = next.n_tokens;
+    const int64_t n_prev   = hparams.ple_ngram_size - 1;
+
+    // the predecessors from the cells hold until the start of this ubatch, which is not stored yet: the ones inside it
+    // are its own tokens. a position missing among them (a gap) gives up, the input then gathers as before
+    std::vector<llama_token> prev;
+    mctx->get_prev_tokens(next, (uint32_t) n_prev, prev);
+
+    std::unordered_map<llama_seq_id, std::unordered_map<llama_pos, llama_token>> own;
+    std::unordered_map<llama_seq_id, llama_pos> pos_min;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        if (next.n_seq_id[i] != 1) {
+            return;
+        }
+        const llama_seq_id s = next.seq_id[i][0];
+        own[s][next.pos[i]] = next.token[i];
+        auto it = pos_min.find(s);
+        if (it == pos_min.end() || next.pos[i] < it->second) {
+            pos_min[s] = next.pos[i];
+        }
+    }
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id s = next.seq_id[i][0];
+        for (int64_t j = 0; j < n_prev; ++j) {
+            const llama_pos p = next.pos[i] - (llama_pos) (n_prev - j);
+            if (p < pos_min[s]) {
+                continue;
+            }
+            const auto it = own[s].find(p);
+            if (it == own[s].end()) {
+                return;
+            }
+            prev[i*n_prev + j] = it->second;
+        }
+    }
+
+    if (!ple_pf) {
+        ple_pf = std::make_unique<ple_prefetch>();
+    }
+    ple_prefetch & pf = *ple_pf;
+
+    std::lock_guard<std::mutex> lock(pf.mutex);
+    pf.finish();
+    qwen4exp_ple_rows(hparams, next, prev, pf.idx);
+    pf.rows.resize(pf.idx.size()*hparams.ple_head_dim);
+    pf.active = true;
+    pf.n_started++;
+    pf.worker = std::thread([this, &pf] {
+        ple_cache->get_rows(pf.idx.data(), (int64_t) pf.idx.size(), pf.rows.data());
+    });
+}
+
+bool llama_model_qwen4exp_fork::ple_prefetch_take(const std::vector<int32_t> & idx, std::vector<float> & dst) const {
+    if (!ple_pf) {
+        return false;
+    }
+    ple_prefetch & pf = *ple_pf;
+
+    std::lock_guard<std::mutex> lock(pf.mutex);
+    if (!pf.active || pf.idx != idx) {
+        return false;
+    }
+    pf.finish();
+    pf.active = false;
+    pf.n_used++;
+    std::swap(dst, pf.rows);
+    return true;
+}
+
+// the fork's step before the graph of a ubatch runs (llama_context::process_ubatch): the PLE rows of the next ubatch
+void llama_fork_before_compute(const llama_model & model, llama_memory_context_i * mctx) {
+    const auto * hyb = dynamic_cast<const llama_memory_hybrid_idx_fork_context *>(mctx);
+    if (hyb == nullptr) {
+        return;
+    }
+    const llama_ubatch * next = hyb->peek_next();
+    const auto * qm = dynamic_cast<const llama_model_qwen4exp_fork *>(&model);
+    if (next == nullptr || qm == nullptr || !qm->ple_cached) {
+        return;
+    }
+    qm->ple_prefetch_start(*next, hyb->get_attn());
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

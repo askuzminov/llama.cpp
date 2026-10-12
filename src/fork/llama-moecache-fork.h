@@ -225,6 +225,12 @@ private:
     size_t upload    (size_t idx, int32_t e, int32_t s);
     void   join_uploads();
 
+    // the experts each layer held, kept across runs in LLAMA_MOE_CACHE_STATE (a file path): saved when the slots are
+    // released and when the cache goes away, read by init() so that the first alloc() uploads them
+    void   state_load();
+    void   state_save() const;
+    std::vector<std::vector<int32_t>> hot_now() const;
+
     const llama_model & model;
 
     const int32_t n_slots_req;
