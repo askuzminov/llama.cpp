@@ -84,8 +84,6 @@ shared float16_t masksh[RMAX * Bc];             // mask value of each token of t
 shared int cellsh[Bc];                          // cell of each slot, -1 for none
 shared float redsh[NSG * SG];                   // row reductions over the LPR lanes of a row
 
-// Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
-const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
 // as flash_attn_base.glsl: P below 1/4, in fp16 range
 const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 
@@ -116,6 +114,10 @@ shared f16vec4 qsh[ROWS * KST / 4];
 #endif
 
 void main() {
+    // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
+    // A local: a function call is not a constant initializer of a global (glslc of SDK 1.4.350 rejects it).
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
     const uint tid  = gl_LocalInvocationIndex;
 #ifndef EMULATE
     const uint sg   = gl_SubgroupID;
