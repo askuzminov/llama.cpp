@@ -85,6 +85,18 @@ uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_co
     return ranges > 1 ? ranges : parts > 1 ? parts : 0u;
 }
 
+uint32_t ggml_vk_fork_fa_ablate() {
+    // the sparse attention at depth on the 395 (13.10) did not move with the K staging (wide), the order of the
+    // parts (split-major) or ranges of KV (kvsplit), so these leave parts out of flash_attn_cm1.comp and the profile
+    // shows what each costs: 1 no block loop (the pre-pass, Q and the stores remain), 2 no K/V reads, 4 no mask, 8 no
+    // matmuls, 16 no softmax. the results are wrong: profiling only. GGML_VK_FA_ABLATE=<sum of these>
+    static const uint32_t bits = [] {
+        const char * env = getenv("GGML_VK_FA_ABLATE");
+        return env ? (uint32_t) atoi(env) & 31u : 0u;
+    }();
+    return bits;
+}
+
 bool ggml_vk_fork_fa_sparse_wide(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv,
                                  bool f32acc, ggml_type k_type, ggml_type v_type) {
     // the sparse folded tile of flash_attn_cm1.comp stages K 16 dims at a time, with two barriers and a lookup of the

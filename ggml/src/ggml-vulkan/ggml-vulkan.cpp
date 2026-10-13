@@ -8809,6 +8809,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+    mask_n_head_log2 |= ggml_vk_fork_fa_ablate() << 27; // fork: profiling only, see ggml_vk_fork_fa_ablate
     if (split_major && split_k > 1) {
         mask_n_head_log2 |= 1u << 25; // fork: SPLIT_MAJOR_BIT of flash_attn_base.glsl
         if (split_kv_range) {

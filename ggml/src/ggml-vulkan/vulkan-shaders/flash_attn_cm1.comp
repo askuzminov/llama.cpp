@@ -86,6 +86,13 @@ void main() {
 
     init_indices();
 
+    // fork: GGML_VK_FA_ABLATE (profiling only, the results are wrong): 1 no block loop, 2 no K/V reads, 4 no mask,
+    // 8 no matmuls, 16 no softmax
+    const uint32_t ablate = p.mask_n_head_log2 >> 27;
+    if ((ablate & 1) != 0) {
+        end_j = start_j;
+    }
+
     const uint32_t tid = gl_LocalInvocationIndex;
 
     const uint32_t threads_per_rowgroup = gl_WorkGroupSize.x / row_split;
@@ -191,6 +198,9 @@ void main() {
                 mask_opt = data_mask_opt[mo_offset + mask_opt_idx];
             }
             mask_opt_bits = (mask_opt >> ((j % 16) * 2)) & 0x3;
+            if ((ablate & 4) != 0) {
+                mask_opt_bits = MASK_OPT_ALL_ZERO;
+            }
             if (mask_opt_bits == MASK_OPT_ALL_NEG_INF) {
                 // skip this block
                 continue;
@@ -315,7 +325,7 @@ void main() {
                     if (idx + tid < Bc * 16) {
                         FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                         const int cell = cellsh[row];
-                        if (cell >= 0 && (HSK == HSK_pad || kc * 64 + col_vec * 4 < HSK)) {
+                        if (cell >= 0 && (ablate & 2) == 0 && (HSK == HSK_pad || kc * 64 + col_vec * 4 < HSK)) {
 #if !defined(BFLOAT16)
                             if (USE_DECODE_K) {
                                 uint coord = uint(cell) * k_stride * BLOCK_SIZE_K + kc * 64 + col_vec * 4;
@@ -335,7 +345,9 @@ void main() {
                 [[unroll]] for (uint32_t d = 0; d < 4; ++d) {
                     coopMatLoad(KMat, kvsh, (gl_SubgroupID * MatBc) * kvshw_stride + d * 4, kvshw_stride, gl_CooperativeMatrixLayoutRowMajor);
                     coopMatLoad(QMat, Qf, (kc * 4 + d) * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
-                    SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+                    if ((ablate & 8) == 0) {
+                        SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+                    }
                 }
             }
         }
@@ -358,7 +370,7 @@ void main() {
                         FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                         uint32_t kcol;
                         bool kv_active = fa_kv_cell(j, row, kcol);
-                        if (kv_active && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
+                        if (kv_active && (ablate & 2) == 0 && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
 #if !defined(BFLOAT16)
                             if (USE_DECODE_K) {
                                 uint coord = kcol * k_stride * BLOCK_SIZE_K + d * 16 + col_vec * 4;
@@ -392,7 +404,9 @@ void main() {
 
             coopMatLoad(QMat, Qf, d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
 
-            SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+            if ((ablate & 8) == 0) {
+                SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+            }
         }
 
         uint coord = gl_SubgroupID * MatBc * sfshstride;
@@ -428,6 +442,10 @@ void main() {
 
         float eMf[rows_per_thread];
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+            eMf[r] = 1.0;
+        }
+        if ((ablate & 16) == 0)
+        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint r_vec  = tile_row(r) / 4;
             const uint r_comp = tile_row(r) % 4;
 
@@ -461,6 +479,7 @@ void main() {
         }
 
         // Calculate and store Pf in Psh
+        if ((ablate & 16) == 0)
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             const uint col = c * cols_per_iter + col_tid;
 
@@ -542,7 +561,7 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (USE_SPARSE ? (kv_active && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
+                    if (USE_SPARSE ? (kv_active && (ablate & 2) == 0 && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -580,7 +599,9 @@ void main() {
                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }
 
-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                    if ((ablate & 8) == 0) {
+                        PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                    }
                 }
 
                 // Store PVMat to pvsh and load into Of
