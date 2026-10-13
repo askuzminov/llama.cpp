@@ -145,11 +145,15 @@ static void ggml_backend_cuda_timing_take_fork(ggml_backend_t backend, double * 
 // ---- GGML_CUDA_OP_TIMING=<report period in compute calls>: the GPU time of every op (a fused group counts as one), a
 // pair of timing events around each, read once passed. the CUDA graphs are off meanwhile (a capture cannot hold the
 // events), so the time between the ops is not the one of a normal run; the time of each kernel is. every period the
-// log gets the ops by total time, with their count and mean, labelled by op, type and shape
+// log gets the ops by total time, with their count and mean, labelled by op, type and shape. GGML_CUDA_OP_TIMING=idle:
+// the report comes when a compute call starts after the GPU was idle for 300 ms or more, so it holds one request of a
+// server (scripts/win-qsa 05: the report of a request is printed at the start of the next one)
 
 #include <map>
 #include <string>
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 
 struct ggml_cuda_op_timing_fork {
     struct span {
@@ -163,17 +167,25 @@ struct ggml_cuda_op_timing_fork {
     int64_t n_calls = 0;
     int64_t n_ops   = 0;
     double  op_us   = 0.0;
+    std::chrono::steady_clock::time_point t_last {}; // the start of the last compute call (idle mode)
 };
 
+// the report period in compute calls, -1 for idle, 0 off
 static int ggml_cuda_op_timing_fork_period() {
-    static const int period = [] { const char * env = getenv("GGML_CUDA_OP_TIMING"); return env ? atoi(env) : 0; }();
+    static const int period = [] {
+        const char * env = getenv("GGML_CUDA_OP_TIMING");
+        if (env == nullptr) {
+            return 0;
+        }
+        return strcmp(env, "idle") == 0 ? -1 : atoi(env);
+    }();
     return period;
 }
 
 static std::unordered_map<const ggml_backend_cuda_context *, std::unique_ptr<ggml_cuda_op_timing_fork>> ggml_cuda_op_timing_fork_ctx;
 
 static ggml_cuda_op_timing_fork * ggml_cuda_op_timing_fork_get(const ggml_backend_cuda_context * ctx) {
-    if (ggml_cuda_op_timing_fork_period() <= 0) {
+    if (ggml_cuda_op_timing_fork_period() == 0) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lock(ggml_cuda_timing_fork_mutex);
@@ -196,7 +208,7 @@ static cudaEvent_t ggml_cuda_op_timing_fork_event(ggml_cuda_op_timing_fork * t) 
 }
 
 static bool ggml_cuda_op_timing_fork_on() {
-    return ggml_cuda_op_timing_fork_period() > 0;
+    return ggml_cuda_op_timing_fork_period() != 0;
 }
 
 // before the op (or the fused group) at node i
@@ -303,6 +315,20 @@ static void ggml_cuda_op_timing_fork_call(ggml_backend_cuda_context * ctx) {
     if (t == nullptr) {
         return;
     }
+    if (ggml_cuda_op_timing_fork_period() < 0) {
+        // idle mode: the calls before a gap are one request, report them before this call adds to them
+        const auto now = std::chrono::steady_clock::now();
+        const bool gap = t->n_ops > 0 && std::chrono::duration<double>(now - t->t_last).count() >= 0.3;
+        t->t_last = now;
+        if (gap) {
+            ggml_cuda_op_timing_fork_drain(t, true);
+            ggml_cuda_op_timing_fork_report(ctx->name.c_str(), t);
+        } else {
+            ggml_cuda_op_timing_fork_drain(t, false);
+        }
+        ++t->n_calls;
+        return;
+    }
     ggml_cuda_op_timing_fork_drain(t, false);
     if (++t->n_calls < ggml_cuda_op_timing_fork_period()) {
         return;
@@ -311,7 +337,7 @@ static void ggml_cuda_op_timing_fork_call(ggml_backend_cuda_context * ctx) {
 }
 
 static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx) {
-    if (ggml_cuda_op_timing_fork_period() <= 0) {
+    if (ggml_cuda_op_timing_fork_period() == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(ggml_cuda_timing_fork_mutex);

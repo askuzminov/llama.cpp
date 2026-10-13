@@ -23,14 +23,14 @@ rem set "MODEL=E:\ml\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\Qwen3.8-Fl
 rem set "SPECDRAFT=E:\ml\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"
 
 rem ---- needed on the 3090: -ncmoe that fits the card (the default is 30) ----
-rem the static layout of 02, 03 and 05: llama-bench and llama-perplexity have no expert cache. 04-decode
-rem adds DECARGS after it, there -ncmoe 48 --moe-cache auto wins: all 48 MoE layers on the cpu, the
+rem the static layout of 03: llama-perplexity has no expert cache. 04-decode and 05-profile
+rem add DECARGS after it, there -ncmoe 48 --moe-cache auto wins: all 48 MoE layers on the cpu, the
 rem free VRAM goes to the cache slots
 rem set "EXTRA=-ngl 99 -ncmoe 46"
 
 rem ---- a comparison of a switch: add an arm, the kept arms do not run again ----
-rem set "BENCHARMS=stable @stable;default;radix0 GGML_VK_TOPK_RADIX=0"
-rem set "BENCHDEPTHS=0,65536,122880"
+rem set "DECARMS=auto @draft --spec-auto;radix0 GGML_VK_TOPK_RADIX=0 @draft --spec-auto"
+rem set "DECPREFIX=none" & set "DECCHAT=0:30:16000"
 rem set "QARMS=default;radix0 GGML_VK_TOPK_RADIX=0"
 rem set "DECARMS=none;n3 @draft --spec-type draft-mtp --spec-draft-n-max 3"
 

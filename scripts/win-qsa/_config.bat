@@ -113,7 +113,13 @@ rem their values (GGML_OP_FLASH_ATTN_LIST, a new op of the fork) instead of the 
 rem set_rows and the pre-pass: from KV 4104 on, where the sparse path runs anyway. Mac: the op passes against the CPU
 rem (scalar path, 7 cases, with and without the fold), the CPU op against flash_attn_ext with the same dense mask, and
 rem a qwen4exp test model at 8192 the same PPL with and without; 01 checks the coopmat path here, 03 the real model
-if not defined RUN_CHECK   set "RUN_CHECK=1"
+rem 13.10 (ef918619): FLASH_ATTN_LIST 7/7, FLASH_ATTN_EXT 53/53; KLD list 0.015593 / default 0.015741 (same top 96.4 /
+rem 96.1 percent); PP at 122880 810.4 against 781.8 (the attention 810 against 909 ms, the mask fill 52 -> 3 ms), TG
+rem 25.74 against 25.39, the 118K prompt 828.8 t/s; the compute buffer 3931 MiB in both (the peak is in the indexer).
+rem dense against sparse: 880.1 / 882.6 at depth 2048, 821.7 / 878.2 at 4096, 589.8 / 864.0 at 16384, so the threshold
+rem of KV 4104 stays. list is the default since then (LLAMA_QSA_FA_LIST=0 = the mask). the next run: conversations
+rem (DECCHAT), what a growing chat sees at 0, ~30K, ~60K and ~118K tokens
+if not defined RUN_CHECK   set "RUN_CHECK=0"
 if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
 if not defined CHECKARMS   set "CHECKARMS=default"
 if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
@@ -213,15 +219,22 @@ rem at 64 tokens; TG none 27.86, auto 38.24, lidall 36.47, sub1g 37.44; 5 server
 rem the load. b16k: the 118K prompt at 816.1 t/s (772.1 with -b 4096 on the build before, not the same build); the PLE
 rem prefetch line was there (a grep of mine cut it off), ple_prefetch_start also logs a reason to skip since then.
 rem 13.10 (19d20ba8), the 118K prompt: auto 797.4, b16k 814.6, wide 799.6 t/s; b16k is in DECARGS since then
-rem list: see CHECKARMS, the 118K prompt and the compute buffer with it
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=500000;list LLAMA_QSA_FA_LIST=1 @draft --spec-auto @p=500000"
+rem 13.10: auto failed three times in the load (failed to allocate a 1.66 GB Vulkan0 buffer, 2.2 GiB in use before),
+rem list right after it loaded; to watch
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
+if not defined DECPREFIX  set "DECPREFIX=500000"
+rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
+rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG
+rem after it from tg_3s; two texts, one seed
+if not defined DECPROMPTS set "DECPROMPTS=os code"
+if not defined DECSEEDS   set "DECSEEDS=1"
+rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX)
+if not defined RUN_PROFILE set "RUN_PROFILE=1"
 
-if not defined RUN_QUALITY set "RUN_QUALITY=1"
+if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
 rem 800 ms in its loop per 4096 prompt at any depth, the dense one 302 at depth 0 and grows with KV: 2048 to 16384
 rem against dense (GGML_VK_FA_SPARSE_DISABLE=1) find the crossing
-if not defined BENCHDEPTHS set "BENCHDEPTHS=2048,4096,8192,16384,122880"
-if not defined BENCHSMALL  set "BENCHSMALL=0"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
@@ -277,10 +290,7 @@ rem twice. both stay off (the switches stay). lidall 775.2 / 948.8, sub1g 782.6 
 rem kv4 / kv8 / kv16: see CHECKARMS, at 122880 only (depth 0 keeps the dense attention); the split_k partials take
 rem 101 MB per range at 4096 tokens (kv16: 1.6 GB)
 rem list: see CHECKARMS
-if not defined BENCHARMS  set "BENCHARMS=default;dense GGML_VK_FA_SPARSE_DISABLE=1 @d=2048,4096,8192,16384;list LLAMA_QSA_FA_LIST=1"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
-if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
-if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
 rem the prompt at depth 0 and a decode step at 122880, the default and the arms of its switches side by side. 07.10: the tile of the fused
 rem gate/up, gpu ms of a 4096-token prompt: 32x64 884, medium 64x64 933, 32x128 922, 16x64 1024, 32x32 1011, 64x32,
 rem 128x32 and 128x64 above 1000. a decode step at 122880: 42.60 ms of gpu time against 42.89 of stable
@@ -289,7 +299,6 @@ rem 531 -> 505), 02 PP +6.4 percent at 0 but +0.3 at 122880. 11.10 (d01bba7a3, f
 rem ms (gate/up 883 -> 613), the wall time of the compute call 5218 -> 4940; 02 lost it to the cold PLE rows of the
 rem first arm at 122880 (BENCHWARMTOKENS). at 0 4367 / 4584 (noelt) / 4060 ms; a decode step at 122880 40.4-40.9 ms
 rem tg@0 next to tg@122880: which ops of a decode step grow with the depth (28.5 -> 25.4 t/s)
-if not defined PROFKINDS  set "PROFKINDS=pp@122880"
 rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the attention gate before 10.10
 rem int8: the MUL_MAT_ID time per op on the int8 path, f16reg is the default since 11.10 (see CHECKARMS)
 rem lidall: the lightning indexer at every size next to the default (64 tokens again since 12.10 evening)
@@ -300,13 +309,12 @@ rem 13.10: 907.9 ms in all; without the loop 101.6 (the sparse compact pre-pass 
 rem grows with the depth), without K/V reads 544.5 (they cost 364), without the mask 876.1 (32), without the matmuls
 rem 772.1 (136), without the softmax 783.5 (124); about 150 ms of loop structure besides
 rem list: the attention without the pre-pass, and no mask fill
-if not defined PROFARMS   set "PROFARMS=default;list LLAMA_QSA_FA_LIST=1"
+if not defined PROFARMS   set "PROFARMS=default"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
 if not defined RUN_KERNELS set "RUN_KERNELS=0"
 rem the server of the 395 runs at -c 262144 with its buffers for the full context, llama-bench does the same
-if not defined BENCHCTX   set "BENCHCTX=262144"
 goto :defaults_done
 
 :cuda_defaults
@@ -407,19 +415,28 @@ rem auto 31.17, t20 30.12 (-3.4 percent), t24 29.35 (-5.8), t20 wins only on rep
 rem everything. more threads do not help the CPU experts (the RAM, not the cores), the default stays; b16k: see DECARGS
 rem the next run (after the GET_ROWS fix, see BENCHARMS): the server with it, short prompts and the 118K prompt
 rem 13.10 (cf12e0b8): the 118K prompt 1002.1 t/s against 903.9 before the fix (+10.9 percent), TG there 28.14; short
-rem prompts TG 31.82, PP 440.9 against 423.4. nothing new for CUDA after it: the 3090 does not run now
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=0,500000"
-if not defined RUN_DECODE  set "RUN_DECODE=0"
-if not defined RUN_BENCH   set "RUN_BENCH=0"
-if not defined RUN_PROFILE set "RUN_PROFILE=0"
+rem prompts TG 31.82, PP 440.9 against 423.4.
+rem the next run (13.10, the user: PP looks to start fast and sag, ~30 t/s at 30K): conversations (DECCHAT), each turn
+rem a few hundred new tokens at the depth so far, as a chat client sends them; the 04 of before computed every prompt
+rem from scratch (cache_prompt off). kvhost (LLAMA_QSA_KV_HOST=1, the QSA KV in RAM, 07.10: 111 expert slots instead
+rem of 68, TG +3.6 percent on short prompts, -5 on a 2541-token one): where it stands now, before KV streaming.
+rem stable: the build of the tag stable (dd5a8f526, 30.09; 00-build.bat stable once), the user: PP was lower then but
+rem nearly flat with the depth, now it starts higher and sags; the same conversations on both builds
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;stable @stable @draft --spec-auto;kvhost LLAMA_QSA_KV_HOST=1 @draft --spec-auto"
+if not defined DECPREFIX  set "DECPREFIX=500000"
+rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
+rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG
+rem after it from tg_3s; two texts, one seed
+if not defined DECPROMPTS set "DECPROMPTS=os code"
+if not defined DECSEEDS   set "DECSEEDS=1"
+rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX)
+if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem the run after the profile of 12.10 night: 01 GET_ROWS for the flat gather of short rows (fork/getrows-fork.inc,
 rem new eval cases of the qwen4exp shapes), 02 default / maskdense / rowsup (GGML_CUDA_GET_ROWS_FLAT=0, upstream), 05
 rem optime / optimemd again
 rem 12.10 night (7c218166): GET_ROWS 224/224 with the new cases
 if not defined RUN_CHECK   set "RUN_CHECK=0"
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
-if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
-if not defined BENCHSMALL  set "BENCHSMALL=0"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
@@ -434,7 +451,6 @@ rem not the size of the mask; TG the same. no alloc peak lines: llama-bench drop
 rem 12.10 night (7c218166), with the flat GET_ROWS: default 1079.6 / 916.8 at 0 / 122880 (+11.4 / +10.6 percent over
 rem 969.2 / 828.6 before), maskdense 1079.4 / 898.6, rowsup (upstream GET_ROWS) 968.6 / 828.8; TG the same. the mask
 rem from positions is ahead again (+2.0 percent at 122880); 05: 3881 ms of gpu time for the run against 5006 before
-if not defined BENCHARMS  set "BENCHARMS=default;maskdense LLAMA_QSA_MASK_POS=0 @d=0,122880;rowsup GGML_CUDA_GET_ROWS_FLAT=0 @d=0,122880"
 rem llama-bench has no expert cache: a profile of it says little about the server of the 3090. optime / optimemd:
 rem GGML_CUDA_OP_TIMING with a period above the compute calls of the run, so the report comes once, when the context
 rem goes: the GPU time of every op of the warmup and the two prompts of 4096 at depth 0, for the 190 ms that the mask
@@ -445,31 +461,19 @@ rem maskdense gathers its mask values per token, [1,2052,4096], 13 ms per call; 
 rem 7.4 ms in both. upstream gives every row a block of 256 threads, 1 of them busy here: about 450 ms of GET_ROWS per
 rem 4096 prompt with the mask from positions, 245 with maskdense. one thread per element since then (fork/getrows-fork.inc)
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
-if not defined PROFKINDS   set "PROFKINDS=pp@0"
-if not defined PROFARMS    set "PROFARMS=optime GGML_CUDA_OP_TIMING=1000000000;optimemd GGML_CUDA_OP_TIMING=1000000000 LLAMA_QSA_MASK_POS=0"
+if not defined PROFARMS    set "PROFARMS=default"
 if not defined KERNARMS   set "KERNARMS=default"
 if not defined RUN_KERNELS set "RUN_KERNELS=0"
 rem auto: -c of each depth is depth + prompt, as --phase-mem sizes the buffers in the server. at a fixed -c 262144
 rem the buffers did not fit the 24 GB and the driver moved some to system memory: PP 115-145 or 285-430 t/s
 rem from one process to the next on 05.10, the same within a process
-if not defined BENCHCTX   set "BENCHCTX=auto"
 
 :defaults_done
 rem ---- the same on both ----
 rem 01-check: test-backend-ops ops, "OP [regex of the case parameters]", separated by ;
 if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
-rem 02-bench: llama-bench, one run per arm and depth
-if not defined BENCHDEPTHS set "BENCHDEPTHS=0,32768,65536,122880"
-if not defined BENCHPP     set "BENCHPP=4096"
-if not defined BENCHTG     set "BENCHTG=64"
-if not defined BENCHUB     set "BENCHUB=4096"
-if not defined BENCHREPS   set "BENCHREPS=3"
-rem tokens of the warmup process of 02 and 05: llama-bench draws the same ones in every process, below 32768 with
-rem msvc, and the warmup reads the PLE rows of those draws into the page cache (warm_page_cache in _run.py). auto: as
-rem many as the deepest measured process draws (its depth, then every rep of its prompt and generation: 135360 at
-rem 122880). 10.10: with 98304 the arm that went first to 122880 read the rest cold (452 against 212 ms of inputs)
-rem and lost 5 percent PP: f16reg at 122880 in two runs
-if not defined BENCHWARMTOKENS set "BENCHWARMTOKENS=auto"
+rem 02-bench (llama-bench) is gone since 13.10: the speed comes from the server (04, DECCHAT), the BENCH* settings
+rem above are history
 rem 03-quality: llama-perplexity, KLD of each arm against QREF (empty: stable when built, else default).
 rem a run holds the logits of half a chunk and the reference of a chunk in ram, 12 GB at 16384. at 32768
 rem (24 GB) the 395 failed with bad allocation and row cache read errors on 05.10: the model takes the rest
@@ -485,19 +489,20 @@ if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
 if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch"
-rem 1: the warmup run of llama-bench, llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds
-rem load time and memory pressure, -lm dio reads the weights at load and the median of 02 drops a cold first rep
+rem 1: the warmup run of llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds load time and
+rem memory pressure, -lm dio reads the weights at load
 if not defined WARMUP      set "WARMUP=0"
 rem 06-kernels: test-backend-ops perf of the model shapes at -ub 4096, "OP [regex of the case parameters]"
 if not defined KERNOPS     set "KERNOPS=MUL_MAT_ID n_mats=512,n_used=10,b=0,m=[0-9]+,n=4096,;MUL_MAT_VEC_FUSION n_mats=512;MUL_MAT type_a=q8_0,type_b=f32,m=[0-9]+,n=4096,"
-rem 05-profile: one ubatch of the prompt (pp) and one decode step (tg) at PROFDEPTH
-if not defined PROFKINDS   set "PROFKINDS=pp"
+rem 05-profile: on the server, a chat at each depth of PROFPREFIX (chars of PPLFILE), then a part of PROFPART chars
+rem (pp, as a chat turn computes it there) and a reply of PROFTG tokens (tg, one decode step), per op
 if not defined PROFARMS    set "PROFARMS=default"
-if not defined PROFDEPTH   set "PROFDEPTH=32768"
+if not defined PROFPREFIX  set "PROFPREFIX=0 60000 500000"
+if not defined PROFPART    set "PROFPART=16000"
+if not defined PROFTG      set "PROFTG=16"
 rem run-all.bat
 if not defined RUN_BUILD   set "RUN_BUILD=1"
 if not defined RUN_CHECK   set "RUN_CHECK=1"
-if not defined RUN_BENCH   set "RUN_BENCH=1"
 if not defined RUN_QUALITY set "RUN_QUALITY=1"
 if not defined RUN_DECODE  set "RUN_DECODE=1"
 

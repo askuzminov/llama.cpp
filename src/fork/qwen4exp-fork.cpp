@@ -1550,11 +1550,13 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     // no -inf mask of n_kv x n_batch (2 GiB at 262144 x 4096), no set_rows into it and no pre-pass of the sparse path
     // that finds the cells in it again; on the 395 (13.10, 122880, ubatch 4096) the pre-pass took ~90 ms and the fill
     // of the mask 52 ms, both growing with the depth. only where Vulkan takes the sparse path anyway (KV at least
-    // 2 x n_top_k and 4096), the dense attention over the mask is faster below. LLAMA_QSA_FA_LIST: 1 = on, 0 = off
-    // (default until measured)
+    // 2 x n_top_k and 4096), the dense attention over the mask is faster below (13.10: dense 821.7 against 878.2 t/s
+    // at depth 4096, equal at 2048). 13.10 on the 395: PP at 122880 810.4 against 781.8 t/s, the attention 810 against
+    // 909 ms, the mask fill 52 -> 3 ms, TG 25.74 against 25.39, KLD 0.015593 against 0.015741, FLASH_ATTN_LIST 7/7;
+    // the compute buffer stays (its peak is in the indexer). LLAMA_QSA_FA_LIST: 1 = on (default), 0 = the mask
     static const int list_mode = [] {
         const char * env = std::getenv("LLAMA_QSA_FA_LIST");
-        return env ? std::atoi(env) : 0;
+        return env ? std::atoi(env) : 1;
     }();
     // LLAMA_QSA_FA_LIST_MIN: the KV size from which, -1 (default) = the sparse threshold of Vulkan above
     static const int64_t list_min = [] {

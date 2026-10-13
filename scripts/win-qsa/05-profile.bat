@@ -1,6 +1,7 @@
 @echo off
-rem where the time of one ubatch goes at PROFDEPTH: per op from GGML_VK_PERF_LOGGER on vulkan, per split from
-rem GGML_SCHED_PROF on cuda. PROFKINDS pp is the prompt ubatch, tg one decode step
+rem where the time goes on the server: a chat reaches each depth of PROFPREFIX (chars) with the prompt cache, then a
+rem part of PROFPART chars (pp) and a reply of PROFTG tokens (tg, one decode step); per op from GGML_VK_PERF_LOGGER
+rem on vulkan, GGML_CUDA_OP_TIMING=idle on cuda
 setlocal
 call "%~dp0_config.bat"
 if not defined PY (

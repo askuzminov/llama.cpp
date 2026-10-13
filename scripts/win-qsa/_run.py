@@ -29,9 +29,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 CACHE = HERE / "cache"
 VERSION = 1
-# the speed results of 02 are kept under their own version: 2 since 07.10, when 02 got its warmup process (the
-# numbers before it had a cold first process in every step), 3 since 07.10 evening, when the warmup started to read
-# the PLE rows of every token llama-bench draws (warm_page_cache)
+# the version of the kept llama-bench results of 02 (02 is gone since 13.10), for history.csv from the cache
 BENCH_VERSION = 3
 BUILD_RECORD = "qsa-build.json"
 ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "OMP_")
@@ -776,186 +774,6 @@ def cmd_check():
 
 # ---------------------------------------------------------------- bench
 
-def warm_page_cache(run, model, ub, done, draws):
-    """One llama-bench process that is not measured, before the first measured one of a step. llama-bench draws its
-    tokens with std::rand(): the same tokens in every process, below 32768 with msvc. The PLE rows of those tokens
-    (llama_row_cache, a 26.8 GiB table on disk) come from the page cache once read, from the drive before. 07.10: the
-    arm that ran first read them cold, 530 against 170 ms of inputs per 4096-token ubatch, PP 786 against 840 t/s at
-    depth 0 on the 395, TG -6 percent at 32768 on the 3090. BENCHWARMTOKENS draws (98304: 24 prompts of 4096) read
-    95 percent of those rows, and the gpu clocks are up after it.
-    draws: the tokens the deepest measured process draws (its depth once, the state is kept for the later reps and
-    tests, then every rep of its prompt and generation). 10.10: with 98304 the first arm at 122880 (135360 draws) read
-    the rows past them cold, 452 against 212 ms of inputs, and lost 5 percent PP to the arm after it.
-    BENCHWARMTOKENS=auto (default) warms that many, a number sets it."""
-    if done or env("BENCHWARMUP", "1") != "1":
-        return
-    done.append(True)
-    exe = Arm("warmup").binary("llama-bench")
-    tokens = draws if env("BENCHWARMTOKENS", "auto") == "auto" else env_int("BENCHWARMTOKENS", draws)
-    reps = max(1, -(-tokens // ub))
-    print(f"warmup: one llama-bench process of {reps} prompts of {ub} tokens, not measured", flush=True)
-    try:
-        execute([exe, *model_args(model), "-c", 16384, "-b", ub, "-ub", ub, "-p", ub, "-n", 0, "-r", reps, "-o", "json"],
-                run.dir / "warmup.log", os.environ.copy(), stdout=run.dir / "warmup.json")
-    except Fail as e:
-        print(f"warmup: {e}", flush=True)
-
-
-def cmd_bench():
-    run = Run("bench")
-    model = model_path()
-    depths = env_ints("BENCHDEPTHS", "0,32768,65536,122880")
-    pp, tg = env_int("BENCHPP", 4096), env_int("BENCHTG", 64)
-    ub, reps = env_int("BENCHUB", 4096), env_int("BENCHREPS", 3)
-    # auto: the context of each depth is just large enough, as --phase-mem sizes the buffers in the server. a fixed
-    # -c reserves the compute buffer for the full context at every depth
-    auto = env("BENCHCTX", "262144") == "auto"
-    ctx = 0 if auto else env_int("BENCHCTX", 262144)
-    arms = parse_arms("BENCHARMS", "default")
-    if not auto and max(depths) + max(pp, tg) > ctx:
-        raise Fail("the deepest BENCHDEPTHS plus the prompt does not fit BENCHCTX")
-
-    warmed = []
-    # the tokens of the deepest process (warm_page_cache): its depth, then every rep of its prompt and generation
-    draws = max(d + reps * (max([a.pp or pp for a in arms]) + tg) for d in depths)
-
-    def warm_up():
-        warm_page_cache(run, model, ub, warmed, draws)
-    results = {}
-    for i, depth in enumerate(depths):
-        # the order turns at each depth, so that no arm always runs right after the same one
-        for arm in (arms if i % 2 == 0 else arms[::-1]):
-            label = f"{arm.name}-d{depth}"
-            if arm.depths is not None and depth not in arm.depths:
-                continue
-            try:
-                exe = arm.binary("llama-bench")
-            except Skip as e:
-                results[arm.name, depth] = f"skip: {e}"
-                continue
-            p = arm.pp or pp
-            c = arm.ctx or (-(-(depth + max(p, tg)) // 256) * 256 if auto else ctx)
-            u = arm.ub or ub
-            cmd = [exe, *model_args(model), "-c", c, "-b", max(p, u), "-ub", u, "-p", p, "-n", tg, "-d", depth,
-                   "-r", reps, "-o", "json", *arm.args]
-            run_env = arm_env(arm, {"GGML_SCHED_LOG_REALLOC": "1"})
-            identity = {"v": BENCH_VERSION, "kind": "bench", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
-                        "env": env_identity(run_env), "model": model_identity(model), "machine": machine()}
-
-            def go(log):
-                warm_up()
-                out = log.with_suffix(".json")
-                _, text = execute(cmd, log, run_env, stdout=out)
-                lines = text.splitlines()
-                r = {"replans": text.count("sched re-reserve:"), "graph_timing": graph_timing(lines),
-                     "host_tg": host_timing(lines, 1)}
-                for row in json.loads(out.read_text(encoding="utf-8")):
-                    samples = sorted(row.get("samples_ts") or [row["avg_ts"]])
-                    r["pp" if row["n_prompt"] else "tg"] = [row["avg_ts"], row["stddev_ts"], statistics.median(samples),
-                                                            samples[0], samples[-1]]
-                if (pp and "pp" not in r) or (tg and "tg" not in r):
-                    raise Fail(f"llama-bench gave no PP or TG row ({log.name})")
-                return r
-
-            try:
-                results[arm.name, depth] = run.measure(label, identity, go)
-            except Fail as e:
-                run.failed = True
-                results[arm.name, depth] = f"FAIL {e}"
-                continue
-            r, kept = results[arm.name, depth]
-            metrics = {"replans": r["replans"]}
-            for kind in ("pp", "tg"):
-                if kind in r:
-                    metrics.update({kind: r[kind][2], kind + "_min": r[kind][3], kind + "_max": r[kind][4]})
-            run.record("bench", arm, f"d{depth}", metrics, kept, exe.parent)
-    run.add(f"bench: llama-bench pp{pp} tg{tg} -ub {ub} -c {'depth + pp' if auto else ctx}, median of {reps} reps "
-            f"(min-max), {model.name}, build {current_build()}")
-    own = [f"{a.name} pp{a.pp or pp} -ub {a.ub or ub}" for a in arms if a.pp or a.ub]
-    if own:
-        run.add("arms with their own prompt or ubatch: " + ", ".join(own))
-    for kind in [k for k, n in (("pp", pp), ("tg", tg)) if n]:
-        rows = []
-        for depth in depths:
-            row = [depth]
-            for arm in arms:
-                r = results.get((arm.name, depth))
-                if isinstance(r, tuple):
-                    _, _, med, lo, hi = r[0][kind]
-                    row.append(f"{med:.2f} ({lo:.1f}-{hi:.1f})" + (" k" if r[1] else ""))
-                else:
-                    row.append("" if r is None else "FAIL" if r.startswith("FAIL") else "skip")
-            rows.append(row)
-        run.add("", f"{kind.upper()} t/s", *table(["depth", *[a.name for a in arms]], rows))
-    # prompts of an agent turn at depth 0: one llama-bench run per arm over the sizes of BENCHSMALL. a small -c is
-    # enough here, the graph of a short prompt at depth 0 does not depend on it
-    small = env_ints("BENCHSMALL", "") if env("BENCHSMALL") not in ("", "0") else []  # 0: no short prompts
-    if small:
-        small_arms = parse_arms("BENCHSMALLARMS", "default")
-        small_ctx = env_int("BENCHSMALLCTX", 16384)
-        small_res = {}
-        for arm in small_arms:
-            try:
-                exe = arm.binary("llama-bench")
-            except Skip as e:
-                small_res[arm.name] = f"skip: {e}"
-                continue
-            cmd = [exe, *model_args(model), "-c", arm.ctx or small_ctx, "-b", max(arm.ub or ub, max(small)), "-ub", arm.ub or ub,
-                   "-p", ",".join(map(str, small)), "-n", 0, "-r", reps, "-o", "json", *arm.args]
-            run_env = arm_env(arm)
-            identity = {"v": BENCH_VERSION, "kind": "bench-small", "build": build_id(exe.parent),
-                        "args": [str(c) for c in cmd[1:]], "env": env_identity(run_env), "model": model_identity(model),
-                        "machine": machine()}
-
-            def go(log):
-                warm_up()
-                out = log.with_suffix(".json")
-                execute(cmd, log, run_env, stdout=out)
-                r = {}
-                for row in json.loads(out.read_text(encoding="utf-8")):
-                    samples = sorted(row.get("samples_ts") or [row["avg_ts"]])
-                    r[str(row["n_prompt"])] = [statistics.median(samples), samples[0], samples[-1]]
-                if any(str(n) not in r for n in small):
-                    raise Fail(f"llama-bench gave no row for every size of BENCHSMALL ({log.name})")
-                return r
-
-            try:
-                small_res[arm.name] = run.measure(f"{arm.name}-small", identity, go)
-            except Fail as e:
-                run.failed = True
-                small_res[arm.name] = f"FAIL {e}"
-                continue
-            r, kept = small_res[arm.name]
-            run.record("bench", arm, "small", {f"pp{n}": r[str(n)][0] for n in small}, kept, exe.parent)
-        rows = []
-        for n in small:
-            row = [n]
-            for arm in small_arms:
-                r = small_res.get(arm.name)
-                if isinstance(r, tuple):
-                    med, lo, hi = r[0][str(n)]
-                    row.append(f"{med:.1f} ({lo:.1f}-{hi:.1f})" + (" k" if r[1] else ""))
-                else:
-                    row.append("skip" if r is None or r.startswith("skip") else "FAIL")
-            rows.append(row)
-        run.add("", f"PP t/s of short prompts at depth 0, -c {small_ctx}", *table(["prompt", *[a.name for a in small_arms]], rows))
-        results.update({(a, "small"): r for a, r in small_res.items() if isinstance(r, str)})
-    notes = sorted({f"  {a}: {r}" for (a, d), r in results.items() if isinstance(r, str) and r.startswith("skip")})
-    notes += [f"  {a}-d{d}: {r}" for (a, d), r in results.items() if isinstance(r, str) and not r.startswith("skip")]
-    notes += [f"  {a}-d{d}: {r[0]['replans']} re-plans of the buffers while computing" for (a, d), r in results.items()
-              if isinstance(r, tuple) and r[0]["replans"]]
-    notes += [f"  {a}-d{d}: {graph_timing_text(r[0]['graph_timing'])}" for (a, d), r in results.items()
-              if isinstance(r, tuple) and r[0].get("graph_timing")]
-    notes += [f"  {a}-d{d}: host per decode step (LLAMA_INPUT_TIMING), median of {h['n']}: graph build {h['graph']:.2f} ms, "
-              f"inputs {h['inputs']:.2f} ms, submit {h['submit']:.2f} ms" for (a, d), r in results.items()
-              if isinstance(r, tuple) and (h := r[0].get("host_tg"))]
-    if notes:
-        run.add("", "notes:", *notes)
-    return run.finish()
-
-
-# ---------------------------------------------------------------- quality
-
 def logits_info(data, ctx, chunks):
     with data.open("rb") as f:
         header = f.read(20)
@@ -1111,13 +929,12 @@ def prompt(name):
     raise Fail(f"unknown prompt {name}: one of {', '.join(PROMPTS)} or a text file")
 
 
-def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
-    """Start llama-server, send the warmup and the requests one after another, stop it. The answers stay next to
-    the log. rows_text, one token long and not measured, reads the PLE rows of the prompts into the page cache first:
-    otherwise the arm that runs first reads them from the drive (see warm_page_cache)."""
-    wait, timeout = env_int("DECWAIT", 900), env_int("DECTIMEOUT", 1800)
+def start_server(exe, args, run_env, log):
+    """Start llama-server and wait for /health, with the retries of a load that fails on memory or stalls; returns the
+    process and the log it writes (a retry writes log-tryN)"""
+    wait = env_int("DECWAIT", 900)
+    port = args[args.index("--port") + 1]
     url = f"http://127.0.0.1:{port}"
-    run_env = dict(run_env, LLAMA_SPEC_TRACE=str(log.with_suffix(".trace.csv")))
     no_server_running()
     first = log
     # a server that fails on memory while loading gets two more tries after longer waits, as in execute(): the driver
@@ -1169,6 +986,47 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
             log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue
         raise Fail(f"llama-server {exit_text(proc.returncode)} while loading: {last_error(text)} ({log.name}, try {attempt})")
+    return proc, log
+
+
+def progress(text):
+    """The server's own speed lines of one request: the prompt progress at every batch, [[n_tokens, seconds], ...]
+    (n_tokens counts the cached part too, the seconds run from the start of this prompt), and the generation speed
+    over the last 3 s, printed every 3 s"""
+    pp = [[int(m[1]), float(m[2])] for m in re.finditer(r"prompt processing, n_tokens =\s*(\d+), progress = [\d.]+, t =\s*([\d.]+) s", text)]
+    tg = [float(m[1]) for m in re.finditer(r"n_gen =\s*\d+, tg =\s*[\d.]+ t/s, tg_3s =\s*([\d.]+) t/s", text)]
+    return pp, tg
+
+
+def ubatches(text, least=1025):
+    """LLAMA_INPUT_TIMING of the prompt ubatches of the model, [[tokens, graph ms, inputs ms, compute ms], ...]; the
+    MTP head computes the prompt in ubatches of 1024 (LLAMA_MTP_UBATCH) and a decode step in 1-4, left out by least"""
+    return [[int(m[1]), float(m[2]), float(m[3]), float(m[4])] for m in
+            re.finditer(r"ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", text)
+            if int(m[1]) >= least]
+
+
+def segments(curve, start=0, least=2048):
+    """The speed of each stretch between progress lines, [[from, to, t/s], ...]; a stretch shorter than least tokens
+    (the tail of a prompt, around a context checkpoint) joins the next one"""
+    out, n0, t0 = [], start, 0.0
+    for n, t in curve:
+        if n - n0 >= least and t > t0:
+            out.append([n0, n, (n - n0) / (t - t0)])
+            n0, t0 = n, t
+    return out
+
+
+def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats=()):
+    """Start llama-server, send the warmup and the requests one after another, stop it. The answers stay next to
+    the log. rows_text, one token long and not measured, reads the PLE rows of the prompts into the page cache first:
+    otherwise the arm that runs first reads them from the drive. chats: conversations as a
+    client keeps them, (name, [(user text, tokens), ...]), each turn sent with the messages before it and the prompt
+    cache on, so a turn after the first computes only its new part at the depth of the conversation"""
+    timeout = env_int("DECTIMEOUT", 1800)
+    url = f"http://127.0.0.1:{port}"
+    run_env = dict(run_env, LLAMA_SPEC_TRACE=str(log.with_suffix(".trace.csv")))
+    proc, log = start_server(exe, args, run_env, log)
     rows = []
     try:
         temp, top_k, top_p = sampling
@@ -1176,6 +1034,7 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
         for name, text, seed, n in [*warm, *requests]:
             body = {"messages": [{"role": "user", "content": text}], "max_tokens": n, "temperature": temp,
                     "top_k": top_k, "top_p": top_p, "seed": seed, "cache_prompt": False, "stream": False}
+            before = log.stat().st_size
             try:
                 _, raw = http(url + "/v1/chat/completions", body, timeout)
             except urllib.error.HTTPError as e:
@@ -1191,10 +1050,46 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
                 continue
             t = answer["timings"]
             message = answer["choices"][0]["message"]
-            rows.append({"name": f"{name}-s{seed}", "prompt_n": t["prompt_n"], "prompt_ms": t["prompt_ms"],
+            time.sleep(0.5)  # the last speed lines of the slot
+            with log.open("rb") as f:
+                f.seek(before)
+                part_text = f.read().decode("utf-8", errors="replace")
+            pp_curve, tg3 = progress(part_text)
+            rows.append({"name": f"{name}-s{seed}", "pp_curve": pp_curve, "tg3": tg3, "ubatches": ubatches(part_text),
+                         "prompt_n": t["prompt_n"], "prompt_ms": t["prompt_ms"],
                          "n": t["predicted_n"], "ms": t["predicted_ms"], "draft_n": t.get("draft_n", 0),
                          "draft_acc": t.get("draft_n_accepted", 0),
                          "answer": text_digest(f"{message.get('content')}\0{message.get('reasoning_content')}")[:16]})
+        chat_rows = []
+        for conv, turns in chats:
+            messages = []
+            for ti, (text, n) in enumerate(turns):
+                messages.append({"role": "user", "content": text})
+                body = {"messages": messages, "max_tokens": n, "temperature": temp, "top_k": top_k, "top_p": top_p,
+                        "seed": 1, "cache_prompt": True, "stream": False}
+                before = log.stat().st_size
+                try:
+                    _, raw = http(url + "/v1/chat/completions", body, timeout)
+                except urllib.error.HTTPError as e:
+                    raise Fail(f"chat {conv} turn {ti}: HTTP {e.code} {e.read()[:300]!r}")
+                except (urllib.error.URLError, OSError) as e:
+                    raise Fail(f"chat {conv} turn {ti}: {e} ({log.name})")
+                answer = json.loads(raw)
+                log.with_name(f"{log.stem}-chat-{conv}-t{ti}.json").write_text(
+                    json.dumps(answer, ensure_ascii=False, indent=1), encoding="utf-8")
+                if "timings" not in answer:
+                    raise Fail(f"chat {conv} turn {ti}: no timings in the answer {raw[:300]!r}")
+                t = answer["timings"]
+                message = answer["choices"][0]["message"]
+                messages.append({"role": "assistant", "content": message.get("content") or ""})
+                time.sleep(0.5)
+                with log.open("rb") as f:
+                    f.seek(before)
+                    pp_curve, tg3 = progress(f.read().decode("utf-8", errors="replace"))
+                chat_rows.append({"conv": conv, "turn": ti, "pp_curve": pp_curve, "tg3": tg3,
+                                  "cache_n": t.get("cache_n", 0), "prompt_n": t["prompt_n"],
+                                  "prompt_ms": t["prompt_ms"], "n": t["predicted_n"], "ms": t["predicted_ms"],
+                                  "draft_n": t.get("draft_n", 0), "draft_acc": t.get("draft_n_accepted", 0)})
         # the slot prints its timings as it is released
         time.sleep(2)
     finally:
@@ -1207,7 +1102,7 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text=""):
     starts = [i for i, s in enumerate(spec) if re.search(r"print: auto: (on|trace only),", s)]
     extra = [s.strip() for s in lines if re.search(KEPT_LINES, s)]
     return {"rows": rows, "spec": spec[starts[-1]:] if starts else [], "extra": extra[-60:],
-            "graph_timing": graph_timing(lines)}
+            "graph_timing": graph_timing(lines), **({"chat": chat_rows} if chats else {})}
 
 
 def graph_timing(lines):
@@ -1253,8 +1148,21 @@ def cmd_decode():
     except ValueError:
         raise Fail(f"DECSAMP must be \"temperature top_k top_p\", got {env('DECSAMP')!r}")
     prompts = [prompt(p) for p in split_args(env("DECPROMPTS", "os db code repeat"))]
-    prefixes = env_ints("DECPREFIX", "0")
-    corpus = Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace") if max(prefixes) > 0 else ""
+    # DECPREFIX=none: only the conversations of DECCHAT
+    prefixes = [] if env("DECPREFIX") == "none" else env_ints("DECPREFIX", "0")
+    # DECCHAT: conversations as a client keeps them (the prompt cache on), "start[:turns[:add]]" each, in chars of
+    # PPLFILE: the first turn is start chars and a question, then turns (DECCHATTURNS) turns of add (DECCHATADD) more
+    # chars and a question each, DECCHATGEN tokens per answer. what a chat sees: the new part of a turn at the depth so
+    # far; "0:30:16000" is a document read in parts of about 4K tokens up to about 120K, the speed against the length
+    chat_specs = []
+    for item in split_args(env("DECCHAT", "")):
+        parts = [int(x) for x in item.split(":")]
+        chat_specs.append((parts[0], parts[1] if len(parts) > 1 else env_int("DECCHATTURNS", 3),
+                           parts[2] if len(parts) > 2 else env_int("DECCHATADD", 2000)))
+    chat_starts = [c[0] for c in chat_specs]
+    chat_gen = env_int("DECCHATGEN", 256)
+    corpus = (Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
+              if max(prefixes, default=0) > 0 or chat_specs else "")
     results = {}
     folders = {}
     for prefix in prefixes:
@@ -1276,7 +1184,8 @@ def cmd_decode():
             args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1,
                     "-fa", "on", "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")),
                     *warmup_args(), *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
-            run_env = arm_env(arm)
+            # the timing of every ubatch (one stderr line each) for the table of the prompt ubatches
+            run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1"})
             identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
                         "draft": model_identity(draft) if arm.draft else None, "sampling": sampling,
@@ -1288,6 +1197,38 @@ def cmd_decode():
             except Fail as e:
                 run.failed = True
                 results[arm.name, prefix] = f"FAIL {e}"
+    chats = []
+    for start, n_turns, add_chars in chat_specs:
+        turns = [((corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", chat_gen)]
+        for ti in range(n_turns):
+            add = corpus[start + ti*add_chars:start + (ti + 1)*add_chars]
+            turns.append((add + "\n\nAnd this part, in two sentences?", chat_gen))
+        chats.append((f"c{start}", turns))
+    if chats:
+        for arm in arms:
+            label = f"{arm.name}-chat"
+            try:
+                if arm.draft and not draft:
+                    raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+                exe = arm.binary("llama-server")
+            except Skip as e:
+                results[arm.name, "chat"] = f"skip: {e}"
+                continue
+            folders[arm.name] = exe.parent
+            args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1,
+                    "-fa", "on", "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")),
+                    *warmup_args(), *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
+            run_env = arm_env(arm)
+            identity = {"v": VERSION, "kind": "decode-chat", "build": build_id(exe.parent), "args": args,
+                        "env": env_identity(run_env), "model": model_identity(model),
+                        "draft": model_identity(draft) if arm.draft else None, "sampling": sampling,
+                        "chats": [[c, [[text_digest(t), n] for t, n in turns]] for c, turns in chats], "machine": machine()}
+            try:
+                results[arm.name, "chat"] = run.measure(label, identity,
+                                                        lambda log: serve(exe, args, run_env, log, [], sampling, port, "", chats))
+            except Fail as e:
+                run.failed = True
+                results[arm.name, "chat"] = f"FAIL {e}"
     run.add(f"decode: llama-server -c {ctx}, prompts {' '.join(n for n, _ in prompts)} x seeds "
             f"{' '.join(map(str, seeds))}, {ngen} tokens, sampling {temp} {top_k} {top_p}, {model.name}, "
             f"build {current_build()}")
@@ -1323,6 +1264,47 @@ def cmd_decode():
             details += [f"  {s}" for s in r["spec"] + ([s for s in r["extra"] if re.search(grep, s)][-20:] if grep else [])]
         run.add("", f"prefix {prefix} chars of {Path(env('PPLFILE')).name}" if prefix else "short prompts",
                 *table(["arm", "TG t/s", "draft accepted", "PP t/s <= 512 (tokens)", "PP t/s > 512 (tokens)"], rows))
+        # the speed along the prompt, from the server's progress line at every batch (-b): one long prompt gives the
+        # curve against the depth; the mean over the requests of that prefix, stretch by stretch
+        curves = []
+        for arm in arms:
+            entry = results.get((arm.name, prefix))
+            if not isinstance(entry, tuple):
+                continue
+            segs = [segments(x.get("pp_curve", [])) for x in entry[0]["rows"] if x["prompt_n"] > 8192]
+            segs = [sg for sg in segs if sg]
+            if not segs:
+                continue
+            n_seg = min(len(sg) for sg in segs)
+            for i in range(n_seg):
+                lo, hi = segs[0][i][0], segs[0][i][1]
+                curves.append([arm.name, f"{lo // 1024}K-{hi // 1024}K", f"{statistics.mean(sg[i][2] for sg in segs):.1f}"])
+            tg3 = [v for x in entry[0]["rows"] if x["prompt_n"] > 8192 for v in x.get("tg3", [])]
+            if tg3:
+                curves.append([arm.name, "TG (tg_3s)", f"{statistics.mean(tg3):.2f} ({min(tg3):.2f}-{max(tg3):.2f})"])
+        if curves:
+            run.add("", "PP along the prompt (the server's progress lines), then TG after it",
+                    *table(["arm", "stretch", "t/s"], curves))
+        # every prompt ubatch of the first long request of each arm (LLAMA_INPUT_TIMING): the start of the curve at
+        # ubatch steps, the host share (graph build, inputs) and the compute; "between" is the time of the progress
+        # stretch that no ubatch of the model accounts for (the MTP head, buffer re-plans, the expert cache)
+        for arm in arms:
+            entry = results.get((arm.name, prefix))
+            if not isinstance(entry, tuple):
+                continue
+            long = [x for x in entry[0]["rows"] if x["prompt_n"] > 8192 and x.get("ubatches")]
+            if not long:
+                continue
+            x, ub_rows, depth = long[0], [], 0
+            for n, g, inp, comp in x["ubatches"]:
+                total = g + inp + comp
+                ub_rows.append([f"{depth // 1024}K", n, f"{g:.0f}", f"{inp:.0f}", f"{comp:.0f}", f"{n / total * 1000:.1f}"])
+                depth += n
+            ub_time = sum(g + inp + comp for _, g, inp, comp in x["ubatches"]) / 1000
+            pp_time = x["pp_curve"][-1][1] if x.get("pp_curve") else 0
+            run.add("", f"{arm.name}, {x['name']}: prompt ubatches (ms), {ub_time:.1f} s in them of {pp_time:.1f} s of prompt"
+                    f" ({pp_time - ub_time:.1f} s between)",
+                    *table(["depth", "tokens", "graph", "inputs", "compute", "t/s"], ub_rows))
         for pair in split_args(env("DECSAME")):
             a, _, b = pair.partition(":")
             ra, rb = results.get((a, prefix)), results.get((b, prefix))
@@ -1332,6 +1314,22 @@ def cmd_decode():
             other = [x["name"] for x, y in zip(ra[0]["rows"], rb[0]["rows"]) if x["answer"] != y["answer"]]
             run.failed |= bool(other)
             run.add(f"same answers {pair}: " + ("all" if not other else "differ in " + " ".join(other)))
+    if chats:
+        # one row per turn: the depth is what the cache held plus the new part
+        rows = []
+        for arm in arms:
+            entry = results.get((arm.name, "chat"))
+            if not isinstance(entry, tuple):
+                rows.append([arm.name, "", "", "", "", "", entry or "skip"])
+                continue
+            r, kept = entry
+            for x in r.get("chat", []):
+                rows.append([arm.name, x["conv"][1:], x["turn"], x["cache_n"] + x["prompt_n"], x["prompt_n"],
+                             f"{rate(x['prompt_n'], x['prompt_ms']):.1f}", f"{rate(x['n'], x['ms']):.2f}",
+                             f"{x['draft_acc']}/{x['draft_n']}" if x["draft_n"] else "-"] + (["k"] if kept else []))
+        run.add("", f"chat: conversations (start:turns:chars) {' '.join(f'{a}:{b}:{c}' for a, b, c in chat_specs)} of "
+                f"{Path(env('PPLFILE')).name}, {chat_gen} tokens per answer, prompt cache on",
+                *table(["arm", "start", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
     run.add(*details)
     return run.finish()
 
@@ -1344,119 +1342,168 @@ def op_group(name):
     return " ".join(parts[:2]) if parts[0] == "FUSED" and len(parts) > 1 else parts[0]
 
 
+def vulkan_blocks(text):
+    """The GGML_VK_PERF_LOGGER blocks of a log part, one per graph compute: [[op, count, ms], ...]"""
+    blocks, cur = [], None
+    for line in text.splitlines():
+        if line.startswith("Vulkan Timings:"):
+            cur = []
+            blocks.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"(.+): (\d+) x [\d.e+-]+ us = ([\d.e+-]+) us", line)
+        if m:
+            cur.append([m[1], int(m[2]), float(m[3]) / 1000])
+        elif line.startswith("Total time:"):
+            cur = None
+    return blocks
+
+
+def cuda_report(text):
+    """The first GGML_CUDA_OP_TIMING report of a log part: (compute calls, [[op, count, ms], ...]) or None"""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"cuda_op_timing \S+: (\d+) compute calls", line)
+        if not m:
+            continue
+        ops = []
+        for x in lines[i + 1:]:
+            r = re.match(r"cuda_op_timing \S+:\s+([\d.]+) ms\s+(\d+) x\s+[\d.]+ us\s+(.+)", x)
+            if not r:
+                break
+            ops.append([r[3].strip(), int(r[2]), float(r[1])])
+        return int(m[1]), ops
+    return None
+
+
+def sum_ops(blocks):
+    total = {}
+    for block in blocks:
+        for op, count, ms in block:
+            c, t = total.get(op, (0, 0.0))
+            total[op] = (c + count, t + ms)
+    return sorted([[op, c, t] for op, (c, t) in total.items()], key=lambda o: -o[2])
+
+
 def cmd_profile():
+    """Where the time goes, on the server: a conversation reaches each depth of PROFPREFIX (chars of PPLFILE) with the
+    prompt cache on, then a part of PROFPART chars (pp: the prompt as a chat turn computes it at that depth) and a
+    reply of PROFTG tokens (tg: one decode step, from the steps of that reply). Vulkan: GGML_VK_PERF_LOGGER, a block
+    per graph compute; CUDA: GGML_CUDA_OP_TIMING=idle, a report when the GPU has been idle, so the report of a request
+    comes at the start of the next one. llama-bench is not used (13.10: it has none of the server's state)"""
     run = Run("profile")
     model = model_path()
     vulkan = env("BACKEND") == "vulkan"
-    depths, pp, tg = env_ints("PROFDEPTH", "65536"), env_int("PROFPP", 4096), env_int("PROFTG", 4)
-    ub = env_int("PROFUB", 4096)
-    # auto: -c of each depth is depth + prompt; a profile asks where the time of a graph goes, and the buffers of a
-    # full context put the 395 at the edge of its memory (05.10: ErrorOutOfDeviceMemory at 122880)
-    prof_auto = env("PROFCTX", "auto") == "auto"
-    ctx = 0 if prof_auto else env_int("PROFCTX", 262144)
     arms = parse_arms("PROFARMS", "default")
-    run.add(f"profile: {'GGML_VK_PERF_LOGGER per op' if vulkan else 'GGML_SCHED_PROF per split'}, host time per ubatch "
-            f"from LLAMA_INPUT_TIMING, llama-bench -ub {ub} -c {'depth + prompt' if prof_auto else ctx}, {model.name}, "
-            f"build {current_build()}")
-    # a kind is pp (PROFPP tokens), ppN (N tokens) or tg, with @d1,d2 for its own depths instead of PROFDEPTH
-    plan = []
-    for k in split_args(env("PROFKINDS", "pp")):
-        name, _, at = k.partition("@")
-        if not re.fullmatch(r"pp\d*|tg", name):
-            raise Fail(f"PROFKINDS: {k} is not pp, ppN or tg")
-        plan += [(name, d) for d in ([int(x) for x in at.split(",") if x] if at else depths)]
-    warmed = []
-    # two reps of each process (cmd below): the deepest one draws its depth and two prompts or generations
-    draws = max(d + 2 * (max(int(k[2:]) if k.startswith("pp") and len(k) > 2 else pp, tg) if k != "tg" else tg) for k, d in plan)
-    for kind, depth in plan:
-        n_pp = int(kind[2:]) if kind.startswith("pp") and len(kind) > 2 else pp
-        done = {}
-        for arm in arms:
-            label = f"{kind}-d{depth}-{arm.name}"
-            if arm.depths is not None and depth not in arm.depths:
-                continue
-            try:
-                exe = arm.binary("llama-bench")
-            except Skip as e:
-                run.add("", f"{label}: skip: {e}")
-                continue
-            sizes = ["-p", n_pp, "-n", 0] if kind != "tg" else ["-p", 0, "-n", tg]
-            # two reps: the last graph then comes from the second, warm, without the warmup run (WARMUP); the depth
-            # state of the first rep is restored, not computed again
-            c = arm.ctx or (-(-(depth + max(n_pp, tg)) // 256) * 256 if prof_auto else ctx)
-            cmd = [exe, *model_args(model), "-c", c, "-b", max(n_pp, arm.ub or ub), "-ub", arm.ub or ub, "-d", depth, *sizes, "-r", 2,
-                   *arm.args]
-            run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1",
-                                    **({"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_SCHED_PROF": "1"})})
-            identity = {"v": VERSION, "kind": "profile", "build": build_id(exe.parent), "args": [str(c) for c in cmd[1:]],
-                        "env": env_identity(run_env), "model": model_identity(model), "machine": machine()}
-            n_tokens = min(n_pp, arm.ub or ub) if kind != "tg" else 1
+    prefixes = env_ints("PROFPREFIX", "0 500000")
+    part, ntg = env_int("PROFPART", 16000), env_int("PROFTG", 16)
+    ctx, port = env_int("DECCTX", 262144), env_int("DECPORT", 8097)
+    corpus = Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
+    run.add(f"profile: llama-server, {'GGML_VK_PERF_LOGGER per op' if vulkan else 'GGML_CUDA_OP_TIMING per op'}, a chat at "
+            f"each depth of {' '.join(map(str, prefixes))} chars, then a part of {part} chars (pp) and {ntg} tokens (tg), "
+            f"{model.name}, build {current_build()}")
+    results = {}
+    for arm in arms:
+        try:
+            exe = arm.binary("llama-server")
+        except Skip as e:
+            run.add("", f"{arm.name}: skip: {e}")
+            continue
+        args = [str(a) for a in ["-m", model, "-c", ctx, "-np", 1, "-fa", "on", "--repeat-penalty", "1.0",
+                *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(), *split_args(env("DECARGS")),
+                *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
+        run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1",
+                                **({"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_CUDA_OP_TIMING": "idle"})})
+        identity = {"v": VERSION, "kind": "profile-server", "build": build_id(exe.parent), "args": args,
+                    "env": env_identity(run_env), "model": model_identity(model), "prefixes": prefixes, "part": part,
+                    "tg": ntg, "corpus": text_digest(corpus[:max(prefixes) + part]), "machine": machine()}
 
-            def go(log):
-                # the host time of the inputs depends on the PLE rows in the page cache (warm_page_cache)
-                warm_page_cache(run, model, ub, warmed, draws)
-                _, text = execute(cmd, log, run_env)
-                lines = text.splitlines()
-                # host time of the last ubatches of the measured size; a build without LLAMA_INPUT_TIMING has none
+        def go(log):
+            proc, log = start_server(exe, args, run_env, log)
+            url = f"http://127.0.0.1:{port}"
+            slices = {}
+            try:
+                def ask(name, messages, n):
+                    before = log.stat().st_size
+                    body = {"messages": messages, "max_tokens": n, "temperature": 0.0, "seed": 1,
+                            "cache_prompt": True, "stream": False}
+                    try:
+                        _, raw = http(url + "/v1/chat/completions", body, env_int("DECTIMEOUT", 1800))
+                    except (urllib.error.URLError, OSError) as e:
+                        raise Fail(f"{name}: {e} ({log.name})")
+                    time.sleep(1.5)  # the slot prints its timings as it is released, and CUDA needs the idle gap
+                    with log.open("rb") as f:
+                        f.seek(before)
+                        slices[name] = f.read().decode("utf-8", errors="replace")
+                    return json.loads(raw)["choices"][0]["message"].get("content") or ""
+                for prefix in prefixes:
+                    msgs = [{"role": "user", "content": (corpus[:prefix] + "\n\n" if prefix else "") + "What is this text about? One word."}]
+                    msgs.append({"role": "assistant", "content": ask(f"fill{prefix}", msgs, 1)})
+                    msgs.append({"role": "user", "content": corpus[prefix:prefix + part] + "\n\nAnd this part? One word."})
+                    msgs.append({"role": "assistant", "content": ask(f"pp{prefix}", msgs, 1)})
+                    msgs.append({"role": "user", "content": "Write a long paragraph about it."})
+                    ask(f"tg{prefix}", msgs, ntg)
+                    ask(f"end{prefix}", [{"role": "user", "content": "ok"}], 1)
+            finally:
+                proc.kill()
+                proc.wait()
+                mark_end()
+            out = {}
+            for prefix in prefixes:
+                pp_text, tg_text, end_text = slices[f"pp{prefix}"], slices[f"tg{prefix}"], slices[f"end{prefix}"]
                 host = [[float(m[2]), float(m[3]), float(m[4])] for m in
-                        (re.match(r"ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", x)
-                         for x in lines) if m and int(m[1]) == n_tokens][-3:]
-                host = [statistics.median(h[i] for h in host) for i in range(3)] if host else None
-                if not vulkan:
-                    # GGML_CUDA_OP_TIMING (an arm sets it): the ops of the run by GPU time, from its last report (the
-                    # flush when the context goes, all of a run with a period above its compute calls)
-                    heads = [i for i, x in enumerate(lines) if re.match(r"cuda_op_timing \S+: \d+ compute calls", x)]
-                    ops = []
-                    for x in lines[heads[-1] + 1:] if heads else []:
-                        m = re.match(r"cuda_op_timing \S+:\s+([\d.]+) ms\s+(\d+) x\s+[\d.]+ us\s+(.+)", x)
-                        if m:
-                            ops.append([m[3].strip(), int(m[2]), float(m[1])])
-                    return {"lines": [x.strip() for x in lines if "sched_prof" in x][-4:], "host": host,
-                            **({"ops": sorted(ops, key=lambda o: -o[2])} if ops else {})}
-                # the last graph is the measured one: the ubatch of the prompt or the last decode step at the depth
-                starts = [i for i, x in enumerate(lines) if x.startswith("Vulkan Timings:")]
-                if not starts:
-                    raise Fail(f"no Vulkan Timings in the log ({log.name})")
-                ops = []
-                for x in lines[starts[-1] + 1:]:
-                    m = re.match(r"(.+): (\d+) x [\d.e+-]+ us = ([\d.e+-]+) us", x)
-                    if m:
-                        ops.append([m[1], int(m[2]), float(m[3]) / 1000])
-                return {"ops": sorted(ops, key=lambda o: -o[2]), "host": host}
+                        (re.match(r".*ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", x)
+                         for x in pp_text.splitlines()) if m]
+                if vulkan:
+                    pp_blocks, tg_blocks = vulkan_blocks(pp_text), vulkan_blocks(tg_text)
+                    steps = tg_blocks[-max(1, ntg - 2):]
+                    out[prefix] = {"pp": sum_ops(pp_blocks), "pp_graphs": len(pp_blocks),
+                                   "tg": [[o, c / len(steps), t / len(steps)] for o, c, t in sum_ops(steps)] if steps else [],
+                                   "host": [sum(h[i] for h in host) for i in range(3)] if host else None}
+                else:
+                    pp_r, tg_r = cuda_report(tg_text), cuda_report(end_text)
+                    out[prefix] = {"pp": pp_r[1] if pp_r else [], "pp_graphs": pp_r[0] if pp_r else 0,
+                                   "tg": [[o, c / ntg, t / ntg] for o, c, t in tg_r[1]] if tg_r else [],
+                                   "host": [sum(h[i] for h in host) for i in range(3)] if host else None}
+            return out
 
-            try:
-                r, kept = run.measure(label, identity, go)
-            except Fail as e:
-                run.failed = True
-                run.add("", f"{label}: FAIL {e}")
+        try:
+            r, kept = run.measure(f"{arm.name}", identity, go)
+        except Fail as e:
+            run.failed = True
+            run.add("", f"{arm.name}: FAIL {e}")
+            continue
+        results[arm.name] = r
+        for prefix in prefixes:
+            x = r.get(prefix) or r.get(str(prefix))
+            if not x:
                 continue
-            done[arm.name] = r
-            host = r.get("host")
-            metrics = {"host_graph": host[0], "host_inputs": host[1], "host_compute": host[2]} if host else {}
-            if r.get("ops"):
-                metrics["gpu_ms"] = sum(o[2] for o in r["ops"])
-            run.record("profile", arm, f"{kind}@{depth}", metrics, kept, exe.parent)
-            title = f"{label}: {'prompt ' + str(n_pp) if kind != 'tg' else 'decode step'} at depth {depth}" + (" k" if kept else "")
-            host = r.get("host")
-            host_line = (f"  host: graph build {host[0]:.2f} ms, inputs {host[1]:.2f} ms, compute call {host[2]:.2f} ms"
-                         if host else "  host: no LLAMA_INPUT_TIMING in this build")
-            if not vulkan and not r.get("ops"):
-                run.add("", title, host_line, *[f"  {x}" for x in r["lines"]])
-                continue
-            total = sum(o[2] for o in r["ops"]) or 1
-            run.add("", f"{title}, {total:.2f} ms of gpu time", host_line,
-                    *table(["  ms", "count", "op"], [[f"  {ms:.2f}", count, name] for name, count, ms in r["ops"][:25]]))
-        if len(done) > 1 and all(r.get("ops") for r in done.values()):
-            # gpu time per kind of op, side by side: where one arm loses against the other
-            groups = {}
-            for name, r in done.items():
-                for op, _, ms in r["ops"]:
-                    groups.setdefault(op_group(op), {}).setdefault(name, 0.0)
-                    groups[op_group(op)][name] += ms
-            top = sorted(groups, key=lambda g: -max(groups[g].values()))[:20]
-            rows = [[g, *[f"{groups[g].get(n, 0):.2f}" for n in done]] for g in top]
-            rows.append(["total", *[f"{sum(o[2] for o in r['ops']):.2f}" for r in done.values()]])
-            run.add("", f"{kind} at depth {depth}: gpu ms per kind of op", *table(["op", *done], rows))
+            for kind in ("pp", "tg"):
+                ops = x[kind]
+                total = sum(o[2] for o in ops)
+                what = (f"prompt part of {part} chars ({x['pp_graphs']} {'graphs' if vulkan else 'compute calls'})"
+                        if kind == "pp" else "decode step (mean)")
+                head = [f"", f"{kind}-p{prefix}-{arm.name}: {what} at {prefix} chars, {total:.2f} ms of gpu time" + (" k" if kept else "")]
+                if kind == "pp" and x.get("host"):
+                    h = x["host"]
+                    head.append(f"  host: graph build {h[0]:.2f} ms, inputs {h[1]:.2f} ms, submit {h[2]:.2f} ms")
+                run.add(*head, *table(["  ms", "count", "op"], [[f"  {ms:.2f}", f"{c:g}", name] for name, c, ms in ops[:25]]))
+            run.record("profile", arm, f"p{prefix}", {"gpu_pp": sum(o[2] for o in x["pp"]),
+                                                      "gpu_tg": sum(o[2] for o in x["tg"])}, kept, exe.parent)
+    if len(results) > 1:
+        for prefix in prefixes:
+            for kind in ("pp", "tg"):
+                groups = {}
+                for name, r in results.items():
+                    x = r.get(prefix) or r.get(str(prefix)) or {}
+                    for op, _, ms in x.get(kind, []):
+                        groups.setdefault(op_group(op), {}).setdefault(name, 0.0)
+                        groups[op_group(op)][name] += ms
+                top = sorted(groups, key=lambda g: -max(groups[g].values()))[:20]
+                rows = [[g, *[f"{groups[g].get(n, 0):.2f}" for n in results]] for g in top]
+                rows.append(["total", *[f"{sum(groups[g].get(n, 0) for g in groups):.2f}" for n in results]])
+                run.add("", f"{kind} at {prefix} chars: gpu ms per kind of op", *table(["op", *results], rows))
     return run.finish()
 
 
@@ -1573,13 +1620,12 @@ def baseline_perplexity(commit):
 
 
 def cmd_build_stable():
-    """Build the tag stable in its own worktree, with the llama-bench of this checkout (it reserves one output, as
-    the server does) and the smaller perplexity buffers."""
+    """Build the tag stable in its own worktree, with the smaller perplexity buffers."""
     run = Run("build-stable")
     source = Path(env("STABLESRC", str(ROOT / "build-stable-src"))).resolve()
     build = Path(env("STABLEBUILD", str(ROOT / "build-stable"))).resolve()
     commit = git("rev-parse", "stable^{commit}").decode().strip()
-    bench, ppl = Path("tools/llama-bench/llama-bench.cpp"), Path("tools/perplexity/perplexity.cpp")
+    ppl = Path("tools/perplexity/perplexity.cpp")
     marker = source / ".qsa-stable-source"
     if source.exists():
         if not marker.is_file():
@@ -1588,7 +1634,6 @@ def cmd_build_stable():
     else:
         subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(source), commit], check=True)
     marker.write_text(commit + "\n")
-    shutil.copy2(ROOT / bench, source / bench)
     (source / ppl).write_bytes(baseline_perplexity(commit))
     log = run.dir / "build.log"
     if os.name == "nt":
@@ -1606,7 +1651,7 @@ def cmd_build_stable():
         execute(["cmake", "--build", build, "--config", "Release", "-j", os.cpu_count() or 4],
                 log.with_name("build2.log"), os.environ.copy(), model=False)
     folder = build_folder(build)
-    patch = hashlib.sha256((ROOT / bench).read_bytes() + (source / ppl).read_bytes()).hexdigest()[:8]
+    patch = hashlib.sha256((source / ppl).read_bytes()).hexdigest()[:8]
     sid = f"stable-{commit[:12]}-{patch}"
     (folder / BUILD_RECORD).write_text(json.dumps({"id": sid, "head": commit[:12], "time": now()}) + "\n",
                                        encoding="utf-8")
@@ -1614,7 +1659,7 @@ def cmd_build_stable():
     return run.finish()
 
 
-COMMANDS = {"check": cmd_check, "bench": cmd_bench, "quality": cmd_quality, "decode": cmd_decode,
+COMMANDS = {"check": cmd_check, "quality": cmd_quality, "decode": cmd_decode,
             "profile": cmd_profile, "kernels": cmd_kernels, "build-begin": cmd_build_begin, "build-end": cmd_build_end,
             "build-stable": cmd_build_stable}
 
