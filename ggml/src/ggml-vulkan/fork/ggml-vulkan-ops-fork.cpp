@@ -42,17 +42,20 @@ vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, con
     return nullptr;
 }
 
-bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows) {
+bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t tournament_cols) {
     // radix-select (one workgroup per row) for a large k over many long rows: the qwen4exp block top-k in prefill, k 513
     // of 31744 x 4096, takes 5.0 ms against 19.3 for the tournament on Strix Halo (8192 x 16: 19 against 32 us). the
     // tournament spreads a row over workgroups and stays faster for a few rows (decode, draft checks: 1 to 4 rows) and
-    // has the short rows of MoE routing. GGML_VK_TOPK_RADIX: 1 = radix-select for every top-k, 0 = only past the k
-    // limit of the tournament
+    // has the short rows of MoE routing. a row longer than its widest workgroup (1024 elements) takes more passes, each
+    // keeping k of every workgroup, so for k 513 a pass only halves the row: on the 395 (13.10, a 118K prompt, 12 calls
+    // per ubatch of 4096) 8 ms at 960 columns (one pass), 20-25 at 1088 (two), 37-43 at 2112 (three), 64 at 3776
+    // (four), radix 15 at 4160. GGML_VK_TOPK_RADIX: 1 = radix-select for every top-k, 0 = only past the k limit of the
+    // tournament
     static const int radix_mode = [] {
         const char * env = getenv("GGML_VK_TOPK_RADIX");
         return env ? atoi(env) : -1;
     }();
-    const bool radix_wins = k >= 256 && ncols >= 4096 && nrows >= 8;
+    const bool radix_wins = k >= 256 && ncols > tournament_cols && nrows >= 8;
     return radix_mode == 1 || (radix_mode != 0 && radix_wins);
 }
 

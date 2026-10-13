@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 
 // [TAG_QWEN4_REIMPLEMENT]
 // TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
@@ -35,12 +36,36 @@ struct llama_model_qwen4exp_fork::ple_prefetch {
     ~ple_prefetch() { finish(); }
 };
 
+struct llama_model_qwen4exp_fork::ple_warmer {
+    std::mutex                        mutex;
+    std::condition_variable           cv;
+    std::thread                       worker;
+    std::vector<std::vector<int32_t>> queue;
+    bool                              stop = false;
+
+    int64_t n_rows = 0;
+
+    ~ple_warmer() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv.notify_one();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+};
+
 llama_model_qwen4exp_fork::llama_model_qwen4exp_fork(const struct llama_model_params & params) : llama_model_base(params) {}
 
 llama_model_qwen4exp_fork::~llama_model_qwen4exp_fork() {
     if (ple_pf && ple_pf->n_started > 0) {
         LLAMA_LOG_INFO("%s: PLE rows of %" PRId64 " ubatches gathered ahead, %" PRId64 " of them used\n", __func__,
                 ple_pf->n_started, ple_pf->n_used);
+    }
+    if (ple_wm && ple_wm->n_rows > 0) {
+        LLAMA_LOG_INFO("%s: %" PRId64 " PLE rows of coming tokens read ahead\n", __func__, ple_wm->n_rows);
     }
     if (ple_cache) {
         ple_cache->print_stats("PLE table");
@@ -402,6 +427,20 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
+
+    // LLAMA_HC_F16=1: the normalized streams in f16. three nodes read them (the down projection, the gated mean and the
+    // injection), each a pass over hc_dim floats per token; the reference keeps the whole residual in FP8 "with almost
+    // no loss" (tech report, 2.2), the residual itself stays f32 here. on Vulkan only, which stores them in f16 in the
+    // combine before (HC_POST_NORM_F16), quantizes them for the int8 matmul from f16 and reads them in the mean, and
+    // from 32 tokens, where that fusion runs
+    static const bool hc_f16 = [] {
+        const char * env = std::getenv("LLAMA_HC_F16");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (hc_f16 && il >= 0 && nt >= 32 && cparams.fused_dsv4_hc_pre &&
+            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "Vulkan") == 0) {
+        xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+    }
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
@@ -1077,6 +1116,26 @@ static bool qsa_use_lid(int64_t idx_dim, int64_t n_idx_h, int64_t n_tps, int64_t
     return mode == 1 || !is_vulkan || n_tps <= vk_tokens;
 }
 
+// LLAMA_MTP_QSA_TOPK: the token budget of a QSA MTP block, unset or 0 for the trunk's indexer_top_k. one layer, so a
+// wider budget costs little per draft step, and the dense block drafted better at depth than the QSA one with 2048
+// (09.10 on the 395 at 118K: acceptance 0.63 / 0.41 / 0.29 by position against 0.59 / 0.34 / 0.23)
+static int64_t qsa_top_k_tokens(const llama_hparams & hp, int il) {
+    static const int64_t mtp = [] {
+        const char * env = std::getenv("LLAMA_MTP_QSA_TOPK");
+        return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+    }();
+    return il >= (int) hp.n_layer() && mtp > 0 ? mtp : (int64_t) hp.indexer_top_k;
+}
+
+// LLAMA_MTP_QSA_REUSE=0: a QSA MTP block runs its indexer at every draft step (see llama_context::set_qsa_reuse)
+static bool qsa_mtp_reuse_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_MTP_QSA_REUSE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_fork_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -1096,7 +1155,8 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
     const int64_t n_blocks = (n_kv + r - 1)/r;
 
     // the reference returns indexer_top_k + compress_ratio - 1 cells: whole blocks plus the tail
-    const int64_t width     = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+    const int64_t top_k_tok = qsa_top_k_tokens(hparams, il);
+    const int64_t width     = std::min<int64_t>(n_kv, top_k_tok + r - 1);
     const int64_t width_blk = std::min<int64_t>(n_blocks, (width + r - 1)/r);
 
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
@@ -1129,7 +1189,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
 
         qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->bypass = bypass;
-        qsa->budget = (int64_t) hparams.indexer_top_k + r - 1;
+        qsa->budget = top_k_tok + r - 1;
 
         if (!bypass) {
             // only one of the two is ever read: the per-block selection turns chosen blocks back
@@ -1271,6 +1331,34 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
     // hides a block with no cells, and always takes one whose cells no block pools
     cb(pool, "indexer_k", il);
 
+    // an MTP block keeps the block scores of the first draft step of a round (one token per stream, without the
+    // bias), and the steps after it (cparams.qsa_reuse, set by the speculative driver) select from them again under
+    // their own bias instead of running the indexer: the reference reuses its top-k across MTP steps, whose queries
+    // come from the head's own hidden state rather than the target's. the bias of a step still brings in the block
+    // of its own position. a first step that skipped the indexer (the budget covered the cache) leaves the scores of
+    // an older round, finite, for at most the steps of one round
+    ggml_tensor * saved = il >= (int) hparams.n_layer() && n_tps == 1 && blk_bias && qsa_mtp_reuse_enabled() ?
+        mctx_hyb->get_score(ctx0, il) : nullptr;
+    if (saved) {
+        saved = ggml_view_3d(ctx0, saved, n_blocks, 1, n_stream, saved->nb[1], saved->nb[1], 0);
+    }
+
+    if (saved && cparams.qsa_reuse) {
+        // nothing below reads the pool in this pass, but the rebuilt keys still have to reach it
+        ggml_build_forward_expand(gf, pool);
+
+        ggml_tensor * bias_f32 = inp->bias->type == GGML_TYPE_F32 ? inp->bias : ggml_cast(ctx0, inp->bias, GGML_TYPE_F32);
+        ggml_tensor * score    = ggml_add(ctx0, saved, bias_f32);
+        cb(score, "indexer_score_reused", il);
+
+        return select_blocks(score);
+    }
+
+    // the scores of a first step go to the store before the bias is added
+    auto save_scores = [&](ggml_tensor * score) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, score, saved));
+    };
+
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
     q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
@@ -1295,10 +1383,19 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
         ggml_tensor * w  = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, n_tps, 1, n_stream), 1.0f);
         ggml_tensor * m  = ggml_reshape_4d(ctx0, bias, n_blocks, n_tps, 1, n_stream);
 
+        // the scores to keep come without the bias: a zero mask, the bias added after
+        if (saved) {
+            m = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_blocks, n_tps, 1, n_stream), 0.0f);
+        }
+
         ggml_tensor * lid = ggml_lightning_indexer(ctx0, q4, k4, w, m); // [n_blocks, n_tps, 1, n_stream]
 
         if (ggml_backend_dev_supports_op(dev, lid)) {
             ggml_tensor * score = ggml_reshape_3d(ctx0, lid, n_blocks, n_tps, n_stream);
+            if (saved) {
+                save_scores(score);
+                score = ggml_add(ctx0, score, ggml_cast(ctx0, bias, GGML_TYPE_F32));
+            }
             cb(score, "indexer_score_blocks", il);
 
             return select_blocks(score);
@@ -1376,6 +1473,9 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
     // run on the block scores. expanding them to a score per cell first would cost n_kv floats per
     // token instead of n_blocks, and the same again for the mask add - the bulk of the indexer.
     if (blk_bias) {
+        if (saved) {
+            save_scores(score);
+        }
         score = ggml_add(ctx0, score, bias);
         cb(score, "indexer_score_blocks", il);
 
@@ -2096,45 +2196,28 @@ void llm_graph_input_ple_fork::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(emb, gathered.data(), 0, ggml_nbytes(emb));
 }
 
-void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, const llama_kv_cache_context * mctx) const {
-    static const bool enabled = [] {
-        const char * env = std::getenv("LLAMA_PLE_PREFETCH");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-    // why a prefetch did not start, once per reason: on the 395 (12.10 night, -b 16384 -ub 4096) the take never logged
-    auto skip = [](int reason, const char * what) {
-        static std::atomic<uint32_t> seen { 0 };
-        if (!(seen.fetch_or(1u << reason) & (1u << reason))) {
-            LLAMA_LOG_INFO("ple_prefetch_start: no prefetch: %s\n", what);
-        }
-    };
-    // a ubatch of tokens only: an image or a mixed ubatch orders its predecessors by position runs this cannot see
-    if (!enabled) {
-        return;
-    }
-    if (!ple_cached || !ple_cache) {
-        skip(0, "the PLE table is loaded, the graph gathers its rows");
-        return;
-    }
-    if (mctx == nullptr || next.token == nullptr || next.embd != nullptr || next.is_mixed()) {
-        skip(1, "the next ubatch is not one of tokens only");
-        return;
+// the PLE rows of a ubatch that is not stored yet: the predecessors before its start from the cells (get_prev, as
+// llama_kv_cache::get_prev_tokens), the ones inside it from its own tokens. 0 when done, else why not: 1 not tokens
+// only (an image or a mixed ubatch orders its predecessors by position runs this cannot see), 2 a token in several
+// sequences, 3 a gap in its positions
+template <typename F>
+static int qwen4exp_ple_rows_ahead(const llama_hparams & hp, const llama_ubatch & next, F && get_prev,
+                                   std::vector<int32_t> & idx) {
+    if (next.token == nullptr || next.embd != nullptr || next.is_mixed()) {
+        return 1;
     }
 
     const int64_t n_tokens = next.n_tokens;
-    const int64_t n_prev   = hparams.ple_ngram_size - 1;
+    const int64_t n_prev   = hp.ple_ngram_size - 1;
 
-    // the predecessors from the cells hold until the start of this ubatch, which is not stored yet: the ones inside it
-    // are its own tokens. a position missing among them (a gap) gives up, the input then gathers as before
     std::vector<llama_token> prev;
-    mctx->get_prev_tokens(next, (uint32_t) n_prev, prev);
+    get_prev(next, (uint32_t) n_prev, prev);
 
     std::unordered_map<llama_seq_id, std::unordered_map<llama_pos, llama_token>> own;
     std::unordered_map<llama_seq_id, llama_pos> pos_min;
     for (int64_t i = 0; i < n_tokens; ++i) {
         if (next.n_seq_id[i] != 1) {
-            skip(2, "a token of the next ubatch is in several sequences");
-            return;
+            return 2;
         }
         const llama_seq_id s = next.seq_id[i][0];
         own[s][next.pos[i]] = next.token[i];
@@ -2152,11 +2235,48 @@ void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, co
             }
             const auto it = own[s].find(p);
             if (it == own[s].end()) {
-                skip(3, "a gap in the positions of the next ubatch");
-                return;
+                return 3;
             }
             prev[i*n_prev + j] = it->second;
         }
+    }
+
+    qwen4exp_ple_rows(hp, next, prev, idx);
+    return 0;
+}
+
+void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, const llama_kv_cache_context * mctx) const {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_PLE_PREFETCH");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    // why a prefetch did not start, once per reason: on the 395 (12.10 night, -b 16384 -ub 4096) the take never logged
+    auto skip = [](int reason, const char * what) {
+        static std::atomic<uint32_t> seen { 0 };
+        if (!(seen.fetch_or(1u << reason) & (1u << reason))) {
+            LLAMA_LOG_INFO("ple_prefetch_start: no prefetch: %s\n", what);
+        }
+    };
+    if (!enabled) {
+        return;
+    }
+    if (!ple_cached || !ple_cache) {
+        skip(0, "the PLE table is loaded, the graph gathers its rows");
+        return;
+    }
+    if (mctx == nullptr) {
+        skip(1, "the next ubatch is not one of tokens only");
+        return;
+    }
+
+    std::vector<int32_t> idx;
+    const int why = qwen4exp_ple_rows_ahead(hparams, next,
+        [mctx](const llama_ubatch & ub, uint32_t n, std::vector<llama_token> & res) { mctx->get_prev_tokens(ub, n, res); }, idx);
+    if (why != 0) {
+        static const char * what[] = { "", "the next ubatch is not one of tokens only",
+            "a token of the next ubatch is in several sequences", "a gap in the positions of the next ubatch" };
+        skip(why, what[why]);
+        return;
     }
 
     if (!ple_pf) {
@@ -2166,13 +2286,61 @@ void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, co
 
     std::lock_guard<std::mutex> lock(pf.mutex);
     pf.finish();
-    qwen4exp_ple_rows(hparams, next, prev, pf.idx);
+    pf.idx = std::move(idx);
     pf.rows.resize(pf.idx.size()*hparams.ple_head_dim);
     pf.active = true;
     pf.n_started++;
     pf.worker = std::thread([this, &pf] {
         ple_cache->get_rows(pf.idx.data(), (int64_t) pf.idx.size(), pf.rows.data());
     });
+}
+
+void llama_model_qwen4exp_fork::ple_warm(const llama_ubatch & next, const llama_kv_cache & kv, int64_t n_new) const {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_PLE_WARM");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (!enabled || !ple_cached || !ple_cache || n_new <= 0) {
+        return;
+    }
+
+    std::vector<int32_t> idx;
+    if (qwen4exp_ple_rows_ahead(hparams, next,
+            [&kv](const llama_ubatch & ub, uint32_t n, std::vector<llama_token> & res) { kv.get_prev_tokens(ub, n, res); }, idx) != 0) {
+        return;
+    }
+    // the last n_new tokens: the ones before were read by an earlier call
+    const int64_t n_heads = hparams.ple_n_heads;
+    const int64_t n_skip  = std::max<int64_t>(0, (int64_t) next.n_tokens - n_new);
+    idx.erase(idx.begin(), idx.begin() + n_skip*n_heads);
+
+    if (!ple_wm) {
+        ple_wm = std::make_unique<ple_warmer>();
+        ple_warmer * wm = ple_wm.get();
+        // one worker for the life of the model; a read of a few rows is a few page faults or block reads
+        wm->worker = std::thread([this, wm] {
+            std::vector<float> scratch;
+            std::unique_lock<std::mutex> lock(wm->mutex);
+            while (true) {
+                wm->cv.wait(lock, [wm] { return wm->stop || !wm->queue.empty(); });
+                if (wm->stop) {
+                    return;
+                }
+                std::vector<int32_t> rows = std::move(wm->queue.front());
+                wm->queue.erase(wm->queue.begin());
+                lock.unlock();
+                scratch.resize(rows.size()*hparams.ple_head_dim);
+                ple_cache->get_rows(rows.data(), (int64_t) rows.size(), scratch.data());
+                lock.lock();
+                wm->n_rows += (int64_t) rows.size();
+            }
+        });
+    }
+    {
+        std::lock_guard<std::mutex> lock(ple_wm->mutex);
+        ple_wm->queue.push_back(std::move(idx));
+    }
+    ple_wm->cv.notify_one();
 }
 
 bool llama_model_qwen4exp_fork::ple_prefetch_take(const std::vector<int32_t> & idx, std::vector<float> & dst) const {
@@ -2203,18 +2371,37 @@ bool llama_model_qwen4exp_fork::ple_prefetch_take(const std::vector<int32_t> & i
     return true;
 }
 
-// the fork's step before the graph of a ubatch runs (llama_context::process_ubatch): the PLE rows of the next ubatch
-void llama_fork_before_compute(const llama_model & model, llama_memory_context_i * mctx) {
+// the fork's step before the graph of a ubatch runs (llama_context::process_ubatch): the PLE rows of the next ubatch,
+// or for the last ubatch of a decode those of hint, the first ubatch of the next decode (llama_set_next_tokens).
+// true when the hint was taken
+bool llama_fork_before_compute(const llama_model & model, llama_memory_context_i * mctx, const llama_ubatch * hint) {
     const auto * hyb = dynamic_cast<const llama_memory_hybrid_idx_fork_context *>(mctx);
     if (hyb == nullptr) {
-        return;
+        return false;
+    }
+    const auto * qm = dynamic_cast<const llama_model_qwen4exp_fork *>(&model);
+    if (qm == nullptr || !qm->ple_cached) {
+        return false;
     }
     const llama_ubatch * next = hyb->peek_next();
-    const auto * qm = dynamic_cast<const llama_model_qwen4exp_fork *>(&model);
-    if (next == nullptr || qm == nullptr || !qm->ple_cached) {
+    if (next != nullptr) {
+        qm->ple_prefetch_start(*next, hyb->get_attn());
+        return false;
+    }
+    if (hint != nullptr) {
+        qm->ple_prefetch_start(*hint, hyb->get_attn());
+        return true;
+    }
+    return false;
+}
+
+void llama_fork_prefetch_tokens(const llama_model & model, llama_memory_i * mem, const llama_ubatch & next, int64_t n_new) {
+    const auto * qm  = dynamic_cast<const llama_model_qwen4exp_fork *>(&model);
+    const auto * hyb = dynamic_cast<const llama_memory_hybrid_idx_fork *>(mem);
+    if (qm == nullptr || hyb == nullptr || hyb->get_mem_attn() == nullptr) {
         return;
     }
-    qm->ple_prefetch_start(*next, hyb->get_attn());
+    qm->ple_warm(next, *hyb->get_mem_attn(), n_new);
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

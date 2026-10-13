@@ -956,6 +956,9 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+    // fork: from an f16 source (the f16 hc read of qwen4exp, LLAMA_HC_F16)
+    string_to_spv("quantize_q8_1_x4_f16", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"A_F16", "1"}});
+    string_to_spv("quantize_q8_1_x4_f16_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"A_F16", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
@@ -1152,6 +1155,9 @@ void process_shaders() {
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
+    // fork: f16 streams in and the normalized ones out (qwen4exp, LLAMA_HC_F16)
+    string_to_spv("dsv4_hc_pre_f16",  "dsv4_hc_pre.comp",  {{"X_F16", "1"}});
+    string_to_spv("dsv4_hc_post_norm_f16n", "dsv4_hc_post_norm.comp", {{"N_F16", "1"}});
     // fork: short-row RMS norm and the conv over the concat sources
     string_to_spv("rms_norm_rows_f32", "rms_norm_rows.comp", {});
     string_to_spv("ssm_conv_concat_f32", "ssm_conv_concat.comp", {});

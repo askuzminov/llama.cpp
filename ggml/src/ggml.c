@@ -6584,7 +6584,8 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         struct ggml_tensor  * weights,
         float                 scale,
         bool                  gated) {
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    // fork: x may be f16, the normalized hc streams of qwen4exp under LLAMA_HC_F16
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];

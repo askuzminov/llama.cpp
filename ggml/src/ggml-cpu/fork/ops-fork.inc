@@ -100,3 +100,47 @@ void ggml_compute_forward_flash_attn_list(const struct ggml_compute_params * par
         }
     }
 }
+
+// ggml_compute_forward_dsv4_hc_pre_f16_fork: DSV4_HC_PRE with f16 streams x (the normalized hc streams of qwen4exp under
+// LLAMA_HC_F16), the weights or gate f32, as ggml_compute_forward_dsv4_hc_pre_f32 does
+void ggml_compute_forward_dsv4_hc_pre_f16_fork(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * x       = dst->src[0];
+    const struct ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F16);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int64_t nr  = n_embd * n_tokens;
+    const int64_t dr  = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t it = ir / n_embd;
+
+        float sum = 0.0f;
+        for (int64_t ih = 0; ih < hc; ++ih) {
+            const float xv = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) x->data +
+                    i0*x->nb[0] + ih*x->nb[1] + it*x->nb[2]));
+            float wv;
+            if (gated) {
+                const float gv = *(const float *) ((const char *) weights->data + i0*weights->nb[0] + ih*weights->nb[1] + it*weights->nb[2]);
+                wv = 1.0f / (1.0f + expf(-gv));
+            } else {
+                wv = *(const float *) ((const char *) weights->data + ih*weights->nb[0] + it*weights->nb[1]);
+            }
+            sum += xv * wv;
+        }
+
+        *(float *) ((char *) dst->data + i0*dst->nb[0] + it*dst->nb[1]) = scale * sum;
+    }
+}

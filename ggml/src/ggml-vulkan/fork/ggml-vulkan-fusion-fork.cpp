@@ -13,19 +13,22 @@ static bool ggml_vk_graph_node_is_empty(const ggml_tensor * node) {
     return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
 }
 
-// nodes: scale, sigmoid, scale, dsv4_hc_post, rms_norm, mul (hc_post_norm_pattern)
+// nodes: scale, sigmoid, scale, dsv4_hc_post, rms_norm, mul (hc_post_norm_pattern), then cpy to f16 when
+// fused_hc_post_norm_f16 (hc_post_norm_f16_pattern): the normalized streams go to the cpy in f16
 void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * scale_in = cgraph->nodes[node_idx];
     const ggml_tensor * hc_post  = cgraph->nodes[node_idx + 3];
     const ggml_tensor * norm     = cgraph->nodes[node_idx + 4];
-    const ggml_tensor * mul      = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * mul      = ctx->fused_hc_post_norm_f16 ? cgraph->nodes[node_idx + 6] : cgraph->nodes[node_idx + 5];
 
     const ggml_tensor * x        = hc_post->src[0];
     const ggml_tensor * residual = hc_post->src[1];
     const ggml_tensor * p_src    = scale_in->src[0];
-    const ggml_tensor * w        = mul->src[1];
 
-    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_post_norm_f32;
+    // the gamma is the second source of the mul, whether the cpy follows it or not
+    const ggml_tensor * w        = cgraph->nodes[node_idx + 5]->src[1];
+
+    vk_pipeline pipeline = ctx->fused_hc_post_norm_f16 ? ctx->device->pipeline_dsv4_hc_post_norm_f16n : ctx->device->pipeline_dsv4_hc_post_norm_f32;
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -53,7 +56,7 @@ void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx
         get_misalign_bytes(ctx, p_src)    / (uint32_t) sizeof(float),
         get_misalign_bytes(ctx, w)        / (uint32_t) sizeof(float),
         get_misalign_bytes(ctx, hc_post)  / (uint32_t) sizeof(float),
-        get_misalign_bytes(ctx, mul)      / (uint32_t) sizeof(float),
+        get_misalign_bytes(ctx, mul)      / (uint32_t) ggml_type_size(mul->type),
         1u,
         ggml_get_op_params_f32(scale_in, 0),
         ggml_get_op_params_f32(hc_post->src[2], 0),
@@ -763,6 +766,7 @@ bool ggml_vk_fork_fuse_concat_ssm_conv(ggml_backend_vk_context * ctx, const stru
 
 void ggml_vk_fork_fusion_reset(ggml_backend_vk_context * ctx) {
     ctx->fused_hc_post_norm = false;
+    ctx->fused_hc_post_norm_f16 = false;
     ctx->fused_mm_relu = false;
     ctx->fused_mm_headsum = false;
     ctx->fused_mm_headsum_bias = nullptr;
@@ -803,6 +807,23 @@ bool ggml_vk_fork_fuse_mul_mat(ggml_backend_vk_context * ctx, const struct ggml_
 
 bool ggml_vk_fork_fuse_hc_post_norm(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int i,
                                     bool * op_srcs_fused_elementwise, const char *& fusion_string) {
+    // the f16 copy of the normalized streams (qwen4exp, LLAMA_HC_F16) goes into the shader's store
+    if (ggml_can_fuse_subgraph(cgraph, i, hc_post_norm_f16_pattern, { i + 3, i + 6 }) &&
+        ggml_check_edges(cgraph, i, hc_post_norm_f16_edges) &&
+        ggml_vk_can_fuse_hc_post_norm(cgraph, i)) {
+        const ggml_tensor * mul = cgraph->nodes[i + 5];
+        const ggml_tensor * cpy = cgraph->nodes[i + 6];
+        if (cpy->type == GGML_TYPE_F16 && cpy->nb[0] == sizeof(ggml_fp16_t) && ggml_is_contiguous(cpy) &&
+            ggml_are_same_shape(mul, cpy) && ctx->device->pipeline_dsv4_hc_post_norm_f16n) {
+            ctx->num_additional_fused_ops = hc_post_norm_f16_pattern.size() - 1;
+            ctx->fused_ops_write_mask |= 1 << 3;
+            ctx->fused_hc_post_norm = true;
+            ctx->fused_hc_post_norm_f16 = true;
+            fusion_string = "HC_POST_NORM_F16";
+            std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            return true;
+        }
+    }
     if (!(ggml_can_fuse_subgraph(cgraph, i, hc_post_norm_pattern, { i + 3, i + 5 }) &&
           ggml_check_edges(cgraph, i, hc_post_norm_edges) &&
           ggml_vk_can_fuse_hc_post_norm(cgraph, i))) {

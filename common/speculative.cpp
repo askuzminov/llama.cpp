@@ -1693,6 +1693,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             i_last[seq_id] = idx;
 
+            // fork: the verify batch starts with id_last at pos0; what its inputs read from storage (the PLE rows of
+            // qwen4exp) is read while the tokens after it are drafted
+            if (params.ctx_tgt) {
+                llama_prefetch_tokens(params.ctx_tgt, &dp.id_last, 1, 1, dp.pos0, seq_id);
+            }
+
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
@@ -1716,6 +1722,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
+
+            // fork: a step after the first selects from the block scores of the first (a QSA MTP block, see
+            // llama_set_qsa_reuse); the steps of chained heads and of shared memory decode other rows
+            llama_set_qsa_reuse(ctx_dft, i > 0 && !chain_heads && !is_mem_shared);
 
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
@@ -1766,6 +1776,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                // fork: the new draft token is the next one of the verify batch: its PLE rows (qwen4exp) are read
+                // while the next step drafts, with id_last and the drafts before it as its n-gram context
+                if (params.ctx_tgt) {
+                    std::vector<llama_token> window;
+                    window.reserve(result.size() + 1);
+                    window.push_back(dp.id_last);
+                    window.insert(window.end(), result.begin(), result.end());
+                    llama_prefetch_tokens(params.ctx_tgt, window.data(), (int32_t) window.size(), 1, dp.pos0, seq_id);
+                }
+
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
@@ -1812,6 +1832,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
         }
+        llama_set_qsa_reuse(ctx_dft, false);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];

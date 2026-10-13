@@ -8,6 +8,8 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "fork/llama-fork.h"
+#include "fork/llama-memory-hybrid-idx-fork.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -422,4 +424,98 @@ int32_t llama_context::state_seq_apply_delta(
     }
 
     return -1;
+}
+
+void llama_context::set_qsa_reuse(bool value) {
+    // only an MTP block that attends through QSA has a score to take: anything else would just lose its graph
+    // reuse between the first draft step and the next ones. LLAMA_MTP_QSA_REUSE=0 runs the indexer at every step
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_MTP_QSA_REUSE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const auto & hp = model.hparams;
+    const bool qsa_mtp = model.arch == LLM_ARCH_QWEN4EXP && hp.n_layer_nextn > 0 &&
+        hp.dsv4_compress_ratios[hp.n_layer()] > 0;
+
+    cparams.qsa_reuse = value && enabled && qsa_mtp;
+}
+
+void llama_set_qsa_reuse(llama_context * ctx, bool value) {
+    ctx->set_qsa_reuse(value);
+}
+
+// a ubatch of tokens of one sequence at consecutive positions, for the fork's reads ahead (the PLE rows need the tokens,
+// their positions and their sequence)
+static llama_ubatch llama_fork_tokens_ubatch(const llama_token * tokens, uint32_t n, llama_pos pos0, llama_seq_id seq_id) {
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.assign(tokens, tokens + n);
+    data->pos.resize(n);
+    data->n_seq_id.assign(n, 1);
+    data->seq_id_data.assign(n, seq_id);
+    data->seq_id.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        data->pos[i]    = pos0 + (llama_pos) i;
+        data->seq_id[i] = &data->seq_id_data[i];
+    }
+    data->seq_id_unq.assign(1, seq_id);
+
+    llama_ubatch ub = {};
+    ub.b_equal_seqs = 1;
+    ub.n_tokens     = n;
+    ub.n_seq_tokens = n;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = 1;
+    ub.token        = data->token.data();
+    ub.pos          = data->pos.data();
+    ub.n_seq_id     = data->n_seq_id.data();
+    ub.seq_id       = data->seq_id.data();
+    ub.seq_id_unq   = data->seq_id_unq.data();
+    ub.data         = data;
+    return ub;
+}
+
+void llama_context::set_next_tokens(const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id) {
+    next_tokens.assign(tokens, tokens + std::max(0, n_tokens));
+    next_pos0  = pos0;
+    next_seq   = seq_id;
+    next_calls = 0;
+}
+
+void llama_context::prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new, llama_pos pos0, llama_seq_id seq_id) {
+    if (n_tokens <= 0 || n_new <= 0 || !memory) {
+        return;
+    }
+    const llama_ubatch ub = llama_fork_tokens_ubatch(tokens, (uint32_t) n_tokens, pos0, seq_id);
+    llama_fork_prefetch_tokens(model, memory.get(), ub, n_new);
+}
+
+void llama_context::fork_before_compute(llama_memory_context_i * mctx) {
+    const auto * hyb = dynamic_cast<const llama_memory_hybrid_idx_fork_context *>(mctx);
+    if (hyb == nullptr) {
+        next_tokens.clear();
+        llama_fork_before_compute(model, mctx, nullptr);
+        return;
+    }
+    // the tokens of set_next_tokens hold for the decode call right after it: a second call drops them
+    if (!next_tokens.empty() && hyb->is_first() && ++next_calls > 1) {
+        next_tokens.clear();
+    }
+    if (next_tokens.empty() || hyb->peek_next() != nullptr) {
+        llama_fork_before_compute(model, mctx, nullptr);
+        return;
+    }
+    // the last ubatch of this call: the next call starts with a ubatch of up to the split size of these tokens
+    const uint32_t n = std::min<uint32_t>((uint32_t) next_tokens.size(), n_ubatch_split());
+    const llama_ubatch hint = llama_fork_tokens_ubatch(next_tokens.data(), n, next_pos0, next_seq);
+    llama_fork_before_compute(model, mctx, &hint);
+    next_tokens.clear();
+}
+
+void llama_set_next_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id) {
+    ctx->set_next_tokens(tokens, n_tokens, pos0, seq_id);
+}
+
+void llama_prefetch_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_new, llama_pos pos0, llama_seq_id seq_id) {
+    ctx->prefetch_tokens(tokens, n_tokens, n_new, pos0, seq_id);
 }

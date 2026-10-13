@@ -463,6 +463,96 @@ struct test_concat_ssm_conv : public test_case {
     }
 };
 
+// DSV4_HC_PRE over f16 streams, the f16 hc read of qwen4exp (LLAMA_HC_F16): x enters in f32 and is cast in the graph
+struct test_dsv4_hc_pre_f16 : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    gated;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_F16";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, gated);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_dsv4_hc_pre_f16(int64_t n_embd, int64_t n_tokens, bool gated) : n_embd(n_embd), n_tokens(n_tokens), gated(gated) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * x16 = ggml_cast(ctx, x, GGML_TYPE_F16);
+
+        if (gated) {
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(gate, "gate");
+
+            out = ggml_dsv4_hc_pre_gated(ctx, x16, gate, 1.0f/hc);
+        } else {
+            ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(weights, "weights");
+
+            out = ggml_dsv4_hc_pre(ctx, x16, weights);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the hc_combine of qwen4exp and the grouped RMSNorm of the next hc read, cast to f16 (LLAMA_HC_F16): one shader on
+// Vulkan from 32 tokens (HC_POST_NORM_F16), both outputs checked
+struct test_dsv4_hc_post_norm_f16 : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    ggml_tensor * out_post = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST_NORM_F16";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return { out_post, out };
+    }
+
+    test_dsv4_hc_post_norm_f16(int64_t n_embd, int64_t n_tokens) : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+
+        post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+
+        out_post = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_set_name(out_post, "out_post");
+
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+
+        out = ggml_cast(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, out_post, 1e-6f), w_norm), GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
     // FLASH_ATTN_LIST: the qwen4exp QSA shape (2 KV heads x 12, 256 dims, 2052 cells in blocks of 4), decode, MTP
     // checks and a prompt ubatch; GQA 8 and 1, two streams, a list longer than the cache
@@ -667,6 +757,30 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 200, 256, 512,
             true, 8, 4, true, false, true, false, {1, 1}));
     }
+
+    // the f16 hc read of qwen4exp (LLAMA_HC_F16): the hc down projection (q8_0, 320 x 10240) of f16 streams, int8 on
+    // Vulkan through an f16 quantize; DSV4_HC_PRE over f16 streams; the combine with the next norm stored in f16
+    for (int64_t n : {32, 64, 77}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 64, 40, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F16, 64, 40, 256, {1, 1}, {1, 1}));
+    for (bool gated : {false, true}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_f16(31, 17, gated));
+        test_cases.emplace_back(new test_dsv4_hc_pre_f16(2560, 40, gated));
+    }
+    for (int64_t n : {17, 33, 64}) {
+        test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(2560, n));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(257, 40));
+
+    // the qwen4exp block top-k (513) of a 4096-token ubatch at n_kv 4352, 8448 and 15104, and one column past the
+    // widest workgroup of the tournament (1024): radix-select on Vulkan there from 8 rows (ggml_vk_topk_use_radix)
+    for (int64_t n_blocks : {1088, 2112, 3776}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_blocks, 4096, 1, 1}, 513));
+    }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1025, 16, 1, 1}, 513));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1025, 16, 1, 1}, 513, true));
 }
 
 static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {

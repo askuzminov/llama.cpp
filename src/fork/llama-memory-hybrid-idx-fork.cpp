@@ -135,7 +135,7 @@ llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
 
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(hp.n_layer_all*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2*hp.n_layer_all*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -159,6 +159,16 @@ llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
         ggml_format_name(t, "qsa_pool_l%d", il);
 
         pool_tensors[il] = t;
+
+        // an MTP block: the block scores of its first draft step, which the next steps select from again
+        // (cparams.qsa_reuse, see build_qsa_top_k). one row per stream, cleared below: a stale row is finite
+        if (il >= hp.n_layer()) {
+            ggml_tensor * s = ggml_new_tensor_2d(it->second.get(), GGML_TYPE_F32, (n_cells + r - 1)/r, n_stream);
+
+            ggml_format_name(s, "qsa_score_l%d", il);
+
+            score_tensors[il] = s;
+        }
     }
 
     for (auto & [buft, ctx] : ctx_map) {
@@ -430,6 +440,12 @@ llama_kv_cache * llama_memory_hybrid_idx_fork::get_mem_idx() const {
 //
 // qwen4exp QSA: pooled block keys
 //
+
+ggml_tensor * llama_memory_hybrid_idx_fork::get_score(int32_t il) const {
+    const auto it = score_tensors.find(il);
+
+    return it == score_tensors.end() ? nullptr : it->second;
+}
 
 ggml_tensor * llama_memory_hybrid_idx_fork::get_pool(int32_t il) const {
     const auto it = pool_tensors.find(il);
@@ -1482,6 +1498,21 @@ void llama_memory_hybrid_idx_fork_context::set_input_qsa_dirty(
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa_dirty(dirty_cells, dirty_pos, dirty_rows, ratio);
+}
+
+ggml_tensor * llama_memory_hybrid_idx_fork_context::get_score(ggml_context * ctx, int32_t il) const {
+    GGML_ASSERT(mem != nullptr);
+    GGML_ASSERT(get_idx() != nullptr);
+
+    ggml_tensor * score = mem->get_score(il);
+
+    if (score == nullptr) {
+        return nullptr;
+    }
+
+    const int64_t s0 = get_idx()->get_s0();
+
+    return ggml_view_2d(ctx, score, score->ne[0], get_n_stream(), score->nb[1], s0*score->nb[1]);
 }
 
 ggml_tensor * llama_memory_hybrid_idx_fork_context::get_pool(ggml_context * ctx, int32_t il) const {

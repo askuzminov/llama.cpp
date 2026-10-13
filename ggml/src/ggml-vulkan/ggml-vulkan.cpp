@@ -3345,8 +3345,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4_f16, "quantize_q8_1_x4_f16", quantize_q8_1_x4_f16_subgroup_len, quantize_q8_1_x4_f16_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4_f16, "quantize_q8_1_x4_f16", quantize_q8_1_x4_f16_len, quantize_q8_1_x4_f16_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
     }
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
@@ -3709,9 +3711,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f16,        "dsv4_hc_pre_f16",        dsv4_hc_pre_f16_len,  dsv4_hc_pre_f16_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f16,  "dsv4_hc_pre_gated_f16",  dsv4_hc_pre_f16_len,  dsv4_hc_pre_f16_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f32,  "dsv4_hc_post_norm_f32",  dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f16n, "dsv4_hc_post_norm_f16n", dsv4_hc_post_norm_f16n_len, dsv4_hc_post_norm_f16n_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
     // fork: short-row RMS norm (32 x 8 invocations, a row per 32) and the conv over the concat sources
     for (uint32_t w = 0; w < 2; ++w) {
         for (uint32_t g = 0; g < 2; ++g) {
@@ -6438,10 +6443,13 @@ vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_ty
     }
 }
 
-void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
+// fork: pipeline, a quantize pipeline other than the f32 one (from an f16 source), null for that one
+void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne, vk_pipeline pipeline) {
     VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
 
-    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    if (!pipeline) {
+        pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    }
 
     const uint32_t num_blocks = CEIL_DIV(ne, pipeline->wg_denoms[0]);
     // clamp the number of elements to the max workgroup count. The shader will iterate over the total number of blocks.
@@ -6529,8 +6537,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // Prefer the int8 MMQ path (quantize src1 to q8_1) whenever a matching pipeline exists.
     // The pipeline lookup returns nullptr for types without a q8_1 pipeline (e.g. RDNA4-skipped
     // quants), in which case coopmat1 falls back to the f16 B-type quant matmul below.
+    // fork: or from an f16 src1, the f16 hc read of qwen4exp (LLAMA_HC_F16) feeding int8 matmuls
+    const bool y_f16_q8 = src1->type == GGML_TYPE_F16 && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
     bool quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
-                      src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+                      (src1->type == GGML_TYPE_F32 || y_f16_q8) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     if (ggml_vk_mul_mat_int8_off(ctx, dst, ne10)) {
         quantize_y = false;
     }
@@ -6611,7 +6621,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+        to_q8_1 = src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_quantize_q8_1_x4_f16 : ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
     {
@@ -6721,7 +6731,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne, to_q8_1);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -7408,6 +7418,10 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     vk_pipeline pipeline = gated ? ctx->device->pipeline_dsv4_hc_pre_gated_f32 : ctx->device->pipeline_dsv4_hc_pre_f32;
+    if (x->type == GGML_TYPE_F16) {
+        // fork: f16 streams (qwen4exp, LLAMA_HC_F16)
+        pipeline = gated ? ctx->device->pipeline_dsv4_hc_pre_gated_f16 : ctx->device->pipeline_dsv4_hc_pre_f16;
+    }
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -11776,9 +11790,13 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     uint32_t k = dst->ne[0];
 
     // tournament path is faster where it fits; use radix-select only past its k limit
-    // fork: or where ggml_vk_topk_use_radix picks it
+    // fork: or where ggml_vk_topk_use_radix picks it, by the widest workgroup the tournament has here
     const uint32_t k_min_pipeline = std::max((uint32_t) log2f(float(k)) + 1, ctx->device->subgroup_size_log2);
-    if (ggml_vk_topk_use_radix(k, ncols, nrows) ||
+    uint32_t tournament_cols = 0;
+    for (uint32_t i = num_topk_pipelines; i-- > 0 && tournament_cols == 0;) {
+        tournament_cols = ctx->device->pipeline_topk_f32[i] ? 1u << i : 0;
+    }
+    if (ggml_vk_topk_use_radix(k, ncols, nrows, tournament_cols) ||
         k_min_pipeline >= num_topk_pipelines || ctx->device->pipeline_topk_f32[k_min_pipeline] == nullptr) {
         vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
         GGML_ASSERT(pipeline != nullptr);
@@ -15310,6 +15328,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         &rms_norm_mul_rope_view_set_rows_pattern,
         &rms_norm_view_set_rows_pattern,
         &rope_view_set_rows_pattern,
+        &hc_post_norm_f16_pattern, // fork: before the shorter one, so the cpy stays next to it
         &hc_post_norm_pattern,
         &hc_post_gate_pattern,
         &rms_norm_mul_sigmoid_mul_pattern,
@@ -16462,7 +16481,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 for (uint32_t i = 0; i < GGML_MAX_SRC; ++i) {
-                    if (op->src[i] && op->src[i]->type != GGML_TYPE_F32) {
+                    // fork: the streams of DSV4_HC_PRE may be f16 (qwen4exp, LLAMA_HC_F16)
+                    const bool f16_ok = op->op == GGML_OP_DSV4_HC_PRE && i == 0;
+                    if (op->src[i] && op->src[i]->type != GGML_TYPE_F32 && !(f16_ok && op->src[i]->type == GGML_TYPE_F16)) {
                         return false;
                     }
                 }

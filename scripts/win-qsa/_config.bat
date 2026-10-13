@@ -99,6 +99,10 @@ rem 12 cases on the path, Bc 64 and 32), so 01 checks the coopmat path here; uni
 rem 12.10 night (1b57e3bc): 53/53 in all four arms, the coopmat path of union included. wide (GGML_VK_FA_SPARSE_WIDE=1,
 rem off by default): the sparse coopmat1 tile reads the cells of a block once and stages K in chunks of 64 dims (8
 rem barriers per block instead of 32); the Mac only compiles and validates the coopmat shader, 01 checks it here
+rem 13.10 night: the ops of the three changes: MUL_MAT of q8_0 / q4_K by f16 (the int8 path through the f16 quantize
+rem of LLAMA_HC_F16 runs only here, the Mac GPUs have no int dot), DSV4_HC_PRE over f16, HC_POST_NORM with the f16
+rem copy fused in, the HC ops and TOP_K (radix past the 1024 columns of the tournament) and the sparse attention again
+if not defined CHECKOPS    set "CHECKOPS=MUL_MAT type_a=q8_0,type_b=f16;MUL_MAT type_a=q4_K,type_b=f16;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;TOP_K;FLASH_ATTN_LIST"
 if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
 rem 13.10 (19d20ba8): wide 53/53, but the attention at 122880 903.4 against 904.2 ms, PP 785.1 against 783.1: the
 rem staging is not what holds the tile either. off, the switch stays. the folded tile reads 17 GB of K/V per layer
@@ -119,7 +123,10 @@ rem 25.74 against 25.39, the 118K prompt 828.8 t/s; the compute buffer 3931 MiB 
 rem dense against sparse: 880.1 / 882.6 at depth 2048, 821.7 / 878.2 at 4096, 589.8 / 864.0 at 16384, so the threshold
 rem of KV 4104 stays. list is the default since then (LLAMA_QSA_FA_LIST=0 = the mask). the next run: conversations
 rem (DECCHAT), what a growing chat sees at 0, ~30K, ~60K and ~118K tokens
-if not defined RUN_CHECK   set "RUN_CHECK=0"
+rem 13.10 night: 01 for the new ops, 03 for hcf16 (LLAMA_HC_F16=1: the normalized hc streams in f16, KLD against
+rem the reference), see DECARMS and PROFARMS
+if not defined RUN_CHECK   set "RUN_CHECK=1"
+if not defined QARMS       set "QARMS=default;hcf16 LLAMA_HC_F16=1"
 if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
 if not defined CHECKARMS   set "CHECKARMS=default"
 if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
@@ -220,18 +227,42 @@ rem the load. b16k: the 118K prompt at 816.1 t/s (772.1 with -b 4096 on the buil
 rem prefetch line was there (a grep of mine cut it off), ple_prefetch_start also logs a reason to skip since then.
 rem 13.10 (19d20ba8), the 118K prompt: auto 797.4, b16k 814.6, wide 799.6 t/s; b16k is in DECARGS since then
 rem 13.10: auto failed three times in the load (failed to allocate a 1.66 GB Vulkan0 buffer, 2.2 GiB in use before),
-rem list right after it loaded; to watch
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
-if not defined DECPREFIX  set "DECPREFIX=500000"
+rem list right after it loaded; to watch. 13.10 evening the fourth time (vk::Device::mapMemory: ErrorMemoryMapFailed,
+rem 2.4 GiB in use), the second try loaded
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
 rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG
 rem after it from tg_3s; two texts, one seed
+rem 13.10 evening (dde0660c), the 118K prompt: 830.5 t/s, TG 32.09. the server stamps a batch when its last ubatch is
+rem submitted and Vulkan returns before the GPU is done, so the first stretch read 1142 t/s and the running mean of
+rem the progress line falls from there. the compute of each ubatch (the step to the next one): 910 t/s at 0, 880 at
+rem 16K, 861 at 64K, 848 at 100K; per batch with the MTP head 849 at 16-32K, 825 at 80-96K. 05 (GPU only, every
+rem ubatch of the 118K fill): 961 at 0 (dense attention), 928 at 4K, 900 at 16K, 878 at 64K, 861 at 118K; what grows
+rem is the attention, 111 -> 143 -> 166 us per token at 4K / 8K / 118K, and the indexer, 13 -> 48 (HEADSUM + TOP_K),
+rem the rest stays at ~950 us. TOP_K took the tournament below 4096 columns: 20-64 ms per ubatch at 1088-3776
+rem columns against 15 for radix at 4160 (past the 1024 elements of its widest workgroup the tournament of k 513 needs
+rem a pass per halving), radix past that width since then (ggml_vk_topk_use_radix). TG with MTP
+rem at 118K 12 percent below depth 0 (12.10: 36.5 / 32.0): the draft step +1.3 ms (the dense attention of the MTP
+rem head over 118K), the verify +4-5 ms (the indexer of 2-4 tokens over 30400 blocks, the PLE rows of new tokens:
+rem 0.9 / 1.8 / 2.9 ms for 2 / 3 / 4 tokens at depth against 0.5-0.7 after the warmup)
+rem the next run: conversations (DECCHAT) as a client sends them: a document in parts of ~4K tokens to ~118K, turns
+rem of ~480 and ~100 tokens after ~29K; 05 again for TOP_K at 4K-16K. mtpqsa: the MTP block through QSA
+rem (LLAMA_MTP_QSA=1). tech_report.pdf of the model: the reference MTP attends through QSA and reuses its top-k across
+rem the draft steps, mean accepted length 4.07 against 4.06 with full attention; ours lost acceptance on 09.10 (0.39
+rem against 0.44 at 118K), the dense block costs +1.3 ms per draft step at 118K and grows with the depth
+rem 13.10 night: the QSA block now selects in draft steps 2+ from the scores of step 1, as the reference reuses
+rem its top-k (LLAMA_MTP_QSA_REUSE, on with LLAMA_MTP_QSA=1); mtpqsa8k with a budget of 8192 tokens for the block
+rem (LLAMA_MTP_QSA_TOPK): one layer, so a wide budget costs little, and the dense block drafted better at depth.
+rem the PLE rows of the draft tokens are read while the next ones are drafted (LLAMA_PLE_WARM, on in all arms) and
+rem those of the first ubatch of each -b batch while the batch before computes (llama_set_next_tokens)
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto;mtpqsa8k LLAMA_MTP_QSA=1 LLAMA_MTP_QSA_TOPK=8192 @draft --spec-auto"
+if not defined DECPREFIX  set "DECPREFIX=none"
+if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000"
 if not defined DECPROMPTS set "DECPROMPTS=os code"
 if not defined DECSEEDS   set "DECSEEDS=1"
 rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX)
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 
-if not defined RUN_QUALITY set "RUN_QUALITY=0"
+if not defined RUN_QUALITY set "RUN_QUALITY=1"
 rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
 rem 800 ms in its loop per 4096 prompt at any depth, the dense one 302 at depth 0 and grows with KV: 2048 to 16384
 rem against dense (GGML_VK_FA_SPARSE_DISABLE=1) find the crossing
@@ -309,7 +340,8 @@ rem 13.10: 907.9 ms in all; without the loop 101.6 (the sparse compact pre-pass 
 rem grows with the depth), without K/V reads 544.5 (they cost 364), without the mask 876.1 (32), without the matmuls
 rem 772.1 (136), without the softmax 783.5 (124); about 150 ms of loop structure besides
 rem list: the attention without the pre-pass, and no mask fill
-if not defined PROFARMS   set "PROFARMS=default"
+rem 13.10 night: hcf16, the GPU time of the HC ops with the normalized streams in f16 (LLAMA_HC_F16=1)
+if not defined PROFARMS   set "PROFARMS=default;hcf16 LLAMA_HC_F16=1"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -422,8 +454,21 @@ rem from scratch (cache_prompt off). kvhost (LLAMA_QSA_KV_HOST=1, the QSA KV in 
 rem of 68, TG +3.6 percent on short prompts, -5 on a 2541-token one): where it stands now, before KV streaming.
 rem stable: the build of the tag stable (dd5a8f526, 30.09; 00-build.bat stable once), the user: PP was lower then but
 rem nearly flat with the depth, now it starts higher and sags; the same conversations on both builds
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;stable @stable @draft --spec-auto;kvhost LLAMA_QSA_KV_HOST=1 @draft --spec-auto"
+rem 13.10 evening (3769084b), the 118K prompt: auto 1002.7 t/s, flat (1060 at 0-16K, 1003 at 80-96K), TG 28.66;
+rem stable 545.3, sagging 643 -> 462 (phase_mem gave it ubatches of 4608 -> 4096 as its buffers grew), TG 21.90;
+rem kvhost 976.7, TG 24.96 (90 expert slots against 48, the verify 27.8 + 19.3 ms per token against 31.0 + 12.3:
+rem the selected cells read from RAM at every step cost more than the slots give). a prompt ubatch is ~3 s of expert
+rem upload (PCIe) plus its kernels (05: 1.9 s of 4.7 at 3707 tokens, 4.0 s of 7.1 at 8192), so a chat turn of a few
+rem hundred tokens pays ~3 s and the moe-cache refill, and one of up to 192 tokens runs in the generation layout at
+rem ~50 t/s (short prompts of 13.10: 49.5). the next run: conversations (DECCHAT) as a client sends them, a document in
+rem parts of ~4K tokens to ~118K, turns of ~480 and ~100 tokens after ~29K; ub16k (-ub 16384, one ubatch per -b
+rem batch, half the upload per token; phase_mem had 8252 MiB free for 3378 MiB at ub 8192 and 117760 cells)
+rem 13.10 night: mtpqsa, the QSA block with its draft steps 2+ selecting from the scores of step 1 (see the 395); the
+rem PLE rows of the first ubatch of each batch are now read while the batch before computes (llama_set_next_tokens),
+rem which ub16k needs: there every ubatch is the first of its batch
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;ub16k @draft --spec-auto -ub 16384;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=500000"
+if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000 120000:6:400"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
 rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG
 rem after it from tg_3s; two texts, one seed

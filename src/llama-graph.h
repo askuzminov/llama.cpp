@@ -887,6 +887,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // fork: a reused-score step builds no indexer query
+        if (cparams.qsa_reuse != other.cparams.qsa_reuse) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

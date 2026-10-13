@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include "fork/server-context-fork.h"
+#include "../../src/llama-ext.h" // fork: llama_set_next_tokens
 
 #include <algorithm>
 #include <cstddef>
@@ -4236,6 +4237,9 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // fork: the PLE rows of the next decode's first ubatch are read while this decode computes
+        set_next_tokens(off);
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -4634,6 +4638,60 @@ private:
 
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+    }
+
+    // fork: while the prompt of one slot goes on past this decode, give the context the tokens the next decode starts
+    // with (llama_set_next_tokens): the rest of this batch, or the slot's next prompt tokens. a next batch cut shorter
+    // (a checkpoint, a user message) leaves the rows read ahead unused
+    void set_next_tokens(int32_t off) {
+        const int32_t n = batch.view.size();
+
+        int32_t id_slot = -1;
+        for (int32_t i = off; i < off + n; ++i) {
+            const auto & t = batch.tokens[i];
+            if (!t.is_prompt || t.i_embd >= 0 || (id_slot >= 0 && t.id_slot != id_slot)) {
+                return;
+            }
+            id_slot = t.id_slot;
+        }
+        if (id_slot < 0) {
+            return;
+        }
+
+        const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_tgt);
+
+        std::vector<llama_token> next;
+        llama_pos pos0 = -1;
+        if (off + n < batch.size()) {
+            for (int32_t i = off + n; i < batch.size() && (int32_t) next.size() < n_ub; ++i) {
+                const auto & t = batch.tokens[i];
+                if (!t.is_prompt || t.i_embd >= 0 || t.id_slot != id_slot) {
+                    break;
+                }
+                if (pos0 < 0) {
+                    pos0 = t.pos[0];
+                }
+                next.push_back(t.token);
+            }
+        } else {
+            const auto & slot = slots[id_slot];
+            if (!slot.task || slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                return;
+            }
+            const auto & input_tokens = slot.task->tokens;
+            for (int32_t i = slot.prompt.n_tokens(); i < slot.task->n_tokens() && (int32_t) next.size() < n_ub; ++i) {
+                const llama_token tok = input_tokens[i];
+                if (tok == LLAMA_TOKEN_NULL) {
+                    break;
+                }
+                next.push_back(tok);
+            }
+            pos0 = slot.prompt.tokens.pos_next();
+        }
+
+        if (!next.empty()) {
+            llama_set_next_tokens(ctx_tgt, next.data(), (int32_t) next.size(), pos0, id_slot);
+        }
     }
 
     //

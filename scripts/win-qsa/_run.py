@@ -999,11 +999,33 @@ def progress(text):
 
 
 def ubatches(text, least=1025):
-    """LLAMA_INPUT_TIMING of the prompt ubatches of the model, [[tokens, graph ms, inputs ms, compute ms], ...]; the
-    MTP head computes the prompt in ubatches of 1024 (LLAMA_MTP_UBATCH) and a decode step in 1-4, left out by least"""
-    return [[int(m[1]), float(m[2]), float(m[3]), float(m[4])] for m in
-            re.finditer(r"ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", text)
-            if int(m[1]) >= least]
+    """LLAMA_INPUT_TIMING of the prompt ubatches of the model, [[tokens, graph ms, inputs ms, submit ms, first], ...],
+    first when the ubatch starts a batch (-b): after a progress line or the ubatches of the MTP head, which computes
+    the prompt in ubatches of 1024 (LLAMA_MTP_UBATCH) and a decode step in 1-4, left out by least"""
+    out, first = [], True
+    for m in re.finditer(r"ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms"
+                         r"|prompt processing, n_tokens =", text):
+        if m[1] is None or int(m[1]) < least:
+            first = True
+            continue
+        out.append([int(m[1]), float(m[2]), float(m[3]), float(m[4]), first])
+        first = False
+    return out
+
+
+def ubatch_gpu(rows):
+    """The compute time of each prompt ubatch, ms, None where the log does not show it. A backend that returns before
+    the GPU is done (Vulkan) shows the first ubatch of a batch with a short submit, and each next ubatch waits in its
+    submit for the one before: the compute of a ubatch is then the step to the next one of the same batch (graph,
+    inputs, submit), the last of a batch ends outside the ubatches. Else the submit is the compute"""
+    rows = [list(r) + [False] * (5 - len(r)) for r in rows]  # a cached result from before the first flag
+    firsts = [r[3] for r in rows if r[4]]
+    others = [r[3] for r in rows if not r[4]]
+    lagged = bool(firsts and others) and statistics.median(firsts) < 0.3 * statistics.median(others)
+    if not lagged:
+        return [r[3] for r in rows], False
+    return [sum(nxt[1:4]) if nxt is not None and not nxt[4] else None
+            for nxt in rows[1:] + [None]], True
 
 
 def segments(curve, start=0, least=2048):
@@ -1203,7 +1225,7 @@ def cmd_decode():
         for ti in range(n_turns):
             add = corpus[start + ti*add_chars:start + (ti + 1)*add_chars]
             turns.append((add + "\n\nAnd this part, in two sentences?", chat_gen))
-        chats.append((f"c{start}", turns))
+        chats.append((f"c{start}-{add_chars}", turns))  # two conversations from one start differ by their turns
     if chats:
         for arm in arms:
             label = f"{arm.name}-chat"
@@ -1285,9 +1307,12 @@ def cmd_decode():
         if curves:
             run.add("", "PP along the prompt (the server's progress lines), then TG after it",
                     *table(["arm", "stretch", "t/s"], curves))
-        # every prompt ubatch of the first long request of each arm (LLAMA_INPUT_TIMING): the start of the curve at
-        # ubatch steps, the host share (graph build, inputs) and the compute; "between" is the time of the progress
-        # stretch that no ubatch of the model accounts for (the MTP head, buffer re-plans, the expert cache)
+            run.add("  the server stamps a batch when its last ubatch is submitted: on Vulkan that ubatch still computes"
+                    " and its time lands in the next stretch, so the first stretch reads high")
+        # every prompt ubatch of the first long request of each arm (LLAMA_INPUT_TIMING): the curve at ubatch steps,
+        # the host share (graph build, inputs) and the compute of each ubatch (ubatch_gpu); "outside" is the time of
+        # the prompt no ubatch line of the model covers: the MTP head, the server between batches and, on Vulkan,
+        # the compute of the last ubatch of each batch
         for arm in arms:
             entry = results.get((arm.name, prefix))
             if not isinstance(entry, tuple):
@@ -1296,15 +1321,18 @@ def cmd_decode():
             if not long:
                 continue
             x, ub_rows, depth = long[0], [], 0
-            for n, g, inp, comp in x["ubatches"]:
-                total = g + inp + comp
-                ub_rows.append([f"{depth // 1024}K", n, f"{g:.0f}", f"{inp:.0f}", f"{comp:.0f}", f"{n / total * 1000:.1f}"])
+            gpu, lagged = ubatch_gpu(x["ubatches"])
+            for (n, g, inp, sub, *_), comp in zip(x["ubatches"], gpu):
+                ub_rows.append([f"{depth // 1024}K", n, f"{g:.0f}", f"{inp:.0f}", f"{sub:.0f}",
+                                f"{comp:.0f}" if comp else "-", f"{n / comp * 1000:.1f}" if comp else "-"])
                 depth += n
-            ub_time = sum(g + inp + comp for _, g, inp, comp in x["ubatches"]) / 1000
+            ub_time = sum(sum(r[1:4]) for r in x["ubatches"]) / 1000
             pp_time = x["pp_curve"][-1][1] if x.get("pp_curve") else 0
+            note = (" compute = the step to the next ubatch of the batch (the backend returns before the GPU is done),"
+                    " the last of a batch computes outside" if lagged else "")
             run.add("", f"{arm.name}, {x['name']}: prompt ubatches (ms), {ub_time:.1f} s in them of {pp_time:.1f} s of prompt"
-                    f" ({pp_time - ub_time:.1f} s between)",
-                    *table(["depth", "tokens", "graph", "inputs", "compute", "t/s"], ub_rows))
+                    f" ({pp_time - ub_time:.1f} s outside);" + note,
+                    *table(["depth", "tokens", "graph", "inputs", "submit", "compute", "t/s"], ub_rows))
         for pair in split_args(env("DECSAME")):
             a, _, b = pair.partition(":")
             ra, rb = results.get((a, prefix)), results.get((b, prefix))
@@ -1329,7 +1357,7 @@ def cmd_decode():
                              f"{x['draft_acc']}/{x['draft_n']}" if x["draft_n"] else "-"] + (["k"] if kept else []))
         run.add("", f"chat: conversations (start:turns:chars) {' '.join(f'{a}:{b}:{c}' for a, b, c in chat_specs)} of "
                 f"{Path(env('PPLFILE')).name}, {chat_gen} tokens per answer, prompt cache on",
-                *table(["arm", "start", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
+                *table(["arm", "start-chars", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
     run.add(*details)
     return run.finish()
 
@@ -1462,7 +1490,12 @@ def cmd_profile():
                                    "tg": [[o, c / len(steps), t / len(steps)] for o, c, t in sum_ops(steps)] if steps else [],
                                    "host": [sum(h[i] for h in host) for i in range(3)] if host else None}
                 else:
-                    pp_r, tg_r = cuda_report(tg_text), cuda_report(end_text)
+                    # the report of the prompt ubatch comes at the next compute call after an idle gap: inside the same
+                    # request when its tail (the last tokens, kept apart for a checkpoint) follows the gap, else at the
+                    # start of the next request. the first report after the last large ubatch line
+                    big = [m.end() for m in re.finditer(r"ubatch timing: (\d+) tokens", pp_text) if int(m[1]) > 1024]
+                    pp_r = cuda_report((pp_text + tg_text)[big[-1]:] if big else tg_text)
+                    tg_r = cuda_report(end_text)
                     out[prefix] = {"pp": pp_r[1] if pp_r else [], "pp_graphs": pp_r[0] if pp_r else 0,
                                    "tg": [[o, c / ntg, t / ntg] for o, c, t in tg_r[1]] if tg_r else [],
                                    "host": [sum(h[i] for h in host) for i in range(3)] if host else None}

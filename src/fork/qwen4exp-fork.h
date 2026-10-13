@@ -9,6 +9,7 @@
 
 class llama_memory_hybrid_idx_fork_context;
 class llama_kv_cache_context;
+class llama_kv_cache;
 struct llama_ubatch;
 
 struct llama_model_qwen4exp_fork : public llama_model_base {
@@ -35,6 +36,13 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
     mutable std::unique_ptr<ple_prefetch> ple_pf;
     void ple_prefetch_start(const llama_ubatch & next, const llama_kv_cache_context * mctx) const;
     bool ple_prefetch_take(const std::vector<int32_t> & idx, std::vector<float> & dst) const;
+
+    // the PLE rows of tokens a coming decode will hold, read from the row cache by a worker now, so that the input
+    // of that decode finds them in the page cache: the draft tokens of a speculative round while the next ones are
+    // drafted (llama_prefetch_tokens). only the last n_new tokens of next are read. LLAMA_PLE_WARM=0: off
+    struct ple_warmer;
+    mutable std::unique_ptr<ple_warmer> ple_wm;
+    void ple_warm(const llama_ubatch & next, const llama_kv_cache & kv, int64_t n_new) const;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

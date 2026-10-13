@@ -446,6 +446,15 @@ private:
     //
 
 public:
+    // the MTP draft steps after the first take the block scores of the first (llama_set_qsa_reuse); ignored unless
+    // the model's MTP block attends through QSA and LLAMA_MTP_QSA_REUSE is not 0
+    void set_qsa_reuse(bool value);
+
+    // the tokens the next decode call starts with (llama_set_next_tokens), and the tokens a coming decode will hold
+    // whose inputs are read from storage now (llama_prefetch_tokens)
+    void set_next_tokens(const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id);
+    void prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new, llama_pos pos0, llama_seq_id seq_id);
+
     // serialize only the cells added after base_pos (0 = the memory cannot produce a delta)
     size_t state_seq_get_delta(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
 
@@ -453,6 +462,15 @@ public:
     int32_t state_seq_apply_delta(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
 
 private:
+    // before the graph of a ubatch runs: the fork's work that overlaps it (llama_fork_before_compute)
+    void fork_before_compute(llama_memory_context_i * mctx);
+
+    // set_next_tokens: the tokens, the position of the first and its sequence; decode calls that saw them
+    std::vector<llama_token> next_tokens;
+    llama_pos                next_pos0  = 0;
+    llama_seq_id             next_seq   = 0;
+    int32_t                  next_calls = 0;
+
     // the graph of an entry that can compute the ubatch of gparams, moved to the front, nullptr if there is none
     llm_graph_result * get_gf_res_reuse(const llm_graph_params & gparams);
 
