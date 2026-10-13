@@ -8626,6 +8626,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Try to use split_k when KV is large enough to be worth the overhead.
     // Sparse: split_kv carries the list capacity, split_k partitions its blocks for occupancy.
     bool split_major = false;
+    bool split_kv_range = false;
     if (use_sparse) {
         split_kv = sparse_capacity;
         const uint32_t total_blocks = CEIL_DIV(sparse_capacity, Bc);
@@ -8634,15 +8635,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             split_k = shader_core_count * 2 / base_wgs;
         }
         // fork: the parts of the lists in the split-major order, see ggml_vk_fork_fa_sparse_split
-        const uint32_t major_parts = gqa_ratio > 1 ? ggml_vk_fork_fa_sparse_split(base_wgs, shader_core_count) : 0;
+        const uint32_t major_parts = gqa_ratio > 1 ? ggml_vk_fork_fa_sparse_split(base_wgs, shader_core_count, split_kv_range) : 0;
         if (major_parts > split_k) {
             split_k = major_parts;
             split_major = true;
         }
-        split_k = std::max(1u, std::min(split_k, total_blocks));
-        // Match the shader's per-split block count so no split is empty.
-        const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
-        split_k = CEIL_DIV(total_blocks, per_blocks);
+        if (split_kv_range && split_major) {
+            // ranges of KV, not of the list: a range a row has no cell in is an empty partial, which the reduce takes
+            split_k = std::min(split_k, KV);
+        } else {
+            split_kv_range = false;
+            split_k = std::max(1u, std::min(split_k, total_blocks));
+            // Match the shader's per-split block count so no split is empty.
+            const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
+            split_k = CEIL_DIV(total_blocks, per_blocks);
+        }
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
@@ -8804,6 +8811,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
     if (split_major && split_k > 1) {
         mask_n_head_log2 |= 1u << 25; // fork: SPLIT_MAJOR_BIT of flash_attn_base.glsl
+        if (split_kv_range) {
+            mask_n_head_log2 |= 1u << 26; // fork: KV_RANGE_BIT
+        }
     }
 
     if (use_mask_opt)

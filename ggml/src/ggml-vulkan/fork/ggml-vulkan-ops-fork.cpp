@@ -56,7 +56,7 @@ bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows) {
     return radix_mode == 1 || (radix_mode != 0 && radix_wins);
 }
 
-uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_count) {
+uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_count, bool & kv_range) {
     // the sparse prefill with the heads folded is one workgroup per token and KV head, each walking its own list of
     // 2052 cells from the start to the end. on the 395 at depth 122880 (12.10, 4096 tokens) the 12 qwen4exp attention
     // layers take 896 ms against 302 at depth 0, about 17 GB of K/V per layer at 224 GB/s, the DRAM rate: neighbouring
@@ -68,8 +68,21 @@ uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_co
         const char * env = getenv("GGML_VK_FA_SPARSE_SPLIT");
         return env ? (uint32_t) std::max(0, atoi(env)) : 0u;
     }();
+    // 12.10 night on the 395: no gain at 4 and 8 parts, the parts of the lists of neighbouring tokens do not cover
+    // one stretch of KV. GGML_VK_FA_SPARSE_KVSPLIT: the number of KV ranges instead, part s of every token takes the
+    // listed cells of range s (the slots found by binary search), so all tokens walk one range at a time: at 122880
+    // cells and 8 ranges 16 MB of K/V per head, against 17 GB of gathers per layer and ubatch that read each cell 66
+    // times. the partials cost as above. takes precedence over GGML_VK_FA_SPARSE_SPLIT
+    static const uint32_t ranges = [] {
+        const char * env = getenv("GGML_VK_FA_SPARSE_KVSPLIT");
+        return env ? (uint32_t) std::max(0, atoi(env)) : 0u;
+    }();
     // fewer workgroups than that: upstream splits for occupancy already (decode, short batches)
-    return base_wgs >= shader_core_count * 2 && parts > 1 ? parts : 0u;
+    if (base_wgs < shader_core_count * 2) {
+        return 0;
+    }
+    kv_range = ranges > 1;
+    return ranges > 1 ? ranges : parts > 1 ? parts : 0u;
 }
 
 bool ggml_vk_fork_fa_sparse_wide(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv,

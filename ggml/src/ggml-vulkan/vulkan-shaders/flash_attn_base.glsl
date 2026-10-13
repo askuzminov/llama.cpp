@@ -79,6 +79,8 @@ layout (push_constant) uniform parameter {
 #define SINK_ENABLE_BIT (1<<24)
 // fork: split_k index is the slow part of gl_WorkGroupID.x, see init_indices
 #define SPLIT_MAJOR_BIT (1<<25)
+// fork: sparse split s takes the listed cells of KV range s instead of a share of the list slots
+#define KV_RANGE_BIT (1<<26)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -152,7 +154,24 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride, sparse_base;
+         q_stride, k_stride, v_stride, m_stride, sparse_base, sparse_lo, sparse_hi;
+
+// fork: the first slot of the sparse list at sparse_base whose cell is not below kv (the list is ascending, the -1
+// padding at its end counts as past every cell)
+uint32_t fa_sparse_lower_bound(const uint32_t kv) {
+    uint32_t lo = 0;
+    uint32_t hi = p.split_kv;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        const int cell = data_sparse[sparse_base + mid];
+        if (cell >= 0 && uint32_t(cell) < kv) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
 
 void init_indices()
 {
@@ -236,6 +255,17 @@ void init_indices()
         uint32_t per_blocks   = CEIL_DIV(total_blocks, p.k_num);
         start_j = min(split_k_index * per_blocks, total_blocks);
         end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
+
+        sparse_lo = 0;
+        sparse_hi = p.split_kv;
+        if ((p.mask_n_head_log2 & KV_RANGE_BIT) != 0 && p.k_num > 1) {
+            // fork: the slots of this split's KV range; with the split-major order all rows walk one range at a time
+            const uint32_t range = CEIL_DIV(KV, p.k_num);
+            sparse_lo = fa_sparse_lower_bound(split_k_index * range);
+            sparse_hi = fa_sparse_lower_bound(min(KV, (split_k_index + 1) * range));
+            start_j = sparse_lo / Bc;
+            end_j   = CEIL_DIV(sparse_hi, Bc);
+        }
     }
 }
 
@@ -247,7 +277,7 @@ bool fa_sparse_tail(uint lin) {
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
 bool fa_kv_index(uint lin, out uint kv_col) {
     if (USE_SPARSE) {
-        if (lin >= p.split_kv) {
+        if (lin >= p.split_kv || lin < sparse_lo || lin >= sparse_hi) {
             kv_col = 0;
             return false;
         }

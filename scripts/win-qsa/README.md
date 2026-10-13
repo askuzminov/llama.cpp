@@ -140,7 +140,7 @@ set "BENCHDEPTHS=0,65536,122880"
 | `EXTRA` | `-ngl 99` | `-ngl 99 -ncmoe 30` |
 | `CHECKARMS` | `default`, `accurate` (f16 и f32-накопление вместо int8 coopmat), `glu0` (сшитые gate/up при любом размере, с тайлом 32x64), `notile` | `default` |
 | `QARMS` | `default`, `nofusion`, `accurate`, `upstream` (`LLAMA_UPSTREAM=qwen4exp`) | `default`, `nofusion` |
-| `DECARGS` | `-fit off -b 4096 -ub 4096` (как `models.ini`) | `-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 4096 -ub 4096` |
+| `DECARGS` | `-fit off -b 16384 -ub 4096` (с 13.10; `-b 16384` - промпт 118K +2.2%) | `-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 16384 -ub 8192` |
 | `BENCHARMS` | `stable`, `default`, `gt` (`GGML_VK_GRAPH_TIMING=16`, `LLAMA_INPUT_TIMING=1`) на 0 и 122880 | `stable`, `default` |
 | `BENCHSMALL`, `BENCHSMALLARMS` | `82,512,2541`; `stable`, `default` | пусто: не запускается |
 | `DECARMS` | `stable` (сервер тега), `none` (с `GGML_VK_GRAPH_TIMING=64`), `auto` (`--spec-auto`) | `base`, `n2`, `auto` |

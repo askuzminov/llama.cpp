@@ -188,7 +188,8 @@ vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, con
 bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows);
 // FLASH_ATTN_EXT, sparse with the heads folded: the split count of the split-major order (GGML_VK_FA_SPARSE_SPLIT),
 // 0 for the upstream order and split count
-uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_count);
+// (GGML_VK_FA_SPARSE_KVSPLIT: by KV ranges instead of list slots, kv_range is set then)
+uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_count, bool & kv_range);
 // FLASH_ATTN_EXT, sparse on coopmat1: K staged in chunks of 64 dims, the cells of a block read once
 // (GGML_VK_FA_SPARSE_WIDE), where the shader takes it and the shared memory holds it
 bool ggml_vk_fork_fa_sparse_wide(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv,

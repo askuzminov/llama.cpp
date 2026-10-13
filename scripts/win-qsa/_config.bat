@@ -101,7 +101,12 @@ rem off by default): the sparse coopmat1 tile reads the cells of a block once an
 rem barriers per block instead of 32); the Mac only compiles and validates the coopmat shader, 01 checks it here
 if not defined RUN_CHECK   set "RUN_CHECK=1"
 if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_EXT n_kv_max=[1-9]"
-if not defined CHECKARMS   set "CHECKARMS=default;wide GGML_VK_FA_SPARSE_WIDE=1"
+rem 13.10 (19d20ba8): wide 53/53, but the attention at 122880 903.4 against 904.2 ms, PP 785.1 against 783.1: the
+rem staging is not what holds the tile either. off, the switch stays. the folded tile reads 17 GB of K/V per layer
+rem and ubatch at 229 GB/s, the DRAM rate, while each cell is read 66 times by different tokens. kv4/kv8/kv16
+rem (GGML_VK_FA_SPARSE_KVSPLIT, off by default): split s of every token takes its listed cells of KV range s, all
+rem tokens walk one range at a time (16 MB of K/V per head with 8 ranges at 122880), partials of split_k between
+if not defined CHECKARMS   set "CHECKARMS=default;kv8 GGML_VK_FA_SPARSE_KVSPLIT=8;kv8w GGML_VK_FA_SPARSE_KVSPLIT=8 GGML_VK_FA_SPARSE_WIDE=1"
 if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
@@ -115,7 +120,9 @@ rem 10.10 evening: f16reg (the experts on f16 activations, the default since 11.
 rem the int8 path (nofusion 0.016073), same top 96.06 against 95.97 percent. int8: the int8 path (GGML_VK_MMID_F16REG=0)
 if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;int8 GGML_VK_MMID_F16REG=0"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
-if not defined DECARGS    set "DECARGS=-fit off -b 4096 -ub 4096"
+rem 13.10 (19d20ba8): -b 16384 took the 118K prompt at 814.6 t/s against 797.4 with -b 4096 (+2.2 percent, one build;
+rem the PLE rows of the next ubatch are gathered while one computes, the log line is there). the default since then
+if not defined DECARGS    set "DECARGS=-fit off -b 16384 -ub 4096"
 rem stable (off since 10.10): the server of the tag, its TG, PP and compute buffers (DECGREP) next to the current ones. 07.10: a short
 rem prompt 0.66 s instead of 1.8 s once the host read of the context checkpoints went through cached memory (stable:
 rem 1.7 s), the 2541-token prompt 697 t/s against 443 of stable, TG 27.2 against 26.7, with --spec-auto 37.6
@@ -194,11 +201,11 @@ rem sub1g) and b16k at the 118K prompt
 rem 12.10 night (1b57e3bc): compute buffer 3931 MiB with the 2 GiB blocks against 5979 of sub1g (the 1 GiB of upstream),
 rem lidall 9720 (the lightning indexer for the prompt keeps a 2 GiB REPEAT and the f16 bias copies alive), so it stays
 rem at 64 tokens; TG none 27.86, auto 38.24, lidall 36.47, sub1g 37.44; 5 server starts with the MTP head, no stop in
-rem the load. b16k: the 118K prompt at 816.1 t/s (772.1 with -b 4096 on the build before, not the same build), and no
-rem PLE prefetch line, unlike the 3090: ple_prefetch_start logs its reason since then. the next run: auto against b16k
-rem at the 118K prompt on one build
-rem wide: see CHECKARMS, the prompt of 118K with it
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=500000;b16k @draft --spec-auto -b 16384 @p=500000;wide GGML_VK_FA_SPARSE_WIDE=1 @draft --spec-auto @p=500000"
+rem the load. b16k: the 118K prompt at 816.1 t/s (772.1 with -b 4096 on the build before, not the same build); the PLE
+rem prefetch line was there (a grep of mine cut it off), ple_prefetch_start also logs a reason to skip since then.
+rem 13.10 (19d20ba8), the 118K prompt: auto 797.4, b16k 814.6, wide 799.6 t/s; b16k is in DECARGS since then
+rem kv8: see CHECKARMS, the 118K prompt with it
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=500000;kv8 GGML_VK_FA_SPARSE_KVSPLIT=8 @draft --spec-auto @p=500000"
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
 if not defined BENCHSMALL  set "BENCHSMALL=0"
@@ -254,8 +261,9 @@ rem 12.10 night (1b57e3bc), PP at 122880: default 782.8, spl4 781.9, spl8 777.1,
 rem attention of the profile 898 / 933 (spl8) / 1758 ms (union). the order of the parts changes nothing, so the folded
 rem tile is not held up by cache misses between workgroups; the union tile computes 48 rows over the union and loses
 rem twice. both stay off (the switches stay). lidall 775.2 / 948.8, sub1g 782.6 / 945.8 against 782.8 / 946.8
-rem wide: see CHECKARMS, at 122880 only (depth 0 keeps the dense attention)
-if not defined BENCHARMS  set "BENCHARMS=default;wide GGML_VK_FA_SPARSE_WIDE=1 @d=122880"
+rem kv4 / kv8 / kv16: see CHECKARMS, at 122880 only (depth 0 keeps the dense attention); the split_k partials take
+rem 101 MB per range at 4096 tokens (kv16: 1.6 GB)
+if not defined BENCHARMS  set "BENCHARMS=default;kv4 GGML_VK_FA_SPARSE_KVSPLIT=4 @d=122880;kv8 GGML_VK_FA_SPARSE_KVSPLIT=8 @d=122880;kv16 GGML_VK_FA_SPARSE_KVSPLIT=16 @d=122880"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -272,8 +280,8 @@ rem noelt: see BENCHARMS, the per-op times of the GDN norms, the conv and the at
 rem int8: the MUL_MAT_ID time per op on the int8 path, f16reg is the default since 11.10 (see CHECKARMS)
 rem lidall: the lightning indexer at every size next to the default (64 tokens again since 12.10 evening)
 rem spl8: see BENCHARMS, the attention and the split_k reduce per op
-rem wide: the attention per op at 122880 against the 898 ms of the default
-if not defined PROFARMS   set "PROFARMS=default;wide GGML_VK_FA_SPARSE_WIDE=1"
+rem kv8 / kv16: the attention and the split_k reduce per op at 122880 against the 904 ms of the default
+if not defined PROFARMS   set "PROFARMS=default;kv8 GGML_VK_FA_SPARSE_KVSPLIT=8;kv16 GGML_VK_FA_SPARSE_KVSPLIT=16"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
