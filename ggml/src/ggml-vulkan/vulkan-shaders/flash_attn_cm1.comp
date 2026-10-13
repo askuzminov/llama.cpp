@@ -226,7 +226,7 @@ void main() {
                                 [[unroll]] for (uint32_t rr = 0; rr < 4; ++rr) {
                                     uint32_t mrow = i * Br + r * 4 + rr;
                                     if (!nem1_bounds_check || mrow < p.nem1) {
-                                        m[rr] = data_m[m_offset + mrow * m_stride + kcol];
+                                        m[rr] = SPARSE_LIST ? data_m[sparse_base + j * Bc + c] : data_m[m_offset + mrow * m_stride + kcol];
                                         max_mask = max(max_mask, float(m[rr]));
                                     }
                                 }

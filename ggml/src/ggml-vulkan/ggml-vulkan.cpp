@@ -225,11 +225,12 @@ uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const uint64_t size_N = node->ne[3] / OC * node->ne[0] * node->ne[1] * node->ne[2];
         return OC * size_N * (size_K + (size_K - 1));
     }
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_FLASH_ATTN_LIST) {
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
-        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+        const int64_t n_kv = node->op == GGML_OP_FLASH_ATTN_LIST ? node->src[5]->ne[0] : k->ne[1];
+        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * n_kv * q->ne[3];
     }
     return 0;
 }
@@ -8446,6 +8447,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // Sparse mask hint (op_params[4]): compact the <= n_kv_max finite positions and gather only those.
     const int32_t n_kv_max = mask ? ggml_get_op_params_i32(dst, 4) : 0;
+    // fork: GGML_OP_FLASH_ATTN_LIST gives the list itself (src[5], the cells of each row) and the values of its slots as
+    // the mask: always the sparse path, without the pre-pass, see ggml_flash_attn_list
+    const ggml_tensor * list_idx = dst->op == GGML_OP_FLASH_ATTN_LIST ? dst->src[5] : nullptr;
     static const bool disable_sparse = getenv("GGML_VK_FA_SPARSE_DISABLE") != nullptr;
     const bool kv_f16 = k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16;
     // coopmat2 vector decode requires 8B strides.
@@ -8454,6 +8458,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
     auto sparse_ok = [&](FaCodePath path) {
+        if (list_idx) {
+            return path != FA_COOPMAT2; // fork: no dense mask to fall back to (supports_op keeps coopmat2 out)
+        }
         // cm2 dense is fast, so it needs a larger reduction to win.
         // With quantized K/V, sparse only breaks even around 16x (measured on RDNA3/RDNA4).
         const int64_t min_ratio = path == FA_COOPMAT2 ? 4 : (kv_f16 ? 2 : 16);
@@ -8478,7 +8485,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return val != nullptr && atoi(val) != 0;
     }();
 
-    if ((N <= 8 || (!sparse_upstream && sparse_gqa && sparse_ok(tuning_params.path))) &&
+    if ((N <= 8 || (!sparse_upstream && sparse_gqa && sparse_ok(tuning_params.path)) || list_idx) &&
         qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
@@ -8511,7 +8518,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const int64_t row_tile_ratio = 8;
 
     const int64_t group_ratio = group_ratio_env >= 0 ? group_ratio_env : 1;
-    const bool    multi_row   = !sparse_upstream && sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1;
+    const bool    multi_row   = !sparse_upstream && sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1 && !list_idx;
+
+    // fork: a list without the fold needs a tile of one row
+    if (list_idx && gqa_ratio == 1 && tuning_params.block_rows > 1) {
+        tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 1, KV, k_type_eff, v_type_eff, f32acc);
+        GGML_ASSERT(tuning_params.block_rows == 1);
+    }
 
     // the tile keeps its rows and walks their union. Without the tile size in the threshold the
     // list can be as long as KV, and then the gather costs a pre-pass and buys nothing
@@ -8526,7 +8539,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // block_rows == 1 only happens on the scalar path, where the tile is one query row
-    const bool use_sparse = sparse_upstream ?
+    const bool use_sparse = list_idx ? true : sparse_upstream ?
         sparse_shape_ok && (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1)) :
         sparse_shape_ok && (use_group || gqa_ratio > 1 || tuning_params.block_rows == 1);
 
@@ -8570,6 +8583,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // fork: the sparse coopmat1 tile stages K in chunks of 64 dims (SPARSE_WIDE of flash_attn_base.glsl)
     if (use_sparse && ggml_vk_fork_fa_sparse_wide(ctx->device, tuning_params, HSK, HSV, f32acc, k_type_eff, v_type_eff)) {
         fa_pipeline_state.flags |= 32;
+    }
+    // fork: the list of GGML_OP_FLASH_ATTN_LIST, the mask values by slot (SPARSE_LIST of flash_attn_base.glsl)
+    if (list_idx) {
+        fa_pipeline_state.flags |= 64;
     }
 
     vk_pipeline pipeline = nullptr;
@@ -8621,7 +8638,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // case is rows_per_group * n_kv_max cells but never more than KV.
     const uint32_t sparse_rows_per_group = (gqa_ratio > 1) ? 1 : Br;
     const uint32_t sparse_n_groups       = CEIL_DIV(nem1, sparse_rows_per_group);
-    const uint32_t sparse_capacity       = std::min<uint32_t>(sparse_rows_per_group * (uint32_t)n_kv_max, KV);
+    const uint32_t sparse_capacity       = list_idx ? (uint32_t) list_idx->ne[0] : std::min<uint32_t>(sparse_rows_per_group * (uint32_t)n_kv_max, KV);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
     // Sparse: split_kv carries the list capacity, split_k partitions its blocks for occupancy.
@@ -8640,7 +8657,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             split_k = major_parts;
             split_major = true;
         }
-        if (split_kv_range && split_major) {
+        if (split_kv_range && split_major && !list_idx) { // fork: a list is not sorted, no ranges
             // ranges of KV, not of the list: a range a row has no cell in is an empty partial, which the reduce takes
             split_k = std::min(split_k, KV);
         } else {
@@ -8744,13 +8761,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Sparse index scratch reuses prealloc_y (mutually exclusive with mask opt).
-    const uint64_t sparse_idx_size = use_sparse
+    const uint64_t sparse_idx_size = use_sparse && !list_idx
         ? sizeof(int32_t) * (uint64_t)sparse_capacity * sparse_n_groups * nem2 * nem3
         : 0;
     vk_pipeline sparse_compact_pipeline = ctx->device->fa_sparse_compact_use_subgroups
         ? ctx->device->pipeline_fa_sparse_compact_subgroup
         : ctx->device->pipeline_fa_sparse_compact;
-    if (use_sparse) {
+    if (use_sparse && !list_idx) {
         ggml_pipeline_request_descriptor_sets(ctx, sparse_compact_pipeline, 1);
         if (ctx->prealloc_size_y < sparse_idx_size) {
             ctx->prealloc_size_y = sparse_idx_size;
@@ -8773,8 +8790,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    if (use_mask_opt || use_sparse) {
+    vk_subbuffer sparse_buf = list_idx ? ggml_vk_tensor_subbuffer(ctx, list_idx) :
+                              use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    if (use_mask_opt || (use_sparse && !list_idx)) {
         // the mask opt bits and the sparse index list overwrite a matmul input converted into prealloc_y
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
@@ -8837,7 +8855,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    if (use_sparse)
+    if (use_sparse && !list_idx)
     {
         const vk_op_flash_attn_sparse_compact_push_constants sc_pc = {
             KV,
@@ -8972,7 +8990,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (use_mask_opt || use_sparse) {
+    if (use_mask_opt || (use_sparse && !list_idx)) {
         ctx->prealloc_y_need_sync = true;
     }
 }
@@ -13140,6 +13158,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_FLASH_ATTN_LIST: // fork: the sparse path over the given list
+        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, nullptr, node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -16125,6 +16148,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_FLASH_ATTN_LIST: // fork: the scalar and coopmat1 sparse paths walk the list
+            if (device->coopmat2 || op->src[5]->type != GGML_TYPE_I32 || op->src[3]->type != GGML_TYPE_F16) {
+                return false;
+            }
+            [[fallthrough]];
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;
@@ -17142,7 +17170,7 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
         name += "(" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," + std::to_string(node->ne[2]) + "," + std::to_string(node->ne[3]) + ")";
         return fusion_str + name;
     }
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_FLASH_ATTN_LIST) {
         const ggml_tensor * dst = node;
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];

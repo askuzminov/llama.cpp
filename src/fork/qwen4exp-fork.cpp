@@ -1022,8 +1022,11 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->set_input_qsa_pos(cell_pos, tok_pos, ubatch);
 
-        const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
-        ggml_backend_tensor_set(neg_inf, &drop, 0, sizeof(drop));
+        // with LLAMA_QSA_FA_LIST no mask is filled and nothing reads the -inf, so it is never allocated
+        if (neg_inf->buffer) {
+            const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+            ggml_backend_tensor_set(neg_inf, &drop, 0, sizeof(drop));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -1543,6 +1546,28 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     const bool from_pos = pos_mode && cparams.causal_attn && !hparams.use_alibi && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
         qsa_mask_pos_ubatch(cparams, ubatch);
 
+    // fork: on Vulkan the attention can take the selected cells and their values as a list (GGML_OP_FLASH_ATTN_LIST):
+    // no -inf mask of n_kv x n_batch (2 GiB at 262144 x 4096), no set_rows into it and no pre-pass of the sparse path
+    // that finds the cells in it again; on the 395 (13.10, 122880, ubatch 4096) the pre-pass took ~90 ms and the fill
+    // of the mask 52 ms, both growing with the depth. only where Vulkan takes the sparse path anyway (KV at least
+    // 2 x n_top_k and 4096), the dense attention over the mask is faster below. LLAMA_QSA_FA_LIST: 1 = on, 0 = off
+    // (default until measured)
+    static const int list_mode = [] {
+        const char * env = std::getenv("LLAMA_QSA_FA_LIST");
+        return env ? std::atoi(env) : 0;
+    }();
+    // LLAMA_QSA_FA_LIST_MIN: the KV size from which, -1 (default) = the sparse threshold of Vulkan above
+    static const int64_t list_min = [] {
+        const char * env = std::getenv("LLAMA_QSA_FA_LIST_MIN");
+        return env ? (int64_t) std::atoll(env) : (int64_t) -1;
+    }();
+    bool use_list = false;
+    if (list_mode == 1 && from_pos && cparams.flash_attn) {
+        ggml_backend_dev_t dev_l = model.dev_layer(il);
+        const bool vk_l = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev_l)), "Vulkan") == 0;
+        use_list = vk_l && n_kv_m >= (list_min >= 0 ? list_min : std::max<int64_t>(4096, 2*top_k->ne[0]));
+    }
+
     ggml_tensor * kq_mask_all = nullptr;
     ggml_tensor * kept        = nullptr;
 
@@ -1580,7 +1605,9 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, kept);
 
         // a node, so that the allocator frees it after the attention as it did the fill of the mask view
-        kq_mask_all = ggml_repeat_4d(ctx0, qsa_pos_inp->neg_inf, 1, n_kv_m, n_tps_m, n_str_m);
+        if (!use_list) {
+            kq_mask_all = ggml_repeat_4d(ctx0, qsa_pos_inp->neg_inf, 1, n_kv_m, n_tps_m, n_str_m);
+        }
     } else {
         // view of the mask with rows of size 1, to read the selected rows out of:
         // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream].
@@ -1603,6 +1630,43 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         kq_mask_all = ggml_fill(ctx0, kq_mask_rows, -INFINITY);
     }
 
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    if (use_list) {
+        // the values f16 as the attention reads them, [1, n_top_k, n_batch, n_stream] -> [n_top_k, n_batch, 1, n_stream]
+        ggml_tensor * vals = ggml_cast(ctx0, kept, GGML_TYPE_F16);
+        vals = ggml_reshape_4d(ctx0, vals, top_k->ne[0], top_k->ne[1], 1, top_k->ne[3]);
+        ggml_tensor * idx = ggml_is_contiguous(top_k_3d) ? top_k_3d : ggml_cont(ctx0, top_k_3d);
+
+        // the attention as build_attn_mha does it for ggml_flash_attn_ext
+        const bool v_trans  = v->nb[1] > v->nb[2];
+        const auto n_stream = k->ne[3];
+        q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (v_trans) {
+            v = ggml_transpose(ctx0, v);
+        }
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+        ggml_tensor * cur = ggml_flash_attn_list(ctx0, q, k, v, vals, idx, kq_scale);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+        return cur;
+    }
+
     // modify KQ mask by restoring the elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
     ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, kept, top_k_3d);
@@ -1610,10 +1674,6 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     // reshape to restore the original shape of KQ mask:
     // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
     kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // kq_mask_all starts at -inf and only the top_k cells get their mask value back, so a row can
     // never hold more than top_k->ne[0] finite entries - the bound ggml_flash_attn_ext_set_n_kv_max wants.

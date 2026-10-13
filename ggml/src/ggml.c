@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "FLASH_ATTN_LIST", // fork
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "flash_attn_list(x)", // fork
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5607,6 +5611,47 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+// fork: ggml_flash_attn_list
+
+struct ggml_tensor * ggml_flash_attn_list(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * vals,
+        struct ggml_tensor  * idx,
+        float                 scale) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+
+    GGML_ASSERT(vals->type == GGML_TYPE_F16 && ggml_is_contiguous(vals));
+    GGML_ASSERT(idx->type  == GGML_TYPE_I32 && ggml_is_contiguous(idx));
+    GGML_ASSERT(vals->ne[0] == idx->ne[0] && vals->ne[1] == idx->ne[1]);
+    GGML_ASSERT(vals->ne[1] >= q->ne[1]);
+    GGML_ASSERT(vals->ne[2] == 1 && idx->ne[2] == vals->ne[3] && idx->ne[3] == 1);
+    GGML_ASSERT(q->ne[3] % vals->ne[3] == 0);
+
+    // permute(0, 2, 1, 3)
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 3, (int32_t) GGML_PREC_F32);
+    ggml_set_op_params_i32(result, 4, (int32_t) idx->ne[0]);
+
+    result->op     = GGML_OP_FLASH_ATTN_LIST;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = vals;
+    result->src[5] = idx;
+
+    return result;
 }
 
 // ggml_flash_attn_back

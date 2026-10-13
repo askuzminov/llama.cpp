@@ -141,7 +141,7 @@ bool ggml_vk_fork_fa_union(ggml_backend_vk_context * ctx, vk_context & subctx, c
     // n_kv_max hint, KV past the sparse threshold; and only where the tiles alone fill the device (prompts), the folded
     // tile keeps decode, draft checks and short batches
     const vk_device & device = ctx->device;
-    if (device->fa_union_mode == 0 || mask == nullptr || sinks != nullptr) {
+    if (device->fa_union_mode == 0 || mask == nullptr || sinks != nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);

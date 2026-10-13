@@ -28,6 +28,9 @@ const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 const bool USE_SPARSE      = (Flags & 16) != 0;
 // fork: the sparse coopmat1 path stages K in chunks of 64 dims and reads the cells of a block once (flash_attn_cm1.comp)
 const bool SPARSE_WIDE     = (Flags & 48) == 48; // with USE_SPARSE; a && of spec constants turns into a branch
+// fork: GGML_OP_FLASH_ATTN_LIST: binding 7 is the given list (unsorted, -1 anywhere), the mask holds the value of each
+// slot at the same index as the list
+const bool SPARSE_LIST     = (Flags & 80) == 80;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -271,7 +274,7 @@ void init_indices()
 
 // The list is ascending and -1 padded, so a block that starts on padding ends the walk.
 bool fa_sparse_tail(uint lin) {
-    return USE_SPARSE && data_sparse[sparse_base + lin] < 0;
+    return USE_SPARSE && !SPARSE_LIST && data_sparse[sparse_base + lin] < 0;
 }
 
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
@@ -282,8 +285,10 @@ bool fa_kv_index(uint lin, out uint kv_col) {
             return false;
         }
         int idx = data_sparse[sparse_base + lin];
-        kv_col = idx >= 0 ? uint(idx) : 0;
-        return idx >= 0;
+        // a given list (SPARSE_LIST) can name cells past KV, which count as left out
+        const bool in_list = idx >= 0 && (!SPARSE_LIST || uint(idx) < KV);
+        kv_col = in_list ? uint(idx) : 0;
+        return in_list;
     }
     kv_col = lin;
     return !KV_bounds_check || lin < KV;

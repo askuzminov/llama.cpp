@@ -99,7 +99,7 @@ rem 12 cases on the path, Bc 64 and 32), so 01 checks the coopmat path here; uni
 rem 12.10 night (1b57e3bc): 53/53 in all four arms, the coopmat path of union included. wide (GGML_VK_FA_SPARSE_WIDE=1,
 rem off by default): the sparse coopmat1 tile reads the cells of a block once and stages K in chunks of 64 dims (8
 rem barriers per block instead of 32); the Mac only compiles and validates the coopmat shader, 01 checks it here
-if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_EXT n_kv_max=[1-9]"
+if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
 rem 13.10 (19d20ba8): wide 53/53, but the attention at 122880 903.4 against 904.2 ms, PP 785.1 against 783.1: the
 rem staging is not what holds the tile either. off, the switch stays. the folded tile reads 17 GB of K/V per layer
 rem and ubatch at 229 GB/s, the DRAM rate, while each cell is read 66 times by different tokens. kv4/kv8/kv16
@@ -108,8 +108,14 @@ rem tokens walk one range at a time (16 MB of K/V per head with 8 ranges at 1228
 rem 13.10 (820839e6): kv8 and kv8w 53/53; PP at 122880 default 781.4, kv4 782.6, kv8 775.0, kv16 754.3, the attention
 rem 915 / 953 (kv8) / 1125 ms (kv16); the 118K prompt auto 814.1, kv8 792.6. no access pattern moves it, so the next
 rem run times the parts of the tile: GGML_VK_FA_ABLATE (profiling only, wrong results), see PROFARMS. kvsplit is off
-if not defined RUN_CHECK   set "RUN_CHECK=0"
-if not defined CHECKARMS   set "CHECKARMS=default;kv8 GGML_VK_FA_SPARSE_KVSPLIT=8;kv8w GGML_VK_FA_SPARSE_KVSPLIT=8 GGML_VK_FA_SPARSE_WIDE=1"
+rem list (13.10, LLAMA_QSA_FA_LIST=1, off by default): qwen4exp on Vulkan gives the attention the selected cells and
+rem their values (GGML_OP_FLASH_ATTN_LIST, a new op of the fork) instead of the -inf mask of n_kv x n_batch, its
+rem set_rows and the pre-pass: from KV 4104 on, where the sparse path runs anyway. Mac: the op passes against the CPU
+rem (scalar path, 7 cases, with and without the fold), the CPU op against flash_attn_ext with the same dense mask, and
+rem a qwen4exp test model at 8192 the same PPL with and without; 01 checks the coopmat path here, 03 the real model
+if not defined RUN_CHECK   set "RUN_CHECK=1"
+if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
+if not defined CHECKARMS   set "CHECKARMS=default"
 if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
@@ -207,11 +213,14 @@ rem at 64 tokens; TG none 27.86, auto 38.24, lidall 36.47, sub1g 37.44; 5 server
 rem the load. b16k: the 118K prompt at 816.1 t/s (772.1 with -b 4096 on the build before, not the same build); the PLE
 rem prefetch line was there (a grep of mine cut it off), ple_prefetch_start also logs a reason to skip since then.
 rem 13.10 (19d20ba8), the 118K prompt: auto 797.4, b16k 814.6, wide 799.6 t/s; b16k is in DECARGS since then
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=500000"
-if not defined RUN_DECODE  set "RUN_DECODE=0"
-if not defined RUN_BENCH   set "RUN_BENCH=0"
-if not defined RUN_QUALITY set "RUN_QUALITY=0"
-if not defined BENCHDEPTHS set "BENCHDEPTHS=0,122880"
+rem list: see CHECKARMS, the 118K prompt and the compute buffer with it
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto @p=500000;list LLAMA_QSA_FA_LIST=1 @draft --spec-auto @p=500000"
+
+if not defined RUN_QUALITY set "RUN_QUALITY=1"
+rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
+rem 800 ms in its loop per 4096 prompt at any depth, the dense one 302 at depth 0 and grows with KV: 2048 to 16384
+rem against dense (GGML_VK_FA_SPARSE_DISABLE=1) find the crossing
+if not defined BENCHDEPTHS set "BENCHDEPTHS=2048,4096,8192,16384,122880"
 if not defined BENCHSMALL  set "BENCHSMALL=0"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
@@ -267,7 +276,8 @@ rem tile is not held up by cache misses between workgroups; the union tile compu
 rem twice. both stay off (the switches stay). lidall 775.2 / 948.8, sub1g 782.6 / 945.8 against 782.8 / 946.8
 rem kv4 / kv8 / kv16: see CHECKARMS, at 122880 only (depth 0 keeps the dense attention); the split_k partials take
 rem 101 MB per range at 4096 tokens (kv16: 1.6 GB)
-if not defined BENCHARMS  set "BENCHARMS=default;kv4 GGML_VK_FA_SPARSE_KVSPLIT=4 @d=122880;kv8 GGML_VK_FA_SPARSE_KVSPLIT=8 @d=122880;kv16 GGML_VK_FA_SPARSE_KVSPLIT=16 @d=122880"
+rem list: see CHECKARMS
+if not defined BENCHARMS  set "BENCHARMS=default;dense GGML_VK_FA_SPARSE_DISABLE=1 @d=2048,4096,8192,16384;list LLAMA_QSA_FA_LIST=1"
 rem 07.10: short prompts of 82 and 512 tokens as fast as stable, 2541 tokens 23 percent faster
 if not defined BENCHSMALL     set "BENCHSMALL=82,512,2541"
 if not defined BENCHSMALLARMS set "BENCHSMALLARMS=default"
@@ -285,8 +295,12 @@ rem int8: the MUL_MAT_ID time per op on the int8 path, f16reg is the default sin
 rem lidall: the lightning indexer at every size next to the default (64 tokens again since 12.10 evening)
 rem spl8: see BENCHARMS, the attention and the split_k reduce per op
 rem ab1..ab16: the attention at 122880 with a part of flash_attn_cm1.comp left out (GGML_VK_FA_ABLATE): 1 no block
-rem loop (the pre-pass, Q and the stores remain), 2 no K/V reads, 4 no mask, 8 no matmuls, 16 no softmax
-if not defined PROFARMS   set "PROFARMS=default;ab1 GGML_VK_FA_ABLATE=1;ab2 GGML_VK_FA_ABLATE=2;ab4 GGML_VK_FA_ABLATE=4;ab8 GGML_VK_FA_ABLATE=8;ab16 GGML_VK_FA_ABLATE=16"
+rem loop (the pre-pass, Q and the stores remain), 2 no K/V reads, 4 no mask, 8 no matmuls, 16 no softmax.
+rem 13.10: 907.9 ms in all; without the loop 101.6 (the sparse compact pre-pass over the 1 GB mask, the only part that
+rem grows with the depth), without K/V reads 544.5 (they cost 364), without the mask 876.1 (32), without the matmuls
+rem 772.1 (136), without the softmax 783.5 (124); about 150 ms of loop structure besides
+rem list: the attention without the pre-pass, and no mask fill
+if not defined PROFARMS   set "PROFARMS=default;list LLAMA_QSA_FA_LIST=1"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"

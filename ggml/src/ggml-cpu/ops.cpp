@@ -12432,3 +12432,5 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+#include "fork/ops-fork.inc" // fork: the CPU ops the fork adds to ggml

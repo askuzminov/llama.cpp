@@ -602,6 +602,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_FLASH_ATTN_LIST, // fork: attention over a list of KV cells per query row, ggml_flash_attn_list
+
         GGML_OP_COUNT,
     };
 
@@ -2517,6 +2519,28 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // fork: attention of each query row over its own list of KV cells, the sparse attention of a top-k selection
+    // without a dense mask. a listed cell takes the additive value of its slot; a cell index below 0 or a value of
+    // -inf leaves the slot out. the list need not be sorted and holds each cell at most once per row
+    //
+    // q:    [n_embd_k, n_batch, n_head,    ne3 ]
+    // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]
+    // v:    [n_embd_v, n_kv,    n_head_kv, ne3 ] !! not transposed !!
+    // vals: [n_list,   n_batch, 1,         ne33] f16, contiguous
+    // idx:  [n_list,   n_batch, ne33]            i32, contiguous
+    // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
+    //
+    // the op params are those of ggml_flash_attn_ext (scale, no ALiBi or softcap, f32 precision, n_kv_max = n_list),
+    // so a backend can run it on its sparse flash attention path
+    GGML_API struct ggml_tensor * ggml_flash_attn_list(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * vals,
+            struct ggml_tensor  * idx,
+            float                 scale);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

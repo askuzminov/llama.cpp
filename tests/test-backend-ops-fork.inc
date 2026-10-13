@@ -208,6 +208,81 @@ struct test_lightning_indexer_unit : public test_case {
     }
 };
 
+// fork: GGML_OP_FLASH_ATTN_LIST, each query row over its own list of cells (ggml_flash_attn_list). blk is the run of
+// consecutive cells of a selection (4 for the qwen4exp blocks); the lists hold unique cells in random order, a few -1
+// slots and -inf values, the rest values in [-1, 0]
+struct test_flash_attn_list : public test_case {
+    const int64_t hsk;
+    const int64_t hsv;
+    const int64_t nh;   // KV heads
+    const int64_t gqa;  // query heads per KV head
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t n_list;
+    const int64_t blk;
+    const int64_t ns;   // streams (ne3)
+
+    std::string vars() override {
+        return VARS_TO_STR9(hsk, hsv, nh, gqa, kv, nb, n_list, blk, ns);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_list(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 1, int64_t gqa = 8, int64_t kv = 4096,
+                         int64_t nb = 16, int64_t n_list = 512, int64_t blk = 4, int64_t ns = 1)
+        : hsk(hsk), hsv(hsv), nh(nh), gqa(gqa), kv(kv), nb(nb), n_list(n_list), blk(blk), ns(ns) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*gqa, ns);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, kv, nh, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsv, kv, nh, ns);
+        ggml_set_name(v, "v");
+        ggml_tensor * vals = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_list, nb, 1, ns);
+        ggml_set_name(vals, "vals");
+        ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_list, nb, ns);
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * out = ggml_flash_attn_list(ctx, q, k, v, vals, idx, 1.0f/sqrtf((float) hsk));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x115Fu);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                const int64_t n_blk = kv/blk;
+                std::vector<int32_t> order(n_blk);
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                    for (int64_t b = 0; b < n_blk; ++b) {
+                        order[b] = (int32_t) b;
+                    }
+                    std::shuffle(order.begin(), order.end(), gen);
+                    for (int64_t s = 0; s < n_list; ++s) {
+                        const int64_t b = s/blk;
+                        data[row*n_list + s] = (b < n_blk && (s % 37) != 11) ? (int32_t) (order[b]*blk + s % blk) : -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "vals") == 0) {
+                std::uniform_real_distribution<float> dist(-1.0f, 0.0f);
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = ggml_fp32_to_fp16((i % 10) == 3 ? -INFINITY : dist(gen));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // the qwen4exp hc combine: SCALE, SIGMOID, SCALE of the injection and DSV4_HC_POST with it as the post weights.
 // Vulkan and CUDA run the four as one HC_POST (HC_POST_GATE)
 struct test_hc_post_gate : public test_case {
@@ -389,6 +464,16 @@ struct test_concat_ssm_conv : public test_case {
 };
 
 static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // FLASH_ATTN_LIST: the qwen4exp QSA shape (2 KV heads x 12, 256 dims, 2052 cells in blocks of 4), decode, MTP
+    // checks and a prompt ubatch; GQA 8 and 1, two streams, a list longer than the cache
+    for (int64_t nb : {1, 4, 64}) {
+        test_cases.emplace_back(new test_flash_attn_list(256, 256, 2, 12, 8192, nb, 2052, 4));
+    }
+    test_cases.emplace_back(new test_flash_attn_list(128, 128, 1, 8, 4096, 37, 512, 4));
+    test_cases.emplace_back(new test_flash_attn_list(128, 128, 4, 1, 4096, 33, 300, 1));
+    test_cases.emplace_back(new test_flash_attn_list(256, 256, 2, 12, 4096, 16, 1024, 4, 2));
+    test_cases.emplace_back(new test_flash_attn_list(64, 64, 1, 4, 256, 8, 512, 4));
+
     // GET_ROWS of short rows (CUDA: one thread per element, fork/getrows-fork.inc): the qwen4exp attention gathers of
     // a 64-token ubatch, the positions of the selected cells (rows of 1, flat), the mask values (rows of 1, per token)
     // and the cells of the selected blocks (rows of 4); a viewed source and index with a column offset
