@@ -929,6 +929,19 @@ def http(url, body=None, timeout=10):
         return r.status, r.read()
 
 
+def wait_no_server(timeout=180):
+    """Until no llama-server.exe is listed: a killed server with 74 GB of pinned host memory leaves the list a while
+    after its parent (nsys) ended, and the next arm refused to start (14.10)"""
+    if os.name != "nt":
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = subprocess.run(["tasklist", "/fi", "imagename eq llama-server.exe"], capture_output=True).stdout
+        if b"llama-server.exe" not in out:
+            return
+        time.sleep(2)
+
+
 def no_server_running():
     if os.name != "nt":
         return
@@ -1884,7 +1897,8 @@ def cmd_trace():
     corpus = Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
     turns = [(corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences."]
     turns += [corpus[start + i*add_chars:start + (i + 1)*add_chars] + "\n\nAnd this part, in two sentences?" for i in range(n_turns)]
-    what = (f"Nsight Systems ({nsys.parent.parent.name}), cuda trace with the nodes of CUDA graphs" if cuda else
+    what = (f"Nsight Systems ({nsys.parent.parent.name}), cuda trace with whole CUDA graphs (an arm with TRACE_TIMELINE=1: "
+            f"GGML_TIMELINE)" if cuda else
             "GGML_TIMELINE, the gpu span of each Vulkan command buffer and the host phases of llama")
     run.add(f"trace: {what}, a conversation of {start} chars and {n_turns} turns of {add_chars}, {gen} tokens per answer, "
             f"{model.name}, build {current_build()}",
@@ -1946,6 +1960,7 @@ def cmd_trace():
                     proc.wait()
                     raise Fail(f"nsys did not end in {wait} s after the server ({log.name})")
                 finally:
+                    wait_no_server()
                     mark_end()
             report = base.with_suffix(".nsys-rep")
             if not report.is_file():
@@ -1964,6 +1979,7 @@ def cmd_trace():
         def go_timeline(log):
             # the file is not part of the identity: it is in the folder of the run
             path = base.with_suffix(".trace.json")
+            wait_no_server()
             proc, log = start_server(exe, args, dict(run_env, GGML_TIMELINE=str(path)), log)
             try:
                 trace_conversation(url, turns, gen, log)
