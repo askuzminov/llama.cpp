@@ -263,13 +263,21 @@ rem mtpqsa accepted 0.742 against 0.743 (auto), TG 39.00 against 38.67, but PP 4
 rem against 712.7): the QSA block attended for every row of the catch-up. mtpqsa8k: 0.738, no gain, PP -7 percent.
 rem since then the catch-up with no output row stores K, V and the indexer keys only (keys_only). the next run: the
 rem document to ~232K tokens (56 turns) for the depth where the dense block costs most, hcf16 in the chats too
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto;hcf16 LLAMA_HC_F16=1 @draft --spec-auto"
+rem 14.10 (305e197b), chats to 213K: PP of the ~3.8K turns auto 733 / 737 / 723 / 706 / 657 / 683 / 649 t/s at 1-12K
+rem / 12-40K / 40-80K / 80-120K / 120-160K / 160-200K / 200-240K, hcf16 790 / 748 / 743 / 716 / 682 / 671 / 683 (last
+rem and hottest, still ahead: the default since); TG 37 to 39 up to 120K, then 35 at 200K+ in all arms: the dense draft
+rem step 4.0 -> 6.2 ms, the verify 31.4 -> 37.5 ms + 6.5 per token at ~200K. mtpqsa: draft step 4.1 -> 5.2 ms, but the
+rem verify ~2 ms dearer, TG equal (37.06 / 37.39), so it stays off. the 395 reached 95 C, the arms after the first ran
+rem 3-5 percent slower at depth (COOL since). the next run: the host share of the verify at depth (LLAMA_INPUT_TIMING
+rem in the chats) and nowarm (LLAMA_PLE_WARM=0) against auto for the PLE rows of the draft tokens read ahead
+if not defined COOL       set "COOL=120"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;nowarm LLAMA_PLE_WARM=0 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 if not defined DECPROMPTS set "DECPROMPTS=os code"
 if not defined DECSEEDS   set "DECSEEDS=1"
-rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX)
-if not defined RUN_PROFILE set "RUN_PROFILE=1"
+rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX); 14.10: not in the next run
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
 
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
@@ -354,6 +362,7 @@ rem 13.10 night (fdd7d181): hcf16 -1.2 percent of the prompt GPU time at 118K (4
 rem combines fused: the f16 copy took the memory of the combine's dead inputs and Vulkan dropped the fusion; the cast
 rem keeps them alive since then (Mac: all fused). again
 if not defined PROFARMS   set "PROFARMS=default;hcf16 LLAMA_HC_F16=1"
+rem 14.10: hcf16 -2.8 / -3.0 / -2.7 percent at 0 / 15K / 118K with all 93 combines fused
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
@@ -478,8 +487,18 @@ rem batch, half the upload per token; phase_mem had 8252 MiB free for 3378 MiB a
 rem 13.10 night: mtpqsa, the QSA block with its draft steps 2+ selecting from the scores of step 1 (see the 395); the
 rem PLE rows of the first ubatch of each batch are now read while the batch before computes (llama_set_next_tokens),
 rem which ub16k needs: there every ubatch is the first of its batch
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;ub16k @draft --spec-auto -ub 16384;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto"
-if not defined DECPREFIX  set "DECPREFIX=500000"
+rem 13.10 night (82fcc3f8): the 118K prompt auto 1024.9 t/s (1002.7 before: the first ubatch of a batch takes its PLE
+rem rows from llama_set_next_tokens, inputs 26-115 ms against 440-530), ub16k 992.2 (phase_mem fits 12032 -> 8704 of
+rem 16384, so a batch is two uneven ubatches that both pay the upload), mtpqsa 963.9 / TG 26.00 against 29.18. chats:
+rem ~3.8K turns 602 / 567 / 537 / 507 t/s at 1-12K / 12-40K / 40-80K / 80-120K, TG flat ~28.5; after 29K turns of ~540
+rem tokens 129 t/s (4.2 s a turn: upload, refill, re-plans) and of ~160 tokens 59 t/s (2.7 s: the generation layout in
+rem ubatches of 31, each reading most experts from RAM); mtpqsa accepted 0.847 against 0.848, TG 27.43 against 28.37
+rem (its catch-up still attended for every row). 05: a 3704-token prompt ubatch is 1.8-2.0 s of kernels of 4.9-5.25 s.
+rem the next run: off128, the CPU experts of short prompts in ubatches of 127 (GGML_OP_OFFLOAD_MIN_BATCH=128, the op
+rem offload from 128 tokens, phase_mem takes its generation layout below), off128s with that layout up to 384 tokens
+rem (LLAMA_PHASE_SMALL_PROMPT); mtpqsa again with the keys_only catch-up
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;off128 GGML_OP_OFFLOAD_MIN_BATCH=128 @draft --spec-auto;off128s GGML_OP_OFFLOAD_MIN_BATCH=128 LLAMA_PHASE_SMALL_PROMPT=384 @draft --spec-auto;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto"
+if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000 120000:6:400"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
 rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG

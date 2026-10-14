@@ -428,14 +428,15 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
 
-    // LLAMA_HC_F16=1: the normalized streams in f16. three nodes read them (the down projection, the gated mean and the
-    // injection), each a pass over hc_dim floats per token; the reference keeps the whole residual in FP8 "with almost
-    // no loss" (tech report, 2.2), the residual itself stays f32 here. on Vulkan only, which stores them in f16 in the
-    // combine before (HC_POST_NORM_F16), quantizes them for the int8 matmul from f16 and reads them in the mean, and
-    // from 32 tokens, where that fusion runs
+    // the normalized streams in f16 (LLAMA_HC_F16, 0 = f32 as upstream). three nodes read them (the down projection, the
+    // gated mean and the injection), each a pass over hc_dim floats per token; the reference keeps the whole residual in
+    // FP8 "with almost no loss" (tech report, 2.2), the residual itself stays f32 here. on Vulkan only, which stores
+    // them in f16 in the combine before (HC_POST_NORM_F16), quantizes them for the int8 matmul from f16 and reads them in
+    // the mean, and from 32 tokens, where that fusion runs. the 395 (14.10): -2.7 to -3.0 percent of the GPU time of a
+    // prompt ubatch at 0 / 15K / 118K, KLD 0.015284 against 0.015465 (13.10)
     static const bool hc_f16 = [] {
         const char * env = std::getenv("LLAMA_HC_F16");
-        return env != nullptr && std::atoi(env) != 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
     if (hc_f16 && il >= 0 && nt >= 32 && cparams.fused_dsv4_hc_pre &&
             std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "Vulkan") == 0) {

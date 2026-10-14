@@ -408,6 +408,14 @@ def settle():
         since = time.time() - float(LAST_RUN.read_text())
     except (OSError, ValueError):
         since = None
+    # COOL seconds (0): at least that long after the last model run, so that the arms of a run start from about the same
+    # temperature (the 395 reached 95 C in an hour of chats to 213K on 14.10, the ops of the last profile depth ran 2
+    # percent slower than the night before)
+    cool = env_int("COOL", 0)
+    if cool > 0 and since is not None and since < cool:
+        print(f"cooling {cool - since:.0f} s after the last model run (COOL)", flush=True)
+        time.sleep(cool - since)
+        since = float(cool)
     max_wait, step = env_int("SETTLE_MAX", 180), env_int("SETTLE_STEP", 3)
     if since is not None and since > max_wait:
         return
@@ -1240,7 +1248,9 @@ def cmd_decode():
             args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1,
                     "-fa", "on", "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")),
                     *warmup_args(), *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
-            run_env = arm_env(arm)
+            # the timing of every ubatch (one stderr line each), for the host share of the verify and draft steps at
+            # depth (not in the summary, the logs keep it)
+            run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1"})
             identity = {"v": VERSION, "kind": "decode-chat", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
                         "draft": model_identity(draft) if arm.draft else None, "sampling": sampling,
