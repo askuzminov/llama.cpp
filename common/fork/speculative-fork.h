@@ -27,6 +27,14 @@ common_speculative_type common_speculative_impl_type(const common_speculative_im
 // chunks of this size, llama_decode splits the target ubatch. LLAMA_MTP_UBATCH: tokens (default 1024), 0 = the target's
 uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
 
+// the catch-up of the MTP head over a decoded batch (process of the MTP implementation): in chunks of the draft
+// ubatch, so that the rows of the next chunk are rendered while the GPU computes the last one, and a batch longer than
+// a verify keeps only its last row of hidden state (drafting goes on from it; accept follows verify batches only).
+// on the 395 (14.10, GGML_TIMELINE) a 16384-token prompt batch stood the GPU 772 ms before the catch-up (the batch of
+// 16384 rows of 40 KiB rendered in one piece) and 288 ms after it (all rows copied for the verify). false with
+// LLAMA_SPEC_CATCHUP_FORK=0: one decode call of the whole batch and every row kept (upstream)
+bool common_speculative_fork_catchup();
+
 // cost-aware draft length (--spec-auto) and the per-cycle trace (LLAMA_SPEC_TRACE=<file>)
 //
 // one more draft position pays off while the chance that it and all positions before it are accepted

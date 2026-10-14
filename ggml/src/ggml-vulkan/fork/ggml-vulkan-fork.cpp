@@ -537,9 +537,8 @@ static ggml_backend_buffer_type_t * ggml_backend_vk_device_get_extra_bufts(ggml_
     return ggml_vk_get_device(ctx->device)->extra_bufts;
 }
 
-// GGML_TIMELINE: the gpu clock has its own zero. a command buffer cannot start before its recording ended, so the shift
-// to ggml_time_us() is the largest (end of recording - gpu start) over the spans, close for the buffers the gpu took at
-// once (after a sync); the spans go to the timeline at the end of the capture, with that shift
+// GGML_TIMELINE: the gpu span of each command buffer in the gpu clock, with the host time its recording ended; they go
+// to the timeline at the end of the capture, shifted onto the host clock (ggml_timeline_device_spans)
 struct vk_timeline_fork {
     static constexpr uint32_t n_slots = 2048;
 
@@ -646,43 +645,6 @@ void ggml_vk_fork_timeline_collect(const vk_device & device) {
     }
 }
 
-// the shift from the gpu clock to ggml_time_us() along the capture: each span gives a lower bound, end of recording -
-// gpu start, tight for a buffer the gpu took at once (after a sync), and the shift is the upper hull of those points,
-// linear between them: no span then starts before its recording ended. the clocks run at slightly different rates
-// (MoltenVK: 0.4 percent, 5 ms in 1.2 s), and the hull of the largest bound of each chunk of spans left the spans before
-// its first point up to 8.5 ms early
-static std::vector<std::array<double, 2>> ggml_vk_fork_timeline_hull(std::vector<std::array<double, 3>> spans) {
-    std::sort(spans.begin(), spans.end());
-    std::vector<std::array<double, 2>> hull;
-    for (const auto & sp : spans) {
-        const std::array<double, 2> p = { sp[0], sp[2] - sp[0] };
-        // drop the last point while it is on or below the line from the one before it to p
-        while (hull.size() >= 2) {
-            const auto & a = hull[hull.size() - 2];
-            const auto & b = hull.back();
-            if ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < 0) {
-                break;
-            }
-            hull.pop_back();
-        }
-        hull.push_back(p);
-    }
-    return hull;
-}
-
-static double ggml_vk_fork_timeline_shift(const std::vector<std::array<double, 2>> & hull, double x) {
-    if (hull.size() == 1) {
-        return hull[0][1];
-    }
-    size_t i = 1;
-    while (i + 1 < hull.size() && hull[i][0] < x) {
-        i++;
-    }
-    const auto & a = hull[i - 1];
-    const auto & b = hull[i];
-    return b[0] > a[0] ? a[1] + (b[1] - a[1]) * (x - a[0]) / (b[0] - a[0]) : std::max(a[1], b[1]);
-}
-
 // ggml_backend_profiler_fork of the backend reg: the start of a capture drops what is left of the last one, the end
 // writes the spans read back so far
 static void ggml_vk_fork_profiler(bool start) {
@@ -691,11 +653,14 @@ static void ggml_vk_fork_profiler(bool start) {
         vk_timeline_fork & tl = *it.second;
         ggml_vk_fork_timeline_read(tl);
         if (!start && !tl.spans.empty()) {
-            const auto hull = ggml_vk_fork_timeline_hull(tl.spans);
+            // the end of the recording of a command buffer stands for its issue time
+            std::vector<double> a, b, c;
             for (const auto & sp : tl.spans) {
-                const double shift = ggml_vk_fork_timeline_shift(hull, sp[0]);
-                ggml_timeline_event(tl.track.c_str(), "gpu", (int64_t) (sp[0] + shift), (int64_t) (sp[1] + shift));
+                a.push_back(sp[0]);
+                b.push_back(sp[1]);
+                c.push_back(sp[2]);
             }
+            ggml_timeline_device_spans(tl.track.c_str(), a.size(), a.data(), b.data(), c.data());
         }
         if (!start) {
             GGML_LOG_INFO("ggml_vulkan: timeline of %s: %zu gpu spans, %zu without timestamps yet, %" PRId64 " left out with the ring full\n",

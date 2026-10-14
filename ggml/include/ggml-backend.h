@@ -379,7 +379,7 @@ extern "C" {
     GGML_API size_t                        ggml_backend_sched_get_n_reserve(ggml_backend_sched_t sched);
 
     // fork: the weights in host memory that a split copies to its device are uploaded while the split depth splits before it computes,
-    // on a second instance of its backend (0: off, the default is GGML_SCHED_PREFETCH). Call before the first reserve or graph: the
+    // on a second instance of its backend (0: off; the default is GGML_SCHED_PREFETCH, else 3). Call before the first reserve or graph: the
     // allocation of the input copies depends on it. A copy callback that maps the weights itself (the MoE cache of llama.cpp) needs 0
     GGML_API void                          ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, int depth);
 
@@ -388,6 +388,9 @@ extern "C" {
     GGML_API bool                          ggml_timeline_on(void);
     GGML_API void                          ggml_timeline_enable(bool enable);
     GGML_API void                          ggml_timeline_event(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us);
+    // fork: n spans of a device clock (start and end in us from any zero of that clock) with the host time each was issued at
+    // (the device cannot start one before), shifted onto ggml_time_us() and written to the timeline as "gpu" spans of track
+    GGML_API void                          ggml_timeline_device_spans(const char * track, size_t n, const double * start_us, const double * end_us, const double * issued_us);
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 

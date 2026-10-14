@@ -29,7 +29,7 @@ struct ggml_backend_sched_prof {
 typedef void (*ggml_backend_timing_enable_fork_t)(ggml_backend_t backend, bool enable);
 typedef void (*ggml_backend_timing_take_fork_t)(ggml_backend_t backend, double * busy_us, int64_t * n_calls);
 
-// GGML_SCHED_PREFETCH=<depth>: the weights in host memory of a split are uploaded while the split <depth> before it
+// GGML_SCHED_PREFETCH=<depth> (3): the weights in host memory of a split are uploaded while the split <depth> before it
 // computes, on a second instance of its backend (see ggml-backend-fork.inc)
 #define GGML_SCHED_PREFETCH_MAX 4
 
@@ -55,6 +55,10 @@ static void ggml_backend_sched_prefetch_add_inputs(ggml_backend_sched_t sched, i
 static void ggml_backend_sched_prefetch_begin(ggml_backend_sched_t sched, int i_split);
 static bool ggml_backend_sched_prefetch_wait(ggml_backend_sched_t sched, int i_split);
 static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched, int i_split);
+
+// GGML_TIMELINE: a CPU split is computed in its call, its span on track "sched cpu" named by its first node (the
+// experts of a layer: the layer number is in the name)
+static void ggml_backend_sched_timeline_split(ggml_backend_t backend, const struct ggml_backend_sched_split * split, int64_t t_start_us);
 
 static void ggml_backend_sched_log_splits(ggml_backend_sched_t sched, const char * what);
 static void ggml_backend_sched_prof_print(ggml_backend_sched_t sched, int bucket);

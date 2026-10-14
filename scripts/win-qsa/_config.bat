@@ -279,7 +279,6 @@ rem page cache of the first arm (PLE input of a prompt ubatch 60 against 45 ms p
 rem 715.0, TG 35.87 against 36.99. COOL now also counts from the end of a build. the next run: the same two arms
 rem in the other order (FORCE=1 with the same build)
 if not defined COOL       set "COOL=120"
-if not defined DECARMS    set "DECARMS=nowarm LLAMA_PLE_WARM=0 @draft --spec-auto;auto @draft --spec-auto"
 rem 14.10: 07-trace on the 395 through GGML_TIMELINE (Nsight Systems sees no AMD gpu): the gpu span of each command
 rem buffer next to the host phases of llama, where the gpu stands still in a prompt ubatch and in a decode step with MTP
 rem 14.10 evening (bc178dcc), nowarm first: nowarm PP 719.1 TG 38.01, auto 724.4 / 37.75: the 4 percent of the run
@@ -289,7 +288,14 @@ rem 07 of 14.10: the gpu busy 94 percent of the conversation (29K prompt and a t
 rem idle in 17.6 s), a decode cycle with MTP has ~6 ms of host gaps in ~60 ms; but between the batches of the prompt
 rem the gpu stood 730 ms (before the MTP catch-up) and 270 ms (before the next batch) with no host phase traced: the
 rem next run traces the decode call and the speculative process of the server too (07 only)
-if not defined RUN_DECODE set "RUN_DECODE=0"
+rem 14.10 evening 07 (6d31a236): both gaps are inside the speculative process of the server: the catch-up of the MTP
+rem head rendered the batch of all 16384 rows of hidden state (40 KiB each) in one piece before its first ubatch (772
+rem ms) and copied all rows for the verify after it (288 ms), about 1 s of host per 16384-token batch with the gpu idle.
+rem since then the catch-up goes in chunks of the draft ubatch and a long batch keeps its last row only
+rem (LLAMA_SPEC_CATCHUP_FORK=0: upstream). the next run: catchup0 against auto in the chats (the ~3.8K turns pay ~250
+rem ms of it each by that rate), 07 again for the gaps
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;catchup0 LLAMA_SPEC_CATCHUP_FORK=0 @draft --spec-auto"
+if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined RUN_TRACE  set "RUN_TRACE=1"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
@@ -545,8 +551,15 @@ rem same in all arms. small352: the ~300-token turns 3.82 s against 3.50 of auto
 rem cheaper than the CPU experts there), the limit stays 192. 03: KLD of pf3 0.01726 against 0.01735 of default, the
 rem reference against itself 0.0043 (CUDA does not give the same result twice), so no sign of a wrong upload.
 rem the next run: auto against pf3 with the threshold, and 07 again (the first nsys run lost the report, see _run.py)
+rem 14.10 night (95744745): pf3 with the threshold 686.1 t/s on the ~3.8K turns against 547.9 of auto, the turns of
+rem ~540 / ~300 / ~160 tokens 4.06 / 3.60 / 2.11 s against 4.21 / 3.63 / 2.07, TG 28.12 / 27.82: GGML_SCHED_PREFETCH=3 is
+rem the default since. 07 (nsys): a prompt ubatch of 8192 tokens 4.29 s, kernels 3.89 s, upload 3.17 s, 2.80 s of it
+rem under the kernels (auto: 0, one after the other, 22.7 GiB/s); between the batches of a prompt the gpu stood ~0.7 s
+rem before and ~0.75 s after the MTP catch-up (the speculative process, see the 395, fixed since, and the plan of
+rem phase_mem, 0.14-0.22 s per batch); a decode step waits for the CPU experts most of its time. the next run: auto (the
+rem new defaults) against catchup0 (LLAMA_SPEC_CATCHUP_FORK=0), 07 for auto
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;pf3 GGML_SCHED_PREFETCH=3 @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;catchup0 LLAMA_SPEC_CATCHUP_FORK=0 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000 120000:6:1000 120000:6:400"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
@@ -567,7 +580,10 @@ if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem 14.10: 07-trace, the timeline of a conversation in Nsight Systems: does the upload of pf3 run under the kernels,
 rem and where the GPU waits in a decode step. needs nsys (Nsight Systems, the CUDA toolkit has it; NSYS= its path)
 if not defined RUN_TRACE  set "RUN_TRACE=1"
-if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto;pf3 GGML_SCHED_PREFETCH=3 @draft --spec-auto"
+rem tl (TRACE_TIMELINE=1): the timeline on CUDA, the gpu span of each compute call next to the CPU splits (the experts
+rem in RAM) and the waits of the scheduler: how a decode step splits into gpu, CPU experts, copies and waits, layer by
+rem layer (07 of 14.10 ran nsys with each node of the CUDA graphs traced: the decode was slower, its shares off)
+if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto;tl TRACE_TIMELINE=1 @draft --spec-auto"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the

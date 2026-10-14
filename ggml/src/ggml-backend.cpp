@@ -1944,9 +1944,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int64_t t_wait = 0; // of the current split
 
+    // fork: the waits and the CPU splits on the timeline (GGML_TIMELINE), see ggml_backend_sched_timeline_split
+    const bool timeline = ggml_timeline_on();
+
     auto sync_backend = [&](ggml_backend_t backend) {
-        const int64_t t_start = prof ? ggml_time_us() : 0;
+        const int64_t t_start = prof || timeline ? ggml_time_us() : 0;
         ggml_backend_synchronize(backend);
+        if (timeline && ggml_time_us() - t_start >= 20) {
+            ggml_timeline_event("sched wait", "wait", t_start, ggml_time_us()); // fork
+        }
         if (sched->parallel_cpu) {
             for (int i = 0; i < sched->n_backends; ++i) {
                 if (sched->backends[i] == backend) {
@@ -1958,8 +1964,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     auto sync_event = [&](ggml_backend_event_t event) {
-        const int64_t t_start = prof ? ggml_time_us() : 0;
+        const int64_t t_start = prof || timeline ? ggml_time_us() : 0;
         ggml_backend_event_synchronize(event);
+        if (timeline && ggml_time_us() - t_start >= 20) {
+            ggml_timeline_event("sched wait", "wait", t_start, ggml_time_us()); // fork
+        }
         if (sched->parallel_cpu) {
             for (int i = 0; i < sched->n_backends; ++i) {
                 if (sched->events[i][sched->cur_copy] == event) {
@@ -2040,10 +2049,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const int64_t t_compute_us = timeline ? ggml_time_us() : 0; // fork
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 ggml_backend_sched_prefetch_sync(sched); // fork
                 return ec;
+            }
+            if (timeline) {
+                ggml_backend_sched_timeline_split(split_backend, split, t_compute_us); // fork
             }
         } else {
             // similar to ggml_backend_compare_graph_backend

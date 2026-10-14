@@ -1585,7 +1585,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
+            const bool timeline = ggml_timeline_on(); // fork: the parts of the catch-up on the timeline (GGML_TIMELINE)
+            int64_t t_part_us = timeline ? ggml_time_us() : 0;
+
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+            if (timeline) {
+                ggml_timeline_event("spec", "mtp hidden", t_part_us, ggml_time_us());
+                t_part_us = ggml_time_us();
+            }
 
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
@@ -1599,10 +1607,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
             }
 
+            if (timeline) {
+                ggml_timeline_event("spec", "mtp rows", t_part_us, ggml_time_us());
+            }
+
             auto * mem_dft = llama_get_memory(ctx_dft);
 
+            // fork: in chunks of the draft ubatch (common_speculative_fork_catchup), else one call
+            const int32_t n_all   = batch.size();
+            const int32_t n_chunk = common_speculative_fork_catchup() ? std::max<int32_t>(1, (int32_t) llama_n_ubatch(ctx_dft)) : n_all;
+
             bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
+            for (int head = 0; head < n_mtp_layers && ok; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1614,12 +1630,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
-                    break;
+                for (int32_t off = 0; off < n_all; off += n_chunk) {
+                    const int32_t n = std::min(n_chunk, n_all - off);
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE,
+                                                     n == n_all ? batch.get() : batch.get_sub_batch(off, n));
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[off].pos[0]);
+                        ok = false;
+                        break;
+                    }
                 }
             }
 
@@ -1631,22 +1651,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const int64_t t_keep_us = ggml_timeline_on() ? ggml_time_us() : 0; // fork: GGML_TIMELINE
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            // fork: a batch longer than any verify (a prompt) keeps its last row only (common_speculative_fork_catchup)
+            const int32_t n_keep = common_speculative_fork_catchup() && n_rows > 256 ? 1 : n_rows;
+            verify_h_rows[seq_id] = n_keep;
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+            for (int32_t i = 0; i < n_keep; ++i) {
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + (n_rows - n_keep) + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (n_keep - 1) * n_embd, row_bytes);
+        }
+
+        if (t_keep_us != 0) {
+            ggml_timeline_event("spec", "mtp keep", t_keep_us, ggml_time_us());
         }
 
         return true;

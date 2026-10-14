@@ -1709,7 +1709,10 @@ def timeline_summary(path, gap_ms):
     # the server: the decode call of the target and the speculative process after it (the MTP catch-up), the requests
     # are the window
     host = [(t, "spec" if n.startswith("spec") else n.split()[0], int(n.split()[-1]) if n.split()[-1].isdigit() else 0, a, b)
-            for t, n, a, b in spans if t in ("llama", "llama mtp", "host") or (t == "server" and not n.startswith("request"))]
+            for t, n, a, b in spans if t in ("llama", "llama mtp", "host", "sched wait") or (t == "server" and not n.startswith("request"))]
+    # the CPU splits of the scheduler: the experts in RAM of a decode step (-ncmoe)
+    cpu = merge([(a, b) for t, n, a, b in spans if t == "sched cpu"])
+    c_starts = [x[0] for x in cpu]
     host.sort(key=lambda h: h[3])
     h_starts = [h[3] for h in host]
     longest = max((h[4] - h[3] for h in host), default=0)
@@ -1739,9 +1742,10 @@ def timeline_summary(path, gap_ms):
     prev_end = None
     for a, b in merge([tuple(x) for x in gpu], gap=gap_ms * 1000):
         if prev_end is not None and a > prev_end:
+            c_ms = covered(clip(cpu, c_starts, prev_end, a))
             rows.append({"kind": "idle", "start_s": (prev_end - w0) / 1e6, "ms": (a - prev_end) / 1000, "gpu_ms": 0.0,
                          "idle_ms": (a - prev_end) / 1000, "gaps_ms": [0.0, 0.0, 0.0], "ubatches": 0, "tokens": 0,
-                         "phases": phases(prev_end, a)})
+                         "phases": phases(prev_end, a), "cpu_ms": c_ms / 1000, "cpu_only_ms": c_ms / 1000})
         part = clip(gpu, starts, a, b)
         gaps = [0.0, 0.0, 0.0]
         for x, y in zip(part, part[1:]):
@@ -1749,24 +1753,46 @@ def timeline_summary(path, gap_ms):
             gaps[0 if d < 0.1 else 1 if d < 1 else 2] += d
         n_ub, tokens = ubatches(a, b)
         busy = covered(part)
+        c_part = clip(cpu, c_starts, a, b)
+        c_ms = covered(c_part)
         rows.append({"kind": "prompt" if tokens >= 1025 else "decode", "start_s": (a - w0) / 1e6, "ms": (b - a) / 1000,
                      "gpu_ms": busy / 1000, "idle_ms": ((b - a) - busy) / 1000, "gaps_ms": gaps, "ubatches": n_ub,
-                     "tokens": tokens, "phases": phases(a, b)})
+                     "tokens": tokens, "phases": phases(a, b), "cpu_ms": c_ms / 1000,
+                     "cpu_only_ms": (c_ms - overlap(c_part, part)) / 1000})
         prev_end = b
+    # each CPU split by the layer in the name of its first node ("ffn_moe_gate_up-12"): its time and the part of it with
+    # the gpu idle, the wait for the experts of that layer
+    layers = {}
+    for t, n, a, b in spans:
+        if t != "sched cpu" or "-" not in n or not n.rsplit("-", 1)[1].isdigit():
+            continue
+        g = clip(gpu, starts, a, b)
+        x = layers.setdefault(int(n.rsplit("-", 1)[1]), [0, 0.0, 0.0])
+        x[0] += 1
+        x[1] += (b - a) / 1000
+        x[2] += ((b - a) - covered(g)) / 1000
     total = phases(w0, w1)
-    busy = covered(clip(gpu, starts, w0, w1))
+    g_all = clip(gpu, starts, w0, w1)
+    c_all = clip(cpu, c_starts, w0, w1)
+    busy = covered(g_all)
     return {"window_ms": (w1 - w0) / 1000, "gpu_ms": busy / 1000, "idle_ms": ((w1 - w0) - busy) / 1000,
-            "n_gpu_spans": sum(1 for t, *_ in spans if t.startswith("gpu")), "phases": total, "stretches": rows}
+            "cpu_ms": covered(c_all) / 1000, "cpu_only_ms": (covered(c_all) - overlap(c_all, g_all)) / 1000,
+            "n_cpu_splits": sum(1 for t, *_ in spans if t == "sched cpu"),
+            "n_gpu_spans": sum(1 for t, *_ in spans if t.startswith("gpu")), "phases": total, "stretches": rows,
+            "layers": [[k, *layers[k]] for k in sorted(layers)]}
 
 
 def timeline_lines(name, r, kept=False):
     """The summary of one timeline (timeline_summary)"""
     w = r["window_ms"]
-    order = ["decode", "spec", "graph", "inputs", "submit", "sync", "mtp graph", "mtp inputs", "mtp submit"]
+    order = ["decode", "spec", "graph", "inputs", "submit", "sync", "wait", "mtp graph", "mtp inputs", "mtp submit"]
     ph = r["phases"]
+    cpu = r.get("n_cpu_splits", 0) > 0
     lines = ["", f"{name}: {r.get('report', '')} (Perfetto, chrome://tracing)" + (" k" if kept else ""),
              f"  requests {w / 1000:.2f} s: gpu {r['gpu_ms'] / 1000:.2f} s ({100 * r['gpu_ms'] / w:.0f}%), idle "
-             f"{r['idle_ms'] / 1000:.2f} s; {r['n_gpu_spans']} command buffers; host: " +
+             f"{r['idle_ms'] / 1000:.2f} s; {r['n_gpu_spans']} gpu spans" +
+             (f"; cpu splits {r['cpu_ms'] / 1000:.2f} s ({r['n_cpu_splits']}), of it with the gpu idle "
+              f"{r['cpu_only_ms'] / 1000:.2f} s" if cpu else "") + "; host: " +
              ", ".join(f"{k} {ph[k] / 1000:.2f} s" for k in order if k in ph)]
     rows = []
     for x in r["stretches"]:
@@ -1774,9 +1800,15 @@ def timeline_lines(name, r, kept=False):
             continue
         p = x["phases"]
         rows.append([f"  {x['start_s']:.2f}", x["kind"], f"{x['ms']:.0f}", f"{x['gpu_ms']:.0f}", f"{x['idle_ms']:.0f}",
+                     *([f"{x.get('cpu_ms', 0):.0f}", f"{x.get('cpu_only_ms', 0):.0f}"] if cpu else []),
                      "/".join(f"{g:.0f}" for g in x["gaps_ms"]), x["ubatches"] or "", x["tokens"] or "",
                      *[f"{p[k]:.0f}" if k in p else "" for k in order]])
-    lines += table(["  s", "kind", "ms", "gpu", "idle", "gaps", "ub", "tokens", *order], rows)
+    lines += table(["  s", "kind", "ms", "gpu", "idle", *(["cpu", "cpu only"] if cpu else []), "gaps", "ub", "tokens", *order], rows)
+    if r.get("layers"):
+        lines += ["  CPU splits by layer (the experts in RAM): calls, ms, of it with the gpu idle, us per call"]
+        lines += table(["    layer", "calls", "ms", "gpu idle", "us/call", "idle us/call"],
+                       [[f"    {k}", c, f"{ms:.0f}", f"{idle:.0f}", f"{1000 * ms / c:.0f}", f"{1000 * idle / c:.0f}"]
+                        for k, c, ms, idle in r["layers"]])
     return lines
 
 
@@ -1825,7 +1857,9 @@ def cmd_trace():
     Systems window, its SQLite export is read into the summary and removed (TRACEKEEP=1 keeps it). Vulkan: GGML_TIMELINE,
     the gpu span of each command buffer next to the host phases of llama (graph, inputs, submit, sync), for Perfetto or
     chrome://tracing, read into the summary. TRACECHAT: the conversation, start:turns:chars of PPLFILE as in DECCHAT;
-    TRACEGEN: tokens per answer; TRACEARMS: the arms; TRACEGAP: the idle gap in ms that ends a stretch (20)"""
+    TRACEGEN: tokens per answer; TRACEARMS: the arms (on CUDA an arm with TRACE_TIMELINE=1 takes the timeline: the gpu
+    span of each compute call, the CPU splits and the waits of the scheduler); TRACEGAP: the idle gap in ms that ends a
+    stretch (20)"""
     run = Run("trace")
     backend = env("BACKEND")
     if backend not in ("cuda", "vulkan"):
@@ -1875,7 +1909,8 @@ def cmd_trace():
             # (stop-shutdown ended the server before the answer of the last request went out, 14.10). nsys writes the
             # report when the server exits; the output of the server goes to its own log, nsys does not pass it on
             server_log = base.with_name(f"{arm.name}-server.log")
-            cmd = ["profile", "--trace=cuda,nvtx", "--cuda-graph-trace=node", "--sample=none", "--cpuctxsw=none",
+            # whole CUDA graphs: the nodes of a graph traced one by one slowed a decode step by half (14.10)
+            cmd = ["profile", "--trace=cuda,nvtx", "--cuda-graph-trace=graph", "--sample=none", "--cpuctxsw=none",
                    "--capture-range=cudaProfilerApi", "--capture-range-end=stop", "--force-overwrite=true",
                    "--output", str(base), str(exe), *args, "--log-file", str(server_log)]
             proc, log = start_server(nsys, cmd, run_env, log)
@@ -1931,13 +1966,16 @@ def cmd_trace():
             result["report"] = path.name
             return result
 
+        # CUDA: an arm with TRACE_TIMELINE=1 takes the timeline too (the gpu span of each compute call next to the CPU
+        # splits of the scheduler and its waits: where a decode step waits for the experts in RAM)
+        nsys_arm = cuda and arm.env.get("TRACE_TIMELINE") != "1"
         try:
-            r, kept = run.measure(f"{arm.name}", identity, go_nsys if cuda else go_timeline)
+            r, kept = run.measure(f"{arm.name}", identity, go_nsys if nsys_arm else go_timeline)
         except Fail as e:
             run.failed = True
             run.add("", f"{arm.name}: FAIL {e}")
             continue
-        run.add(*(trace_lines(arm.name, r, kept) if cuda else timeline_lines(arm.name, r, kept)))
+        run.add(*(trace_lines(arm.name, r, kept) if nsys_arm else timeline_lines(arm.name, r, kept)))
     return run.finish()
 
 

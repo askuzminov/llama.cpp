@@ -1,6 +1,7 @@
 // the fork's additions to the scheduler, included at the end of ggml-backend.cpp: they use its internal structs.
 // ggml-backend-fork-decl.inc declares them where ggml-backend.cpp uses them first
 
+#include <array>
 #include <mutex>
 #include <string>
 
@@ -329,7 +330,7 @@ void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snapshot) {
     delete snapshot;
 }
 
-// GGML_SCHED_PREFETCH=<depth> (0, off; at most GGML_SCHED_PREFETCH_MAX): the weights in host memory that a split copies to
+// GGML_SCHED_PREFETCH=<depth> (3; 0 off; at most GGML_SCHED_PREFETCH_MAX): the weights in host memory that a split copies to
 // its device are uploaded while the split <depth> before it computes, on a second instance of the device's backend,
 // instead of at the start of the split after a sync of the device. With the experts in RAM (llama.cpp -ncmoe) and the op
 // offload of a prompt ubatch, each split of a MoE layer starts with such a copy: on the 3090 (14.10) ~3 s of PCIe per
@@ -436,8 +437,10 @@ static void ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched) {
         pf->supported[b] = props.caps.async && props.caps.events;
     }
 
+    // on by default since 14.10 (3090 chats, depth 3 with the threshold of 20 per expert): the ~3.8K turns 686.1 t/s
+    // against 547.9, the turns of 160-540 tokens and TG the same. GGML_SCHED_PREFETCH=0: off (upstream)
     const char * depth = getenv("GGML_SCHED_PREFETCH");
-    ggml_backend_sched_set_prefetch(sched, depth ? atoi(depth) : 0);
+    ggml_backend_sched_set_prefetch(sched, depth ? atoi(depth) : 3);
 }
 
 void ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, int depth) {
@@ -659,4 +662,58 @@ void ggml_timeline_event(const char * track, const char * name, int64_t t_start_
     }
     fprintf(ggml_timeline_file, "{\"ph\":\"X\",\"pid\":1,\"tid\":%zu,\"ts\":%lld,\"dur\":%lld,\"name\":\"%s\"},\n", tid + 1,
             (long long) t_start_us, (long long) std::max<int64_t>(0, t_end_us - t_start_us), clean(name).c_str());
+}
+
+// the shift from a device clock to ggml_time_us() along the capture: each span gives a lower bound, the host time it
+// was issued at - its device start, tight for a span the device began at once, and the shift is the upper hull of those
+// points, linear between them, so that no span starts before it was issued. the clocks run at slightly different rates
+// (MoltenVK: 0.4 percent, 5 ms in 1.2 s); a hull of the largest bound per chunk of spans left the spans before its first
+// point up to 8.5 ms early
+void ggml_timeline_device_spans(const char * track, size_t n, const double * start_us, const double * end_us, const double * issued_us) {
+    if (!ggml_timeline_on() || n == 0) {
+        return;
+    }
+    std::vector<std::array<double, 2>> pts(n);
+    for (size_t i = 0; i < n; i++) {
+        pts[i] = { start_us[i], issued_us[i] - start_us[i] };
+    }
+    std::sort(pts.begin(), pts.end());
+    std::vector<std::array<double, 2>> hull;
+    for (const auto & p : pts) {
+        // drop the last point while it is on or below the line from the one before it to p
+        while (hull.size() >= 2) {
+            const auto & a = hull[hull.size() - 2];
+            const auto & b = hull.back();
+            if ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < 0) {
+                break;
+            }
+            hull.pop_back();
+        }
+        hull.push_back(p);
+    }
+    auto shift = [&](double x) {
+        if (hull.size() == 1) {
+            return hull[0][1];
+        }
+        size_t i = 1;
+        while (i + 1 < hull.size() && hull[i][0] < x) {
+            i++;
+        }
+        const auto & a = hull[i - 1];
+        const auto & b = hull[i];
+        return b[0] > a[0] ? a[1] + (b[1] - a[1]) * (x - a[0]) / (b[0] - a[0]) : std::max(a[1], b[1]);
+    };
+    for (size_t i = 0; i < n; i++) {
+        const double d = shift(start_us[i]);
+        ggml_timeline_event(track, "gpu", (int64_t) (start_us[i] + d), (int64_t) (end_us[i] + d));
+    }
+}
+
+static void ggml_backend_sched_timeline_split(ggml_backend_t backend, const struct ggml_backend_sched_split * split, int64_t t_start_us) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return;
+    }
+    const char * name = split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "cpu";
+    ggml_timeline_event("sched cpu", name[0] != '\0' ? name : "cpu", t_start_us, ggml_time_us());
 }

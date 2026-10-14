@@ -505,3 +505,11 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch) {
     const long   cap = env ? std::strtol(env, nullptr, 10) : 1024;
     return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
 }
+
+bool common_speculative_fork_catchup() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_SPEC_CATCHUP_FORK");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}

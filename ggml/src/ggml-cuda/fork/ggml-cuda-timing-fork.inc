@@ -6,7 +6,9 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #include <cuda_profiler_api.h>
+#include <array>
 #include <deque>
+#include <string>
 
 struct ggml_cuda_timing_fork {
     struct span {
@@ -80,8 +82,136 @@ static cudaEvent_t ggml_cuda_timing_fork_event(ggml_cuda_timing_fork * t) {
     return e;
 }
 
+// GGML_TIMELINE (ggml_timeline_on): the device span of each compute call of every context, a pair of timing events
+// around it, read back when they have passed and written at the end of the capture (ggml_backend_profiler_fork) with
+// the host time of the call, shifted onto the host clock (ggml_timeline_device_spans); the times come from
+// cudaEventElapsedTime against an event of the device recorded at the start of the capture
+struct ggml_cuda_timeline_fork {
+    struct span {
+        cudaEvent_t start;
+        cudaEvent_t end;
+        double      issued_us;
+        int         device;
+    };
+    std::mutex       mutex;
+    std::deque<span> pending; // both events recorded, not read yet
+    std::unordered_map<const ggml_backend_cuda_context *, span> open;
+    std::vector<cudaEvent_t> free_events[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t base[GGML_CUDA_MAX_DEVICES] = {};
+    std::vector<std::array<double, 3>> spans[GGML_CUDA_MAX_DEVICES]; // start, end (us from base), issued
+};
+
+static ggml_cuda_timeline_fork ggml_cuda_timeline;
+
+static cudaEvent_t ggml_cuda_timeline_event(int device) {
+    auto & fe = ggml_cuda_timeline.free_events[device];
+    if (!fe.empty()) {
+        cudaEvent_t e = fe.back();
+        fe.pop_back();
+        return e;
+    }
+    cudaEvent_t e;
+    CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDefault));
+    return e;
+}
+
+// the spans whose end has passed, all of them with wait; under the mutex
+static void ggml_cuda_timeline_read(bool wait) {
+    auto & tl = ggml_cuda_timeline;
+    while (!tl.pending.empty()) {
+        const ggml_cuda_timeline_fork::span s = tl.pending.front();
+        if (wait) {
+            CUDA_CHECK(cudaEventSynchronize(s.end));
+        } else {
+            const cudaError_t err = cudaEventQuery(s.end);
+            if (err == cudaErrorNotReady) {
+                if (cudaPeekAtLastError() == cudaErrorNotReady) {
+                    (void) cudaGetLastError();
+                }
+                break;
+            }
+            CUDA_CHECK(err);
+        }
+        float a = 0.0f;
+        float b = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&a, tl.base[s.device], s.start));
+        CUDA_CHECK(cudaEventElapsedTime(&b, tl.base[s.device], s.end));
+        tl.spans[s.device].push_back({ 1e3*(double) a, 1e3*(double) b, s.issued_us });
+        tl.free_events[s.device].push_back(s.start);
+        tl.free_events[s.device].push_back(s.end);
+        tl.pending.pop_front();
+    }
+}
+
+static void ggml_cuda_timeline_begin(ggml_backend_cuda_context * ctx) {
+    if (!ggml_timeline_on() || ctx->device < 0 || ctx->device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    auto & tl = ggml_cuda_timeline;
+    std::lock_guard<std::mutex> lock(tl.mutex);
+    if (tl.base[ctx->device] == nullptr) {
+        return; // the capture started before this device had a base event
+    }
+    ggml_cuda_timeline_read(tl.pending.size() >= 65536);
+    ggml_cuda_timeline_fork::span s = { ggml_cuda_timeline_event(ctx->device), ggml_cuda_timeline_event(ctx->device),
+                                        (double) ggml_time_us(), ctx->device };
+    CUDA_CHECK(cudaEventRecord(s.start, ctx->stream()));
+    tl.open[ctx] = s;
+}
+
+static void ggml_cuda_timeline_end(ggml_backend_cuda_context * ctx) {
+    auto & tl = ggml_cuda_timeline;
+    std::lock_guard<std::mutex> lock(tl.mutex);
+    auto it = tl.open.find(ctx);
+    if (it == tl.open.end()) {
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(it->second.end, ctx->stream()));
+    tl.pending.push_back(it->second);
+    tl.open.erase(it);
+}
+
+// the start of a capture records the base event of each device, its end writes the spans
+static void ggml_cuda_timeline_profiler(bool start) {
+    auto & tl = ggml_cuda_timeline;
+    std::lock_guard<std::mutex> lock(tl.mutex);
+    const int n_dev = std::min(ggml_backend_cuda_get_device_count(), GGML_CUDA_MAX_DEVICES);
+    if (start) {
+        if (!ggml_timeline_on()) {
+            return;
+        }
+        for (int d = 0; d < n_dev; d++) {
+            ggml_cuda_set_device(d);
+            if (tl.base[d] == nullptr) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&tl.base[d], cudaEventDefault));
+            }
+            CUDA_CHECK(cudaEventRecord(tl.base[d], 0));
+            tl.spans[d].clear();
+        }
+        return;
+    }
+    ggml_cuda_timeline_read(true);
+    for (int d = 0; d < n_dev; d++) {
+        auto & sp = tl.spans[d];
+        if (sp.empty()) {
+            continue;
+        }
+        std::vector<double> a, b, c;
+        for (const auto & x : sp) {
+            a.push_back(x[0]);
+            b.push_back(x[1]);
+            c.push_back(x[2]);
+        }
+        const std::string track = "gpu " GGML_CUDA_NAME + std::to_string(d);
+        ggml_timeline_device_spans(track.c_str(), a.size(), a.data(), b.data(), c.data());
+        GGML_LOG_INFO("%s: timeline of %s: %zu gpu spans\n", __func__, track.c_str(), sp.size());
+        sp.clear();
+    }
+}
+
 // before the compute call, outside a stream capture
 static void ggml_cuda_timing_fork_begin(ggml_backend_cuda_context * ctx) {
+    ggml_cuda_timeline_begin(ctx);
     ggml_cuda_timing_fork * t = ggml_cuda_timing_fork_get(ctx);
     if (t == nullptr) {
         return;
@@ -95,6 +225,7 @@ static void ggml_cuda_timing_fork_begin(ggml_backend_cuda_context * ctx) {
 
 // after the compute call: the graph is launched and the capture is over
 static void ggml_cuda_timing_fork_end(ggml_backend_cuda_context * ctx) {
+    ggml_cuda_timeline_end(ctx);
     ggml_cuda_timing_fork * t = ggml_cuda_timing_fork_get(ctx);
     if (t == nullptr || t->pending.empty()) {
         return;
@@ -367,6 +498,7 @@ static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx)
 static void ggml_backend_cuda_profiler_fork(bool start) {
     // a profiler that refuses is not a reason to stop the server
     if (start) {
+        ggml_cuda_timeline_profiler(true);
         const cudaError_t err = cudaProfilerStart();
         if (err != cudaSuccess) {
             GGML_LOG_WARN("%s: cudaProfilerStart: %s\n", __func__, cudaGetErrorString(err));
@@ -377,6 +509,7 @@ static void ggml_backend_cuda_profiler_fork(bool start) {
         ggml_cuda_set_device(d);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+    ggml_cuda_timeline_profiler(false);
     const cudaError_t err = cudaProfilerStop();
     if (err != cudaSuccess) {
         GGML_LOG_WARN("%s: cudaProfilerStop: %s\n", __func__, cudaGetErrorString(err));
