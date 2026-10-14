@@ -294,9 +294,12 @@ rem ms) and copied all rows for the verify after it (288 ms), about 1 s of host 
 rem since then the catch-up goes in chunks of the draft ubatch and a long batch keeps its last row only
 rem (LLAMA_SPEC_CATCHUP_FORK=0: upstream). the next run: catchup0 against auto in the chats (the ~3.8K turns pay ~250
 rem ms of it each by that rate), 07 again for the gaps
+rem 14.10 night (5b0b75f9): the 29K prompt 864.0 t/s against 842.0 of catchup0 (+2.6 percent), the ~3.8K turns 731.3
+rem against 721.2, TG 37.0 / 37.9 (text); 07: the gap between the batches 33 ms instead of 772, the gpu busy 97 percent
+rem of the conversation (94 before). nothing pending on the 395
 if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;catchup0 LLAMA_SPEC_CATCHUP_FORK=0 @draft --spec-auto"
-if not defined RUN_DECODE set "RUN_DECODE=1"
-if not defined RUN_TRACE  set "RUN_TRACE=1"
+if not defined RUN_DECODE set "RUN_DECODE=0"
+if not defined RUN_TRACE  set "RUN_TRACE=0"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
@@ -558,6 +561,11 @@ rem under the kernels (auto: 0, one after the other, 22.7 GiB/s); between the ba
 rem before and ~0.75 s after the MTP catch-up (the speculative process, see the 395, fixed since, and the plan of
 rem phase_mem, 0.14-0.22 s per batch); a decode step waits for the CPU experts most of its time. the next run: auto (the
 rem new defaults) against catchup0 (LLAMA_SPEC_CATCHUP_FORK=0), 07 for auto
+rem 14.10 night (9b660096): the 29K prompt 1115.0 t/s against 1084.3 of catchup0 (+2.8 percent), the ~3.8K turns 693.0
+rem against 692.2, TG the same; between the batches of a prompt ~0.9 s instead of ~1.5 (the catch-up in chunks, then
+rem ~0.47 s: the plan of phase_mem 0.14-0.22 s, graph, inputs). 07 tl took the result of auto (the identity, fixed):
+rem the next run is 07 only, tl for the decode step (gpu, CPU experts by layer, waits)
+if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;catchup0 LLAMA_SPEC_CATCHUP_FORK=0 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"

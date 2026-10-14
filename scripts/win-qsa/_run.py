@@ -1638,6 +1638,13 @@ def trace_summary(db, gap_ms):
     names = dict(con.execute("select id, value from StringIds")) if "StringIds" in tables else {}
     kern = sorted((a, b, names.get(n, str(n)), st) for a, b, n, st in
                   con.execute("select start, end, shortName, streamId from CUPTI_ACTIVITY_KIND_KERNEL"))
+    # --cuda-graph-trace=graph: a launched CUDA graph is one activity in a table of its own, not kernels (the decode
+    # graphs looked idle without it, 14.10); any table of graph activities with start, end and a stream counts as kernels
+    for table_name in sorted(t for t in tables if "GRAPH" in t.upper()):
+        cols = {r[1] for r in con.execute(f"pragma table_info({table_name})")}
+        if {"start", "end", "streamId"} <= cols:
+            kern += [(a, b, "cuda graph", st) for a, b, st in con.execute(f"select start, end, streamId from {table_name}")]
+    kern.sort()
     mem = sorted(con.execute("select start, end, bytes, copyKind, streamId from CUPTI_ACTIVITY_KIND_MEMCPY")) if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables else []
     mset = list(con.execute("select start, end from CUPTI_ACTIVITY_KIND_MEMSET")) if "CUPTI_ACTIVITY_KIND_MEMSET" in tables else []
     con.close()
@@ -1897,10 +1904,15 @@ def cmd_trace():
                 "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
                 *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
         run_env = arm_env(arm, {"LLAMA_TRACE_REQUESTS": f"2:{1 + len(turns)}", "LLAMA_INPUT_TIMING": "1"})
+        # CUDA: an arm with TRACE_TIMELINE=1 takes the timeline too (the gpu span of each compute call next to the CPU
+        # splits of the scheduler and its waits: where a decode step waits for the experts in RAM). the tool is part of
+        # the identity: TRACE_TIMELINE is no GGML_/LLAMA_ variable, and the tl arm took the nsys result of auto (14.10)
+        nsys_arm = cuda and arm.env.get("TRACE_TIMELINE") != "1"
         identity = {"v": VERSION, "kind": "trace", "build": build_id(exe.parent), "args": args,
                     "env": env_identity(run_env), "model": model_identity(model),
                     "draft": model_identity(draft) if arm.draft else None, "turns": [text_digest(t) for t in turns],
-                    "gen": gen, "gap": gap, "tool": nsys.parent.parent.name if cuda else "timeline", "machine": machine()}
+                    "gen": gen, "gap": gap, "tool": nsys.parent.parent.name if nsys_arm else "timeline",
+                    "analysis": 2, "machine": machine()}  # 2: CUDA graphs and the CPU splits counted (14.10)
         base = run.dir / arm.name
         url = f"http://127.0.0.1:{port}"
 
@@ -1966,16 +1978,13 @@ def cmd_trace():
             result["report"] = path.name
             return result
 
-        # CUDA: an arm with TRACE_TIMELINE=1 takes the timeline too (the gpu span of each compute call next to the CPU
-        # splits of the scheduler and its waits: where a decode step waits for the experts in RAM)
-        nsys_arm = cuda and arm.env.get("TRACE_TIMELINE") != "1"
         try:
             r, kept = run.measure(f"{arm.name}", identity, go_nsys if nsys_arm else go_timeline)
         except Fail as e:
             run.failed = True
             run.add("", f"{arm.name}: FAIL {e}")
             continue
-        run.add(*(trace_lines(arm.name, r, kept) if nsys_arm else timeline_lines(arm.name, r, kept)))
+        run.add(*(trace_lines(arm.name, r, kept) if "phases" not in r else timeline_lines(arm.name, r, kept)))
     return run.finish()
 
 
