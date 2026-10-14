@@ -440,6 +440,22 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
     if (hc_f16 && il >= 0 && nt >= 32 && cparams.fused_dsv4_hc_pre &&
             std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "Vulkan") == 0) {
         xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+
+        // the inputs of the combine before (block output, residual, injection) stay alive until the f16 copy is
+        // allocated: half the size of the f32 streams, it fit where they had been freed, and Vulkan then dropped the
+        // fusion of the combine with the norm and the copy, whose shader still reads them (395, 13.10: 45 of 93
+        // fused). the copy reads only its src[0], extra sources only order the allocation
+        if (x->op == GGML_OP_DSV4_HC_POST) {
+            const ggml_tensor * w = x->src[2]; // 2*sigmoid(inject/hc): scale <- sigmoid <- scale <- inject
+            ggml_tensor * inj = w && w->src[0] && w->src[0]->src[0] ? w->src[0]->src[0]->src[0] : nullptr;
+            ggml_tensor * keep[] = { x->src[0], x->src[1], inj };
+            int slot = 2;
+            for (ggml_tensor * t : keep) {
+                if (t != nullptr && slot < GGML_MAX_SRC) {
+                    xn->src[slot++] = t;
+                }
+            }
+        }
     }
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
@@ -775,7 +791,22 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
     cb(cur, "mtp_hc_attn_pre", il);
 
     if (mtp_qsa) {
-        cur = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+        // a catch-up over prompt rows with no output (common_speculative process()): K, V and the indexer keys of
+        // every row are stored, nothing attends, as the dense branch below does for its rows. attending for all rows
+        // took the 395 prompt down 4 percent at 80-120K and 7 with a budget of 8192 (13.10 night, chats).
+        // LLAMA_MTP_ROWS_ALL=1: attend for every row
+        static const bool rows_all_qsa = [] {
+            const char * env = std::getenv("LLAMA_MTP_ROWS_ALL");
+            return env != nullptr && std::atoi(env) != 0;
+        }();
+        if (!rows_all_qsa && !cparams.training && inp_out_ids != nullptr && inp_out_ids->ne[0] == 0) {
+            build_layer_attn(inp_hyb->get_attn(), mctx_hyb, cur, inp_pos, sections, il, true);
+            // no row: the rows below are empty and nothing reads the attention
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            rows_only = true;
+        } else {
+            cur = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+        }
     } else {
         // dense self-attention, mirroring the trunk's full-attention branch
         const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -962,7 +993,10 @@ public:
             return;
         }
 
-        mctx->set_input_qsa(cell_blk, blk_cells, bias, ubatch, ratio, blk_bias, causal_attn);
+        // keys_only scores nothing: no bias and no block tables were built
+        if (!keys_only) {
+            mctx->set_input_qsa(cell_blk, blk_cells, bias, ubatch, ratio, blk_bias, causal_attn);
+        }
         mctx->set_input_qsa_dirty(dirty_cells, dirty_pos, dirty_rows, ratio);
     }
 
@@ -1004,8 +1038,10 @@ public:
             res &= blk_cells->ne[1] == n_stream;
         }
 
-        res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
+        if (bias) {
+            res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
+            res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
+        }
 
         // how many block keys this pass has to rebuild decides the shape of the dirty list
         res &= dirty_rows->ne[0] == (int64_t) mctx->qsa_prepare(&params.ubatch, ratio, blk_bias).n_dirty;
@@ -1028,6 +1064,9 @@ public:
     // when the budget covers the cache the indexer is skipped and only k_idxs is built
     bool    bypass = false;
     int64_t budget = 0;
+
+    // the keys of every row are stored and the pooled ones rebuilt, nothing is scored (see build_layer_attn)
+    bool    keys_only = false;
 
     const llama_memory_hybrid_idx_fork_context * mctx;
     const uint32_t ratio;
@@ -1142,7 +1181,8 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool                                    keys_only) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -1190,12 +1230,15 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
         qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->bypass = bypass;
         qsa->budget = top_k_tok + r - 1;
+        qsa->keys_only = keys_only;
 
         if (!bypass) {
             // only one of the two is ever read: the per-block selection turns chosen blocks back
             // into cells, the per-cell one spreads a block score over its cells. an input no node
             // reads is never allocated, so building both would leave set_input writing into null
-            if (blk_bias) {
+            if (keys_only) {
+                // nothing is selected or scored
+            } else if (blk_bias) {
                 qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
 
                 ggml_set_input(qsa->blk_cells);
@@ -1206,12 +1249,14 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
             }
 
             // the lightning indexer takes the per-block bias as its f16 mask, see the scores below
-            ggml_backend_dev_t dev_l = model.dev_layer(il);
-            const bool vk_l = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev_l)), "Vulkan") == 0;
-            qsa->bias = ggml_new_tensor_3d(ctx0, blk_bias && qsa_use_lid(idx_dim, n_idx_h, n_tps, n_stream, vk_l) ? GGML_TYPE_F16 : GGML_TYPE_F32,
-                    blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            if (!keys_only) {
+                ggml_backend_dev_t dev_l = model.dev_layer(il);
+                const bool vk_l = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev_l)), "Vulkan") == 0;
+                qsa->bias = ggml_new_tensor_3d(ctx0, blk_bias && qsa_use_lid(idx_dim, n_idx_h, n_tps, n_stream, vk_l) ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                        blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-            ggml_set_input(qsa->bias);
+                ggml_set_input(qsa->bias);
+            }
 
             // the pooled block keys are kept across passes, so only the moved ones are rebuilt
             const int64_t n_dirty = mctx_hyb->qsa_prepare(&ubatch, (uint32_t) r, blk_bias).n_dirty;
@@ -1330,6 +1375,11 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
     // blocks past the live ones keep an old key. they are never picked on their score: the bias
     // hides a block with no cells, and always takes one whose cells no block pools
     cb(pool, "indexer_k", il);
+
+    if (keys_only) {
+        ggml_build_forward_expand(gf, pool);
+        return nullptr;
+    }
 
     // an MTP block keeps the block scores of the first draft step of a round (one token per stream, without the
     // bias), and the steps after it (cparams.qsa_reuse, set by the speculative driver) select from them again under
@@ -1797,12 +1847,48 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        bool                      keys_only) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+
+    if (keys_only) {
+        // K and V of every row to the cache, the indexer keys too, no query: a later decode attends over them
+        GGML_ASSERT(qsa);
+        build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, true);
+
+        ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Kcur, "Kcur", il);
+
+        ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "Vcur", il);
+
+        // as build_attn_qsa stores them
+        if (inp->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+        }
+        if (inp->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+        }
+        ggml_tensor * k_store = inp->mctx->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il);
+        ggml_tensor * v_store = inp->mctx->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il);
+        if (mctx_hyb->is_kv_host()) {
+            ggml_backend_sched_set_tensor_backend(sched, k_store, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, v_store, backend_cpu);
+        }
+        ggml_build_forward_expand(gf, k_store);
+        ggml_build_forward_expand(gf, v_store);
+        return nullptr;
+    }
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 

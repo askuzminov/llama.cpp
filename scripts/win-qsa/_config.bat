@@ -125,7 +125,10 @@ rem of KV 4104 stays. list is the default since then (LLAMA_QSA_FA_LIST=0 = the 
 rem (DECCHAT), what a growing chat sees at 0, ~30K, ~60K and ~118K tokens
 rem 13.10 night: 01 for the new ops, 03 for hcf16 (LLAMA_HC_F16=1: the normalized hc streams in f16, KLD against
 rem the reference), see DECARMS and PROFARMS
-if not defined RUN_CHECK   set "RUN_CHECK=1"
+rem 13.10 night (fdd7d181): 01 all passed (MUL_MAT q8_0 x f16 20/20, q4_K x f16 17/17 through the int8 path, HC_PRE_F16
+rem 4/4, HC_POST_NORM_F16 4/4, TOP_K 536/536, FLASH_ATTN_LIST 7/7); 03 hcf16 KLD 0.015284 against 0.015465 of default.
+rem the next run: no 01 / 03 (kernels and math unchanged since)
+if not defined RUN_CHECK   set "RUN_CHECK=0"
 if not defined QARMS       set "QARMS=default;hcf16 LLAMA_HC_F16=1"
 if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
 if not defined CHECKARMS   set "CHECKARMS=default"
@@ -254,15 +257,21 @@ rem its top-k (LLAMA_MTP_QSA_REUSE, on with LLAMA_MTP_QSA=1); mtpqsa8k with a bu
 rem (LLAMA_MTP_QSA_TOPK): one layer, so a wide budget costs little, and the dense block drafted better at depth.
 rem the PLE rows of the draft tokens are read while the next ones are drafted (LLAMA_PLE_WARM, on in all arms) and
 rem those of the first ubatch of each -b batch while the batch before computes (llama_set_next_tokens)
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto;mtpqsa8k LLAMA_MTP_QSA=1 LLAMA_MTP_QSA_TOPK=8192 @draft --spec-auto"
+rem 13.10 night (fdd7d181), chats: TG flat with the depth (auto 36.0 / 39.0 / 38.6 / 39.3 t/s at 1-12K / 12-40K /
+rem 40-80K / 80-120K), PP of the ~3.8K turns 767 / 743 / 722 / 713; turns of ~520 tokens after 29K 336 t/s.
+rem mtpqsa accepted 0.742 against 0.743 (auto), TG 39.00 against 38.67, but PP 4 percent lower at 80-120K (684.8
+rem against 712.7): the QSA block attended for every row of the catch-up. mtpqsa8k: 0.738, no gain, PP -7 percent.
+rem since then the catch-up with no output row stores K, V and the indexer keys only (keys_only). the next run: the
+rem document to ~232K tokens (56 turns) for the depth where the dense block costs most, hcf16 in the chats too
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto;hcf16 LLAMA_HC_F16=1 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
-if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000"
+if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 if not defined DECPROMPTS set "DECPROMPTS=os code"
 if not defined DECSEEDS   set "DECSEEDS=1"
 rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX)
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 
-if not defined RUN_QUALITY set "RUN_QUALITY=1"
+if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
 rem 800 ms in its loop per 4096 prompt at any depth, the dense one 302 at depth 0 and grows with KV: 2048 to 16384
 rem against dense (GGML_VK_FA_SPARSE_DISABLE=1) find the crossing
@@ -341,6 +350,9 @@ rem grows with the depth), without K/V reads 544.5 (they cost 364), without the 
 rem 772.1 (136), without the softmax 783.5 (124); about 150 ms of loop structure besides
 rem list: the attention without the pre-pass, and no mask fill
 rem 13.10 night: hcf16, the GPU time of the HC ops with the normalized streams in f16 (LLAMA_HC_F16=1)
+rem 13.10 night (fdd7d181): hcf16 -1.2 percent of the prompt GPU time at 118K (4550 -> 4496 ms), but only 45 of 93
+rem combines fused: the f16 copy took the memory of the combine's dead inputs and Vulkan dropped the fusion; the cast
+rem keeps them alive since then (Mac: all fused). again
 if not defined PROFARMS   set "PROFARMS=default;hcf16 LLAMA_HC_F16=1"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
