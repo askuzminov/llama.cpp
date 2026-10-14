@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 
 #include <cstdint>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -101,15 +102,27 @@ private:
         std::vector<int32_t>  tr_ids;
         std::vector<uint32_t> tr_off;   // [n_steps + 1] start of each step in tr_ids
         std::vector<uint8_t>  tr_first; // 1 for the first access of an expert in its step
+
+        // the routing of this layer that its router gives for the router input of the layer d before it (index d - 1),
+        // n_pred_top ids per token, token-major, empty in a step without that layer
+        std::vector<int32_t>  pr_ids[2];
+        std::vector<uint32_t> pr_off[2]; // [n_steps + 1]
+
+        // the prediction counts of this layer (replay_pred), by d and top width
+        uint64_t pr_miss[2]    = {};
+        uint64_t pr_cov[2][3]  = {};
+        uint64_t pr_up[2][3]   = {};
     };
 
     int  layer_idx(int il);
     std::vector<int32_t> table_slots() const;
     std::vector<int32_t> table_ins()   const;
     void sim_init(sim & s) const;
-    void replay_layer    (sim & s, int idx) const;
+    // on_step: called at the start of each step with the slots as the graph of the step reads them
+    void replay_layer    (sim & s, int idx, const std::function<void(size_t k, int32_t g, const sim_layer & l)> * on_step = nullptr) const;
     void replay_layer_opt(sim & s, int idx) const;
     void replay_pooled   (sim & s) const;
+    void replay_pred();
     void replay();
 
     const llama_model & model;
@@ -134,6 +147,11 @@ private:
     std::vector<int>       il2idx;
     std::vector<moe_layer> mlayers;
     std::vector<sim>       sims;
+
+    // the prefetch by prediction (t_moe_pred): top ids per token, the widths it tries and the cache it is measured on
+    int64_t n_pred_top = 0;
+    int32_t pred_top[3] = { 0, 0, 0 };
+    sim     pred_sim;
 
     uint64_t tr_step0 = 0; // decode step at the start of the trace
 

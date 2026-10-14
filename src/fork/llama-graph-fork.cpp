@@ -44,6 +44,32 @@ static bool moe_cache_runs_on_cpu(ggml_backend_sched_t sched, ggml_backend_t bac
     return true;
 }
 
+// top ids per token of a prediction, more than n_expert_used so that the report can try a wider prefetch
+static const int64_t MOE_PRED_TOP = 24;
+
+void llm_graph_context::build_moe_pred(ggml_tensor * cur, ggml_tensor * gate_inp, int il) const {
+    // only the steps that the stats count as decode, the router inputs of the earlier layers stay alive until here
+    if (cur->ne[1] > llama_moe_cache_fork::N_TOKENS_MAX || gate_inp == nullptr) {
+        return;
+    }
+    const int64_t n_top = std::min<int64_t>(MOE_PRED_TOP, gate_inp->ne[1]);
+    for (int d = 1; d <= 2; ++d) {
+        ggml_tensor * prev = res->moe_pred_inp[d - 1];
+        if (prev == nullptr || prev->ne[0] != cur->ne[0] || prev->ne[1] != cur->ne[1]) {
+            continue;
+        }
+        ggml_tensor * logits = ggml_mul_mat(ctx0, gate_inp, prev); // [n_expert, n_tokens]
+        ggml_tensor * ids    = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, n_top));
+        ggml_format_name(ids, "ffn_moe_pred%d-%d", d, il);
+        ggml_build_forward_expand(gf, ids);
+        res->t_moe_pred.push_back(ids);
+        res->t_moe_pred_il.push_back(il);
+        res->t_moe_pred_d.push_back(d);
+    }
+    res->moe_pred_inp[1] = res->moe_pred_inp[0];
+    res->moe_pred_inp[0] = cur;
+}
+
 ggml_tensor * llm_graph_context::build_moe_cache(
          ggml_tensor * mm_up,
          ggml_tensor * mm_gate,

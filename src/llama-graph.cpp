@@ -1380,6 +1380,11 @@ void llm_graph_result::reset() {
     t_moe_mm.clear();
     t_moe_topk_il.clear();
 
+    t_moe_pred.clear();
+    t_moe_pred_il.clear();
+    t_moe_pred_d.clear();
+    std::fill(std::begin(moe_pred_inp), std::end(moe_pred_inp), nullptr);
+
     moe_cache_il.clear();
     moe_cache_n_ids.clear();
 
@@ -1470,6 +1475,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         }
     }
     for (auto * tensor : t_moe_topk) {
+        ggml_set_output(tensor);
+    }
+    for (auto * tensor : t_moe_pred) {
         ggml_set_output(tensor);
     }
 }
@@ -2220,6 +2228,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, topk);
         res->t_moe_topk.push_back(topk);
         res->t_moe_topk_il.push_back(il);
+
+        // the routing of this layer as the router inputs of the layers before it predict it
+        build_moe_pred(cur, gate_inp, il);
     }
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]

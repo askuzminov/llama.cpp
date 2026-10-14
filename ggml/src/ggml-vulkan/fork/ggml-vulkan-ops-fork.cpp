@@ -42,6 +42,21 @@ vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, con
     return nullptr;
 }
 
+int ggml_vk_fork_dmmv_wg() {
+    // GGML_VK_DMMV_WG=large|subgroup: the workgroup of every dequant mat-vec (and its MUL_MAT_ID form) instead of the
+    // upstream choice, which gives the large one (4 subgroups, hybrid reduction) only on NVIDIA and Intel for a small M.
+    // the expert mat-vec of qwen4exp is small M (640 rows of gate/up, 2560 of down with 640 columns) and runs at
+    // 164-171 GB/s on the 395 against ~230 of the dense ones (05 of 14.10, one token)
+    static const int mode = [] {
+        const char * env = getenv("GGML_VK_DMMV_WG");
+        if (env == nullptr) {
+            return -1;
+        }
+        return strcmp(env, "large") == 0 ? 1 : strcmp(env, "subgroup") == 0 ? 0 : -1;
+    }();
+    return mode;
+}
+
 bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t tournament_cols) {
     // radix-select (one workgroup per row) for a large k over many long rows: the qwen4exp block top-k in prefill, k 513
     // of 31744 x 4096, takes 5.0 ms against 19.3 for the tournament on Strix Halo (8192 x 16: 19 against 32 us). the

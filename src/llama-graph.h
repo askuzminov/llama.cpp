@@ -971,6 +971,13 @@ public:
     std::vector<ggml_tensor *> t_moe_mm;
     std::vector<int>           t_moe_topk_il;
 
+    // the top ids that the router of a MoE layer gives for the router input of a layer d before it (d = 1, 2), the
+    // routing a prefetch could know one or two layers ahead; LLAMA_MOE_CACHE_STATS, decode steps
+    std::vector<ggml_tensor *> t_moe_pred;
+    std::vector<int>           t_moe_pred_il; // the layer of the router
+    std::vector<int>           t_moe_pred_d;
+    ggml_tensor * moe_pred_inp[2] = { nullptr, nullptr }; // the router inputs of the last two MoE layers, newest first
+
     // MoE layers that use the expert cache and the number of routing ids they copy to the cache
     std::vector<int>     moe_cache_il;
     std::vector<int64_t> moe_cache_n_ids;
@@ -1213,6 +1220,12 @@ struct llm_graph_context {
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
+                     int   il) const;
+
+    // the predictions of the routing of layer il from the router inputs of the layers before it (t_moe_pred)
+    void build_moe_pred(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
                      int   il) const;
 
     // activation between the up/gate and the down projections of the experts

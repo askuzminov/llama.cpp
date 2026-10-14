@@ -388,6 +388,8 @@ extern "C" {
     GGML_API bool                          ggml_timeline_on(void);
     GGML_API void                          ggml_timeline_enable(bool enable);
     GGML_API void                          ggml_timeline_event(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us);
+    // fork: the same with the members of the span's args object, as "op":"MUL_MAT","bytes":1024 (NULL: none)
+    GGML_API void                          ggml_timeline_event_args(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us, const char * args);
     // fork: n spans of a device clock (start and end in us from any zero of that clock) with the host time each was issued at
     // (the device cannot start one before), shifted onto ggml_time_us() and written to the timeline as "gpu" spans of track
     GGML_API void                          ggml_timeline_device_spans(const char * track, size_t n, const double * start_us, const double * end_us, const double * issued_us);

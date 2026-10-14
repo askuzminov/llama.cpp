@@ -296,17 +296,30 @@ rem (LLAMA_SPEC_CATCHUP_FORK=0: upstream). the next run: catchup0 against auto i
 rem ms of it each by that rate), 07 again for the gaps
 rem 14.10 night (5b0b75f9): the 29K prompt 864.0 t/s against 842.0 of catchup0 (+2.6 percent), the ~3.8K turns 731.3
 rem against 721.2, TG 37.0 / 37.9 (text); 07: the gap between the batches 33 ms instead of 772, the gpu busy 97 percent
-rem of the conversation (94 before). nothing pending on the 395
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;catchup0 LLAMA_SPEC_CATCHUP_FORK=0 @draft --spec-auto"
-if not defined RUN_DECODE set "RUN_DECODE=0"
+rem of the conversation (94 before)
+rem 14.10 night, by depth (5b0b75f9 chats to 213K): TG 39 to 120K, 36 at 120-160K, 34.5 at 160-213K with the same
+rem acceptance (0.70-0.74): the step itself grows (the dense attention of the MTP head over the whole context, the
+rem verify); PP of the ~3.8K turns 798 / 732 / 690 at 0-20K / 80-100K / 140-213K. the next run: 05 with the MTP head
+rem (mtp): the verify step of 2-4 tokens and the head steps per op at 0, ~122K and ~195K (the GB/s of the expert
+rem mat-vec at 3-4 tokens, the ops that grow with the depth); 04 hq8 (-ctkd q8_0 -ctvd q8_0: the KV of the head in
+rem q8_0, half the bytes its attention reads at depth) against auto in the chats to 213K
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;hq8 @draft --spec-auto -ctkd q8_0 -ctvd q8_0"
+if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined RUN_TRACE  set "RUN_TRACE=0"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 if not defined DECPROMPTS set "DECPROMPTS=os code"
 if not defined DECSEEDS   set "DECSEEDS=1"
-rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX); 14.10: not in the next run
-if not defined RUN_PROFILE set "RUN_PROFILE=0"
+rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX); 14.10 night: mtp, the
+rem reply with the MTP head (its verify steps and head steps apart), 64 tokens, at 0, ~122K and ~195K tokens; at 0
+rem only: mtpL (GGML_VK_DMMV_WG=large: the large workgroup for every mat-vec, upstream gives it only to NVIDIA and
+rem Intel for a small M; the expert mat-vec at one token runs at 164-171 GB/s against ~230 of the dense ones) and
+rem mtpQ (GGML_VK_FORCE_MMVQ=1, upstream: the int8 mat-vec also for k < 2048, the down of the experts at one token)
+if not defined PROFARMS   set "PROFARMS=mtp @draft --spec-auto;mtpL GGML_VK_DMMV_WG=large @d=0 @draft --spec-auto;mtpQ GGML_VK_FORCE_MMVQ=1 @d=0 @draft --spec-auto"
+if not defined PROFPREFIX set "PROFPREFIX=0 500000 800000"
+if not defined PROFTG     set "PROFTG=64"
+if not defined RUN_PROFILE set "RUN_PROFILE=1"
 
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
@@ -565,11 +578,15 @@ rem 14.10 night (9b660096): the 29K prompt 1115.0 t/s against 1084.3 of catchup0
 rem against 692.2, TG the same; between the batches of a prompt ~0.9 s instead of ~1.5 (the catch-up in chunks, then
 rem ~0.47 s: the plan of phase_mem 0.14-0.22 s, graph, inputs). 07 tl took the result of auto (the identity, fixed):
 rem the next run is 07 only, tl for the decode step (gpu, CPU experts by layer, waits)
-if not defined RUN_DECODE set "RUN_DECODE=0"
+rem 14.10 night, by depth (9b660096 chats to 115K): TG flat 27-28, PP of the ~3.8K turns 780 / 680 / 641 at 0-20K /
+rem 60-100K / 100-120K (-18 percent), while one long prompt stays flat (13.10) and the gpu work of a turn grows 12
+rem percent (05): ~0.8 s more per turn at depth with no owner yet. the next run: 04 the chat to ~213K as on the 395,
+rem auto alone; 07 deep / deepn: a prompt of 400000 chars (~97K tokens) and two turns of 16000 (timeline / nsys)
+if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;catchup0 LLAMA_SPEC_CATCHUP_FORK=0 @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
-if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000 120000:6:1000 120000:6:400"
+if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
 rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG
 rem after it from tg_3s; two texts, one seed
@@ -591,7 +608,18 @@ if not defined RUN_TRACE  set "RUN_TRACE=1"
 rem tl (TRACE_TIMELINE=1): the timeline on CUDA, the gpu span of each compute call next to the CPU splits (the experts
 rem in RAM) and the waits of the scheduler: how a decode step splits into gpu, CPU experts, copies and waits, layer by
 rem layer (07 of 14.10 ran nsys with each node of the CUDA graphs traced: the decode was slower, its shares off)
-if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto;tl TRACE_TIMELINE=1 @draft --spec-auto"
+rem 14.10 evening, tl (9b660096, 64 tokens per answer): the generation after the 29K prompt 3450 ms, gpu 35 percent,
+rem the CPU splits 1735 ms (1627 of it with the gpu idle); turn 2 2611 ms, gpu 40 percent, CPU 1107 (994); the CPU
+rem experts of a layer 0.4-1.6 ms per verify step, layers 0, 2, 47 the slowest: a step waits for the experts in RAM.
+rem the next run: tl with the nodes of the CPU graphs (the GB/s of the expert matmuls against the 45-50 of the DDR4,
+rem the wake of the threads), tl8 (8 threads, one per P-core, pinned) and tl24 (all 24) against the default 16, and
+rem pred (LLAMA_MOE_CACHE_STATS=64): how well the router of a layer names its experts from the router input of the
+rem layer before (d=1) or two before (d=2), against the misses of the cache: the case for an upload of the predicted
+rem experts while the GPU computes the layer before, when the RAM is idle. tlflat (GGML_CPU_MMID_FLAT=1): the rows of
+rem all the experts of a CPU MUL_MAT_ID from one counter in chunks of 64, not piece i of each expert to thread i (the
+rem slowest thread holds the node). 256 tokens per answer
+if not defined TRACEARMS  set "TRACEARMS=tl TRACE_TIMELINE=1 @draft --spec-auto;tl8 TRACE_TIMELINE=1 @draft --spec-auto -t 8 -C 0x5555 --cpu-strict 1;tl24 TRACE_TIMELINE=1 @draft --spec-auto -t 24;tlflat TRACE_TIMELINE=1 GGML_CPU_MMID_FLAT=1 @draft --spec-auto;pred TRACE_TIMELINE=1 LLAMA_MOE_CACHE_STATS=64 @draft --spec-auto;deep TRACE_TIMELINE=1 TRACECHAT=400000:2:16000 @draft --spec-auto;deepn TRACECHAT=400000:2:16000 @draft --spec-auto"
+if not defined TRACEGEN   set "TRACEGEN=256"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the

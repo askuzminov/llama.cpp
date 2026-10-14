@@ -5790,6 +5790,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             }
         }
     }
+    if (ggml_vk_fork_dmmv_wg() >= 0) { // fork: GGML_VK_DMMV_WG
+        dmmv_wg = ggml_vk_fork_dmmv_wg() ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
+    }
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -5877,6 +5880,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+    }
+    if (ggml_vk_fork_dmmv_wg() >= 0) { // fork: GGML_VK_DMMV_WG
+        dmmv_wg = ggml_vk_fork_dmmv_wg() ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
     }
 
     if (b_type == GGML_TYPE_Q8_1) {

@@ -114,6 +114,9 @@ int llama_moe_stats_fork::layer_idx(int il) {
 
     // the steps in the trace had no routing for this layer
     ml.tr_off.assign(n_steps_dec - tr_step0 + 1, 0);
+    for (auto & off : ml.pr_off) {
+        off.assign(n_steps_dec - tr_step0 + 1, 0);
+    }
 
     const int idx = (int) mlayers.size();
     il2idx[il] = idx;
@@ -144,8 +147,12 @@ void llama_moe_stats_fork::add_ubatch(const llm_graph_result * res, ggml_backend
         return;
     }
 
+    // the predictions follow the routing in buf
+    std::vector<ggml_tensor *> reads = res->t_moe_topk;
+    reads.insert(reads.end(), res->t_moe_pred.begin(), res->t_moe_pred.end());
+
     size_t total = 0;
-    for (ggml_tensor * t : res->t_moe_topk) {
+    for (ggml_tensor * t : reads) {
         total += ggml_nelements(t);
     }
     buf.resize(total);
@@ -153,7 +160,7 @@ void llama_moe_stats_fork::add_ubatch(const llm_graph_result * res, ggml_backend
     backends.clear();
 
     size_t off = 0;
-    for (ggml_tensor * t : res->t_moe_topk) {
+    for (ggml_tensor * t : reads) {
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, t);
         if (backend != nullptr) {
             if (std::find(backends.begin(), backends.end(), backend) == backends.end()) {
@@ -196,8 +203,29 @@ void llama_moe_stats_fork::add_ubatch(const llm_graph_result * res, ggml_backend
         off += n;
     }
 
+    for (size_t i = 0; i < res->t_moe_pred.size(); ++i) {
+        ggml_tensor * t = res->t_moe_pred[i];
+
+        const int64_t n   = ggml_nelements(t);
+        const int     idx = layer_idx(res->t_moe_pred_il[i]);
+        const int     d   = res->t_moe_pred_d[i];
+
+        if (idx >= 0 && mlayers[idx].on_host && d >= 1 && d <= 2) {
+            n_pred_top = t->ne[0];
+            auto & ids = mlayers[idx].pr_ids[d - 1];
+            for (int64_t j = 0; j < n; ++j) {
+                const int32_t e = buf[off + j];
+                ids.push_back(e >= 0 && e < n_expert ? e : 0);
+            }
+        }
+        off += n;
+    }
+
     for (auto & ml : mlayers) {
         ml.tr_off.push_back((uint32_t) ml.tr_ids.size());
+        for (int d = 0; d < 2; ++d) {
+            ml.pr_off[d].push_back((uint32_t) ml.pr_ids[d].size());
+        }
     }
 
     n_steps_dec++;
@@ -292,7 +320,7 @@ void llama_moe_stats_fork::sim_init(sim & s) const {
 }
 
 // LRU, LRU/1, 2Q and LFU, the order of the updates is the order of update() in llama_moe_cache_fork
-void llama_moe_stats_fork::replay_layer(sim & s, int idx) const {
+void llama_moe_stats_fork::replay_layer(sim & s, int idx, const std::function<void(size_t k, int32_t g, const sim_layer & l)> * on_step) const {
     const moe_layer & ml = mlayers[idx];
     sim_layer       & l  = s.layers[idx];
 
@@ -305,6 +333,10 @@ void llama_moe_stats_fork::replay_layer(sim & s, int idx) const {
         const int32_t g = (int32_t) (tr_step0 + k);
 
         l.n_ins = 0;
+
+        if (on_step) {
+            (*on_step)(k, g, l);
+        }
 
         for (uint32_t j = ml.tr_off[k]; j < ml.tr_off[k + 1]; ++j) {
             const int32_t e = ml.tr_ids[j];
@@ -582,6 +614,80 @@ void llama_moe_stats_fork::replay_layer_opt(sim & s, int idx) const {
     }
 }
 
+// the prefetch a router one or two layers ahead could do: for each step and layer, the experts the cache misses (as the
+// cache of --moe-cache, or 48 slots LFU without it) and of them the ones the prediction names, with the experts it names
+// that are not cached, the uploads such a prefetch would take. the counts add up over the reports
+void llama_moe_stats_fork::replay_pred() {
+    if (n_pred_top <= 0) {
+        return;
+    }
+    if (pred_sim.layers.empty()) {
+        pred_sim.pol     = cache_slots <= 0 || cache_lfu ? POLICY_LFU : POLICY_LRU;
+        pred_sim.n_slots = cache_slots > 0 ? cache_slots : 48;
+        pred_sim.max_ins = cache_ins > 0 ? cache_ins : 1;
+        pred_sim.delay   = MOE_STATS_DELAY;
+        const int32_t widths[3] = { (int32_t) n_expert_used, 16, 24 };
+        for (int w = 0; w < 3; ++w) {
+            pred_top[w] = (int32_t) std::min<int64_t>(widths[w], n_pred_top);
+        }
+    }
+    sim_init(pred_sim);
+
+    std::vector<int32_t> miss_stamp(n_expert, -1);
+    std::vector<int32_t> pred_stamp(n_expert, -1);
+    int32_t key = 0;
+
+    for (int idx = 0; idx < (int) mlayers.size(); ++idx) {
+        moe_layer & ml = mlayers[idx];
+        if (!ml.on_host) {
+            continue;
+        }
+        std::function<void(size_t, int32_t, const sim_layer &)> on_step = [&](size_t k, int32_t g, const sim_layer & l) {
+            auto hit = [&](int32_t e) {
+                return (l.ready[e] >= 0 && l.ready[e] <= g) || l.gone[e] == g;
+            };
+            const int32_t step_key = ++key;
+            int64_t n_miss = 0;
+            for (uint32_t j = ml.tr_off[k]; j < ml.tr_off[k + 1]; ++j) {
+                const int32_t e = ml.tr_ids[j];
+                if (ml.tr_first[j] && !hit(e)) {
+                    miss_stamp[e] = step_key;
+                    n_miss++;
+                }
+            }
+            for (int d = 0; d < 2; ++d) {
+                if (k + 1 >= ml.pr_off[d].size()) {
+                    continue;
+                }
+                const uint32_t b = ml.pr_off[d][k];
+                const uint32_t n = ml.pr_off[d][k + 1] - b;
+                if (n == 0) {
+                    continue;
+                }
+                ml.pr_miss[d] += n_miss;
+                const uint32_t n_tok = n / (uint32_t) n_pred_top;
+                for (int w = 0; w < 3; ++w) {
+                    const int32_t wkey = ++key;
+                    for (uint32_t t = 0; t < n_tok; ++t) {
+                        for (int32_t r = 0; r < pred_top[w]; ++r) {
+                            const int32_t e = ml.pr_ids[d][b + t*n_pred_top + r];
+                            if (pred_stamp[e] == wkey) {
+                                continue;
+                            }
+                            pred_stamp[e] = wkey;
+                            if (!hit(e)) {
+                                ml.pr_up[d][w]++;
+                                ml.pr_cov[d][w] += miss_stamp[e] == step_key;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        replay_layer(pred_sim, idx, &on_step);
+    }
+}
+
 void llama_moe_stats_fork::replay() {
     const int64_t t_start_us = ggml_time_us();
 
@@ -653,10 +759,16 @@ void llama_moe_stats_fork::replay() {
         t.join();
     }
 
+    replay_pred();
+
     for (auto & ml : mlayers) {
         ml.tr_ids.clear();
         ml.tr_first.clear();
         ml.tr_off.assign(1, 0);
+        for (int d = 0; d < 2; ++d) {
+            ml.pr_ids[d].clear();
+            ml.pr_off[d].assign(1, 0);
+        }
     }
     tr_step0 = n_steps_dec;
 
@@ -774,6 +886,53 @@ void llama_moe_stats_fork::report() {
                     (double) s.b_ins / mib / n_steps, (double) s.b_host / mib / n_steps);
         }
         LLAMA_LOG_WARN(MOE_LOG ": %s\n", line);
+    }
+
+    if (n_pred_top > 0) {
+        LLAMA_LOG_WARN(MOE_LOG ": prefetch by prediction: the router of a layer on the router input of the layer d before it, top w ids per token, "
+                "against the misses of a cache of %d slots, %s, %d uploads per layer per step (the * cell)\n",
+                pred_sim.n_slots, pred_sim.pol == POLICY_LFU ? "LFU" : "LRU", pred_sim.max_ins);
+        LLAMA_LOG_WARN(MOE_LOG ": each width: the share of the misses it names, the experts it names that are not cached (uploads) per layer per step and their MiB\n");
+        double b_avg = 0.0; // expert bytes, mean over the host layers
+        for (const auto & ml : mlayers) {
+            b_avg += ml.on_host ? (double) ml.bytes / n_host : 0.0;
+        }
+        for (int d = 0; d < 2; ++d) {
+            uint64_t miss = 0;
+            uint64_t cov[3] = {};
+            uint64_t up[3]  = {};
+            int n_l = 0;
+            for (const auto & ml : mlayers) {
+                if (!ml.on_host || ml.pr_off[d].empty()) {
+                    continue;
+                }
+                n_l += ml.pr_miss[d] > 0 || ml.pr_up[d][0] > 0;
+                miss += ml.pr_miss[d];
+                for (int w = 0; w < 3; ++w) {
+                    cov[w] += ml.pr_cov[d][w];
+                    up[w]  += ml.pr_up[d][w];
+                }
+            }
+            if (n_l == 0) {
+                continue;
+            }
+            const double per = 1.0 / (n_steps * n_l); // per layer per step
+            char line[512];
+            int  n = snprintf(line, sizeof(line), "pred d=%d, %d layers: misses %.2f per layer per step", d + 1, n_l, miss * per);
+            for (int w = 0; w < 3 && n > 0 && n < (int) sizeof(line); ++w) {
+                n += snprintf(line + n, sizeof(line) - n, "; top %d: %5.1f%%, uploads %.2f (%.1f MiB)", pred_top[w],
+                        miss ? 100.0*(double) cov[w]/(double) miss : 0.0, up[w] * per, up[w] * per * b_avg / mib);
+            }
+            LLAMA_LOG_WARN(MOE_LOG ": %s\n", line);
+        }
+        // the layers that a prefetch could not serve well
+        std::string line = "pred d=1 top " + std::to_string(pred_top[0]) + " by layer:";
+        for (const auto & ml : mlayers) {
+            if (ml.on_host && ml.pr_miss[0] > 0) {
+                line += " " + std::to_string(ml.il) + ":" + std::to_string((int) (100.0*(double) ml.pr_cov[0][0]/(double) ml.pr_miss[0] + 0.5));
+            }
+        }
+        LLAMA_LOG_WARN(MOE_LOG ": %s\n", line.c_str());
     }
 
     for (const auto & d : model.devices) {

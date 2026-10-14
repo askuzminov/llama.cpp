@@ -634,6 +634,10 @@ void ggml_timeline_enable(bool enable) {
 }
 
 void ggml_timeline_event(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us) {
+    ggml_timeline_event_args(track, name, t_start_us, t_end_us, nullptr);
+}
+
+void ggml_timeline_event_args(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us, const char * args) {
     if (!ggml_timeline_on()) {
         return;
     }
@@ -660,8 +664,10 @@ void ggml_timeline_event(const char * track, const char * name, int64_t t_start_
         fprintf(ggml_timeline_file, "{\"ph\":\"M\",\"pid\":1,\"tid\":%zu,\"name\":\"thread_name\",\"args\":{\"name\":\"%s\"}},\n",
                 tid + 1, clean(track).c_str());
     }
-    fprintf(ggml_timeline_file, "{\"ph\":\"X\",\"pid\":1,\"tid\":%zu,\"ts\":%lld,\"dur\":%lld,\"name\":\"%s\"},\n", tid + 1,
-            (long long) t_start_us, (long long) std::max<int64_t>(0, t_end_us - t_start_us), clean(name).c_str());
+    // the args are built by our callers from names and numbers, the name inside them is cleaned there
+    fprintf(ggml_timeline_file, "{\"ph\":\"X\",\"pid\":1,\"tid\":%zu,\"ts\":%lld,\"dur\":%lld,\"name\":\"%s\"%s%s%s},\n", tid + 1,
+            (long long) t_start_us, (long long) std::max<int64_t>(0, t_end_us - t_start_us), clean(name).c_str(),
+            args ? ",\"args\":{" : "", args ? args : "", args ? "}" : "");
 }
 
 // the shift from a device clock to ggml_time_us() along the capture: each span gives a lower bound, the host time it

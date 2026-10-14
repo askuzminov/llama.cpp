@@ -1438,6 +1438,19 @@ def cuda_report(text):
     return None
 
 
+def block_kind(block):
+    """("target" | "head", tokens) of a GGML_VK_PERF_LOGGER block: the target has an expert matmul per layer, the MTP
+    head one layer; the tokens from the dst of its attention, None without one (the head's catch-up attends for no row)"""
+    n_mmid = sum(c for op, c, _ in block if op.startswith("MUL_MAT_ID"))
+    tokens = None
+    for op, _, _ in block:
+        m = re.match(r"FLASH_ATTN_\w+ dst\(\d+,\d+,(\d+),", op)
+        if m:
+            tokens = int(m[1])
+            break
+    return ("target" if n_mmid >= 8 else "head"), tokens
+
+
 def sum_ops(blocks):
     total = {}
     for block in blocks:
@@ -1457,6 +1470,7 @@ def cmd_profile():
     model = model_path()
     vulkan = env("BACKEND") == "vulkan"
     arms = parse_arms("PROFARMS", "default")
+    draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
     prefixes = env_ints("PROFPREFIX", "0 500000")
     part, ntg = env_int("PROFPART", 16000), env_int("PROFTG", 16)
     ctx, port = env_int("DECCTX", 262144), env_int("DECPORT", 8097)
@@ -1467,18 +1481,26 @@ def cmd_profile():
     results = {}
     for arm in arms:
         try:
+            if arm.draft and not draft:
+                raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
             exe = arm.binary("llama-server")
         except Skip as e:
             run.add("", f"{arm.name}: skip: {e}")
             continue
-        args = [str(a) for a in ["-m", model, "-c", ctx, "-np", 1, "-fa", "on", "--repeat-penalty", "1.0",
-                *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(), *split_args(env("DECARGS")),
-                *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
+        # @d= limits the arm to these depths of PROFPREFIX
+        arm_prefixes = [p for p in prefixes if not arm.depths or p in arm.depths]
+        if not arm_prefixes:
+            run.add("", f"{arm.name}: skip: none of its depths {sorted(arm.depths)} is in PROFPREFIX")
+            continue
+        args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1, "-fa", "on",
+                "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
+                *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
         run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1",
                                 **({"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_CUDA_OP_TIMING": "idle"})})
         identity = {"v": VERSION, "kind": "profile-server", "build": build_id(exe.parent), "args": args,
-                    "env": env_identity(run_env), "model": model_identity(model), "prefixes": prefixes, "part": part,
-                    "tg": ntg, "corpus": text_digest(corpus[:max(prefixes) + part]), "machine": machine()}
+                    "env": env_identity(run_env), "model": model_identity(model), "prefixes": arm_prefixes, "part": part,
+                    "tg": ntg, "corpus": text_digest(corpus[:max(arm_prefixes) + part]), "machine": machine(),
+                    "draft": model_identity(draft) if arm.draft else None}
 
         def go(log):
             proc, log = start_server(exe, args, run_env, log)
@@ -1498,7 +1520,7 @@ def cmd_profile():
                         f.seek(before)
                         slices[name] = f.read().decode("utf-8", errors="replace")
                     return json.loads(raw)["choices"][0]["message"].get("content") or ""
-                for prefix in prefixes:
+                for prefix in arm_prefixes:
                     msgs = [{"role": "user", "content": (corpus[:prefix] + "\n\n" if prefix else "") + "What is this text about? One word."}]
                     msgs.append({"role": "assistant", "content": ask(f"fill{prefix}", msgs, 1)})
                     msgs.append({"role": "user", "content": corpus[prefix:prefix + part] + "\n\nAnd this part? One word."})
@@ -1511,12 +1533,30 @@ def cmd_profile():
                 proc.wait()
                 mark_end()
             out = {}
-            for prefix in prefixes:
+            for prefix in arm_prefixes:
                 pp_text, tg_text, end_text = slices[f"pp{prefix}"], slices[f"tg{prefix}"], slices[f"end{prefix}"]
                 host = [[float(m[2]), float(m[3]), float(m[4])] for m in
                         (re.match(r".*ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", x)
                          for x in pp_text.splitlines()) if m]
-                if vulkan:
+                if vulkan and arm.draft:
+                    # with the MTP head the reply interleaves the target's verify graphs (2-4 tokens) and the head's
+                    # graphs (its draft steps and the catch-up of the accepted rows): apart by the expert matmuls
+                    pp_blocks = [b for b in vulkan_blocks(pp_text) if block_kind(b)[0] == "target"]
+                    groups = {}
+                    for b in vulkan_blocks(tg_text):
+                        kind, n = block_kind(b)
+                        label = (f"verify of {n} tokens" if kind == "target" else
+                                 "head draft step" if n else "head catch-up of accepted rows")
+                        if kind == "target" and (n is None or n > 8):
+                            continue  # the prompt of the reply
+                        groups.setdefault(label, []).append(b)
+                    tg_groups = [[label, len(bl), [[o, c / len(bl), t / len(bl)] for o, c, t in sum_ops(bl)]]
+                                 for label, bl in sorted(groups.items(), key=lambda g: -len(g[1]))]
+                    verify = [g for g in tg_groups if g[0].startswith("verify")]
+                    out[prefix] = {"pp": sum_ops(pp_blocks), "pp_graphs": len(pp_blocks),
+                                   "tg": verify[0][2] if verify else [], "tg_groups": tg_groups,
+                                   "host": [sum(h[i] for h in host) for i in range(3)] if host else None}
+                elif vulkan:
                     pp_blocks, tg_blocks = vulkan_blocks(pp_text), vulkan_blocks(tg_text)
                     steps = tg_blocks[-max(1, ntg - 2):]
                     out[prefix] = {"pp": sum_ops(pp_blocks), "pp_graphs": len(pp_blocks),
@@ -1541,15 +1581,17 @@ def cmd_profile():
             run.add("", f"{arm.name}: FAIL {e}")
             continue
         results[arm.name] = r
-        for prefix in prefixes:
+        for prefix in arm_prefixes:
             x = r.get(prefix) or r.get(str(prefix))
             if not x:
                 continue
-            for kind in ("pp", "tg"):
-                ops = x[kind]
+            sections = [("pp", f"prompt part of {part} chars ({x['pp_graphs']} {'graphs' if vulkan else 'compute calls'})", x["pp"])]
+            if x.get("tg_groups"):
+                sections += [("tg", f"{label} (mean of {n})", ops) for label, n, ops in x["tg_groups"]]
+            else:
+                sections.append(("tg", "decode step (mean)", x["tg"]))
+            for kind, what, ops in sections:
                 total = sum(o[2] for o in ops)
-                what = (f"prompt part of {part} chars ({x['pp_graphs']} {'graphs' if vulkan else 'compute calls'})"
-                        if kind == "pp" else "decode step (mean)")
                 head = [f"", f"{kind}-p{prefix}-{arm.name}: {what} at {prefix} chars, {total:.2f} ms of gpu time" + (" k" if kept else "")]
                 if kind == "pp" and x.get("host"):
                     h = x["host"]
@@ -1780,17 +1822,42 @@ def timeline_summary(path, gap_ms):
                      "tokens": tokens, "phases": phases(a, b), "cpu_ms": c_ms / 1000,
                      "cpu_only_ms": (c_ms - overlap(c_part, part)) / 1000})
         prev_end = b
+    def layer_of(n):
+        return int(n.rsplit("-", 1)[1]) if "-" in n and n.rsplit("-", 1)[1].isdigit() else None
+
     # each CPU split by the layer in the name of its first node ("ffn_moe_gate_up-12"): its time and the part of it with
-    # the gpu idle, the wait for the experts of that layer
+    # the gpu idle, the wait for the experts of that layer; then the expert matmuls of the layer (MUL_MAT_ID nodes)
     layers = {}
     for t, n, a, b in spans:
-        if t != "sched cpu" or "-" not in n or not n.rsplit("-", 1)[1].isdigit():
+        if t != "sched cpu" or layer_of(n) is None:
             continue
         g = clip(gpu, starts, a, b)
-        x = layers.setdefault(int(n.rsplit("-", 1)[1]), [0, 0.0, 0.0])
+        x = layers.setdefault(layer_of(n), [0, 0.0, 0.0, 0.0, 0])
         x[0] += 1
         x[1] += (b - a) / 1000
         x[2] += ((b - a) - covered(g)) / 1000
+    # the nodes of the CPU graphs (ggml-cpu/fork/timeline-fork.inc): thread 0 marks each node after the barrier that
+    # waits for the slowest thread, with the weight bytes of a matmul (the experts a MUL_MAT_ID computes, once each);
+    # "cpu wake": from the compute call to the start of the last thread
+    nodes, wake = {}, [0, 0.0]
+    for e in events:
+        if e.get("ph") != "X":
+            continue
+        t = tracks.get(e["tid"])
+        if t == "cpu nodes":
+            a = e.get("args", {})
+            il = layer_of(e["name"])
+            key = (a.get("op", "?"), e["name"].rsplit("-", 1)[0] if il is not None else e["name"])
+            x = nodes.setdefault(key, [0, 0.0, 0])
+            x[0] += 1
+            x[1] += e["dur"] / 1000
+            x[2] += a.get("bytes", 0)
+            if a.get("op") == "MUL_MAT_ID" and il in layers:
+                layers[il][3] += e["dur"] / 1000
+                layers[il][4] += a.get("bytes", 0)
+        elif t == "cpu wake":
+            wake[0] += 1
+            wake[1] += e["dur"] / 1000
     total = phases(w0, w1)
     g_all = clip(gpu, starts, w0, w1)
     c_all = clip(cpu, c_starts, w0, w1)
@@ -1799,7 +1866,8 @@ def timeline_summary(path, gap_ms):
             "cpu_ms": covered(c_all) / 1000, "cpu_only_ms": (covered(c_all) - overlap(c_all, g_all)) / 1000,
             "n_cpu_splits": sum(1 for t, *_ in spans if t == "sched cpu"),
             "n_gpu_spans": sum(1 for t, *_ in spans if t.startswith("gpu")), "phases": total, "stretches": rows,
-            "layers": [[k, *layers[k]] for k in sorted(layers)]}
+            "layers": [[k, *layers[k]] for k in sorted(layers)],
+            "nodes": sorted([[op, n, *x] for (op, n), x in nodes.items()], key=lambda r: -r[3]), "wake": wake}
 
 
 def timeline_lines(name, r, kept=False):
@@ -1824,11 +1892,25 @@ def timeline_lines(name, r, kept=False):
                      "/".join(f"{g:.0f}" for g in x["gaps_ms"]), x["ubatches"] or "", x["tokens"] or "",
                      *[f"{p[k]:.0f}" if k in p else "" for k in order]])
     lines += table(["  s", "kind", "ms", "gpu", "idle", *(["cpu", "cpu only"] if cpu else []), "gaps", "ub", "tokens", *order], rows)
+    if r.get("nodes"):
+        n_ms = sum(x[3] for x in r["nodes"])
+        wk = r.get("wake", [0, 0.0])
+        lines += [f"  CPU graph nodes (thread 0, each up to the barrier after it): {n_ms:.0f} ms in nodes, wake {wk[1]:.0f} ms "
+                  f"in {wk[0]} graphs ({1000 * wk[1] / max(wk[0], 1):.0f} us each, the compute call to the start of the last "
+                  f"thread), the rest of the CPU splits {r['cpu_ms'] - n_ms - wk[1]:.0f} ms; GB/s of the weights read"]
+        lines += table(["    op", "node", "calls", "ms", "us/call", "MB/call", "GB/s"],
+                       [[f"    {op}", n, c, f"{ms:.0f}", f"{1000 * ms / c:.0f}", f"{b / c / 1e6:.2f}" if b else "",
+                         f"{b / (ms * 1e6):.1f}" if b and ms > 0 else ""] for op, n, c, ms, b in r["nodes"] if ms >= 1])
     if r.get("layers"):
-        lines += ["  CPU splits by layer (the experts in RAM): calls, ms, of it with the gpu idle, us per call"]
-        lines += table(["    layer", "calls", "ms", "gpu idle", "us/call", "idle us/call"],
-                       [[f"    {k}", c, f"{ms:.0f}", f"{idle:.0f}", f"{1000 * ms / c:.0f}", f"{1000 * idle / c:.0f}"]
-                        for k, c, ms, idle in r["layers"]])
+        mm = any(len(x) > 4 and x[5] for x in r["layers"])
+        lines += ["  CPU splits by layer (the experts in RAM): calls, ms, of it with the gpu idle, us per call" +
+                  ("; its MUL_MAT_ID nodes: MB of experts per split, GB/s" if mm else "")]
+        lines += table(["    layer", "calls", "ms", "gpu idle", "us/call", "idle us/call", *(["mm MB", "mm GB/s"] if mm else [])],
+                       [[f"    {x[0]}", x[1], f"{x[2]:.0f}", f"{x[3]:.0f}", f"{1000 * x[2] / x[1]:.0f}", f"{1000 * x[3] / x[1]:.0f}",
+                         *([f"{x[5] / x[1] / 1e6:.1f}", f"{x[5] / (x[4] * 1e6):.1f}" if x[4] > 0 else ""] if mm else [])]
+                        for x in r["layers"]])
+    if r.get("log_lines"):
+        lines += ["  from the log:", *[f"    {x}" for x in r["log_lines"]]]
     return lines
 
 
@@ -1892,11 +1974,17 @@ def cmd_trace():
     draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
     ctx, port, gen = env_int("DECCTX", 262144), env_int("DECPORT", 8097), env_int("TRACEGEN", 64)
     gap = float(env("TRACEGAP", "20"))
-    parts = [int(x) for x in env("TRACECHAT", "120000:1:2000").split(":")]
-    start, n_turns, add_chars = parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 2000
     corpus = Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
-    turns = [(corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences."]
-    turns += [corpus[start + i*add_chars:start + (i + 1)*add_chars] + "\n\nAnd this part, in two sentences?" for i in range(n_turns)]
+
+    def chat_turns(spec):
+        """TRACECHAT start:turns:chars: a prompt of start chars of PPLFILE, then turns of the next chars"""
+        parts = [int(x) for x in spec.split(":")]
+        start, n_turns, add_chars = parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 2000
+        out = [(corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences."]
+        out += [corpus[start + i*add_chars:start + (i + 1)*add_chars] + "\n\nAnd this part, in two sentences?" for i in range(n_turns)]
+        return out, (start, n_turns, add_chars)
+
+    turns, (start, n_turns, add_chars) = chat_turns(env("TRACECHAT", "120000:1:2000"))
     what = (f"Nsight Systems ({nsys.parent.parent.name}), cuda trace with whole CUDA graphs (an arm with TRACE_TIMELINE=1: "
             f"GGML_TIMELINE)" if cuda else
             "GGML_TIMELINE, the gpu span of each Vulkan command buffer and the host phases of llama")
@@ -1906,6 +1994,7 @@ def cmd_trace():
             ("prompt = a GiB or more uploaded" if cuda else "prompt = a ubatch of 1025 tokens or more; idle = the gaps "
              "between stretches with the host phases in them") +
             "; gaps inside a stretch under 0.1 ms / 0.1-1 ms / over 1 ms (the GPU waits for the host)")
+    base_turns = turns
     for arm in arms:
         try:
             if arm.draft and not draft:
@@ -1914,6 +2003,11 @@ def cmd_trace():
         except Skip as e:
             run.add("", f"{arm.name}: skip: {e}")
             continue
+        # an arm can take its own conversation: TRACECHAT=start:turns:chars among its variables (a turn at depth)
+        turns = base_turns
+        if arm.env.get("TRACECHAT"):
+            turns, spec = chat_turns(arm.env["TRACECHAT"])
+            run.add("", f"{arm.name}: a conversation of {spec[0]} chars and {spec[1]} turns of {spec[2]}")
         args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1, "-fa", "on",
                 "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
                 *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
@@ -1926,7 +2020,7 @@ def cmd_trace():
                     "env": env_identity(run_env), "model": model_identity(model),
                     "draft": model_identity(draft) if arm.draft else None, "turns": [text_digest(t) for t in turns],
                     "gen": gen, "gap": gap, "tool": nsys.parent.parent.name if nsys_arm else "timeline",
-                    "analysis": 2, "machine": machine()}  # 2: CUDA graphs and the CPU splits counted (14.10)
+                    "analysis": 3, "machine": machine()}  # 2: CUDA graphs and the CPU splits counted (14.10), 3: CPU nodes
         base = run.dir / arm.name
         url = f"http://127.0.0.1:{port}"
 
@@ -1992,6 +2086,16 @@ def cmd_trace():
                 raise Fail(f"no {path.name}: {last_error(read_log(log))} ({log.name})")
             result = timeline_summary(path, gap)
             result["report"] = path.name
+            # LLAMA_MOE_CACHE_STATS: the last report of the cache and of the prediction (the counts add up)
+            text = read_log(log).splitlines()
+            keep = []
+            for pattern in (r"moe_cache: \d+ layers, .*hit", r"moe_cache: host time per step"):
+                hits = [x for x in text if re.search(pattern, x)]
+                keep += hits[-1:]
+            first = max((i for i, x in enumerate(text) if "moe_cache_stats: prefetch by prediction" in x), default=None)
+            if first is not None:
+                keep += [x for x in text[first:] if re.search(r"moe_cache_stats: (prefetch|each width|pred )", x)][:8]
+            result["log_lines"] = [re.sub(r"^.*?(moe_cache)", r"\1", x) for x in keep]
             return result
 
         try:

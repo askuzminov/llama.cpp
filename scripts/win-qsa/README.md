@@ -16,9 +16,9 @@
 | `01-check.bat` | нет | test-backend-ops: операции, которые менял форк, на GPU против CPU (`CHECKOPS` x `CHECKARMS`) |
 | `03-quality.bat` | да | llama-perplexity: отношение PPL и KLD каждого плеча против опорного `QREF` |
 | `04-decode.bat` | да | llama-server: генерация с MTP, кэшем экспертов, overlap CPU и GPU; длинный промпт через `DECPREFIX` |
-| `05-profile.bat` | да | куда уходит время на сервере (с 13.10): разговор доходит до каждой глубины `PROFPREFIX`, потом часть `PROFPART` символов (pp) и ответ `PROFTG` токенов (tg); по операциям, `GGML_VK_PERF_LOGGER` на Vulkan, `GGML_CUDA_OP_TIMING=idle` на CUDA |
+| `05-profile.bat` | да | куда уходит время на сервере (с 13.10): разговор доходит до каждой глубины `PROFPREFIX`, потом часть `PROFPART` символов (pp) и ответ `PROFTG` токенов (tg); по операциям, `GGML_VK_PERF_LOGGER` на Vulkan, `GGML_CUDA_OP_TIMING=idle` на CUDA. Плечо с `@draft` (14.10 ночь, Vulkan): ответ с головой MTP, шаги проверки по числу токенов и шаги головы (черновик, догонка принятых строк) отдельно, по среднему на шаг |
 | `06-kernels.bat` | нет | test-backend-ops perf на формах модели (`KERNOPS`) для каждого плеча `KERNARMS`, например тайлов int8 coopmat; TFLOPS по случаям |
-| `07-trace.bat` | да | таймлайн разговора (с 14.10), только на ходах `TRACECHAT` после прогрева (`LLAMA_TRACE_REQUESTS`). CUDA: llama-server под `nsys profile`, по каждому участку работы GPU ядра, заливка на устройство, то и другое одновременно, простой; отчёт `.nsys-rep` рядом с логом. Vulkan: `GGML_TIMELINE`, время GPU каждого командного буфера и фазы хоста llama (граф, входы, отправка, ожидание GPU) по участкам работы GPU и паузам между ними; файл `.trace.json` открывается в ui.perfetto.dev |
+| `07-trace.bat` | да | таймлайн разговора (с 14.10), только на ходах `TRACECHAT` после прогрева (`LLAMA_TRACE_REQUESTS`). CUDA: llama-server под `nsys profile`, по каждому участку работы GPU ядра, заливка на устройство, то и другое одновременно, простой; отчёт `.nsys-rep` рядом с логом. Vulkan: `GGML_TIMELINE`, время GPU каждого командного буфера и фазы хоста llama (граф, входы, отправка, ожидание GPU) по участкам работы GPU и паузам между ними; файл `.trace.json` открывается в ui.perfetto.dev. На CUDA плечо с `TRACE_TIMELINE=1` берёт `GGML_TIMELINE`: время GPU каждого вызова, CPU-сплиты по слоям, узлы CPU-графов (время узла до барьера за ним и ГБ/с прочитанных весов матмулов экспертов, пробуждение потоков), с `LLAMA_MOE_CACHE_STATS` в сводку идут строки кеша и предсказания из лога. `TRACECHAT=старт:ходы:символы` среди переменных плеча даёт ему свой разговор (ход на глубине) |
 | `run-all.bat` | да | 00, 01, 06, 03, 04, 05, 07 по очереди (05 и 06 только на 395, 07 только на 3090), `RUN_*` выключают шаги. `02-bench` (llama-bench) удалён 13.10: у него нет состояния сервера (кэш экспертов, MTP, кэш промпта), а глубина из случайных токенов; скорость меряет 04 (`DECCHAT`) |
 | `serve.bat` | да | повседневный запуск llama-server (router, `models.ini`), не замер |
 | `get-wikitext.bat` | нет | текст для 03 и для `DECPREFIX` |
@@ -150,9 +150,9 @@ set "DECCHAT=0:30:16000"
 | `DECARGS` | `-fit off -b 16384 -ub 4096` (с 13.10; `-b 16384` - промпт 118K +2.2%) | `-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 16384 -ub 8192` |
 | `DECARMS` | `stable` (сервер тега), `none` (с `GGML_VK_GRAPH_TIMING=64`), `auto` (`--spec-auto`) | `base`, `n2`, `auto` |
 | `RUN_PROFILE` | 1 | 0 |
-| `PROFPREFIX`, `PROFPART`, `PROFTG`, `PROFARMS` | `0 500000`, 16000, 16; `default` | то же |
+| `PROFPREFIX`, `PROFPART`, `PROFTG`, `PROFARMS` | `0 500000 800000`, 16000, 64; `mtp` (`@draft --spec-auto`, 14.10 ночь) | `0 500000`, 16000, 16; `default` |
 | `RUN_KERNELS`, `KERNARMS` | 0; `default` | 0; `default` |
-| `RUN_TRACE`, `TRACEARMS` | 1 (14.10, `GGML_TIMELINE`); `auto` | 1 (14.10, Nsight Systems); `auto`, `pf3` |
+| `RUN_TRACE`, `TRACEARMS`, `TRACEGEN` | 1 (14.10, `GGML_TIMELINE`); `auto`; 64 | 1 (14.10); `tl`, `tl8`, `tl24`, `tlflat`, `pred` (`GGML_TIMELINE` с узлами CPU-графов, потоки 16 / 8 по P-ядрам / 24, `GGML_CPU_MMID_FLAT=1`, предсказание экспертов); 256 |
 
 Общие:
 
