@@ -7,6 +7,7 @@ did not change, the script prints the kept result and does not run the measureme
 Each new result also goes to history.csv in the logs folder, one row per number (Run.record)."""
 
 import argparse
+import bisect
 import csv
 import hashlib
 import json
@@ -359,6 +360,8 @@ def cache_put(identity, result, log):
 # ---------------------------------------------------------------- running
 
 LAST_RUN = CACHE / "last-model-run.txt"
+# the end of the last model run or build, for COOL: a build loads every core for minutes and heats the 395 as a run does
+LAST_HEAT = CACHE / "last-heat.txt"
 
 
 DEVICE_LINE = re.compile(r"^\s*(\S+): .*\((\d+) MiB, (\d+) MiB free\)\s*$")
@@ -408,14 +411,20 @@ def settle():
         since = time.time() - float(LAST_RUN.read_text())
     except (OSError, ValueError):
         since = None
-    # COOL seconds (0): at least that long after the last model run, so that the arms of a run start from about the same
-    # temperature (the 395 reached 95 C in an hour of chats to 213K on 14.10, the ops of the last profile depth ran 2
-    # percent slower than the night before)
+    # COOL seconds (0): at least that long after the last model run or build, so that the arms of a run start from about
+    # the same temperature (the 395 reached 95 C in an hour of chats to 213K on 14.10, the ops of the last profile depth
+    # ran 2 percent slower than the night before; the first arm after the build of 14.10 ran 3 to 5 percent slower in
+    # every phase than the second, also in the steps that read nothing from the drive)
     cool = env_int("COOL", 0)
-    if cool > 0 and since is not None and since < cool:
-        print(f"cooling {cool - since:.0f} s after the last model run (COOL)", flush=True)
-        time.sleep(cool - since)
-        since = float(cool)
+    try:
+        heat = time.time() - float(LAST_HEAT.read_text())
+    except (OSError, ValueError):
+        heat = since
+    if cool > 0 and heat is not None and heat < cool:
+        print(f"cooling {cool - heat:.0f} s after the last model run or build (COOL)", flush=True)
+        time.sleep(cool - heat)
+        if since is not None:
+            since += cool - heat
     max_wait, step = env_int("SETTLE_MAX", 180), env_int("SETTLE_STEP", 3)
     if since is not None and since > max_wait:
         return
@@ -466,6 +475,7 @@ def retry_wait(attempt):
 def mark_end():
     CACHE.mkdir(parents=True, exist_ok=True)
     LAST_RUN.write_text(f"{time.time()}\n")
+    LAST_HEAT.write_text(f"{time.time()}\n")
 
 
 def exit_text(code):
@@ -1550,6 +1560,384 @@ def cmd_profile():
     return run.finish()
 
 
+# ---------------------------------------------------------------- trace
+
+def nsys_path():
+    """nsys of Nsight Systems: NSYS, else nsys on PATH, else the newest one under Program Files (the CUDA toolkit
+    installs one)"""
+    given = env("NSYS")
+    if given:
+        if not Path(given).is_file():
+            raise Fail(f"NSYS={given} is not a file")
+        return Path(given)
+    found = shutil.which("nsys")
+    if found:
+        return Path(found)
+    root = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA Corporation"
+    found = sorted(root.glob("Nsight Systems */target-windows-x64/nsys.exe"), key=lambda q: q.parent.parent.name) if root.is_dir() else []
+    if not found:
+        raise Skip("no nsys: install Nsight Systems (the CUDA toolkit has it) or set NSYS to nsys.exe")
+    return found[-1]
+
+
+def merge(intervals, gap=0):
+    """The union of [start, end] intervals, joining the ones less than gap apart"""
+    out = []
+    for a, b in sorted(intervals):
+        if out and a <= out[-1][1] + gap:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def covered(union, a=None, b=None):
+    """The length of a merged union, within [a, b] when given"""
+    total = 0
+    for x, y in union:
+        if a is not None:
+            x, y = max(x, a), min(y, b)
+        if y > x:
+            total += y - x
+    return total
+
+
+def overlap(u, v):
+    """The length of the intersection of two merged unions"""
+    i = j = total = 0
+    while i < len(u) and j < len(v):
+        a, b = max(u[i][0], v[j][0]), min(u[i][1], v[j][1])
+        if b > a:
+            total += b - a
+        if u[i][1] < v[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def clip(union, starts, a, b):
+    """The part of a merged union inside [a, b]; starts are the starts of its intervals"""
+    i = max(0, bisect.bisect_right(starts, a) - 1)
+    j = bisect.bisect_right(starts, b)
+    return [[max(x, a), min(y, b)] for x, y in union[i:j] if y > a and x < b]
+
+
+def trace_summary(db, gap_ms):
+    """What the GPU did in the trace (the SQLite export of nsys): the kernels, the copies host to device (H2D) and
+    back (D2H), and the time it did nothing, in the whole window and in each stretch of activity that a gap of
+    gap_ms or more of a fully idle GPU separates (the host work between prompt ubatches); a stretch that copies a GiB
+    or more to the device is a prompt ubatch with the experts uploaded, the others are decode steps and small batches.
+    In a decode stretch a D2H copy is about one step (the logits), the gaps are the GPU waiting for the host: for the
+    CPU experts, the graph launch, the sampling"""
+    import sqlite3
+    con = sqlite3.connect(str(db))
+    tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+    if "CUPTI_ACTIVITY_KIND_KERNEL" not in tables:
+        raise Fail(f"no kernels in {db.name}: the profiler range caught nothing (LLAMA_TRACE_REQUESTS, a CUDA build?)")
+    names = dict(con.execute("select id, value from StringIds")) if "StringIds" in tables else {}
+    kern = sorted((a, b, names.get(n, str(n)), st) for a, b, n, st in
+                  con.execute("select start, end, shortName, streamId from CUPTI_ACTIVITY_KIND_KERNEL"))
+    mem = sorted(con.execute("select start, end, bytes, copyKind, streamId from CUPTI_ACTIVITY_KIND_MEMCPY")) if "CUPTI_ACTIVITY_KIND_MEMCPY" in tables else []
+    mset = list(con.execute("select start, end from CUPTI_ACTIVITY_KIND_MEMSET")) if "CUPTI_ACTIVITY_KIND_MEMSET" in tables else []
+    con.close()
+    # copyKind of CUPTI: 1 host to device, 2 device to host, 8 device to device
+    h2d = [m for m in mem if m[3] == 1]
+    d2h = [m for m in mem if m[3] == 2]
+    u_k = merge([(a, b) for a, b, _, _ in kern])
+    u_h = merge([(a, b) for a, b, _, _, _ in h2d])
+    u_d = merge([(a, b) for a, b, _, _, _ in d2h])
+    u_all = merge([(a, b) for a, b, _, _ in kern] + [(m[0], m[1]) for m in mem] + mset)
+    s_k, s_h, s_all = [x[0] for x in u_k], [x[0] for x in u_h], [x[0] for x in u_all]
+    h_starts, d_starts, k_starts = [m[0] for m in h2d], [m[0] for m in d2h], [k[0] for k in kern]
+    h_bytes_sum = [0]
+    for m in h2d:
+        h_bytes_sum.append(h_bytes_sum[-1] + m[2])
+    t0, t1 = u_all[0][0], u_all[-1][1]
+    ms = 1e-6
+    out = {"window_ms": (t1 - t0) * ms, "kernel_ms": covered(u_k) * ms, "h2d_ms": covered(u_h) * ms,
+           "h2d_gib": h_bytes_sum[-1] / 2**30, "d2h_ms": covered(u_d) * ms, "both_ms": overlap(u_k, u_h) * ms,
+           "idle_ms": (t1 - t0 - covered(u_all)) * ms, "n_kernels": len(kern),
+           "kernel_streams": len({k[3] for k in kern}), "h2d_streams": len({m[4] for m in h2d})}
+    rows = []
+    for a, b in merge([tuple(x) for x in u_all], gap=gap_ms * 1e6):
+        ck, ch, call = clip(u_k, s_k, a, b), clip(u_h, s_h, a, b), clip(u_all, s_all, a, b)
+        hi, hj = bisect.bisect_left(h_starts, a), bisect.bisect_right(h_starts, b)
+        ki, kj = bisect.bisect_left(k_starts, a), bisect.bisect_right(k_starts, b)
+        tops = {}
+        for k in kern[ki:kj]:
+            tops[k[2]] = tops.get(k[2], 0) + k[1] - k[0]
+        # the idle time inside the stretch by the length of the gap: launches (< 0.1 ms), short waits, the host
+        gaps = [0.0, 0.0, 0.0]
+        for x, y in zip(call, call[1:]):
+            d = (y[0] - x[1]) * ms
+            gaps[0 if d < 0.1 else 1 if d < 1 else 2] += d
+        h_bytes = h_bytes_sum[hj] - h_bytes_sum[hi]
+        rows.append({"start_s": (a - t0) * 1e-9, "ms": (b - a) * ms, "kernel_ms": covered(ck) * ms,
+                     "h2d_ms": covered(ch) * ms, "h2d_gib": h_bytes / 2**30, "both_ms": overlap(ck, ch) * ms,
+                     "idle_ms": ((b - a) - covered(call)) * ms, "gaps_ms": gaps, "n_kernels": kj - ki,
+                     "n_d2h": bisect.bisect_right(d_starts, b) - bisect.bisect_left(d_starts, a),
+                     "prompt": h_bytes >= 2**30,
+                     "top": [[n, t * ms] for n, t in sorted(tops.items(), key=lambda kv: -kv[1])[:3]]})
+    out["stretches"] = rows
+    total = {}
+    for a, b, n, _ in kern:
+        t = total.setdefault(n, [0, 0])
+        t[0] += 1
+        t[1] += b - a
+    out["top"] = [[n, c, t * ms] for n, (c, t) in sorted(total.items(), key=lambda kv: -kv[1][1])[:20]]
+    return out
+
+
+def timeline_summary(path, gap_ms):
+    """The timeline of GGML_TIMELINE (Vulkan: the gpu span of each command buffer; llama: graph, inputs and submit of each
+    ubatch, "llama mtp" for the MTP head; host: the syncs; server: the requests): how long the GPU ran and stood still in
+    the requests, the stretches of gpu work apart by gap_ms or more of idle, and the idle stretches between them, each
+    with the host time of every phase that started in it. A stretch with a ubatch of 1025 tokens or more is a prompt"""
+    text = path.read_text(encoding="utf-8").rstrip().rstrip(",")
+    events = json.loads(text if text.endswith("]") else text + "]")
+    tracks = {e["tid"]: e["args"]["name"] for e in events if e.get("ph") == "M"}
+    spans = [(tracks.get(e["tid"], "?"), e["name"], e["ts"], e["ts"] + e["dur"]) for e in events if e.get("ph") == "X"]
+    gpu = merge([(a, b) for t, n, a, b in spans if t.startswith("gpu")])
+    if not gpu:
+        raise Fail(f"no gpu spans in {path.name} (a Vulkan build, LLAMA_TRACE_REQUESTS?)")
+    requests = [(a, b) for t, n, a, b in spans if t == "server"]
+    w0 = min(a for a, _ in requests) if requests else gpu[0][0]
+    w1 = max(b for _, b in requests) if requests else gpu[-1][1]
+    starts = [x[0] for x in gpu]
+    host = [(t, n.split()[0], int(n.split()[1]) if len(n.split()) > 1 and n.split()[1].isdigit() else 0, a, b)
+            for t, n, a, b in spans if t in ("llama", "llama mtp", "host")]
+    host.sort(key=lambda h: h[3])
+    h_starts = [h[3] for h in host]
+    longest = max((h[4] - h[3] for h in host), default=0)
+
+    def phases(a, b):
+        """the host time of each phase inside [a, b], the part of a span that overlaps it"""
+        out, i = {}, bisect.bisect_left(h_starts, a - longest)
+        while i < len(host) and host[i][3] < b:
+            t, phase, n, x, y = host[i]
+            d = min(y, b) - max(x, a)
+            if d > 0:
+                key = ("mtp " if t == "llama mtp" else "") + phase
+                out[key] = out.get(key, 0.0) + d / 1000
+            i += 1
+        return out
+
+    def ubatches(a, b):
+        i, tokens, n = bisect.bisect_left(h_starts, a), 0, 0
+        while i < len(host) and host[i][3] < b:
+            if host[i][0] == "llama" and host[i][1] == "submit":
+                n += 1
+                tokens = max(tokens, host[i][2])
+            i += 1
+        return n, tokens
+
+    rows = []
+    prev_end = None
+    for a, b in merge([tuple(x) for x in gpu], gap=gap_ms * 1000):
+        if prev_end is not None and a > prev_end:
+            rows.append({"kind": "idle", "start_s": (prev_end - w0) / 1e6, "ms": (a - prev_end) / 1000, "gpu_ms": 0.0,
+                         "idle_ms": (a - prev_end) / 1000, "gaps_ms": [0.0, 0.0, 0.0], "ubatches": 0, "tokens": 0,
+                         "phases": phases(prev_end, a)})
+        part = clip(gpu, starts, a, b)
+        gaps = [0.0, 0.0, 0.0]
+        for x, y in zip(part, part[1:]):
+            d = (y[0] - x[1]) / 1000
+            gaps[0 if d < 0.1 else 1 if d < 1 else 2] += d
+        n_ub, tokens = ubatches(a, b)
+        busy = covered(part)
+        rows.append({"kind": "prompt" if tokens >= 1025 else "decode", "start_s": (a - w0) / 1e6, "ms": (b - a) / 1000,
+                     "gpu_ms": busy / 1000, "idle_ms": ((b - a) - busy) / 1000, "gaps_ms": gaps, "ubatches": n_ub,
+                     "tokens": tokens, "phases": phases(a, b)})
+        prev_end = b
+    total = phases(w0, w1)
+    busy = covered(clip(gpu, starts, w0, w1))
+    return {"window_ms": (w1 - w0) / 1000, "gpu_ms": busy / 1000, "idle_ms": ((w1 - w0) - busy) / 1000,
+            "n_gpu_spans": sum(1 for t, *_ in spans if t.startswith("gpu")), "phases": total, "stretches": rows}
+
+
+def timeline_lines(name, r, kept=False):
+    """The summary of one timeline (timeline_summary)"""
+    w = r["window_ms"]
+    order = ["graph", "inputs", "submit", "sync", "mtp graph", "mtp inputs", "mtp submit"]
+    ph = r["phases"]
+    lines = ["", f"{name}: {r.get('report', '')} (Perfetto, chrome://tracing)" + (" k" if kept else ""),
+             f"  requests {w / 1000:.2f} s: gpu {r['gpu_ms'] / 1000:.2f} s ({100 * r['gpu_ms'] / w:.0f}%), idle "
+             f"{r['idle_ms'] / 1000:.2f} s; {r['n_gpu_spans']} command buffers; host: " +
+             ", ".join(f"{k} {ph[k] / 1000:.2f} s" for k in order if k in ph)]
+    rows = []
+    for x in r["stretches"]:
+        if x["ms"] < 1:
+            continue
+        p = x["phases"]
+        rows.append([f"  {x['start_s']:.2f}", x["kind"], f"{x['ms']:.0f}", f"{x['gpu_ms']:.0f}", f"{x['idle_ms']:.0f}",
+                     "/".join(f"{g:.0f}" for g in x["gaps_ms"]), x["ubatches"] or "", x["tokens"] or "",
+                     *[f"{p[k]:.0f}" if k in p else "" for k in order]])
+    lines += table(["  s", "kind", "ms", "gpu", "idle", "gaps", "ub", "tokens", *order], rows)
+    return lines
+
+
+def trace_lines(name, r, kept=False):
+    """The summary of one trace (trace_summary)"""
+    w = r["window_ms"]
+    lines = ["", f"{name}: {r.get('report', '')} (Nsight Systems)" + (" k" if kept else ""),
+             f"  window {w / 1000:.2f} s: kernels {r['kernel_ms'] / 1000:.2f} s ({100 * r['kernel_ms'] / w:.0f}%), "
+             f"H2D {r['h2d_ms'] / 1000:.2f} s {r['h2d_gib']:.1f} GiB, D2H {r['d2h_ms']:.0f} ms, kernels and H2D at once "
+             f"{r['both_ms'] / 1000:.2f} s, GPU idle {r['idle_ms'] / 1000:.2f} s; {r['n_kernels']} kernels on "
+             f"{r['kernel_streams']} streams, H2D on {r['h2d_streams']}"]
+    rows = []
+    for x in r["stretches"]:
+        if x["ms"] < 1:
+            continue
+        rows.append([f"  {x['start_s']:.2f}", "prompt" if x["prompt"] else "decode", f"{x['ms']:.0f}", f"{x['kernel_ms']:.0f}",
+                     f"{x['h2d_ms']:.0f}", f"{x['h2d_gib']:.1f}", f"{x['both_ms']:.0f}", f"{x['idle_ms']:.0f}",
+                     "/".join(f"{g:.0f}" for g in x["gaps_ms"]), x["n_kernels"], x["n_d2h"],
+                     f"{x['top'][0][1]:.0f} {x['top'][0][0][:48]}" if x["top"] else ""])
+    lines += table(["  s", "kind", "ms", "kernels", "H2D", "GiB", "both", "idle", "gaps", "n_kern", "d2h", "top kernel (ms)"], rows)
+    lines += ["  kernels by time:", *table(["    ms", "count", "mean us", "kernel"],
+                                          [[f"    {t:.1f}", c, f"{1000 * t / c:.1f}", n[:90]] for n, c, t in r["top"]])]
+    return lines
+
+
+def trace_conversation(url, turns, gen, log):
+    """The warmup (request 1, not traced) and the turns of the conversation with the prompt cache on"""
+    messages = []
+    for i, text in enumerate([WARMUP, *turns]):
+        msgs = [{"role": "user", "content": text}] if i == 0 else messages + [{"role": "user", "content": text}]
+        body = {"messages": msgs, "max_tokens": 16 if i == 0 else gen, "temperature": 0.0, "seed": 1,
+                "cache_prompt": i > 0, "stream": False}
+        try:
+            _, raw = http(url + "/v1/chat/completions", body, env_int("DECTIMEOUT", 1800))
+        except (urllib.error.URLError, OSError) as e:
+            raise Fail(f"request {i}: {e} ({log.name})")
+        if i > 0:
+            messages = msgs + [{"role": "assistant", "content": json.loads(raw)["choices"][0]["message"].get("content") or ""}]
+
+
+def cmd_trace():
+    """A timeline of one conversation on the server, the requests of the conversation only, after the warmup
+    (LLAMA_TRACE_REQUESTS, tools/server/fork/server-trace-fork.cpp). CUDA: Nsight Systems, nsys profile
+    --capture-range=cudaProfilerApi: where the GPU runs kernels, copies (the experts of -ncmoe uploaded for a prompt
+    ubatch) or waits (for the CPU experts of a decode step, the host); the report stays next to the log for the Nsight
+    Systems window, its SQLite export is read into the summary and removed (TRACEKEEP=1 keeps it). Vulkan: GGML_TIMELINE,
+    the gpu span of each command buffer next to the host phases of llama (graph, inputs, submit, sync), for Perfetto or
+    chrome://tracing, read into the summary. TRACECHAT: the conversation, start:turns:chars of PPLFILE as in DECCHAT;
+    TRACEGEN: tokens per answer; TRACEARMS: the arms; TRACEGAP: the idle gap in ms that ends a stretch (20)"""
+    run = Run("trace")
+    backend = env("BACKEND")
+    if backend not in ("cuda", "vulkan"):
+        run.add(f"trace: no timeline for {backend}")
+        return run.finish()
+    cuda = backend == "cuda"
+    nsys = nsys_path() if cuda else None
+    model = model_path()
+    arms = parse_arms("TRACEARMS", "default")
+    draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
+    ctx, port, gen = env_int("DECCTX", 262144), env_int("DECPORT", 8097), env_int("TRACEGEN", 64)
+    gap = float(env("TRACEGAP", "20"))
+    parts = [int(x) for x in env("TRACECHAT", "120000:1:2000").split(":")]
+    start, n_turns, add_chars = parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 2000
+    corpus = Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
+    turns = [(corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences."]
+    turns += [corpus[start + i*add_chars:start + (i + 1)*add_chars] + "\n\nAnd this part, in two sentences?" for i in range(n_turns)]
+    what = (f"Nsight Systems ({nsys.parent.parent.name}), cuda trace with the nodes of CUDA graphs" if cuda else
+            "GGML_TIMELINE, the gpu span of each Vulkan command buffer and the host phases of llama")
+    run.add(f"trace: {what}, a conversation of {start} chars and {n_turns} turns of {add_chars}, {gen} tokens per answer, "
+            f"{model.name}, build {current_build()}",
+            f"stretches: gpu work apart by {gap:g} ms of idle; " +
+            ("prompt = a GiB or more uploaded" if cuda else "prompt = a ubatch of 1025 tokens or more; idle = the gaps "
+             "between stretches with the host phases in them") +
+            "; gaps inside a stretch under 0.1 ms / 0.1-1 ms / over 1 ms (the GPU waits for the host)")
+    for arm in arms:
+        try:
+            if arm.draft and not draft:
+                raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+            exe = arm.binary("llama-server")
+        except Skip as e:
+            run.add("", f"{arm.name}: skip: {e}")
+            continue
+        args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1, "-fa", "on",
+                "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
+                *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
+        run_env = arm_env(arm, {"LLAMA_TRACE_REQUESTS": f"2:{1 + len(turns)}", "LLAMA_INPUT_TIMING": "1"})
+        identity = {"v": VERSION, "kind": "trace", "build": build_id(exe.parent), "args": args,
+                    "env": env_identity(run_env), "model": model_identity(model),
+                    "draft": model_identity(draft) if arm.draft else None, "turns": [text_digest(t) for t in turns],
+                    "gen": gen, "gap": gap, "tool": nsys.parent.parent.name if cuda else "timeline", "machine": machine()}
+        base = run.dir / arm.name
+        url = f"http://127.0.0.1:{port}"
+
+        def go_nsys(log):
+            cmd = ["profile", "--trace=cuda,nvtx", "--cuda-graph-trace=node", "--sample=none", "--cpuctxsw=none",
+                   "--capture-range=cudaProfilerApi", "--capture-range-end=stop-shutdown", "--force-overwrite=true",
+                   "--output", str(base), str(exe), *args]
+            proc, log = start_server(nsys, cmd, run_env, log)
+            try:
+                trace_conversation(url, turns, gen, log)
+                # stop-shutdown ends the session at the end of the last traced request: nsys writes the report and
+                # exits. a server still up a minute later is stopped by name, then nsys writes the report (no other
+                # llama-server runs, see no_server_running)
+                t_last, wait, killed = time.time(), env_int("TRACEWAIT", 1800), False
+                while proc.poll() is None and time.time() - t_last < wait:
+                    time.sleep(5)
+                    if not killed and os.name == "nt" and time.time() - t_last > 60:
+                        try:
+                            http(url + "/health", timeout=2)
+                            subprocess.run(["taskkill", "/f", "/im", "llama-server.exe"], capture_output=True)
+                            killed = True
+                        except (urllib.error.URLError, OSError):
+                            pass
+                if proc.poll() is None:
+                    raise Fail(f"nsys did not end in {wait} s after the last request ({log.name})")
+            finally:
+                if proc.poll() is None:
+                    if os.name == "nt":
+                        subprocess.run(["taskkill", "/f", "/t", "/pid", str(proc.pid)], capture_output=True)
+                    else:
+                        proc.kill()
+                    proc.wait()
+                mark_end()
+            report = base.with_suffix(".nsys-rep")
+            if not report.is_file():
+                raise Fail(f"nsys wrote no {report.name}: {last_error(read_log(log))} ({log.name})")
+            db = base.with_suffix(".sqlite")
+            execute([nsys, "export", "--type=sqlite", "--force-overwrite=true", "--output", db, report],
+                    log.with_name(f"{arm.name}-export.log"), os.environ.copy(), model=False)
+            try:
+                result = trace_summary(db, gap)
+            finally:
+                if env("TRACEKEEP") != "1":
+                    db.unlink(missing_ok=True)
+            result["report"] = report.name
+            return result
+
+        def go_timeline(log):
+            # the file is not part of the identity: it is in the folder of the run
+            path = base.with_suffix(".trace.json")
+            proc, log = start_server(exe, args, dict(run_env, GGML_TIMELINE=str(path)), log)
+            try:
+                trace_conversation(url, turns, gen, log)
+                time.sleep(1)
+            finally:
+                proc.kill()
+                proc.wait()
+                mark_end()
+            if not path.is_file():
+                raise Fail(f"no {path.name}: {last_error(read_log(log))} ({log.name})")
+            result = timeline_summary(path, gap)
+            result["report"] = path.name
+            return result
+
+        try:
+            r, kept = run.measure(f"{arm.name}", identity, go_nsys if cuda else go_timeline)
+        except Fail as e:
+            run.failed = True
+            run.add("", f"{arm.name}: FAIL {e}")
+            continue
+        run.add(*(trace_lines(arm.name, r, kept) if cuda else timeline_lines(arm.name, r, kept)))
+    return run.finish()
+
+
 # ---------------------------------------------------------------- kernels
 
 def case_name(op, params):
@@ -1639,6 +2027,8 @@ def cmd_build_begin():
 
 
 def cmd_build_end():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    LAST_HEAT.write_text(f"{time.time()}\n")
     build = Path(env("BUILD")).resolve()
     pending = build / "qsa-build.pending.json"
     if pending.is_file():
@@ -1703,8 +2093,8 @@ def cmd_build_stable():
 
 
 COMMANDS = {"check": cmd_check, "quality": cmd_quality, "decode": cmd_decode,
-            "profile": cmd_profile, "kernels": cmd_kernels, "build-begin": cmd_build_begin, "build-end": cmd_build_end,
-            "build-stable": cmd_build_stable}
+            "profile": cmd_profile, "kernels": cmd_kernels, "trace": cmd_trace, "build-begin": cmd_build_begin,
+            "build-end": cmd_build_end, "build-stable": cmd_build_stable}
 
 
 def main():

@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "fork/server-trace-fork.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -294,8 +295,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
+    // fork: server_trace_fork, the requests that LLAMA_TRACE_REQUESTS names run under the profiler
+    ctx_http.post("/chat/completions",         ex_wrapper(server_trace_fork(routes.post_chat_completions)));
+    ctx_http.post("/v1/chat/completions",      ex_wrapper(server_trace_fork(routes.post_chat_completions)));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));

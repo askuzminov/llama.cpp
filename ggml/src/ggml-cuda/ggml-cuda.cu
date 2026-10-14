@@ -6001,6 +6001,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_timing_take_fork") == 0) {
         return (void *)ggml_backend_cuda_timing_take_fork;
     }
+    if (strcmp(name, "ggml_backend_profiler_fork") == 0) {
+        return (void *)ggml_backend_cuda_profiler_fork;
+    }
 #endif
     return nullptr;
 }

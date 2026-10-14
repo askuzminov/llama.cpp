@@ -5,6 +5,7 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+#include <cuda_profiler_api.h>
 #include <deque>
 
 struct ggml_cuda_timing_fork {
@@ -358,6 +359,21 @@ static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx)
         CUDA_CHECK(cudaEventDestroy(e));
     }
     ggml_cuda_op_timing_fork_ctx.erase(it);
+}
+
+// the capture range of nsys --capture-range=cudaProfilerApi, set by llama-server (LLAMA_TRACE_REQUESTS) through the proc
+// address ggml_backend_profiler_fork. The stop waits for the devices: the work of the traced requests is in the trace
+// only once it ends
+static void ggml_backend_cuda_profiler_fork(bool start) {
+    if (start) {
+        CUDA_CHECK(cudaProfilerStart());
+        return;
+    }
+    for (int d = 0; d < ggml_backend_cuda_get_device_count(); d++) {
+        ggml_cuda_set_device(d);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    CUDA_CHECK(cudaProfilerStop());
 }
 
 #define GGML_CUDA_TIMING_FORK 1

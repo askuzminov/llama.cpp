@@ -70,6 +70,8 @@ endif()
 target_sources(${TARGET} PRIVATE
     fork/server-models-fork.cpp
     fork/server-models-fork.h
+    fork/server-trace-fork.cpp
+    fork/server-trace-fork.h
 )
 
 # llama-server executable

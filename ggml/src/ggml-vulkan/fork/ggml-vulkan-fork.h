@@ -181,6 +181,13 @@ void ggml_vk_fork_int_tiles(vk_device & device, const vk_pipeline & requested, u
 // get_proc_address of the backend reg: ggml_backend_dev_get_extra_bufts (the <name>_Shared buffer type)
 void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name);
 
+// GGML_TIMELINE (ggml_timeline_on): the gpu span of each command buffer of a compute queue, timestamps at its begin
+// (ggml_vk_ctx_begin) and its end (ggml_vk_ctx_end), read back at the syncs (ggml_vk_synchronize) and written to the
+// timeline at the end of the capture (ggml_backend_profiler_fork)
+void ggml_vk_fork_timeline_begin(vk_device & device, vk_context & subctx);
+void ggml_vk_fork_timeline_end(vk_context & ctx);
+void ggml_vk_fork_timeline_collect(const vk_device & device);
+
 // GGML_VK_GRAPH_TIMING: the start of graph_compute, returns the entry time (0 when off)
 int64_t ggml_vk_fork_graph_timing_begin(ggml_backend_vk_context * ctx);
 // the end of the last node in ggml_vk_build_graph, before the context ends

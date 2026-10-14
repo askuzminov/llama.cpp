@@ -729,6 +729,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    // fork: the upstream MoE cache maps the experts in its copy callback, the uploads ahead would bypass it
+    if (moe_cache) {
+        ggml_backend_sched_set_prefetch(sched.get(), 0);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -771,6 +775,10 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+                // fork: the upstream MoE cache maps the experts in its copy callback, the uploads ahead would bypass it
+                if (moe_cache) {
+                    ggml_backend_sched_set_prefetch(sched.get(), 0);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1511,7 +1519,10 @@ bool llama_context::set_adapter_cvec(
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // LLAMA_INPUT_TIMING: the host time of each ubatch on stderr (graph build and allocation, input fills,
     // graph submission), with the fills of the slow inputs from llm_graph_result::set_inputs
-    static const bool timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
+    static const bool timing_env = getenv("LLAMA_INPUT_TIMING") != nullptr;
+    // fork: the same spans on the timeline (GGML_TIMELINE, ggml_timeline_on)
+    const bool timeline = ggml_timeline_on();
+    const bool timing = timing_env || timeline;
     const int64_t t_start_us = timing ? ggml_time_us() : 0;
 
     if (mctx && !mctx->apply()) {
@@ -1636,8 +1647,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (timing) {
         const int64_t t_end_us = ggml_time_us();
-        fprintf(stderr, "ubatch timing: %u tokens, graph %.1f ms, inputs %.1f ms, submit %.1f ms\n", ubatch.n_tokens,
-                (t_graph_us - t_start_us)/1000.0, (t_inputs_us - t_graph_us)/1000.0, (t_end_us - t_inputs_us)/1000.0);
+        if (timing_env) {
+            fprintf(stderr, "ubatch timing: %u tokens, graph %.1f ms, inputs %.1f ms, submit %.1f ms\n", ubatch.n_tokens,
+                    (t_graph_us - t_start_us)/1000.0, (t_inputs_us - t_graph_us)/1000.0, (t_end_us - t_inputs_us)/1000.0);
+        }
+        if (timeline) {
+            const char * track = gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "llama mtp" : "llama";
+            char name[64];
+            snprintf(name, sizeof(name), "graph %u", ubatch.n_tokens);
+            ggml_timeline_event(track, name, t_start_us, t_graph_us);
+            snprintf(name, sizeof(name), "inputs %u", ubatch.n_tokens);
+            ggml_timeline_event(track, name, t_graph_us, t_inputs_us);
+            snprintf(name, sizeof(name), "submit %u", ubatch.n_tokens);
+            ggml_timeline_event(track, name, t_inputs_us, t_end_us);
+        }
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);

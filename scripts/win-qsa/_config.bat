@@ -270,8 +270,20 @@ rem step 4.0 -> 6.2 ms, the verify 31.4 -> 37.5 ms + 6.5 per token at ~200K. mtp
 rem verify ~2 ms dearer, TG equal (37.06 / 37.39), so it stays off. the 395 reached 95 C, the arms after the first ran
 rem 3-5 percent slower at depth (COOL since). the next run: the host share of the verify at depth (LLAMA_INPUT_TIMING
 rem in the chats) and nowarm (LLAMA_PLE_WARM=0) against auto for the PLE rows of the draft tokens read ahead
+rem 14.10 (37d358f4), auto first right after the build, nowarm second after COOL: the PLE input of a verify 0.19-0.31 ms
+rem with the rows read ahead against 0.88-1.74 without, but auto ran 3 to 5 percent slower in every phase, also in
+rem those the read ahead does not touch: the kernels of a prompt ubatch 1214 against 1176 ms per 1000 tokens, the
+rem three MTP draft steps (no PLE) 13.3 / 15.3 / 17.1 / 18.1 ms against 12.6 / 14.6 / 16.5 / 17.5 by quarter of the
+rem chat (nowarm as auto of the run before, 12.6 / 14.6 / 16.7 / 17.6), the gap largest at the start; plus the cold
+rem page cache of the first arm (PLE input of a prompt ubatch 60 against 45 ms per 1000 tokens). PP 685.1 against
+rem 715.0, TG 35.87 against 36.99. COOL now also counts from the end of a build. the next run: the same two arms
+rem in the other order (FORCE=1 with the same build)
 if not defined COOL       set "COOL=120"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;nowarm LLAMA_PLE_WARM=0 @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=nowarm LLAMA_PLE_WARM=0 @draft --spec-auto;auto @draft --spec-auto"
+rem 14.10: 07-trace on the 395 through GGML_TIMELINE (Nsight Systems sees no AMD gpu): the gpu span of each command
+rem buffer next to the host phases of llama, where the gpu stands still in a prompt ubatch and in a decode step with MTP
+if not defined RUN_TRACE  set "RUN_TRACE=1"
+if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 if not defined DECPROMPTS set "DECPROMPTS=os code"
@@ -376,7 +388,9 @@ if not defined EXTRA      set "EXTRA=-ngl 99 -ncmoe 30"
 if not defined CHECKARMS  set "CHECKARMS=default"
 rem 09.10: pool32 (QSA key pool in f32) mean KLD 0.01768 against 0.01783 of the f16 default (repeat 0.010); PP at 122880
 rem 605.5 against 616.5, TG the same, moe-cache slots +1-2 with f16. the arm is off
-if not defined QARMS      set "QARMS=default;nofusion GGML_CUDA_DISABLE_FUSION=1"
+rem 14.10: pf3 (GGML_SCHED_PREFETCH=3, see DECARMS) must give the KLD of default to the digit: the same kernels on the
+rem same data, only the uploads of the experts run on a second stream (QUB 2048 offloads the experts of -ncmoe 30)
+if not defined QARMS      set "QARMS=default;pf3 GGML_SCHED_PREFETCH=3"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 rem 10.10: -b 8192 -ub 8192 (n2ub8k): the 118K prompt at 607.0 t/s against 527.6 with 4096, --phase-mem took ubatch
 rem 6656 at 106K cells and 5888 at 120K (the memory); TG 26.86 against 27.40, acceptance 0.512 against 0.523 (text)
@@ -497,22 +511,46 @@ rem (its catch-up still attended for every row). 05: a 3704-token prompt ubatch 
 rem the next run: off128, the CPU experts of short prompts in ubatches of 127 (GGML_OP_OFFLOAD_MIN_BATCH=128, the op
 rem offload from 128 tokens, phase_mem takes its generation layout below), off128s with that layout up to 384 tokens
 rem (LLAMA_PHASE_SMALL_PROMPT); mtpqsa again with the keys_only catch-up
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;off128 GGML_OP_OFFLOAD_MIN_BATCH=128 @draft --spec-auto;off128s GGML_OP_OFFLOAD_MIN_BATCH=128 LLAMA_PHASE_SMALL_PROMPT=384 @draft --spec-auto;mtpqsa LLAMA_MTP_QSA=1 @draft --spec-auto"
+rem 14.10 (c9877fcd), chats: off128 took the turns of 111-197 tokens after 29K in 2.09 s against 2.57 of auto (-19
+rem percent), the ~3.8K turns at 553.3 t/s against 533.7, the turns of ~520 tokens 4.01 s against 4.09, TG the same
+rem (27.95 against 28.25 on the long one, 28.0 / 27.8 on the short ones); the moe-cache 50 slots against 51 at the
+rem start, 47 in both later. off128s: no turn fell between 192 and 384 tokens, the same as off128. mtpqsa: TG 27.22
+rem against 28.25, the short turns 2.97 s, slower everywhere here: off. GGML_OP_OFFLOAD_MIN_BATCH=128 is the default of
+rem this machine since then (the op offload of the host experts from 128 tokens, ubatches of 127 in the generation
+rem layout). 05 of 14.10: the inputs of a ~3.7K prompt part 197 / 213 / 289 ms against 330 / 313 / 313 the day before
+rem at 0 / 60000 / 500000 chars (the PLE rows of the next ubatch from llama_set_next_tokens), the kernels the same.
+rem the next run: the limit of the generation layout for short prompts. a turn there costs about 0.12 s per ubatch and
+rem 10 ms per token (the CPU experts), in the prompt layout about 3 s of upload and the moe-cache refill plus 1.8 ms
+rem per token, so with ubatches of 127 the two meet near 350 tokens, not 192 (the limit of the ubatches of 31):
+rem small352 (LLAMA_PHASE_SMALL_PROMPT=352) against auto on turns of ~300 tokens (120000:6:1000) besides the others.
+rem pf2 / pf3 (GGML_SCHED_PREFETCH=2 / 3): the experts of a split are uploaded while the split 2 / 3 before it computes,
+rem on a second CUDA stream, instead of after a sync at its start: a prompt ubatch is now ~3 s of upload and ~1.9 s of
+rem kernels in series (05 of 14.10, 3707 tokens). By the profile of 14.10 a pipeline of the two takes 3.15 s instead of
+rem 5.0 at depth 2, and 4.4 / 4.1 s instead of 7.2 at 8192 tokens and depth 2 / 3; it costs 2 / 3 more copies of the
+rem experts of a split in the compute buffer (0.5-0.9 GB each), so phase_mem may take a smaller ubatch deep in a chat
+if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;small352 LLAMA_PHASE_SMALL_PROMPT=352 @draft --spec-auto;pf2 GGML_SCHED_PREFETCH=2 @draft --spec-auto;pf3 GGML_SCHED_PREFETCH=3 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
-if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000 120000:6:400"
+if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000 120000:6:1000 120000:6:400"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
 rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG
 rem after it from tg_3s; two texts, one seed
 if not defined DECPROMPTS set "DECPROMPTS=os code"
 if not defined DECSEEDS   set "DECSEEDS=1"
-rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX)
-if not defined RUN_PROFILE set "RUN_PROFILE=1"
+rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (PROFPREFIX); 14.10: measured, not in
+rem the next run (the kernels do not change)
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
 rem the run after the profile of 12.10 night: 01 GET_ROWS for the flat gather of short rows (fork/getrows-fork.inc,
 rem new eval cases of the qwen4exp shapes), 02 default / maskdense / rowsup (GGML_CUDA_GET_ROWS_FLAT=0, upstream), 05
 rem optime / optimemd again
 rem 12.10 night (7c218166): GET_ROWS 224/224 with the new cases
 if not defined RUN_CHECK   set "RUN_CHECK=0"
-if not defined RUN_QUALITY set "RUN_QUALITY=0"
+rem 14.10: 03 again for the uploads of the experts on a second stream (pf3 in QARMS)
+if not defined RUN_QUALITY set "RUN_QUALITY=1"
+rem 14.10: 07-trace, the timeline of a conversation in Nsight Systems: does the upload of pf3 run under the kernels,
+rem and where the GPU waits in a decode step. needs nsys (Nsight Systems, the CUDA toolkit has it; NSYS= its path)
+if not defined RUN_TRACE  set "RUN_TRACE=1"
+if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto;pf3 GGML_SCHED_PREFETCH=3 @draft --spec-auto"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
@@ -564,12 +602,19 @@ if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
-if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch"
+if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch|prefetch_issue"
 rem 1: the warmup run of llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds load time and
 rem memory pressure, -lm dio reads the weights at load
 if not defined WARMUP      set "WARMUP=0"
 rem 06-kernels: test-backend-ops perf of the model shapes at -ub 4096, "OP [regex of the case parameters]"
 if not defined KERNOPS     set "KERNOPS=MUL_MAT_ID n_mats=512,n_used=10,b=0,m=[0-9]+,n=4096,;MUL_MAT_VEC_FUSION n_mats=512;MUL_MAT type_a=q8_0,type_b=f32,m=[0-9]+,n=4096,"
+rem 07-trace: llama-server under nsys profile, the profiler on for the requests of the conversation only: TRACECHAT
+rem start:turns:chars of PPLFILE (as DECCHAT; 120000 is a prompt of ~29K tokens in ubatches of -ub, then a turn of
+rem ~500 tokens), TRACEGEN tokens per answer, TRACEGAP ms of idle GPU that end a stretch of the table
+if not defined RUN_TRACE   set "RUN_TRACE=0"
+if not defined TRACECHAT   set "TRACECHAT=120000:1:2000"
+if not defined TRACEGEN    set "TRACEGEN=64"
+if not defined TRACEGAP    set "TRACEGAP=20"
 rem 05-profile: on the server, a chat at each depth of PROFPREFIX (chars of PPLFILE), then a part of PROFPART chars
 rem (pp, as a chat turn computes it there) and a reply of PROFTG tokens (tg, one decode step), per op
 if not defined PROFARMS    set "PROFARMS=default"

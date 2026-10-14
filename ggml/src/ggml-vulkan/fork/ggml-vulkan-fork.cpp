@@ -2,6 +2,11 @@
 
 #include "ggml-vulkan-fork.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cinttypes>
+
 // runs a probe shader with one storage buffer of `words` 32-bit words, zeroed, on n_wg workgroups and copies the
 // buffer to `out`. spec: the specialization constants 0.., subgroup_size: a required subgroup size or 0. false when
 // the driver refuses the shader or it does not complete. plain Vulkan calls: it runs before the device has its pipelines
@@ -532,10 +537,182 @@ static ggml_backend_buffer_type_t * ggml_backend_vk_device_get_extra_bufts(ggml_
     return ggml_vk_get_device(ctx->device)->extra_bufts;
 }
 
+// GGML_TIMELINE: the gpu clock has its own zero. a command buffer cannot start before its recording ended, so the shift
+// to ggml_time_us() is the largest (end of recording - gpu start) over the spans, close for the buffers the gpu took at
+// once (after a sync); the spans go to the timeline at the end of the capture, with that shift
+struct vk_timeline_fork {
+    static constexpr uint32_t n_slots = 2048;
+
+    vk::Device    dev;
+    vk::QueryPool pool;
+    double        period_us = 0.0;
+    std::string   track;
+    uint32_t      next = 0;
+
+    std::vector<uint8_t>  busy;       // a slot begun and not read back
+    std::vector<int64_t>  rec_end_us; // the host time at the end of its recording
+    std::vector<uint32_t> pending;    // ended, not read back
+    std::unordered_map<VkCommandBuffer, uint32_t> open; // begun, not ended
+    std::vector<std::array<double, 3>> spans;           // gpu start and end (us of the gpu clock), end of recording
+    int64_t n_dropped = 0;                              // begun while the ring was full
+};
+
+static std::mutex vk_timeline_mutex;
+static std::atomic<bool> vk_timeline_any { false };
+static std::unordered_map<const vk_device_struct *, std::unique_ptr<vk_timeline_fork>> vk_timelines;
+
+void ggml_vk_fork_timeline_begin(vk_device & device, vk_context & subctx) {
+    // a transfer queue may have no timestamps
+    if (!ggml_timeline_on() || subctx->s == nullptr || subctx->p == nullptr || subctx->p->q->transfer_only) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(vk_timeline_mutex);
+    auto & tl = vk_timelines[device.get()];
+    if (!tl) {
+        tl = std::make_unique<vk_timeline_fork>();
+        vk::QueryPoolCreateInfo info;
+        info.queryType  = vk::QueryType::eTimestamp;
+        info.queryCount = 2 * vk_timeline_fork::n_slots;
+        tl->dev       = device->device;
+        tl->pool      = device->device.createQueryPool(info);
+        tl->period_us = 1e-3 * device->properties.limits.timestampPeriod;
+        tl->track     = "gpu " + device->name;
+        tl->busy.assign(vk_timeline_fork::n_slots, 0);
+        tl->rec_end_us.assign(vk_timeline_fork::n_slots, 0);
+        device->device.resetQueryPool(tl->pool, 0, 2 * vk_timeline_fork::n_slots);
+        vk_timeline_any = true;
+    }
+    // a full ring waits for the next sync: the span is left out
+    if (tl->busy[tl->next]) {
+        tl->n_dropped++;
+        return;
+    }
+    const uint32_t slot = tl->next;
+    tl->next = (tl->next + 1) % vk_timeline_fork::n_slots;
+    tl->busy[slot] = 1;
+    vk::CommandBuffer buf = subctx->s->buffer->buf;
+    buf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, tl->pool, 2 * slot);
+    tl->open[(VkCommandBuffer) buf] = slot;
+}
+
+void ggml_vk_fork_timeline_end(vk_context & ctx) {
+    if (!vk_timeline_any || ctx->s == nullptr || ctx->p == nullptr) {
+        return;
+    }
+    vk_device device = ctx->p->q->handle->device.lock();
+    std::lock_guard<std::mutex> lock(vk_timeline_mutex);
+    auto it = vk_timelines.find(device.get());
+    if (it == vk_timelines.end()) {
+        return;
+    }
+    vk_timeline_fork & tl = *it->second;
+    vk::CommandBuffer buf = ctx->s->buffer->buf;
+    auto o = tl.open.find((VkCommandBuffer) buf);
+    if (o == tl.open.end()) {
+        return;
+    }
+    buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, tl.pool, 2 * o->second + 1);
+    tl.rec_end_us[o->second] = ggml_time_us();
+    tl.pending.push_back(o->second);
+    tl.open.erase(o);
+}
+
+// the spans whose two timestamps are there, without waiting (a buffer ended but not submitted yet stays)
+static void ggml_vk_fork_timeline_read(vk_timeline_fork & tl) {
+    std::vector<uint32_t> keep;
+    for (const uint32_t slot : tl.pending) {
+        uint64_t r[4] = {};
+        const vk::Result res = tl.dev.getQueryPoolResults(tl.pool, 2 * slot, 2, sizeof(r), r, 2 * sizeof(uint64_t),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        if ((res == vk::Result::eSuccess || res == vk::Result::eNotReady) && r[1] != 0 && r[3] != 0) {
+            tl.spans.push_back({ r[0] * tl.period_us, r[2] * tl.period_us, (double) tl.rec_end_us[slot] });
+            tl.dev.resetQueryPool(tl.pool, 2 * slot, 2);
+            tl.busy[slot] = 0;
+        } else {
+            keep.push_back(slot);
+        }
+    }
+    tl.pending.swap(keep);
+}
+
+void ggml_vk_fork_timeline_collect(const vk_device & device) {
+    if (!vk_timeline_any) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(vk_timeline_mutex);
+    auto it = vk_timelines.find(device.get());
+    if (it != vk_timelines.end()) {
+        ggml_vk_fork_timeline_read(*it->second);
+    }
+}
+
+// the shift from the gpu clock to ggml_time_us() along the capture: each span gives a lower bound, end of recording -
+// gpu start, tight for a buffer the gpu took at once (after a sync), and the shift is the upper hull of those points,
+// linear between them: no span then starts before its recording ended. the clocks run at slightly different rates
+// (MoltenVK: 0.4 percent, 5 ms in 1.2 s), and the hull of the largest bound of each chunk of spans left the spans before
+// its first point up to 8.5 ms early
+static std::vector<std::array<double, 2>> ggml_vk_fork_timeline_hull(std::vector<std::array<double, 3>> spans) {
+    std::sort(spans.begin(), spans.end());
+    std::vector<std::array<double, 2>> hull;
+    for (const auto & sp : spans) {
+        const std::array<double, 2> p = { sp[0], sp[2] - sp[0] };
+        // drop the last point while it is on or below the line from the one before it to p
+        while (hull.size() >= 2) {
+            const auto & a = hull[hull.size() - 2];
+            const auto & b = hull.back();
+            if ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < 0) {
+                break;
+            }
+            hull.pop_back();
+        }
+        hull.push_back(p);
+    }
+    return hull;
+}
+
+static double ggml_vk_fork_timeline_shift(const std::vector<std::array<double, 2>> & hull, double x) {
+    if (hull.size() == 1) {
+        return hull[0][1];
+    }
+    size_t i = 1;
+    while (i + 1 < hull.size() && hull[i][0] < x) {
+        i++;
+    }
+    const auto & a = hull[i - 1];
+    const auto & b = hull[i];
+    return b[0] > a[0] ? a[1] + (b[1] - a[1]) * (x - a[0]) / (b[0] - a[0]) : std::max(a[1], b[1]);
+}
+
+// ggml_backend_profiler_fork of the backend reg: the start of a capture drops what is left of the last one, the end
+// writes the spans read back so far
+static void ggml_vk_fork_profiler(bool start) {
+    std::lock_guard<std::mutex> lock(vk_timeline_mutex);
+    for (auto & it : vk_timelines) {
+        vk_timeline_fork & tl = *it.second;
+        ggml_vk_fork_timeline_read(tl);
+        if (!start && !tl.spans.empty()) {
+            const auto hull = ggml_vk_fork_timeline_hull(tl.spans);
+            for (const auto & sp : tl.spans) {
+                const double shift = ggml_vk_fork_timeline_shift(hull, sp[0]);
+                ggml_timeline_event(tl.track.c_str(), "gpu", (int64_t) (sp[0] + shift), (int64_t) (sp[1] + shift));
+            }
+        }
+        if (!start) {
+            GGML_LOG_INFO("ggml_vulkan: timeline of %s: %zu gpu spans, %zu without timestamps yet, %" PRId64 " left out with the ring full\n",
+                    tl.track.c_str(), tl.spans.size(), tl.pending.size(), tl.n_dropped);
+        }
+        tl.spans.clear();
+        tl.n_dropped = 0;
+    }
+}
+
 void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         return (void *) ggml_backend_vk_device_get_extra_bufts;
+    }
+    if (strcmp(name, "ggml_backend_profiler_fork") == 0) {
+        return (void *) ggml_vk_fork_profiler;
     }
     return nullptr;
 }

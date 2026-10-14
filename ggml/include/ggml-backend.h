@@ -377,6 +377,17 @@ extern "C" {
 
     // Number of buffer plans made: by ggml_backend_sched_reserve, and by ggml_backend_sched_alloc_graph for a graph that did not fit the last plan
     GGML_API size_t                        ggml_backend_sched_get_n_reserve(ggml_backend_sched_t sched);
+
+    // fork: the weights in host memory that a split copies to its device are uploaded while the split depth splits before it computes,
+    // on a second instance of its backend (0: off, the default is GGML_SCHED_PREFETCH). Call before the first reserve or graph: the
+    // allocation of the input copies depends on it. A copy callback that maps the weights itself (the MoE cache of llama.cpp) needs 0
+    GGML_API void                          ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, int depth);
+
+    // fork: a timeline of host and device spans in the trace event format of Perfetto and chrome://tracing, written to the file
+    // GGML_TIMELINE names while on (llama-server turns it on for LLAMA_TRACE_REQUESTS). Times are those of ggml_time_us()
+    GGML_API bool                          ggml_timeline_on(void);
+    GGML_API void                          ggml_timeline_enable(bool enable);
+    GGML_API void                          ggml_timeline_event(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us);
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 

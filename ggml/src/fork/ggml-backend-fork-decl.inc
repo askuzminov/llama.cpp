@@ -29,6 +29,33 @@ struct ggml_backend_sched_prof {
 typedef void (*ggml_backend_timing_enable_fork_t)(ggml_backend_t backend, bool enable);
 typedef void (*ggml_backend_timing_take_fork_t)(ggml_backend_t backend, double * busy_us, int64_t * n_calls);
 
+// GGML_SCHED_PREFETCH=<depth>: the weights in host memory of a split are uploaded while the split <depth> before it
+// computes, on a second instance of its backend (see ggml-backend-fork.inc)
+#define GGML_SCHED_PREFETCH_MAX 4
+
+struct ggml_backend_sched_prefetch {
+    int depth;    // 0: off
+    int min_load; // a MUL_MAT_ID at the start of a split is uploaded whole when its ids select at least this many per expert
+
+    bool                 supported[GGML_SCHED_MAX_BACKENDS]; // a device with async copies and events, fixed at the start
+    bool                 failed   [GGML_SCHED_MAX_BACKENDS]; // no second instance or events: copies at the start of the split
+    ggml_backend_t       copy     [GGML_SCHED_MAX_BACKENDS]; // the second instance, created at the first upload
+    ggml_backend_event_t before   [GGML_SCHED_MAX_BACKENDS]; // on the backend, before the split that uploads
+    ggml_backend_event_t done     [GGML_SCHED_MAX_BACKENDS][GGML_SCHED_PREFETCH_MAX + 1]; // on the copy, by split % (MAX + 1)
+
+    int64_t n_uploads; // the first one is logged
+};
+
+static void ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched);
+static void ggml_backend_sched_prefetch_free(ggml_backend_sched_t sched);
+static void ggml_backend_sched_prefetch_sync(ggml_backend_sched_t sched);
+static void ggml_backend_sched_prefetch_plan(ggml_backend_sched_t sched);
+static bool ggml_backend_sched_prefetch_input(const struct ggml_backend_sched_split * split, const struct ggml_tensor * input);
+static void ggml_backend_sched_prefetch_add_inputs(ggml_backend_sched_t sched, int i_split, struct ggml_cgraph * graph_copy);
+static void ggml_backend_sched_prefetch_begin(ggml_backend_sched_t sched, int i_split);
+static bool ggml_backend_sched_prefetch_wait(ggml_backend_sched_t sched, int i_split);
+static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched, int i_split);
+
 static void ggml_backend_sched_log_splits(ggml_backend_sched_t sched, const char * what);
 static void ggml_backend_sched_prof_print(ggml_backend_sched_t sched, int bucket);
 static void ggml_backend_sched_prof_gpu_init(ggml_backend_sched_t sched);

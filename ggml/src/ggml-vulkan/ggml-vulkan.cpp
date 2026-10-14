@@ -5962,6 +5962,9 @@ void ggml_vk_ctx_end(vk_context& ctx) {
         vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT(ctx->s->buffer->buf);
     }
 
+    // fork: the end of its gpu span on the timeline
+    ggml_vk_fork_timeline_end(ctx);
+
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
@@ -5985,6 +5988,9 @@ void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
             ggml_vk_cmd_label_begin(subctx->s->buffer->buf, label.c_str());
         }
     }
+
+    // fork: the start of its gpu span on the timeline
+    ggml_vk_fork_timeline_begin(device, subctx);
 }
 
 vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
@@ -13933,6 +13939,9 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+
+    // fork: the gpu spans of the timeline that ended
+    ggml_vk_fork_timeline_collect(ctx->device);
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {

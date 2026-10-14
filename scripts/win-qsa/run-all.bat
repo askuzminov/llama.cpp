@@ -1,6 +1,6 @@
 @echo off
 rem the build and every measurement, in order: 00-build, 01-check, 06-kernels (no model), 03-quality, 04-decode,
-rem 05-profile (02-bench with llama-bench is gone since 13.10: it has none of the server's state). each one runs
+rem 05-profile, 07-trace (Nsight Systems on CUDA, GGML_TIMELINE on Vulkan) (02-bench with llama-bench is gone since 13.10: it has none of the server's state). each one runs
 rem only what the same sources have not measured yet, so after a change of the code everything runs, and after a
 rem change of the scripts only the new arms do. RUN_* in _local.bat turn steps
 rem off (05 and 06 are on for the 395 only); serve.bat is not part of it.
@@ -14,6 +14,7 @@ if "%RUN_KERNELS%"=="1" set "STEPS=%STEPS% 06-kernels"
 if "%RUN_QUALITY%"=="1" set "STEPS=%STEPS% 03-quality"
 if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 04-decode"
 if "%RUN_PROFILE%"=="1" set "STEPS=%STEPS% 05-profile"
+if "%RUN_TRACE%"=="1"   set "STEPS=%STEPS% 07-trace"
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do
     exit /b 1
