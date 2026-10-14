@@ -337,7 +337,7 @@ void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snapshot) {
 // them, so nothing computed in between takes their memory, and an upload waits for the work before that split, whose
 // memory it may reuse. ggml-alloc gives a graph the offsets of the reserved graph by node index, so the order of the
 // nodes must not depend on the batch: which splits upload ahead is fixed by the splits, and a split that starts with a
-// MUL_MAT_ID whose ids select fewer than GGML_SCHED_PREFETCH_LOAD (4) per expert of its weight is copied as before, at
+// MUL_MAT_ID whose ids select fewer than GGML_SCHED_PREFETCH_LOAD (20) per expert of its weight is copied as before, at
 // its start, only the experts its ids name (the copy callback)
 
 // a weight in host memory or a view of one: a view gets its buffer only when the graph is allocated, after the split,
@@ -419,8 +419,11 @@ static bool ggml_backend_sched_prefetch_on(ggml_backend_sched_t sched, const str
 static void ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_prefetch * pf = &sched->prefetch;
 
+    // 14.10, 3090: a 485-token prompt ubatch took 2.39 s with the experts its ids name (about 70 percent of them, the
+    // routing is uneven) against 3.20 s uploading them all ahead, a 3761-token one 3.52 s ahead against 4.83 s; so the
+    // whole tensor goes ahead from 20 selections per expert (1024 tokens of 10 of 512 experts)
     const char * load = getenv("GGML_SCHED_PREFETCH_LOAD");
-    pf->min_load = load ? std::max(0, atoi(load)) : 4;
+    pf->min_load = load ? std::max(0, atoi(load)) : 20;
 
     for (int b = 0; b < sched->n_backends; b++) {
         ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);

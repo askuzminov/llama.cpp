@@ -4243,12 +4243,18 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // fork: the decode call on the timeline (GGML_TIMELINE)
+        const int64_t t_decode_us = ggml_timeline_on() ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (t_decode_us != 0) {
+            const std::string name = "decode " + std::to_string(batch.view.size());
+            ggml_timeline_event("server", name.c_str(), t_decode_us, ggml_time_us());
+        }
 
         if (ret != 0) {
             {
@@ -4308,9 +4314,14 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_spec_us = ggml_timeline_on() ? ggml_time_us() : 0; // fork: GGML_TIMELINE
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            if (t_spec_us != 0) {
+                const std::string name = "spec process " + std::to_string(batch.view.size());
+                ggml_timeline_event("server", name.c_str(), t_spec_us, ggml_time_us());
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

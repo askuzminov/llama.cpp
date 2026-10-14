@@ -1691,7 +1691,8 @@ def trace_summary(db, gap_ms):
 
 def timeline_summary(path, gap_ms):
     """The timeline of GGML_TIMELINE (Vulkan: the gpu span of each command buffer; llama: graph, inputs and submit of each
-    ubatch, "llama mtp" for the MTP head; host: the syncs; server: the requests): how long the GPU ran and stood still in
+    ubatch, "llama mtp" for the MTP head; host: the syncs; server: the requests, each decode call of the target and the
+    speculative process after it): how long the GPU ran and stood still in
     the requests, the stretches of gpu work apart by gap_ms or more of idle, and the idle stretches between them, each
     with the host time of every phase that started in it. A stretch with a ubatch of 1025 tokens or more is a prompt"""
     text = path.read_text(encoding="utf-8").rstrip().rstrip(",")
@@ -1705,8 +1706,10 @@ def timeline_summary(path, gap_ms):
     w0 = min(a for a, _ in requests) if requests else gpu[0][0]
     w1 = max(b for _, b in requests) if requests else gpu[-1][1]
     starts = [x[0] for x in gpu]
-    host = [(t, n.split()[0], int(n.split()[1]) if len(n.split()) > 1 and n.split()[1].isdigit() else 0, a, b)
-            for t, n, a, b in spans if t in ("llama", "llama mtp", "host")]
+    # the server: the decode call of the target and the speculative process after it (the MTP catch-up), the requests
+    # are the window
+    host = [(t, "spec" if n.startswith("spec") else n.split()[0], int(n.split()[-1]) if n.split()[-1].isdigit() else 0, a, b)
+            for t, n, a, b in spans if t in ("llama", "llama mtp", "host") or (t == "server" and not n.startswith("request"))]
     host.sort(key=lambda h: h[3])
     h_starts = [h[3] for h in host]
     longest = max((h[4] - h[3] for h in host), default=0)
@@ -1759,7 +1762,7 @@ def timeline_summary(path, gap_ms):
 def timeline_lines(name, r, kept=False):
     """The summary of one timeline (timeline_summary)"""
     w = r["window_ms"]
-    order = ["graph", "inputs", "submit", "sync", "mtp graph", "mtp inputs", "mtp submit"]
+    order = ["decode", "spec", "graph", "inputs", "submit", "sync", "mtp graph", "mtp inputs", "mtp submit"]
     ph = r["phases"]
     lines = ["", f"{name}: {r.get('report', '')} (Perfetto, chrome://tracing)" + (" k" if kept else ""),
              f"  requests {w / 1000:.2f} s: gpu {r['gpu_ms'] / 1000:.2f} s ({100 * r['gpu_ms'] / w:.0f}%), idle "
@@ -1868,35 +1871,35 @@ def cmd_trace():
         url = f"http://127.0.0.1:{port}"
 
         def go_nsys(log):
+            # capture-range-end stop: the collection ends with the last traced request and the server answers it
+            # (stop-shutdown ended the server before the answer of the last request went out, 14.10). nsys writes the
+            # report when the server exits; the output of the server goes to its own log, nsys does not pass it on
+            server_log = base.with_name(f"{arm.name}-server.log")
             cmd = ["profile", "--trace=cuda,nvtx", "--cuda-graph-trace=node", "--sample=none", "--cpuctxsw=none",
-                   "--capture-range=cudaProfilerApi", "--capture-range-end=stop-shutdown", "--force-overwrite=true",
-                   "--output", str(base), str(exe), *args]
+                   "--capture-range=cudaProfilerApi", "--capture-range-end=stop", "--force-overwrite=true",
+                   "--output", str(base), str(exe), *args, "--log-file", str(server_log)]
             proc, log = start_server(nsys, cmd, run_env, log)
             try:
                 trace_conversation(url, turns, gen, log)
-                # stop-shutdown ends the session at the end of the last traced request: nsys writes the report and
-                # exits. a server still up a minute later is stopped by name, then nsys writes the report (no other
-                # llama-server runs, see no_server_running)
-                t_last, wait, killed = time.time(), env_int("TRACEWAIT", 1800), False
-                while proc.poll() is None and time.time() - t_last < wait:
-                    time.sleep(5)
-                    if not killed and os.name == "nt" and time.time() - t_last > 60:
-                        try:
-                            http(url + "/health", timeout=2)
-                            subprocess.run(["taskkill", "/f", "/im", "llama-server.exe"], capture_output=True)
-                            killed = True
-                        except (urllib.error.URLError, OSError):
-                            pass
-                if proc.poll() is None:
-                    raise Fail(f"nsys did not end in {wait} s after the last request ({log.name})")
             finally:
-                if proc.poll() is None:
+                # the server only, by name (no other llama-server runs, see no_server_running): nsys then writes the
+                # report and exits. killing nsys too would lose the report
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/f", "/im", "llama-server.exe"], capture_output=True)
+                else:
+                    subprocess.run(["pkill", "-x", "llama-server"], capture_output=True)
+                wait = env_int("TRACEWAIT", 1800)
+                try:
+                    proc.wait(timeout=wait)
+                except subprocess.TimeoutExpired:
                     if os.name == "nt":
                         subprocess.run(["taskkill", "/f", "/t", "/pid", str(proc.pid)], capture_output=True)
                     else:
                         proc.kill()
                     proc.wait()
-                mark_end()
+                    raise Fail(f"nsys did not end in {wait} s after the server ({log.name})")
+                finally:
+                    mark_end()
             report = base.with_suffix(".nsys-rep")
             if not report.is_file():
                 raise Fail(f"nsys wrote no {report.name}: {last_error(read_log(log))} ({log.name})")

@@ -365,15 +365,22 @@ static void ggml_cuda_op_timing_fork_free(const ggml_backend_cuda_context * ctx)
 // address ggml_backend_profiler_fork. The stop waits for the devices: the work of the traced requests is in the trace
 // only once it ends
 static void ggml_backend_cuda_profiler_fork(bool start) {
+    // a profiler that refuses is not a reason to stop the server
     if (start) {
-        CUDA_CHECK(cudaProfilerStart());
+        const cudaError_t err = cudaProfilerStart();
+        if (err != cudaSuccess) {
+            GGML_LOG_WARN("%s: cudaProfilerStart: %s\n", __func__, cudaGetErrorString(err));
+        }
         return;
     }
     for (int d = 0; d < ggml_backend_cuda_get_device_count(); d++) {
         ggml_cuda_set_device(d);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
-    CUDA_CHECK(cudaProfilerStop());
+    const cudaError_t err = cudaProfilerStop();
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: cudaProfilerStop: %s\n", __func__, cudaGetErrorString(err));
+    }
 }
 
 #define GGML_CUDA_TIMING_FORK 1

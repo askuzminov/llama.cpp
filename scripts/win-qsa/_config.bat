@@ -282,6 +282,14 @@ if not defined COOL       set "COOL=120"
 if not defined DECARMS    set "DECARMS=nowarm LLAMA_PLE_WARM=0 @draft --spec-auto;auto @draft --spec-auto"
 rem 14.10: 07-trace on the 395 through GGML_TIMELINE (Nsight Systems sees no AMD gpu): the gpu span of each command
 rem buffer next to the host phases of llama, where the gpu stands still in a prompt ubatch and in a decode step with MTP
+rem 14.10 evening (bc178dcc), nowarm first: nowarm PP 719.1 TG 38.01, auto 724.4 / 37.75: the 4 percent of the run
+rem before was the order (the first arm right after the build). the read ahead: verify 0.2-0.9 ms faster (PLE input
+rem 0.2 against 0.7 ms), the 3 draft steps 0.1-0.4 ms slower, within the noise; it stays on.
+rem 07 of 14.10: the gpu busy 94 percent of the conversation (29K prompt and a turn): a prompt ubatch is gpu bound (72 ms
+rem idle in 17.6 s), a decode cycle with MTP has ~6 ms of host gaps in ~60 ms; but between the batches of the prompt
+rem the gpu stood 730 ms (before the MTP catch-up) and 270 ms (before the next batch) with no host phase traced: the
+rem next run traces the decode call and the speculative process of the server too (07 only)
+if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_TRACE  set "RUN_TRACE=1"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
@@ -528,8 +536,17 @@ rem on a second CUDA stream, instead of after a sync at its start: a prompt ubat
 rem kernels in series (05 of 14.10, 3707 tokens). By the profile of 14.10 a pipeline of the two takes 3.15 s instead of
 rem 5.0 at depth 2, and 4.4 / 4.1 s instead of 7.2 at 8192 tokens and depth 2 / 3; it costs 2 / 3 more copies of the
 rem experts of a split in the compute buffer (0.5-0.9 GB each), so phase_mem may take a smaller ubatch deep in a chat
+rem 14.10 evening (d3c32c75): pf3 took the ~3.8K turns at 670.7 t/s against 552.4 of auto (+21 percent; 734 / 670 / 674 /
+rem 597 against 582 / 567 / 539 / 515 by quarter of the chat to ~118K), pf2 662.1; a 3761-token ubatch 3.52 s against 4.83.
+rem but the turns of ~540 and ~300 tokens 4.88 / 4.74 s against 4.10 / 3.50: a 485-token ubatch took 2.39 s with the
+rem experts its ids name (about 70 percent, the routing is uneven) and 3.20 s with all of them uploaded ahead. since
+rem then a split uploads ahead only from 20 selections per expert (GGML_SCHED_PREFETCH_LOAD, 1024 tokens here). TG the
+rem same in all arms. small352: the ~300-token turns 3.82 s against 3.50 of auto (the upload of the named experts is
+rem cheaper than the CPU experts there), the limit stays 192. 03: KLD of pf3 0.01726 against 0.01735 of default, the
+rem reference against itself 0.0043 (CUDA does not give the same result twice), so no sign of a wrong upload.
+rem the next run: auto against pf3 with the threshold, and 07 again (the first nsys run lost the report, see _run.py)
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;small352 LLAMA_PHASE_SMALL_PROMPT=352 @draft --spec-auto;pf2 GGML_SCHED_PREFETCH=2 @draft --spec-auto;pf3 GGML_SCHED_PREFETCH=3 @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;pf3 GGML_SCHED_PREFETCH=3 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:30:16000 120000:6:2000 120000:6:1000 120000:6:400"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
@@ -545,8 +562,8 @@ rem new eval cases of the qwen4exp shapes), 02 default / maskdense / rowsup (GGM
 rem optime / optimemd again
 rem 12.10 night (7c218166): GET_ROWS 224/224 with the new cases
 if not defined RUN_CHECK   set "RUN_CHECK=0"
-rem 14.10: 03 again for the uploads of the experts on a second stream (pf3 in QARMS)
-if not defined RUN_QUALITY set "RUN_QUALITY=1"
+rem 14.10: 03 for the uploads of the experts on a second stream (pf3 in QARMS): measured, see DECARMS
+if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem 14.10: 07-trace, the timeline of a conversation in Nsight Systems: does the upload of pf3 run under the kernels,
 rem and where the GPU waits in a decode step. needs nsys (Nsight Systems, the CUDA toolkit has it; NSYS= its path)
 if not defined RUN_TRACE  set "RUN_TRACE=1"
