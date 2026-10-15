@@ -603,9 +603,15 @@ rem the experts in RAM (07 deepn: 67 GiB in 2.9 s per ubatch of a turn at 95K). 
 rem the ubatch of the target, though it splits at its own 1024: its dense KQ mask counted 1.4 GiB at 214K x 3584
 rem instead of 0.4 (fixed since, phase_size; by the sizes of this run ~5120 at 214K with the fix alone). qmc
 rem (LLAMA_QSA_MASK_MIB=512): also the queries of QSA in chunks whose mask fits 512 MiB, the ubatch can stay 8192
+rem pf8 / pf12 (with qmc): LLAMA_MOE_PREFETCH=8 / 12, the experts the router of layer L+1 predicts on the router
+rem input of layer L (top 16 per token) and the cache misses go to 8 / 12 stage slots of L+1 on a second stream
+rem while the GPU computes L (07 pred of 15.10: from one layer before the top 10 name 65 percent of the misses); the
+rem stage slots come out of the cache (48 -> 40 / 36 slots). LLAMA_MOE_CACHE_REPORT: the cache line every 1024
+rem steps (hit, host MiB per step, the prefetch: uploads per layer and step and the share of them routed)
 if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qmc LLAMA_QSA_MASK_MIB=512 @draft --spec-auto"
+if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qmc LLAMA_QSA_MASK_MIB=512 @draft --spec-auto;pf8 LLAMA_QSA_MASK_MIB=512 LLAMA_MOE_PREFETCH=8 @draft --spec-auto;pf12 LLAMA_QSA_MASK_MIB=512 LLAMA_MOE_PREFETCH=12 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
@@ -693,7 +699,7 @@ if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
-if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch|prefetch_issue"
+if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache: prefetch|moe_cache: [0-9]+ layers|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch|prefetch_issue"
 rem 1: the warmup run of llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds load time and
 rem memory pressure, -lm dio reads the weights at load
 if not defined WARMUP      set "WARMUP=0"

@@ -1007,6 +1007,10 @@ struct ggml_backend_sched {
 
     // fork: uploads of the host weights of later splits [GGML_SCHED_PREFETCH]
     struct ggml_backend_sched_prefetch prefetch;
+
+    // fork: after each CPU split (ggml_backend_sched_set_split_callback_fork)
+    ggml_backend_sched_split_callback_fork split_callback_fork;
+    void *                                 split_callback_fork_user_data;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2058,6 +2062,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (timeline) {
                 ggml_backend_sched_timeline_split(split_backend, split, t_compute_us); // fork
             }
+            ggml_backend_sched_split_done_fork(sched, split_backend, split); // fork
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -2351,6 +2356,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_split_callback_fork(ggml_backend_sched_t sched, ggml_backend_sched_split_callback_fork callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->split_callback_fork = callback;
+    sched->split_callback_fork_user_data = user_data;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

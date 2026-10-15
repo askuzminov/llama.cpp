@@ -60,6 +60,9 @@ static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched, int i_
 // experts of a layer: the layer number is in the name)
 static void ggml_backend_sched_timeline_split(ggml_backend_t backend, const struct ggml_backend_sched_split * split, int64_t t_start_us);
 
+// the split callback of the fork after a CPU split (ggml_backend_sched_set_split_callback_fork)
+static void ggml_backend_sched_split_done_fork(ggml_backend_sched_t sched, ggml_backend_t backend, struct ggml_backend_sched_split * split);
+
 static void ggml_backend_sched_log_splits(ggml_backend_sched_t sched, const char * what);
 static void ggml_backend_sched_prof_print(ggml_backend_sched_t sched, int bucket);
 static void ggml_backend_sched_prof_gpu_init(ggml_backend_sched_t sched);

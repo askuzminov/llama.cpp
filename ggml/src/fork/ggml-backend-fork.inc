@@ -715,6 +715,17 @@ void ggml_timeline_device_spans(const char * track, size_t n, const double * sta
     }
 }
 
+static void ggml_backend_sched_split_done_fork(ggml_backend_sched_t sched, ggml_backend_t backend, struct ggml_backend_sched_split * split) {
+    if (sched->split_callback_fork == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return;
+    }
+    sched->split_callback_fork(backend, &split->graph, sched->split_callback_fork_user_data);
+}
+
 static void ggml_backend_sched_timeline_split(ggml_backend_t backend, const struct ggml_backend_sched_split * split, int64_t t_start_us) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {

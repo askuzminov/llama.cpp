@@ -729,6 +729,7 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_split_callback_fork(sched.get(), sched_split_done_fork, this); // fork
     // fork: the upstream MoE cache maps the experts in its copy callback, the uploads ahead would bypass it
     if (moe_cache) {
         ggml_backend_sched_set_prefetch(sched.get(), 0);
@@ -775,6 +776,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+                ggml_backend_sched_set_split_callback_fork(sched.get(), sched_split_done_fork, this); // fork
                 // fork: the upstream MoE cache maps the experts in its copy callback, the uploads ahead would bypass it
                 if (moe_cache) {
                     ggml_backend_sched_set_prefetch(sched.get(), 0);
