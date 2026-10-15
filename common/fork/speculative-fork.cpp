@@ -510,8 +510,9 @@ static llama_model * g_draft_preloaded = nullptr;
 static std::string   g_draft_preloaded_path;
 
 void common_speculative_fork_preload_draft(const common_params & params_base) {
+    // on by default since 15.10 night (the 395: speed the same, see the header); LLAMA_DRAFT_LOAD_FIRST=0: upstream order
     const char * env = getenv("LLAMA_DRAFT_LOAD_FIRST");
-    if (env == nullptr || atoi(env) == 0 || !params_base.speculative.has_dft() || g_draft_preloaded != nullptr) {
+    if ((env != nullptr && atoi(env) == 0) || !params_base.speculative.has_dft() || g_draft_preloaded != nullptr) {
         return;
     }
     // the same parameters as common_speculative_init_result gets from the server

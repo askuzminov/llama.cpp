@@ -865,13 +865,15 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         const bool manual_ok = !cparams.training && inp_attn->self_k_rot == nullptr && inp_attn->self_v_rot == nullptr &&
             kq_mask != nullptr && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 && ggml_is_contiguous(kq_mask);
 
-        // LLAMA_MTP_WINDOW=<cells> (0, off): the draft attends to the last <cells> cells of its KV only. its dense
-        // attention reads the whole context per draft step: on the 395 the step took 3.7 ms at depth 0 and 5.6 at ~195K
-        // (05, 15.10). the drafts are verified by the target, a window changes the acceptance only. the cells of the
-        // draft memory follow the positions (one sequence, filled in order), so the last ones are the nearest
+        // LLAMA_MTP_WINDOW=<cells> (16384; 0: the whole context): the draft attends to the last <cells> cells of its KV
+        // only. its dense attention reads the whole context per draft step: on the 395 the step took 3.7 ms at depth 0
+        // and 5.6 at ~195K (05, 15.10). the drafts are verified by the target, a window changes the acceptance only. the
+        // cells of the draft memory follow the positions (one sequence, filled in order), so the last ones are the
+        // nearest. the 395 (15.10 night, chats to 213K): 16384 against the whole context TG 38.64 / 36.39 / 36.84
+        // against 37.08 / 34.76 / 35.37 at 120-160K / 160-200K / 200K+, acceptance 0.719 against 0.723
         static const int64_t mtp_window = [] {
             const char * env = std::getenv("LLAMA_MTP_WINDOW");
-            return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+            return env ? (int64_t) std::atoll(env) : (int64_t) 16384;
         }();
         ggml_tensor * k_all = inp_attn->mctx->get_k(ctx0, il);
         ggml_tensor * v_all = inp_attn->mctx->get_v(ctx0, il);

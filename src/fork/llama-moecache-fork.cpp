@@ -962,13 +962,6 @@ llama_moe_cache_fork::llama_moe_cache_fork(const llama_model & model, int32_t n_
     frequency_admission = policy == nullptr || strcmp(policy, "lru") != 0;
     const char * async = getenv("LLAMA_MOE_CACHE_ASYNC");
     async_table = async && atoi(async) != 0;
-    // LLAMA_MOE_PREFETCH=<slots>: stage slots per layer for the predicted experts (0: off), see on_cpu_split()
-    const char * pf = getenv("LLAMA_MOE_PREFETCH");
-    n_stage = pf ? std::max(0, atoi(pf)) : 0;
-    const char * pt = getenv("LLAMA_MOE_PREFETCH_TOP");
-    n_pred_top = pt && atoi(pt) > 0 ? atoi(pt) : 16;
-    const char * ps = getenv("LLAMA_MOE_PREFETCH_SELF");
-    stage_self = ps && atoi(ps) != 0;
 }
 
 llama_moe_cache_fork::~llama_moe_cache_fork() {
@@ -983,15 +976,6 @@ llama_moe_cache_fork::~llama_moe_cache_fork() {
     }
     if (backend_up != nullptr) {
         ggml_backend_free(backend_up);
-    }
-    if (backend_stage != nullptr) {
-        ggml_backend_synchronize(backend_stage);
-    }
-    for (auto * ev : ev_stage) {
-        ggml_backend_event_free(ev);
-    }
-    if (backend_stage != nullptr) {
-        ggml_backend_free(backend_stage);
     }
 }
 
@@ -1021,8 +1005,6 @@ void llama_moe_cache_fork::init(ggml_backend_sched_t sched) {
         layer l;
         l.il     = il;
         l.merged = ml.ffn_gate_up_exps != nullptr;
-        // the prediction is the top of the router logits: a selection bias or a router bias would move it
-        l.gate_inp = ml.ffn_gate_inp_b == nullptr && ml.ffn_exp_probs_b == nullptr ? ml.ffn_gate_inp : nullptr;
         l.w_up   = l.merged ? ml.ffn_gate_up_exps : ml.ffn_up_exps;
         l.w_gate = l.merged ? nullptr : ml.ffn_gate_exps;
         l.w_down = ml.ffn_down_exps;
@@ -1104,20 +1086,6 @@ void llama_moe_cache_fork::init(ggml_backend_sched_t sched) {
 
     ev_up = ggml_backend_event_new(dev);
     async_upload = async_table && strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0;
-
-    if (n_stage > 0) {
-        backend_stage = ggml_backend_dev_init(dev, nullptr);
-        ev_stage.assign(sel.size(), nullptr);
-        bool ok = backend_stage != nullptr;
-        for (size_t i = 0; i < sel.size() && ok; ++i) {
-            ev_stage[i] = ggml_backend_event_new(dev);
-            ok = ev_stage[i] != nullptr;
-        }
-        if (!ok) {
-            LLAMA_LOG_WARN("%s: %s has no second upload instance or no events, the prefetch is off\n", MOE_CACHE_LOG, ggml_backend_dev_name(dev));
-            n_stage = 0;
-        }
-    }
     LLAMA_LOG_INFO("%s: policy %s, async uploads %d, async table %d\n", MOE_CACHE_LOG,
             frequency_admission ? "lfu" : "lru", async_upload, async_table);
 
@@ -1167,8 +1135,6 @@ void llama_moe_cache_fork::alloc() {
         // one more slot covers the zero slot and the padding
         const size_t need = MOE_CACHE_MARGIN + b_slot;
         n = free > need ? (int64_t) ((free - need) / b_slot) : 0;
-        // the stage slots of LLAMA_MOE_PREFETCH come out of the same memory
-        n = std::max<int64_t>(0, n - n_stage);
     }
     n = std::min<int64_t>(n, n_expert);
 
@@ -1189,7 +1155,7 @@ void llama_moe_cache_fork::alloc() {
             /*.no_alloc   =*/ true,
         };
         ctx_dev.reset(ggml_init(params));
-        params.mem_size = (3*n_layers + (async_table ? 1 : 0))*ggml_tensor_overhead();
+        params.mem_size = (2*n_layers + (async_table ? 1 : 0))*ggml_tensor_overhead();
         ctx_host.reset(ggml_init(params));
     }
 
@@ -1209,7 +1175,7 @@ void llama_moe_cache_fork::alloc() {
             if (w == nullptr) {
                 return nullptr;
             }
-            ggml_tensor * t = ggml_new_tensor_3d(ctx_dev.get(), w->type, w->ne[0], w->ne[1], n + n_stage + 1);
+            ggml_tensor * t = ggml_new_tensor_3d(ctx_dev.get(), w->type, w->ne[0], w->ne[1], n + 1);
             ggml_format_name(t, "moe_cache.%d.%s", l.il, name);
             return t;
         };
@@ -1226,12 +1192,6 @@ void llama_moe_cache_fork::alloc() {
 
         l.ids = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, n_used_max*N_TOKENS_MAX);
         ggml_format_name(l.ids, "moe_cache.%d.ids", l.il);
-
-        l.pred = nullptr;
-        if (n_stage > 0 && l.gate_inp != nullptr) {
-            l.pred = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, (int64_t) n_pred_top*N_TOKENS_MAX);
-            ggml_format_name(l.pred, "moe_cache.%d.pred", l.il);
-        }
     }
 
     buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), ggml_backend_dev_buffer_type(dev)));
@@ -1246,7 +1206,7 @@ void llama_moe_cache_fork::alloc() {
         LLAMA_LOG_ERROR("%s: failed to allocate %d slots on %s, no slots\n", MOE_CACHE_LOG, (int) n, ggml_backend_dev_name(dev));
         buf_dev.reset();
         for (auto & l : layers) {
-            l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = l.pred = nullptr;
+            l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = nullptr;
         }
         table_all = nullptr;
         table_staging = nullptr;
@@ -1263,34 +1223,7 @@ void llama_moe_cache_fork::alloc() {
     n_slots   = (int32_t) n;
     n_slots_l = n_slots;
 
-    table_host.assign(n_expert*n_layers, slot_zero());
-
-    // LLAMA_MOE_PREFETCH: the table rows go to the device asynchronously, from pinned memory that stays until they land
-    ids_root.clear();
-    pred_root.clear();
-    staged.assign(n_layers, {});
-    stage_wait.assign(n_layers, 0);
-    stage_mark.assign(n_expert, 0);
-    if (n_stage > 0) {
-        ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead(),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        ctx_stage.reset(ggml_init(params));
-        stage_rows = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_I32, n_expert, n_layers);
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
-        if (!buft) {
-            buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-        }
-        buf_stage.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_stage.get(), buft));
-        for (int idx = 0; idx < n_layers; ++idx) {
-            ids_root[layers[idx].ids] = idx;
-            if (layers[idx].pred != nullptr) {
-                pred_root[layers[idx].pred] = idx;
-            }
-        }
-    }
+    table_host.assign(n_expert*n_layers, n_slots);
 
     lrus.assign(n_layers, lru());
 
@@ -1363,22 +1296,12 @@ void llama_moe_cache_fork::release() {
         ev_up_recorded = false;
     }
     ggml_backend_synchronize(backend_up);
-    if (backend_stage != nullptr) {
-        ggml_backend_synchronize(backend_stage);
-    }
 
     hot = hot_now();
     for (size_t idx = 0; idx < layers.size(); ++idx) {
         layer & l = layers[idx];
-        l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = l.pred = nullptr;
+        l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = nullptr;
     }
-    ids_root.clear();
-    pred_root.clear();
-    staged.clear();
-    stage_wait.clear();
-    stage_rows = nullptr;
-    buf_stage.reset();
-    ctx_stage.reset();
     state_save();
 
     table_all = nullptr;
@@ -1559,15 +1482,14 @@ void llama_moe_cache_fork::join_uploads() {
     pending_uploads.clear();
 }
 
-size_t llama_moe_cache_fork::upload(size_t idx, int32_t e, int32_t s, ggml_backend_t bk) {
+size_t llama_moe_cache_fork::upload(size_t idx, int32_t e, int32_t s) {
     const layer & l = layers[idx];
 
     size_t b = 0;
 
-    ggml_backend_t target = bk ? bk : backend_up;
     auto up = [&](const ggml_tensor * w, ggml_tensor * t) {
         if (w != nullptr) {
-            ggml_backend_tensor_set_async(target, t, (const char *) w->data + e*w->nb[2], s*t->nb[2], w->nb[2]);
+            ggml_backend_tensor_set_async(backend_up, t, (const char *) w->data + e*w->nb[2], s*t->nb[2], w->nb[2]);
             b += w->nb[2];
         }
     };
@@ -1576,89 +1498,6 @@ size_t llama_moe_cache_fork::upload(size_t idx, int32_t e, int32_t s, ggml_backe
     up(l.w_down, l.s_down);
 
     return b;
-}
-
-// LLAMA_MOE_PREFETCH. the graph of layer L computes the router of layer L+1 on the router input of L (the top
-// n_pred_top ids per token) and copies the ids to the host in the CPU split that copies the routing ids of L. after
-// that split: the compute stream waits for the stage uploads of L, if there are any (the cached path of L follows),
-// and the predicted experts of L+1 that are not in its cache slots go to its stage slots on backend_stage, with the
-// table row of L+1 that points them there; the CPU skips them. 3090, 15.10 (07 pred): from one layer before, the top
-// 10 ids per token name 65% of the experts the cache misses, with 14.5 uploads per layer and step (43 MiB)
-void llama_moe_cache_fork::on_cpu_split(struct ggml_cgraph * graph) {
-    if (n_stage <= 0 || !ready() || ids_root.empty()) {
-        return;
-    }
-    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-        const ggml_tensor * node = ggml_graph_node(graph, i);
-        // the copies into the host tensors, not the views of their destinations, which are nodes of the split too
-        if (node->op != GGML_OP_CPY || node->view_src == nullptr) {
-            continue;
-        }
-        const ggml_tensor * root = node->view_src;
-        auto it = ids_root.find(root);
-        if (it != ids_root.end()) {
-            // LLAMA_MOE_PREFETCH_SELF=1: the experts the routing of this layer missed go up now, its cached path
-            // waits for them (the split of the misses between the CPU and the device within the layer; with the real
-            // ids the stage slots are always read, which also tests them)
-            if (stage_self) {
-                stage(it->second, (const int32_t *) layers[it->second].ids->data, node->ne[0], node->ne[1]);
-            }
-            if (stage_wait[it->second]) {
-                ggml_backend_event_wait(backend, ev_stage[it->second]);
-                stage_wait[it->second] = 0;
-            }
-        }
-        auto ip = pred_root.find(root);
-        if (ip != pred_root.end() && !stage_self) {
-            stage(ip->second, (const int32_t *) layers[ip->second].pred->data, node->ne[0], node->ne[1]);
-        }
-    }
-}
-
-void llama_moe_cache_fork::stage(size_t idx, const int32_t * pred, int64_t n_top, int64_t n_tokens) {
-    const int64_t t_start_us = ggml_time_us();
-
-    const layer & l = layers[idx];
-    const lru   & c = lrus[idx];
-
-    int32_t * skip = (int32_t *) l.skip->data;
-
-    // the ids by rank over the tokens: the best of every token first
-    std::vector<int32_t> & sel = staged[idx];
-    sel.clear();
-    const int32_t key = ++stage_key;
-    for (int64_t r = 0; r < n_top && (int32_t) sel.size() < n_stage; ++r) {
-        for (int64_t t = 0; t < n_tokens && (int32_t) sel.size() < n_stage; ++t) {
-            const int32_t e = pred[t*n_top + r];
-            if (e < 0 || e >= n_expert || stage_mark[e] == key) {
-                continue;
-            }
-            stage_mark[e] = key;
-            if (c.slot[e] >= 0 && c.live[c.slot[e]]) {
-                continue;
-            }
-            sel.push_back(e);
-        }
-    }
-    if (sel.empty()) {
-        t_stage_us += ggml_time_us() - t_start_us;
-        return;
-    }
-
-    int32_t * row = (int32_t *) stage_rows->data + idx*n_expert;
-    memcpy(row, table_host.data() + idx*n_expert, n_expert*sizeof(int32_t));
-    for (size_t i = 0; i < sel.size(); ++i) {
-        upload(idx, sel[i], n_slots + (int32_t) i, backend_stage);
-        row[sel[i]]  = n_slots + (int32_t) i;
-        skip[sel[i]] = 1;
-    }
-    ggml_backend_tensor_set_async(backend_stage, table_all, row, idx*table_all->nb[1], n_expert*sizeof(int32_t));
-    ggml_backend_event_record(ev_stage[idx], backend_stage);
-    stage_wait[idx] = 1;
-
-    n_stage_ins += sel.size();
-    n_stage_lay++;
-    t_stage_us  += ggml_time_us() - t_start_us;
 }
 
 void llama_moe_cache_fork::update(const llm_graph_result * res) {
@@ -1681,9 +1520,6 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
         ev_up_recorded = false;
     }
     ggml_backend_synchronize(backend_up);
-    if (backend_stage != nullptr) {
-        ggml_backend_synchronize(backend_stage);
-    }
 
     const int64_t t_wait_end_us = ggml_time_us();
     t_wait_us += t_wait_end_us - t_graph_end_us;
@@ -1744,32 +1580,6 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
     bool dirty  = false;
     bool issued = false;
 
-    // LLAMA_MOE_PREFETCH: the stage slots served this step only, their experts go back to the CPU and the device table
-    // is sent whole below; first the count of the staged experts that the step routed
-    for (size_t i = 0; i < res->moe_cache_il.size() && !staged.empty(); ++i) {
-        const int idx = il2idx[res->moe_cache_il[i]];
-        if (staged[idx].empty()) {
-            continue;
-        }
-        const int32_t * ids = (const int32_t *) layers[idx].ids->data;
-        for (int32_t e : staged[idx]) {
-            bool used = false;
-            for (int64_t j = 0; j < res->moe_cache_n_ids[i] && !used; ++j) {
-                used = ids[j] == e;
-            }
-            n_stage_used += used;
-        }
-    }
-    for (size_t idx = 0; idx < staged.size(); ++idx) {
-        int32_t * skip = (int32_t *) layers[idx].skip->data;
-        for (int32_t e : staged[idx]) {
-            skip[e] = 0;
-            dirty   = true;
-        }
-        staged[idx].clear();
-        stage_wait[idx] = 0;
-    }
-
     for (size_t idx = 0; idx < layers.size(); ++idx) {
         lru & c = lrus[idx];
 
@@ -1779,7 +1589,7 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
         // the next graph must not read the slots that receive new uploads
         for (int32_t v : c.evicted) {
             skip[v]  = 0;
-            table[v] = slot_zero();
+            table[v] = n_slots;
         }
         for (int32_t s : c.uploads_done) {
             const int32_t e = c.expert[s];
@@ -1854,12 +1664,6 @@ void llama_moe_cache_fork::report() const {
             MOE_CACHE_LOG, ms*(double) t_graph_us, ms*(double) t_wait_us, ms*(double) t_upd_us);
     if (async_upload) {
         LLAMA_LOG_WARN("%s: worker upload submission %.2f ms per step, join time is included in upload wait\n", MOE_CACHE_LOG, ms*(double) t_submit_us);
-    }
-    if (n_stage > 0) {
-        LLAMA_LOG_WARN("%s: prefetch: %d stage slots per layer, top %d predicted per token: %.2f uploads per layer and step with any, "
-                "%.1f%% of them routed, %" PRIu64 " (step, layer) pairs, host %.2f ms per step\n",
-                MOE_CACHE_LOG, n_stage, n_pred_top, n_stage_lay ? (double) n_stage_ins/(double) n_stage_lay : 0.0,
-                n_stage_ins ? 100.0*(double) n_stage_used/(double) n_stage_ins : 0.0, n_stage_lay, ms*(double) t_stage_us);
     }
     if (n_alloc > 1) {
         LLAMA_LOG_WARN("%s: slots allocated %" PRIu64 " times, refilled %" PRIu64 " experts (%.1f MiB), alloc and release %.1f ms per call\n",

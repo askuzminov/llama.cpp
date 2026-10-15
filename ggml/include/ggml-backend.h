@@ -383,11 +383,6 @@ extern "C" {
     // allocation of the input copies depends on it. A copy callback that maps the weights itself (the MoE cache of llama.cpp) needs 0
     GGML_API void                          ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, int depth);
 
-    // fork: called after the compute call of each split on a CPU device, which computes in the call (llama.cpp starts the
-    // uploads of the predicted experts of a later layer there, --moe-cache with LLAMA_MOE_PREFETCH)
-    typedef void (*ggml_backend_sched_split_callback_fork)(ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
-    GGML_API void                          ggml_backend_sched_set_split_callback_fork(ggml_backend_sched_t sched, ggml_backend_sched_split_callback_fork callback, void * user_data);
-
     // fork: a timeline of host and device spans in the trace event format of Perfetto and chrome://tracing, written to the file
     // GGML_TIMELINE names while on (llama-server turns it on for LLAMA_TRACE_REQUESTS). Times are those of ggml_time_us()
     GGML_API bool                          ggml_timeline_on(void);

@@ -10,6 +10,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+// fork: the sleep of the allocation retry (alloc_tensor_range_fork)
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MAX_FREE_BLOCKS 256
 
@@ -1239,6 +1252,23 @@ static bool alloc_tensor_range_fork(struct ggml_context * ctx,
         ggml_backend_buffer_t ** buffers, size_t * n_buffers,
         ggml_backend_alloc_range_cb cb, void * cb_user_data) {
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
+    // GGML_ALLOC_RETRY=<tries> (3): a failed buffer is asked for again after 2 s. the driver frees the memory of a
+    // process that just ended lazily: on the 395 (15.10, 08-starts) two of 20 starts failed on the first buffers of
+    // the model with the memory shown free, 2-10 s after the previous server
+    static int n_retry = -1;
+    if (n_retry < 0) {
+        const char * env = getenv("GGML_ALLOC_RETRY");
+        n_retry = env ? atoi(env) : 3;
+    }
+    for (int i = 0; buffer == NULL && i < n_retry; ++i) {
+        GGML_LOG_WARN("%s: failed to allocate %s buffer of size %zu, trying again in 2 s\n", __func__, ggml_backend_buft_name(buft), size);
+#ifdef _WIN32
+        Sleep(2000);
+#else
+        usleep(2000*1000);
+#endif
+        buffer = ggml_backend_buft_alloc_buffer(buft, size);
+    }
     bool ok = buffer != NULL;
     if (!ok) {
         GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);

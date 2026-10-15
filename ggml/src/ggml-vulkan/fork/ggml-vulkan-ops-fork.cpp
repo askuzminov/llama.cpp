@@ -42,34 +42,6 @@ vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, con
     return nullptr;
 }
 
-int ggml_vk_fork_dmmv_wg() {
-    // GGML_VK_DMMV_WG=large|subgroup: the workgroup of every dequant mat-vec (and its MUL_MAT_ID form) instead of the
-    // upstream choice, which gives the large one (4 subgroups, hybrid reduction) only on NVIDIA and Intel for a small M.
-    // the expert mat-vec of qwen4exp is small M (640 rows of gate/up, 2560 of down with 640 columns) and runs at
-    // 164-171 GB/s on the 395 against ~230 of the dense ones (05 of 14.10, one token)
-    static const int mode = [] {
-        const char * env = getenv("GGML_VK_DMMV_WG");
-        if (env == nullptr) {
-            return -1;
-        }
-        return strcmp(env, "large") == 0 ? 1 : strcmp(env, "subgroup") == 0 ? 0 : -1;
-    }();
-    return mode;
-}
-
-uint32_t ggml_vk_fork_dmmv_id_rows() {
-    // GGML_VK_DMMV_ID_ROWS=<n>: the rows per workgroup of the expert mat-vec (MUL_MAT_ID of up to 8 tokens): the int8
-    // path of every type (RDNA3/4: 4 upstream) and the float path of q4_K, q5_K, q5_1, q8_0 (2, 2, 2, 1 upstream). a
-    // workgroup of one subgroup reads 2 rows of 1440 bytes (q4_K gate/up) or 480 (q5_1 down, 640 columns): little work
-    // per thread for the latency; the expert mat-vec runs at 163-174 GB/s on the 395 against ~230 of the dense ones
-    static const uint32_t rows = [] {
-        const char * env = getenv("GGML_VK_DMMV_ID_ROWS");
-        const int v = env ? atoi(env) : 0;
-        return (uint32_t) (v > 0 && v <= 64 ? v : 0);
-    }();
-    return rows;
-}
-
 bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t tournament_cols) {
     // radix-select (one workgroup per row) for a large k over many long rows: the qwen4exp block top-k in prefill, k 513
     // of 31744 x 4096, takes 5.0 ms against 19.3 for the tournament on Strix Halo (8192 x 16: 19 against 32 us). the

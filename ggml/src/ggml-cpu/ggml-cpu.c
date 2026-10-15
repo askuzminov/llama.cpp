@@ -1564,8 +1564,6 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-#include "fork/mmid-fork.inc" // fork: GGML_CPU_MMID_FLAT
-
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1688,17 +1686,7 @@ static void ggml_compute_forward_mul_mat_id(
         *current_chunk_ctr = nth;
     }
 
-    // fork: GGML_CPU_MMID_FLAT, one counter for the chunks of all the experts (fork/mmid-fork.inc)
-    if (ith == 0 && ggml_cpu_mmid_flat_rows_fork() > 0) {
-        ggml_threadpool_chunk_set(params->threadpool, nth);
-    }
-
     ggml_barrier(params->threadpool);
-
-    if (ggml_cpu_mmid_flat_fork(params, dst, matrix_row_counts, matrix_rows,
-            (src1->type == vec_dot_type) ? src1->data : params->wdata, ggml_row_size(vec_dot_type, ne10), src1_cont)) {
-        return;
-    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];

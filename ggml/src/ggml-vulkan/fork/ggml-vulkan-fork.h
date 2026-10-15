@@ -204,10 +204,6 @@ bool ggml_vk_get_rows_flat(const ggml_tensor * src0, const ggml_tensor * src1);
 vk_pipeline ggml_vk_get_rows_flat_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 // CONCAT of a transposed source through tiles, nullptr for the plain concat
 vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1);
-// the workgroup of the dequant mat-vec pipelines (GGML_VK_DMMV_WG): -1 the upstream choice, 0 one subgroup, 1 large
-int ggml_vk_fork_dmmv_wg();
-// the rows per workgroup of the expert mat-vec pipelines (GGML_VK_DMMV_ID_ROWS), 0 for the upstream count
-uint32_t ggml_vk_fork_dmmv_id_rows();
 // TOP_K: radix-select instead of the tournament (GGML_VK_TOPK_RADIX); tournament_cols: the elements of the widest
 // workgroup of the tournament, what it reduces to k in one pass
 bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t tournament_cols);

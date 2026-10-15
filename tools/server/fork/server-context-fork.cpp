@@ -302,9 +302,10 @@ const common_prompt_checkpoint * server_ckpt_restore(
 }
 
 bool server_ckpt_user_break_fork() {
+    // off by default since 16.10 (the 3090, see the header); LLAMA_CKPT_USER_BREAK=1: upstream
     static const bool brk = [] {
         const char * env = getenv("LLAMA_CKPT_USER_BREAK");
-        return env == nullptr || atoi(env) != 0;
+        return env != nullptr && atoi(env) != 0;
     }();
     return brk;
 }

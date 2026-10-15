@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <functional>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 class llm_graph_result;
@@ -183,14 +182,9 @@ public:
         ggml_tensor * s_gate = nullptr;
         ggml_tensor * s_down = nullptr;
 
-        ggml_tensor * table = nullptr; // device I32 [1, n_expert]: slot of each expert, slot_zero() when not cached
+        ggml_tensor * table = nullptr; // device I32 [1, n_expert]: slot of each expert, n_slots when not cached
         ggml_tensor * skip  = nullptr; // host I32 [n_expert]: 1 when the expert is cached
         ggml_tensor * ids   = nullptr; // host I32 [n_used_max*N_TOKENS_MAX]: routing ids of the last step
-
-        // LLAMA_MOE_PREFETCH: the router of this layer, for the prediction the layer before makes (nullptr when its
-        // selection takes a bias the prediction does not see), and the predicted ids the graph writes there
-        ggml_tensor * gate_inp = nullptr;
-        ggml_tensor * pred     = nullptr; // host I32 [n_pred_top*N_TOKENS_MAX], token-major
     };
 
     llama_moe_cache_fork(const llama_model & model, int32_t n_slots_req);
@@ -221,13 +215,6 @@ public:
     // the uploads run during the next graph and the graph after it can use them
     void update(const llm_graph_result * res);
 
-    // LLAMA_MOE_PREFETCH=<slots>: after the CPU split of layer L that copies its routing ids, the predicted experts of
-    // layer L+1 that are not cached go to stage slots of L+1 on a second upload stream while the device computes L;
-    // the compute stream waits for them before L+1 reads its slots (ggml_backend_sched_set_split_callback_fork)
-    int32_t get_n_stage()    const { return n_stage; }
-    int32_t get_n_pred_top() const { return n_pred_top; }
-    void on_cpu_split(struct ggml_cgraph * graph);
-
     void report() const;
 
 private:
@@ -253,11 +240,7 @@ private:
     void   lru_unlink(lru & c, int32_t e);
     void   lru_push  (lru & c, int32_t e);
     void   insert    (size_t idx, int32_t e);
-    size_t upload    (size_t idx, int32_t e, int32_t s, ggml_backend_t b = nullptr);
-    void   stage     (size_t idx, const int32_t * pred, int64_t n_top, int64_t n_tokens);
-
-    // the slot every expert that is not on the device points to, it stays zero
-    int32_t slot_zero() const { return n_slots + n_stage; }
+    size_t upload    (size_t idx, int32_t e, int32_t s);
     void   join_uploads();
 
     // the experts each layer held, kept across runs in LLAMA_MOE_CACHE_STATE (a file path): saved when the slots are
@@ -288,8 +271,6 @@ private:
 
     int64_t n_expert  = 0;
     int32_t n_slots   = 0;
-    int32_t n_stage    = 0;  // LLAMA_MOE_PREFETCH: stage slots per layer, after the cache slots
-    int32_t n_pred_top = 16; // LLAMA_MOE_PREFETCH_TOP: predicted ids per token
     int32_t n_slots_l = 0; // slots of the last alloc()
     int32_t max_ins   = 1; // max expert uploads per layer per step, 1 measured best up to 192 slots
     size_t  b_slot    = 0; // bytes of one slot on every cached layer
@@ -312,23 +293,6 @@ private:
     ggml_tensor * table_all = nullptr; // device I32 [n_expert, n_layers]
     ggml_tensor * table_staging = nullptr;
 
-    // LLAMA_MOE_PREFETCH
-    ggml_backend_t                    backend_stage = nullptr; // a third instance, the stage uploads
-    std::vector<ggml_backend_event_t> ev_stage;                // [n_layers] the stage uploads and table row of a layer
-    std::vector<uint8_t>              stage_wait;              // [n_layers] recorded, the compute stream does not wait yet
-    std::vector<std::vector<int32_t>> staged;                  // [n_layers] experts in the stage slots this step
-    std::vector<int32_t>              stage_mark;              // [n_expert] dedup of the predictions
-    int32_t                           stage_key = 0;
-    bool                              stage_self = false;      // LLAMA_MOE_PREFETCH_SELF: the real ids of the layer
-    ggml_context_ptr                  ctx_stage;
-    ggml_backend_buffer_ptr           buf_stage;
-    ggml_tensor *                     stage_rows = nullptr;    // pinned I32 [n_expert, n_layers]: the table rows sent
-    std::unordered_map<const ggml_tensor *, int> ids_root;     // the host ids tensor of a layer -> its index
-    std::unordered_map<const ggml_tensor *, int> pred_root;    // the host pred tensor of a layer -> its index
-    uint64_t n_stage_ins  = 0; // experts uploaded to stage slots
-    uint64_t n_stage_used = 0; // of them routed in their step
-    uint64_t n_stage_lay  = 0; // (step, layer) pairs with stage uploads
-    int64_t  t_stage_us   = 0; // host time of the stage decisions and calls
 
     std::vector<int32_t> table_host; // host copy of table_all
     std::vector<int>     il2idx;

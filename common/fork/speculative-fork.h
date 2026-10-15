@@ -36,8 +36,10 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
 // LLAMA_SPEC_CATCHUP_FORK=0: one decode call of the whole batch and every row kept (upstream)
 bool common_speculative_fork_catchup();
 
-// LLAMA_DRAFT_LOAD_FIRST=1 (off by default): the server loads the weights of the draft model (-md) before the target
-// model and its context, and common_speculative_init_result takes them. on the 395 the head loaded last, after the KV
+// LLAMA_DRAFT_LOAD_FIRST (1 by default since 15.10 night, 0: upstream order): the server loads the weights of the draft
+// model (-md) before the target model and its context, and common_speculative_init_result takes them. the 395 (15.10
+// night): PP 728.1 against 727.2, TG 37.75 against 37.55 in the chats to 213K; in 10 starts each, the head buffer past
+// the carve-out failed to allocate once in the upstream order, never loaded first. on the 395 the head loaded last, after the KV
 // and the compute buffers of the target, at ~99.2 GB of the device heap: past the 96 GiB carve-out, and its first
 // upload stalled in some starts (15.10: the first start of each of three profile arms, exit 75 after 181 s). loaded
 // first, its buffer is placed while the device is nearly empty and what goes past the carve-out is a compute buffer

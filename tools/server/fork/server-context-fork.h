@@ -38,12 +38,14 @@ struct server_ckpt_limits {
     size_t budget(size_t held, int n_parallel) const;
 };
 
-// LLAMA_CKPT_USER_BREAK=0 (default 1, upstream): the prompt batch does not stop at the start of the last user message
+// LLAMA_CKPT_USER_BREAK (0 by default since 16.10, 1: upstream): with 0 the prompt batch does not stop at the start of the last user message
 // (or of a user message past checkpoint_min_step) for a checkpoint there. The new tokens of a chat turn (the last
 // answer as the client sends it back, the template, the new message) then go in one batch; the checkpoints near the
 // end of the prompt, which the next turn restores, stay. With the experts in RAM (-ncmoe) every prompt batch uploads
 // them: the part before the last user message ran on its own (3090, 15.10: 8 tokens 0.18 s, 60 tokens 0.51 s in the
-// generation layout; past 192 tokens it would be a second full upload of the experts, ~2.5 s)
+// generation layout; past 192 tokens it would be a second full upload of the experts, ~2.5 s). the 3090 (15.10 night,
+// chat to 213K): the part ran on its own in 63 of 65 turns, 69 tokens and 0.66 s on average; without the break PP of
+// the chat 756.1 against 647.4, turns of ~550 tokens after 29K 3.62 s against 4.41, TG the same
 bool server_ckpt_user_break_fork();
 
 // create the prompt cache for --cache-ram != 0, with the disk spill when it is configured

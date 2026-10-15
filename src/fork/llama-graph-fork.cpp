@@ -207,20 +207,6 @@ ggml_tensor * llm_graph_context::build_moe_cache(
     // the scheduler overlap is on unless GGML_SCHED_PARALLEL_CPU=0 (ggml_backend_sched_new)
     const char * parallel_cpu = getenv("GGML_SCHED_PARALLEL_CPU");
     if (parallel_cpu == nullptr || atoi(parallel_cpu) > 0) {
-        // LLAMA_MOE_PREFETCH: the router of the next cached layer on the router input of this one, its top ids go to
-        // the host in the same CPU split as the routing ids (llama_moe_cache_fork::on_cpu_split)
-        ggml_tensor * pred_host = nullptr;
-        const llama_moe_cache_fork::layer * cn = moe_cache_fork->get_n_stage() > 0 ? moe_cache_fork->get_layer(il + 1) : nullptr;
-        if (cn != nullptr && cn->gate_inp != nullptr && cn->pred != nullptr && cn->gate_inp->ne[0] == cur->ne[0]) {
-            const int64_t k = std::min<int64_t>(moe_cache_fork->get_n_pred_top(), cn->gate_inp->ne[1]);
-            ggml_tensor * logits = ggml_mul_mat(ctx0, cn->gate_inp, ggml_reshape_2d(ctx0, cur, cur->ne[0], n_tok));
-            ggml_tensor * top    = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, k));
-            cb(top, "ffn_moe_pred", il + 1);
-            ggml_build_forward_expand(gf, top);
-            pred_host = ggml_cpy(ctx0, top, ggml_view_2d(ctx0, cn->pred, k, n_tok, k*ggml_element_size(cn->pred), 0));
-            ggml_backend_sched_set_tensor_backend(sched, pred_host, backend_cpu);
-        }
-
         // Copy the CPU inputs before the device starts the cached experts.
         ggml_tensor * cur_host = ggml_dup(ctx0, cur);
         ggml_set_name(cur_host, "ffn_moe_cache_input_host");
@@ -228,9 +214,6 @@ ggml_tensor * llm_graph_context::build_moe_cache(
         ggml_backend_sched_set_tensor_backend(sched, ids_host, backend_cpu);
         ggml_build_forward_expand(gf, cur_host);
         ggml_build_forward_expand(gf, ids_host);
-        if (pred_host != nullptr) {
-            ggml_build_forward_expand(gf, pred_host);
-        }
 
         mm_up->src[1] = cur_host;
         for (ggml_tensor * mm : mms) {
