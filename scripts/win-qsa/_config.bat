@@ -326,7 +326,7 @@ rem 13.10: 05 on the server, the ops of a ~4K part at depths 0, ~15K and ~118K (
 rem reply with the MTP head (its verify steps and head steps apart), 64 tokens, at 0, ~122K and ~195K tokens; at 0
 rem only: mtpL (GGML_VK_DMMV_WG=large: the large workgroup for every mat-vec, upstream gives it only to NVIDIA and
 rem Intel for a small M; the expert mat-vec at one token runs at 164-171 GB/s against ~230 of the dense ones) and
-rem mtpQ (GGML_VK_FORCE_MMVQ=1, upstream: the int8 mat-vec also for k < 2048, the down of the experts at one token)
+rem mtpQ (GGML_VK_FORCE_MMVQ=1, upstream: the int8 mat-vec also for k under 2048, the down of the experts at one token)
 rem 15.10 next: rows8 / rows16 (GGML_VK_DMMV_ID_ROWS: 8 / 16 rows per workgroup of the expert mat-vec, 2 in the float
 rem path and 4 in the int8 one upstream) against mtp, at 0
 if not defined PROFARMS   set "PROFARMS=mtp @d=0 @draft --spec-auto;rows8 GGML_VK_DMMV_ID_ROWS=8 @d=0 @draft --spec-auto;rows16 GGML_VK_DMMV_ID_ROWS=16 @d=0 @draft --spec-auto"
