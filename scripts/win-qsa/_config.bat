@@ -128,7 +128,11 @@ rem the reference), see DECARMS and PROFARMS
 rem 13.10 night (fdd7d181): 01 all passed (MUL_MAT q8_0 x f16 20/20, q4_K x f16 17/17 through the int8 path, HC_PRE_F16
 rem 4/4, HC_POST_NORM_F16 4/4, TOP_K 536/536, FLASH_ATTN_LIST 7/7); 03 hcf16 KLD 0.015284 against 0.015465 of default.
 rem the next run: no 01 / 03 (kernels and math unchanged since)
-if not defined RUN_CHECK   set "RUN_CHECK=0"
+rem 15.10: 01 MUL_MAT_ID with GGML_VK_DMMV_ID_ROWS=8 / 16 (rows per workgroup of the expert mat-vec): the Mac checked
+rem the float path (965/965 each), its GPUs have no int dot, the int8 path of a verify step runs only here
+if not defined CHECKOPS   set "CHECKOPS=MUL_MAT_ID"
+if not defined CHECKARMS  set "CHECKARMS=rows8 GGML_VK_DMMV_ID_ROWS=8;rows16 GGML_VK_DMMV_ID_ROWS=16"
+if not defined RUN_CHECK   set "RUN_CHECK=1"
 if not defined QARMS       set "QARMS=default;hcf16 LLAMA_HC_F16=1"
 if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
 if not defined CHECKARMS   set "CHECKARMS=default"
@@ -303,8 +307,15 @@ rem verify); PP of the ~3.8K turns 798 / 732 / 690 at 0-20K / 80-100K / 140-213K
 rem (mtp): the verify step of 2-4 tokens and the head steps per op at 0, ~122K and ~195K (the GB/s of the expert
 rem mat-vec at 3-4 tokens, the ops that grow with the depth); 04 hq8 (-ctkd q8_0 -ctvd q8_0: the KV of the head in
 rem q8_0, half the bytes its attention reads at depth) against auto in the chats to 213K
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;hq8 @draft --spec-auto -ctkd q8_0 -ctvd q8_0"
-if not defined RUN_DECODE set "RUN_DECODE=1"
+rem 15.10 (6e37337e), chats to 213K: hq8 TG the same as auto (34.1-34.6 against 34.3-35.3 at 180-213K) and PP down
+rem with the depth (488 against 695 t/s at 200K+): with a quantized cache the head takes the rotation of K/V and
+rem its catch-up attends for every row again. rejected. auto: PP 767 / 721 / 694 at 0-20K / 80-100K / 200K+, TG
+rem 38.6 / 37.4 / 35.3. 05 mtp: the verify step 39.7 / 45.8 / 51.6 / 56.9 ms for 1-4 tokens at 0 (+5.7 ms a token,
+rem the expert mat-vec 21.2 of the 56.9), at ~195K only +1.2-2.2 ms (indexer 1.35, list attention 1.0, TOP_K 0.7);
+rem the head draft step 3.7 -> 5.6 ms at ~195K (its dense attention). mtpL (large workgroup) 60.5 ms for one token
+rem against 39.7, mtpQ the same as mtp: both off
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
+if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_TRACE  set "RUN_TRACE=0"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
@@ -316,7 +327,9 @@ rem reply with the MTP head (its verify steps and head steps apart), 64 tokens, 
 rem only: mtpL (GGML_VK_DMMV_WG=large: the large workgroup for every mat-vec, upstream gives it only to NVIDIA and
 rem Intel for a small M; the expert mat-vec at one token runs at 164-171 GB/s against ~230 of the dense ones) and
 rem mtpQ (GGML_VK_FORCE_MMVQ=1, upstream: the int8 mat-vec also for k < 2048, the down of the experts at one token)
-if not defined PROFARMS   set "PROFARMS=mtp @draft --spec-auto;mtpL GGML_VK_DMMV_WG=large @d=0 @draft --spec-auto;mtpQ GGML_VK_FORCE_MMVQ=1 @d=0 @draft --spec-auto"
+rem 15.10 next: rows8 / rows16 (GGML_VK_DMMV_ID_ROWS: 8 / 16 rows per workgroup of the expert mat-vec, 2 in the float
+rem path and 4 in the int8 one upstream) against mtp, at 0
+if not defined PROFARMS   set "PROFARMS=mtp @d=0 @draft --spec-auto;rows8 GGML_VK_DMMV_ID_ROWS=8 @d=0 @draft --spec-auto;rows16 GGML_VK_DMMV_ID_ROWS=16 @d=0 @draft --spec-auto"
 if not defined PROFPREFIX set "PROFPREFIX=0 500000 800000"
 if not defined PROFTG     set "PROFTG=64"
 if not defined RUN_PROFILE set "RUN_PROFILE=1"
@@ -582,9 +595,17 @@ rem 14.10 night, by depth (9b660096 chats to 115K): TG flat 27-28, PP of the ~3.
 rem 60-100K / 100-120K (-18 percent), while one long prompt stays flat (13.10) and the gpu work of a turn grows 12
 rem percent (05): ~0.8 s more per turn at depth with no owner yet. the next run: 04 the chat to ~213K as on the 395,
 rem auto alone; 07 deep / deepn: a prompt of 400000 chars (~97K tokens) and two turns of 16000 (timeline / nsys)
+rem 15.10 (66564657), the chat to 213K: TG 28.1 / 27.9 / 26.2-26.9 at 0-20K / 80-100K / 180-213K, PP 762 / 659 / 607
+rem at 120-140K / 530 at 160-200K / 432 past 200K: --phase-mem shrinks the prompt ubatch with the depth (8192 at 4K,
+rem 6144 at 81K, 4096 at 158K, 3328 at 199K, 3072 at 214K) to fit the -inf mask of QSA (n_kv x n_ubatch f16, 3.3
+rem GiB at 214K x 8192, CUDA has no list attention), and a turn of ~3.7K then takes two ubatches, each uploading all
+rem the experts in RAM (07 deepn: 67 GiB in 2.9 s per ubatch of a turn at 95K). and the plan sized the MTP head at
+rem the ubatch of the target, though it splits at its own 1024: its dense KQ mask counted 1.4 GiB at 214K x 3584
+rem instead of 0.4 (fixed since, phase_size; by the sizes of this run ~5120 at 214K with the fix alone). qmc
+rem (LLAMA_QSA_MASK_MIB=512): also the queries of QSA in chunks whose mask fits 512 MiB, the ubatch can stay 8192
 if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qmc LLAMA_QSA_MASK_MIB=512 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
@@ -604,7 +625,8 @@ rem 14.10: 03 for the uploads of the experts on a second stream (pf3 in QARMS): 
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem 14.10: 07-trace, the timeline of a conversation in Nsight Systems: does the upload of pf3 run under the kernels,
 rem and where the GPU waits in a decode step. needs nsys (Nsight Systems, the CUDA toolkit has it; NSYS= its path)
-if not defined RUN_TRACE  set "RUN_TRACE=1"
+rem 15.10: 07 measured (see TRACEARMS), not in the next run
+if not defined RUN_TRACE  set "RUN_TRACE=0"
 rem tl (TRACE_TIMELINE=1): the timeline on CUDA, the gpu span of each compute call next to the CPU splits (the experts
 rem in RAM) and the waits of the scheduler: how a decode step splits into gpu, CPU experts, copies and waits, layer by
 rem layer (07 of 14.10 ran nsys with each node of the CUDA graphs traced: the decode was slower, its shares off)

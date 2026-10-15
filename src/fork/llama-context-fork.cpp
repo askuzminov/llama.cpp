@@ -68,6 +68,11 @@ int llama_context::phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, 
 
     std::vector<size_t> s(backend_ptrs.size(), 0);
 
+    // a follower (the MTP head) splits its batches at its own n_ubatch (1024 on the 3090), as n_ubatch_split() and its
+    // reserve do: sized at the ubatch of the target, its dense KQ mask of n_kv x n_ub counted 1.4 GiB at 214K x 3584
+    // instead of 0.4, and the plan took a smaller ubatch for the target than the memory held (3072 at 214K, 15.10)
+    n_ub = std::min(n_ub, cparams.n_ubatch);
+
     // the scheduler has no buffers, so the query does not change them
     graph_reserve(n_ub, cparams.n_seq_max, std::min(n_ub, cparams.n_outputs_max), mctx.get(), true, s.data());
 

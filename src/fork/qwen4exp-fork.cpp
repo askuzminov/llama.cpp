@@ -1820,6 +1820,58 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         return cur;
     }
 
+    // fork: without the list attention (CUDA, CPU) the -inf mask of the selected cells is n_kv x n_batch f16, 3.3 GiB at
+    // 214K x 8192, and --phase-mem shrank the prompt ubatch with the depth to fit it (the 3090, 15.10: 8192 at 4K, 4096
+    // at 158K, 3072 at 214K), so a turn of ~3.7K tokens took two ubatches, each uploading all the experts in RAM (PP of
+    // the turns 762 at 0-20K, 530 at 160-200K, 432 past 200K). LLAMA_QSA_MASK_MIB=<MiB> (0, off by default until the
+    // 3090 measures it): the queries go in chunks whose mask fits, one chunk's mask alive at a time; each query attends
+    // as before (CPU: the same attention output, Vulkan with LLAMA_QSA_FA_LIST=0: equal to float rounding)
+    static const int64_t mask_mib = [] {
+        const char * env = std::getenv("LLAMA_QSA_MASK_MIB");
+        return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+    }();
+    // LLAMA_QSA_MASK_CHUNK=<tokens>: the chunk itself (tests)
+    static const int64_t mask_chunk = [] {
+        const char * env = std::getenv("LLAMA_QSA_MASK_CHUNK");
+        return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+    }();
+    const int64_t n_tok_q = top_k->ne[1];
+    const int64_t chunk   = mask_chunk > 0 ? mask_chunk :
+        mask_mib > 0 ? std::max<int64_t>(256, (mask_mib*1024*1024 / (2*n_kv_m)) / 256 * 256) : 0;
+    if (from_pos && n_str_m == 1 && chunk > 0 && n_tok_q > chunk) {
+        std::vector<ggml_tensor *> parts;
+        for (int64_t t0 = 0; t0 < n_tok_q; t0 += chunk) {
+            const int64_t nc = std::min(chunk, n_tok_q - t0);
+            ggml_tensor * kept_c = ggml_view_4d(ctx0, kept, 1, kept->ne[1], nc, 1, kept->nb[1], kept->nb[2], kept->nb[3], t0*kept->nb[2]);
+            ggml_tensor * idx_c  = ggml_view_3d(ctx0, top_k_3d, top_k_3d->ne[0], nc, 1, top_k_3d->nb[1], top_k_3d->nb[2], t0*top_k_3d->nb[1]);
+            ggml_tensor * mask_c = ggml_repeat_4d(ctx0, qsa_pos_inp->neg_inf, 1, n_kv_m, nc, 1);
+            mask_c = ggml_set_rows(ctx0, mask_c, kept_c, idx_c);
+            mask_c = ggml_view_4d(ctx0, mask_c, n_kv_m, nc, 1, 1, mask_c->nb[2], mask_c->nb[3], mask_c->nb[3], 0);
+            ggml_tensor * q_c = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nc, q->nb[1], q->nb[2], t0*q->nb[2]);
+            ggml_tensor * cur_c = build_attn_mha(q_c, k, v, nullptr, mask_c, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+            // in order: the mask of the next chunk can take the memory of this one
+            ggml_build_forward_expand(gf, cur_c);
+            parts.push_back(cur_c);
+        }
+        // pairwise, so that each row is copied log2(chunks) times
+        while (parts.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+                next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+            }
+            if (parts.size() % 2) {
+                next.push_back(parts.back());
+            }
+            parts.swap(next);
+        }
+        ggml_tensor * cur = parts[0];
+        cb(cur, "kqv_out", il);
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+        return cur;
+    }
+
     // modify KQ mask by restoring the elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
     ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, kept, top_k_3d);
