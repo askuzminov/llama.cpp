@@ -15,6 +15,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "fork/speculative-fork.h" // fork: LLAMA_DRAFT_LOAD_FIRST
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -1216,6 +1217,8 @@ private:
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
+
+        common_speculative_fork_preload_draft(params_base); // fork: LLAMA_DRAFT_LOAD_FIRST
 
         llama_init = common_init_from_params(params_base);
 
@@ -4051,7 +4054,7 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens()) && server_ckpt_user_break_fork()) { // fork
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 

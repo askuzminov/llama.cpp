@@ -862,9 +862,23 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
             return env != nullptr && std::atoi(env) != 0;
         }();
         ggml_tensor * kq_mask = inp_attn->get_kq_mask();
-        rows_only = !rows_all && !cparams.training && inp_out_ids != nullptr && inp_out_ids->ne[0] < n_tokens &&
-            inp_attn->self_k_rot == nullptr && inp_attn->self_v_rot == nullptr &&
+        const bool manual_ok = !cparams.training && inp_attn->self_k_rot == nullptr && inp_attn->self_v_rot == nullptr &&
             kq_mask != nullptr && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 && ggml_is_contiguous(kq_mask);
+
+        // LLAMA_MTP_WINDOW=<cells> (0, off): the draft attends to the last <cells> cells of its KV only. its dense
+        // attention reads the whole context per draft step: on the 395 the step took 3.7 ms at depth 0 and 5.6 at ~195K
+        // (05, 15.10). the drafts are verified by the target, a window changes the acceptance only. the cells of the
+        // draft memory follow the positions (one sequence, filled in order), so the last ones are the nearest
+        static const int64_t mtp_window = [] {
+            const char * env = std::getenv("LLAMA_MTP_WINDOW");
+            return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+        }();
+        ggml_tensor * k_all = inp_attn->mctx->get_k(ctx0, il);
+        ggml_tensor * v_all = inp_attn->mctx->get_v(ctx0, il);
+        const bool windowed = mtp_window > 0 && manual_ok && cparams.n_seq_max == 1 && kq_mask->ne[0] > mtp_window &&
+            k_all->ne[2] == kq_mask->ne[0] && v_all->nb[1] <= v_all->nb[2];
+
+        rows_only = manual_ok && ((!rows_all && inp_out_ids != nullptr && inp_out_ids->ne[0] < n_tokens) || windowed);
 
         if (rows_only) {
             ggml_build_forward_expand(gf, Vcur);
@@ -872,19 +886,35 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
             ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
             ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
 
-            const int64_t n_out = inp_out_ids->ne[0];
+            const int64_t n_out = inp_out_ids ? inp_out_ids->ne[0] : n_tokens;
 
-            ggml_tensor * q_out = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, Qcur, n_embd_head*n_head, n_tokens), inp_out_ids);
-            gate = ggml_get_rows(ctx0, gate, inp_out_ids);
+            ggml_tensor * q_out = ggml_reshape_2d(ctx0, Qcur, n_embd_head*n_head, n_tokens);
+            if (inp_out_ids) {
+                q_out = ggml_get_rows(ctx0, q_out, inp_out_ids);
+                gate  = ggml_get_rows(ctx0, gate, inp_out_ids);
+            }
 
             if (n_out > 0) {
                 // the mask rows of the output tokens; get_rows of an f16 source gives f32, the attention reads f16
-                ggml_tensor * mask_out = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1]), inp_out_ids);
-                mask_out = ggml_cast(ctx0, mask_out, GGML_TYPE_F16);
+                ggml_tensor * mask_out = ggml_reshape_2d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1]);
+                if (inp_out_ids) {
+                    mask_out = ggml_get_rows(ctx0, mask_out, inp_out_ids);
+                }
+                ggml_tensor * k = k_all;
+                ggml_tensor * v = v_all;
+                if (windowed) {
+                    const int64_t n_kv = kq_mask->ne[0];
+                    const int64_t off  = n_kv - mtp_window;
+                    k = ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], mtp_window, k_all->ne[3], k_all->nb[1], k_all->nb[2], k_all->nb[3], off*k_all->nb[2]);
+                    v = ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], mtp_window, v_all->ne[3], v_all->nb[1], v_all->nb[2], v_all->nb[3], off*v_all->nb[2]);
+                    mask_out = ggml_cont(ctx0, ggml_view_2d(ctx0, mask_out, mtp_window, n_out, mask_out->nb[1], off*ggml_element_size(mask_out)));
+                }
+                if (mask_out->type != GGML_TYPE_F16) {
+                    mask_out = ggml_cast(ctx0, mask_out, GGML_TYPE_F16);
+                }
 
                 cur = build_attn_mha(ggml_reshape_3d(ctx0, q_out, n_embd_head, n_head, n_out),
-                        inp_attn->mctx->get_k(ctx0, il), inp_attn->mctx->get_v(ctx0, il),
-                        nullptr, mask_out, nullptr, nullptr, 0, kq_scale, il);
+                        k, v, nullptr, mask_out, nullptr, nullptr, 0, kq_scale, il);
             } else {
                 // no output row: the rows below are empty and nothing reads the attention
                 cur = q_out;

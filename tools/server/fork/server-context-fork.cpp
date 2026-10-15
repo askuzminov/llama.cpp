@@ -300,3 +300,11 @@ const common_prompt_checkpoint * server_ckpt_restore(
 
     return ok ? &restored_cp : nullptr;
 }
+
+bool server_ckpt_user_break_fork() {
+    static const bool brk = [] {
+        const char * env = getenv("LLAMA_CKPT_USER_BREAK");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return brk;
+}

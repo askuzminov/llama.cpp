@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 // draft length cap of --spec-auto when --spec-draft-n-max is not given. 3 since 12.10: on the 395 the cap 6 ran 35.87
@@ -34,6 +35,15 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
 // 16384 rows of 40 KiB rendered in one piece) and 288 ms after it (all rows copied for the verify). false with
 // LLAMA_SPEC_CATCHUP_FORK=0: one decode call of the whole batch and every row kept (upstream)
 bool common_speculative_fork_catchup();
+
+// LLAMA_DRAFT_LOAD_FIRST=1 (off by default): the server loads the weights of the draft model (-md) before the target
+// model and its context, and common_speculative_init_result takes them. on the 395 the head loaded last, after the KV
+// and the compute buffers of the target, at ~99.2 GB of the device heap: past the 96 GiB carve-out, and its first
+// upload stalled in some starts (15.10: the first start of each of three profile arms, exit 75 after 181 s). loaded
+// first, its buffer is placed while the device is nearly empty and what goes past the carve-out is a compute buffer
+void          common_speculative_fork_preload_draft(const common_params & params_base);
+// the preloaded draft model of this path, once, nullptr when there is none
+llama_model * common_speculative_fork_take_draft(const std::string & path);
 
 // cost-aware draft length (--spec-auto) and the per-cycle trace (LLAMA_SPEC_TRACE=<file>)
 //

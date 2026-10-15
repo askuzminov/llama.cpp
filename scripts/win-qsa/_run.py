@@ -2108,6 +2108,87 @@ def cmd_trace():
     return run.finish()
 
 
+# ---------------------------------------------------------------- starts
+
+def cmd_starts():
+    """How often the server starts, for a load that stalls sometimes (the 395: the upload into the MTP head buffer,
+    past the 96 GiB carve-out): STARTS starts of each arm of STARTARMS with the arguments of 04, one try each (no
+    retries), each until /health answers or the process ends; the load watchdog ends a stalled load after
+    LLAMA_LOAD_WATCH_EXIT seconds (45 here, 180 in the server). A start that answered is stopped at once"""
+    run = Run("starts")
+    model = model_path()
+    arms = parse_arms("STARTARMS", "default @draft --spec-auto")
+    draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
+    n_starts, ctx, port = env_int("STARTS", 10), env_int("DECCTX", 262144), env_int("DECPORT", 8097)
+    run.add(f"starts: {n_starts} starts of llama-server per arm, one try each, {model.name}, build {current_build()}", "")
+    rows = []
+    for arm in arms:
+        try:
+            if arm.draft and not draft:
+                raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+            exe = arm.binary("llama-server")
+        except Skip as e:
+            run.add(f"{arm.name}: skip: {e}")
+            continue
+        args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1, "-fa", "on",
+                "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
+                *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
+        run_env = arm_env(arm, {"LLAMA_LOAD_WATCH_EXIT": env("STARTWATCH", "45")})
+        identity = {"v": VERSION, "kind": "starts", "build": build_id(exe.parent), "args": args, "env": env_identity(run_env),
+                    "model": model_identity(model), "draft": model_identity(draft) if arm.draft else None,
+                    "starts": n_starts, "machine": machine()}
+        url = f"http://127.0.0.1:{port}"
+
+        def go(log):
+            outcomes = []
+            for i in range(n_starts):
+                wait_no_server()
+                no_server_running()
+                settle()
+                one = log.with_name(f"{log.stem}-{i + 1}.log")
+                with one.open("w", encoding="utf-8") as f:
+                    f.write(json.dumps({"command": [str(exe), *args], "env": env_identity(run_env)}) + "\n")
+                    f.flush()
+                    proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
+                t0, ok = time.time(), False
+                while proc.poll() is None and time.time() - t0 < env_int("DECWAIT", 900):
+                    time.sleep(1)
+                    try:
+                        if http(url + "/health")[0] == 200:
+                            ok = True
+                            break
+                    except (urllib.error.URLError, OSError):
+                        pass
+                ready = time.time() - t0
+                code = proc.poll()
+                if code is None:
+                    proc.kill()
+                    proc.wait()
+                mark_end()
+                text = read_log(one)
+                kind = "ok" if ok else "stall" if "load_all_data: no progress" in text else f"fail {exit_text(proc.returncode)}"
+                outcomes.append({"kind": kind, "s": round(ready, 1), "note": "" if ok else (load_watch(one) or last_error(text))[:160]})
+                print(f"{arm.name} start {i + 1}: {kind} in {ready:.0f} s", flush=True)
+            return {"outcomes": outcomes}
+
+        try:
+            r, kept = run.measure(arm.name, identity, go)
+        except Fail as e:
+            run.failed = True
+            run.add(f"{arm.name}: FAIL {e}")
+            continue
+        o = r["outcomes"]
+        oks = [x["s"] for x in o if x["kind"] == "ok"]
+        rows.append([arm.name, len(o), len(oks), sum(1 for x in o if x["kind"] == "stall"),
+                     sum(1 for x in o if x["kind"].startswith("fail")),
+                     f"{sorted(oks)[len(oks) // 2]:.0f}" if oks else "", "k" if kept else ""])
+        for x in o:
+            if x["kind"] != "ok":
+                run.add(f"  {arm.name}: {x['kind']} after {x['s']:.0f} s: {x['note']}")
+    run.add("", *table(["arm", "starts", "ok", "stalled", "failed", "median s to ready", ""], rows))
+    return run.finish()
+
+
 # ---------------------------------------------------------------- kernels
 
 def case_name(op, params):
@@ -2262,7 +2343,7 @@ def cmd_build_stable():
     return run.finish()
 
 
-COMMANDS = {"check": cmd_check, "quality": cmd_quality, "decode": cmd_decode,
+COMMANDS = {"starts": cmd_starts, "check": cmd_check, "quality": cmd_quality, "decode": cmd_decode,
             "profile": cmd_profile, "kernels": cmd_kernels, "trace": cmd_trace, "build-begin": cmd_build_begin,
             "build-end": cmd_build_end, "build-stable": cmd_build_stable}
 

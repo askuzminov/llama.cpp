@@ -506,6 +506,34 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch) {
     return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
 }
 
+static llama_model * g_draft_preloaded = nullptr;
+static std::string   g_draft_preloaded_path;
+
+void common_speculative_fork_preload_draft(const common_params & params_base) {
+    const char * env = getenv("LLAMA_DRAFT_LOAD_FIRST");
+    if (env == nullptr || atoi(env) == 0 || !params_base.speculative.has_dft() || g_draft_preloaded != nullptr) {
+        return;
+    }
+    // the same parameters as common_speculative_init_result gets from the server
+    // mparams points into params_dft (devices, overrides), which lives until the load returns
+    common_params params_dft = common_base_params_to_speculative(params_base);
+    const auto mparams = common_model_params_to_llama(params_dft);
+    const std::string & path = params_dft.speculative.draft.mparams.path;
+    LOG_INF("%s: loading the draft model '%s' before the target (LLAMA_DRAFT_LOAD_FIRST)\n", __func__, path.c_str());
+    g_draft_preloaded = llama_model_load_from_file(path.c_str(), mparams);
+    g_draft_preloaded_path = g_draft_preloaded ? path : std::string();
+}
+
+llama_model * common_speculative_fork_take_draft(const std::string & path) {
+    if (g_draft_preloaded == nullptr || path != g_draft_preloaded_path) {
+        return nullptr;
+    }
+    llama_model * m = g_draft_preloaded;
+    g_draft_preloaded = nullptr;
+    g_draft_preloaded_path.clear();
+    return m;
+}
+
 bool common_speculative_fork_catchup() {
     static const bool enabled = [] {
         const char * env = getenv("LLAMA_SPEC_CATCHUP_FORK");

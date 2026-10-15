@@ -15,6 +15,7 @@ if "%RUN_QUALITY%"=="1" set "STEPS=%STEPS% 03-quality"
 if "%RUN_DECODE%"=="1"  set "STEPS=%STEPS% 04-decode"
 if "%RUN_PROFILE%"=="1" set "STEPS=%STEPS% 05-profile"
 if "%RUN_TRACE%"=="1"   set "STEPS=%STEPS% 07-trace"
+if "%RUN_STARTS%"=="1"  set "STEPS=%STEPS% 08-starts"
 if "%STEPS%"=="" (
     echo every RUN_* is 0, nothing to do
     exit /b 1

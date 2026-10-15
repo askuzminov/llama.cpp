@@ -128,11 +128,9 @@ rem the reference), see DECARMS and PROFARMS
 rem 13.10 night (fdd7d181): 01 all passed (MUL_MAT q8_0 x f16 20/20, q4_K x f16 17/17 through the int8 path, HC_PRE_F16
 rem 4/4, HC_POST_NORM_F16 4/4, TOP_K 536/536, FLASH_ATTN_LIST 7/7); 03 hcf16 KLD 0.015284 against 0.015465 of default.
 rem the next run: no 01 / 03 (kernels and math unchanged since)
-rem 15.10: 01 MUL_MAT_ID with GGML_VK_DMMV_ID_ROWS=8 / 16 (rows per workgroup of the expert mat-vec): the Mac checked
-rem the float path (965/965 each), its GPUs have no int dot, the int8 path of a verify step runs only here
-if not defined CHECKOPS   set "CHECKOPS=MUL_MAT_ID"
-if not defined CHECKARMS  set "CHECKARMS=rows8 GGML_VK_DMMV_ID_ROWS=8;rows16 GGML_VK_DMMV_ID_ROWS=16"
-if not defined RUN_CHECK   set "RUN_CHECK=1"
+rem 15.10 (dabe4f1a): 01 with rows8 / rows16 ran the CHECKOPS above (all passed), not MUL_MAT_ID: the CHECKOPS of
+rem this run came after them. the int8 path with GGML_VK_DMMV_ID_ROWS is not checked; the switch stays off (05)
+if not defined RUN_CHECK   set "RUN_CHECK=0"
 if not defined QARMS       set "QARMS=default;hcf16 LLAMA_HC_F16=1"
 if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
 if not defined CHECKARMS   set "CHECKARMS=default"
@@ -314,8 +312,14 @@ rem 38.6 / 37.4 / 35.3. 05 mtp: the verify step 39.7 / 45.8 / 51.6 / 56.9 ms for
 rem the expert mat-vec 21.2 of the 56.9), at ~195K only +1.2-2.2 ms (indexer 1.35, list attention 1.0, TOP_K 0.7);
 rem the head draft step 3.7 -> 5.6 ms at ~195K (its dense attention). mtpL (large workgroup) 60.5 ms for one token
 rem against 39.7, mtpQ the same as mtp: both off
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
-if not defined RUN_DECODE set "RUN_DECODE=0"
+rem 15.10 night: w16k (LLAMA_MTP_WINDOW=16384: the draft attends to the last 16384 cells of its KV, its dense attention
+rem took the draft step 3.7 -> 5.6 ms at ~195K) and dfirst (LLAMA_DRAFT_LOAD_FIRST=1: the MTP head loads before the
+rem target, against the stalled starts; what goes past the 96 GiB carve-out is then the compute buffer of the
+rem target: does the speed change) against auto in the chats to 213K; 08-starts: 10 starts of auto and of dfirst
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;w16k LLAMA_MTP_WINDOW=16384 @draft --spec-auto;dfirst LLAMA_DRAFT_LOAD_FIRST=1 @draft --spec-auto"
+if not defined RUN_DECODE set "RUN_DECODE=1"
+if not defined RUN_STARTS set "RUN_STARTS=1"
+if not defined STARTARMS  set "STARTARMS=auto @draft --spec-auto;dfirst LLAMA_DRAFT_LOAD_FIRST=1 @draft --spec-auto"
 if not defined RUN_TRACE  set "RUN_TRACE=0"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
@@ -327,12 +331,14 @@ rem reply with the MTP head (its verify steps and head steps apart), 64 tokens, 
 rem only: mtpL (GGML_VK_DMMV_WG=large: the large workgroup for every mat-vec, upstream gives it only to NVIDIA and
 rem Intel for a small M; the expert mat-vec at one token runs at 164-171 GB/s against ~230 of the dense ones) and
 rem mtpQ (GGML_VK_FORCE_MMVQ=1, upstream: the int8 mat-vec also for k under 2048, the down of the experts at one token)
-rem 15.10 next: rows8 / rows16 (GGML_VK_DMMV_ID_ROWS: 8 / 16 rows per workgroup of the expert mat-vec, 2 in the float
-rem path and 4 in the int8 one upstream) against mtp, at 0
+rem 15.10 (dabe4f1a) rows8 / rows16 (GGML_VK_DMMV_ID_ROWS: 8 / 16 rows per workgroup of the expert mat-vec, 2 in the
+rem float path and 4 in the int8 one upstream) against mtp at 0: the verify step of 1 token 41.6 / 41.9 ms against
+rem 39.9, of 4 tokens 56.7 / 57.1 against 57.1: no gain, off. the first start of each arm failed (the MTP load hang,
+rem then a Vulkan buffer that did not map after it), the second one ran. nothing pending on the 395
 if not defined PROFARMS   set "PROFARMS=mtp @d=0 @draft --spec-auto;rows8 GGML_VK_DMMV_ID_ROWS=8 @d=0 @draft --spec-auto;rows16 GGML_VK_DMMV_ID_ROWS=16 @d=0 @draft --spec-auto"
 if not defined PROFPREFIX set "PROFPREFIX=0 500000 800000"
 if not defined PROFTG     set "PROFTG=64"
-if not defined RUN_PROFILE set "RUN_PROFILE=1"
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
 
 if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
@@ -608,10 +614,23 @@ rem input of layer L (top 16 per token) and the cache misses go to 8 / 12 stage 
 rem while the GPU computes L (07 pred of 15.10: from one layer before the top 10 name 65 percent of the misses); the
 rem stage slots come out of the cache (48 -> 40 / 36 slots). LLAMA_MOE_CACHE_REPORT: the cache line every 1024
 rem steps (hit, host MiB per step, the prefetch: uploads per layer and step and the share of them routed)
+rem 15.10 evening (936c1e45), the chat to 213K: the plan fix alone takes ub 4864-6144 at 176-209K (3072-3840 before),
+rem the turns fit one ubatch again: PP 570 / 607 / 559 at 160-180K / 180-200K / 200K+ against 529 / 532 / 432 (the
+rem whole chat 638.6 against 611.6), TG 27.42 against 27.59. qmc: ub 6912-7680 there, but the turns fit already: PP
+rem 639.4, TG 27.13; off (for one long prompt at depth it would save ubatches, not measured). pf8 / pf12: 76 -> 119 /
+rem 141 ms per verify step, TG 21.78 / 18.50: 7.9 uploads per layer and step, 68-70 percent of them routed, but an
+rem expert goes over PCIe at ~23 GB/s slower than the CPU computes it from RAM at ~39, the uploads of a layer do not
+rem fit before the next one and the GPU waits; the acceptance 0.69 against 0.86 is the longer drafts of --spec-auto
+rem (2.29 against 1.26 per step, 2.59 tokens per step against 2.09), the texts are fine. off
 if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qmc LLAMA_QSA_MASK_MIB=512 @draft --spec-auto;pf8 LLAMA_QSA_MASK_MIB=512 LLAMA_MOE_PREFETCH=8 @draft --spec-auto;pf12 LLAMA_QSA_MASK_MIB=512 LLAMA_MOE_PREFETCH=12 @draft --spec-auto"
+rem 15.10 night: a turn of ~500 tokens at 29K took 3.7 s: the prompt ubatch 2.45 (the uploads of the experts), the
+rem refill of the moe-cache 0.49, the part before the last user message on its own 0.18 (8 tokens; 60 tokens 0.51 at
+rem 95K), the phases 0.25, the checkpoints 0.11. nobrk (LLAMA_CKPT_USER_BREAK=0): the new tokens of a turn in one
+rem batch, no checkpoint at the start of the last user message (the one near the end, which the next turn restores,
+rem stays); with a longer answer before it (tool calls) that part would be a second upload of all the experts
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;nobrk LLAMA_CKPT_USER_BREAK=0 @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
@@ -709,6 +728,10 @@ rem 07-trace: llama-server under nsys profile, the profiler on for the requests 
 rem start:turns:chars of PPLFILE (as DECCHAT; 120000 is a prompt of ~29K tokens in ubatches of -ub, then a turn of
 rem ~500 tokens), TRACEGEN tokens per answer, TRACEGAP ms of idle GPU that end a stretch of the table
 if not defined RUN_TRACE   set "RUN_TRACE=0"
+rem 08-starts: STARTS starts of each arm of STARTARMS, one try each (the stalls of the load counted)
+if not defined RUN_STARTS  set "RUN_STARTS=0"
+if not defined STARTS      set "STARTS=10"
+if not defined STARTARMS   set "STARTARMS=default @draft --spec-auto"
 if not defined TRACECHAT   set "TRACECHAT=120000:1:2000"
 if not defined TRACEGEN    set "TRACEGEN=64"
 if not defined TRACEGAP    set "TRACEGAP=20"
