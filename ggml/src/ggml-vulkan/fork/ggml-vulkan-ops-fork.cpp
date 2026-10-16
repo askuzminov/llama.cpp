@@ -300,12 +300,12 @@ bool ggml_vk_set_tensor_mapped(vk_context & cpy_ctx, const ggml_tensor * tensor,
 }
 
 // MUL_MAT_ID on mul_mmid_f16reg.comp (GGML_VK_MMID_F16REG): q4_K, q5_K (also the fused gate/up), q5_1 and q8_0 experts
-// with f32 activations read in place, the hoisted row ids of count_experts.comp, rows in whole 128-row tiles and K in
+// with f32 activations read in place, the row map of count_experts.comp, rows in whole 128-row tiles and K in
 // whole 64-column stages of whole blocks, 32-bit offsets. from GGML_VK_MMID_F16REG_MIN_ROWS rows per expert on average
 // (16): decode batches take the mat-vec path before they get here
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
-                                     bool hoist_row_ids, bool y_f32_kernel, uint64_t n_per_expert) {
-    if (ctx->device->mmid_f16reg_mode == 0 || !hoist_row_ids || !y_f32_kernel || src1->type != GGML_TYPE_F32) {
+                                     bool y_f32_kernel, uint64_t n_per_expert) {
+    if (ctx->device->mmid_f16reg_mode == 0 || !y_f32_kernel || src1->type != GGML_TYPE_F32) {
         return nullptr;
     }
     static const uint64_t min_rows = [] { const char * env = getenv("GGML_VK_MMID_F16REG_MIN_ROWS"); return env ? (uint64_t) atoi(env) : 16u; }();

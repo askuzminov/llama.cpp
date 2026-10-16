@@ -452,12 +452,13 @@ static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struc
     if (a->src[2]->ne[1] < min_tokens) {
         return false;
     }
-    // mul_mmid_f16reg.comp, when ggml_vk_mul_mat_id_q_f16 takes it for these operands (hoisted row ids as it decides them)
+    // mul_mmid_f16reg.comp, when ggml_vk_mul_mat_id_q_f16 takes it for these operands (B read in place as f32, as it
+    // decides it: not on coopmat2, not where Intel coopmat1 prefers f16 activations)
     const ggml_tensor * ids = a->src[2];
     const uint64_t n_as = w0->ne[2];
-    const bool hoist = n_as <= 1024 && ids->ne[0] <= 0xffff && ids->ne[1] <= 0xffff &&
-                       (2 * n_as + 1 + ids->ne[0] * ids->ne[1]) * sizeof(uint32_t) <= ctx->device->properties.limits.maxStorageBufferRange;
-    if (ggml_vk_fork_mmid_f16reg(ctx, w0, x, w1, hoist, ggml_vk_dim01_contiguous(x), CEIL_DIV(ids->ne[0] * ids->ne[1], n_as)) != nullptr) {
+    const bool y_f32_in_place = ggml_vk_dim01_contiguous(x) && !ctx->device->coopmat2 &&
+        !(ctx->device->coopmat_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ggml_is_quantized(w0->type));
+    if (ggml_vk_fork_mmid_f16reg(ctx, w0, x, w1, y_f32_in_place, CEIL_DIV(ids->ne[0] * ids->ne[1], n_as)) != nullptr) {
         return true;
     }
     return int8 && ggml_vk_get_mul_mat_mat_pipeline_map(ctx, w0->type, GGML_TYPE_Q8_1, (ggml_prec) a->op_params[0], true, true) != nullptr;

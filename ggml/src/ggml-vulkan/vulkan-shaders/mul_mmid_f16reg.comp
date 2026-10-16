@@ -64,7 +64,7 @@ layout(binding = 6) readonly buffer A2 { uint data_a2[]; };
 layout(binding = 1) readonly buffer B4 { vec4 data_b4[]; };
 layout(binding = 2) writeonly buffer D { float data_d[]; };
 layout(binding = 3) readonly buffer IDS { int data_ids[]; };
-layout(binding = 4) readonly buffer Counts { int data_expert_count[]; };
+layout(binding = 4) readonly buffer RowMap { uint data_row_map[]; };
 layout(binding = 5) readonly buffer FusedScale { float data_fscale[]; };
 
 layout(push_constant) uniform parameter {
@@ -82,7 +82,7 @@ layout(push_constant) uniform parameter {
     uint nbi1;
     uint ne11;
     uint n_experts;
-    uint hoist_row_ids;
+    uint row_ids_offset;
     uint fusion_flags;
 } p;
 
@@ -376,20 +376,19 @@ void frag_store(const float acc[8], const uint off) {
 void main() {
     const uint tid    = gl_LocalInvocationID.x;
     const uint ir     = gl_WorkGroupID.x;
-    const uint ic     = gl_WorkGroupID.y;
-    const uint expert = gl_WorkGroupID.z;
     const uint wave   = gl_SubgroupID;
     const uint lane   = gl_SubgroupInvocationID;
 
-    // the rows of this expert in this tile, from the hoisted list of count_experts.comp
-    const uint count = uint(data_expert_count[expert]);
-    if (ic * BN >= count) {
+    // the expert and the rows of this tile, from the row map of count_experts.comp
+    const uint tile = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
+    if (tile >= data_row_map[0]) {
         return;
     }
-    const uint tile_count = min(BN, count - ic * BN);
-    const uint ids_base = 2 * p.n_experts + 1 + uint(data_expert_count[p.n_experts + expert]) + ic * BN;
+    const uint expert     = data_row_map[1 + 2 * tile];
+    const uint tile_count = data_row_map[2 + 2 * tile];
+    const uint ids_base   = p.row_ids_offset + tile * BN;
     for (uint i = tid; i < tile_count; i += BLOCK_SIZE) {
-        const uint packed = uint(data_expert_count[ids_base + i]);
+        const uint packed = data_row_map[ids_base + i];
         row_ids[i] = u16vec2(packed & 0xFFFFu, packed >> 16);
     }
 

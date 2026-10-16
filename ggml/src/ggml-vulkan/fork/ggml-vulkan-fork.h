@@ -223,7 +223,7 @@ bool ggml_vk_fork_fa_union(ggml_backend_vk_context * ctx, vk_context & subctx, c
                            const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst);
 // MUL_MAT_ID: the mul_mmid_f16reg.comp pipeline for these operands, or nullptr for the upstream choice
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
-                                     bool hoist_row_ids, bool y_f32_kernel, uint64_t n_per_expert);
+                                     bool y_f32_kernel, uint64_t n_per_expert);
 // MUL_MAT: the matmuls that stay off the int8 path (GGML_VK_INT_COOPMAT=3, graph outputs, K under 512)
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
 // set_tensor_2d_async: writes weights in place where the device memory is mapped, returns false for the staged copy

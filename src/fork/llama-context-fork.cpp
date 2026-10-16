@@ -43,12 +43,7 @@ void llama_context::sched_free() {
     gf_res_prev_active = nullptr;
 
     // the old scheduler frees its buffers, the new one allocates them only in a reserve
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-    // fork: the upstream MoE cache maps the experts in its copy callback, the uploads ahead would bypass it
-    if (moe_cache) {
-        ggml_backend_sched_set_prefetch(sched.get(), 0);
-    }
+    sched_new(max_nodes, cparams.pipeline_parallel);
 
     sched_need_reserve = true;
 }

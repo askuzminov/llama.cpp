@@ -102,6 +102,13 @@ rem barriers per block instead of 32); the Mac only compiles and validates the c
 rem 13.10 night: the ops of the three changes: MUL_MAT of q8_0 / q4_K by f16 (the int8 path through the f16 quantize
 rem of LLAMA_HC_F16 runs only here, the Mac GPUs have no int dot), DSV4_HC_PRE over f16, HC_POST_NORM with the f16
 rem copy fused in, the HC ops and TOP_K (radix past the 1024 columns of the tournament) and the sparse attention again
+rem 16.10, after the merge of master (ceefd16da): matmul_id takes the prepass of upstream (966baae76: count_experts.comp
+rem lays the rows out in tiles, the ids that repeat in a token included), mul_mmid_f16reg.comp reads its table, and
+rem the matmul dispatch is split above maxComputeWorkGroupCount (411d54851). the Mac: MUL_MAT_ID 965/965 and f16reg
+rem emulated 104 cases on the AMD gpu, KLD against the build before the merge 1e-6. 01 the ops of the model with both
+rem expert paths (int8: GGML_VK_MMID_F16REG=0), 03 default against the reference, 04 auto in the chats to 213K against
+rem the run of 15.10 night (b5c02638: PP 734, TG 38.54 for the whole chat)
+if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16"
 if not defined CHECKOPS    set "CHECKOPS=MUL_MAT type_a=q8_0,type_b=f16;MUL_MAT type_a=q4_K,type_b=f16;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;TOP_K;FLASH_ATTN_LIST"
 if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
 rem 13.10 (19d20ba8): wide 53/53, but the attention at 122880 903.4 against 904.2 ms, PP 785.1 against 783.1: the
@@ -130,6 +137,11 @@ rem 4/4, HC_POST_NORM_F16 4/4, TOP_K 536/536, FLASH_ATTN_LIST 7/7); 03 hcf16 KLD
 rem the next run: no 01 / 03 (kernels and math unchanged since)
 rem 15.10 (dabe4f1a): 01 with rows8 / rows16 ran the CHECKOPS above (all passed), not MUL_MAT_ID: the CHECKOPS of
 rem this run came after them. the int8 path with GGML_VK_DMMV_ID_ROWS is not checked; the switch stays off (05)
+rem 16.10: the run after the merge of master, see CHECKOPS
+if not defined RUN_CHECK   set "RUN_CHECK=1"
+if not defined QARMS       set "QARMS=default"
+if not defined CHECKARMS   set "CHECKARMS=default;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_REPEAT,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
+if not defined RUN_QUALITY set "RUN_QUALITY=1"
 if not defined RUN_CHECK   set "RUN_CHECK=0"
 if not defined QARMS       set "QARMS=default;hcf16 LLAMA_HC_F16=1"
 if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
@@ -321,6 +333,8 @@ rem 200K+ (whole chat 38.54 against 37.55), acceptance 0.719 against 0.723, PP 7
 rem dfirst PP 728.1, TG 37.75 (the same); 08: auto 8 of 10 starts (the head buffer past the carve-out failed to
 rem allocate once, a model buffer right at the start once), dfirst 9 of 10 (a model buffer at the start), no
 rem stall in 20: the default since, and a failed buffer is asked for again after 2 s (GGML_ALLOC_RETRY, 3)
+rem 16.10: auto after the merge of master, see CHECKOPS
+if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -443,6 +457,17 @@ rem 09.10: pool32 (QSA key pool in f32) mean KLD 0.01768 against 0.01783 of the 
 rem 605.5 against 616.5, TG the same, moe-cache slots +1-2 with f16. the arm is off
 rem 14.10: pf3 (GGML_SCHED_PREFETCH=3, see DECARMS) must give the KLD of default to the digit: the same kernels on the
 rem same data, only the uploads of the experts run on a second stream (QUB 2048 offloads the experts of -ncmoe 30)
+rem 16.10, after the merge of master (ceefd16da): the CUDA side got the chunked GDN kernel (62df1815b), the top-k
+rem choice of upstream (radix from 3 rows; GGML_CUDA_TOPK_RADIX stays on top of it), the MMQ tile picked on the host
+rem (fc9ce6b9d; ncols_max of the expert cache kept), the pinned CUDA_Host buffer at most 4 GB (b6334e37e: the 74 GB of
+rem experts in ~19 buffers), the AVX2 tiled kernel and F16C changes of the CPU, and the server checkpoint without the KV
+rem of the MTP context (e467e5b5e). the Mac does not build CUDA, the merged mmq.cu / top-k.cu / ggml-cuda.cu were only
+rem read. 01 the ops of the model, 03 default against the reference, 04 auto in the chats to 213K against the run of
+rem 15.10 night (285415bc, nobrk: PP 756.1, TG 27.11)
+if not defined CHECKOPS   set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT"
+if not defined RUN_CHECK  set "RUN_CHECK=1"
+if not defined RUN_QUALITY set "RUN_QUALITY=1"
+if not defined QARMS      set "QARMS=default"
 if not defined QARMS      set "QARMS=default;pf3 GGML_SCHED_PREFETCH=3"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 rem 10.10: -b 8192 -ub 8192 (n2ub8k): the 118K prompt at 607.0 t/s against 527.6 with 4096, --phase-mem took ubatch
@@ -626,6 +651,8 @@ rem 141 ms per verify step, TG 21.78 / 18.50: 7.9 uploads per layer and step, 68
 rem expert goes over PCIe at ~23 GB/s slower than the CPU computes it from RAM at ~39, the uploads of a layer do not
 rem fit before the next one and the GPU waits; the acceptance 0.69 against 0.86 is the longer drafts of --spec-auto
 rem (2.29 against 1.26 per step, 2.59 tokens per step against 2.09), the texts are fine. off
+rem 16.10: auto after the merge of master, see QARMS
+if not defined RUN_DECODE set "RUN_DECODE=1"
 if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"

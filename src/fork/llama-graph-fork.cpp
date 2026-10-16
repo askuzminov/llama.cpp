@@ -157,7 +157,7 @@ ggml_tensor * llm_graph_context::build_moe_cache(
 
     ggml_tensor * down = ggml_mul_mat_id(ctx0, cl->s_down, act, ids);
     ggml_mul_mat_set_hint(down, GGML_HINT_IDS_REPEAT);
-    if (arch == LLM_ARCH_MISTRAL4) {
+    if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM) {
         ggml_prec_set_src(down, GGML_PREC_F32, 1);
     }
     cb(down, "ffn_moe_cache_down", il);
