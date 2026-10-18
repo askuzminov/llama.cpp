@@ -832,6 +832,13 @@
 ## Прочее
 
 - [docs/build-windows-vulkan-cuda.md](docs/build-windows-vulkan-cuda.md) - сборка под Windows.
+- [scripts/fork/gguf-replace-tensor.mjs](scripts/fork/gguf-replace-tensor.mjs) (18.10, node или bun, без пакетов) -
+  копия модели с одним тензором из другой модели: таблица n-грамм Qwen3.8-Flash-Next (`per_layer_token_embd.weight`,
+  IQ4_NL в UD-Q4_K_XL) из полной модели как есть (`--type keep`) или в `q8_0` / `bf16` (байты как у llama-quantize).
+  Переписывается только split с тензором, остальные split ставятся жёсткими ссылками; перед записью строки старой и
+  новой таблицы сравниваются, другой порядок строк останавливает скрипт. `--list <файл>` - типы тензоров файла.
+  Проверено на тестовой qwen4exp: результат побайтно совпадает с llama-quantize (98/98 тензоров), модель грузится,
+  в том числе через кеш строк (`-lzm dio`). Инструкция: [scripts/fork/gguf-replace-tensor.md](scripts/fork/gguf-replace-tensor.md).
 - [scripts/win-qsa/](scripts/win-qsa/) - батники для замеров на целевой Windows-машине, свой README.
   Там же ведётся список отброшенных вариантов и опровергнутых гипотез с числами, чтобы не
   возвращаться к ним по второму разу.
