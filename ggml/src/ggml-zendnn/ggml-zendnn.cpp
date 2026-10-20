@@ -706,6 +706,10 @@ static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const
             const ggml_tensor * weights = op->src[0];
             const ggml_tensor * inputs = op->src[1];
 
+            if (op->op == GGML_OP_MUL_MAT_ID && op->src[3]) {
+                return false;
+            }
+
             const int64_t ne10 = inputs->ne[0];
             const int64_t ne0 = op->ne[0];
             const int64_t ne1 = op->ne[1];

@@ -131,6 +131,9 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    uint32_t get_n_kv_used() const override;
+    void     set_n_kv_full(uint32_t n_kv) override;
+
     bool get_can_shift() const override;
 
     void clear(bool data) override;
@@ -151,6 +154,19 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // delta state write/load for checkpoint compression
+    size_t state_write_delta(
+            llama_io_write_i & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) const override;
+
+    bool state_read_delta(
+            llama_io_read_i  & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) override;
+
     //
     // llama_kv_cache specific API
     //
@@ -158,6 +174,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+
+    // n_kv of the full contexts, see set_n_kv_full()
+    uint32_t get_n_kv_full() const;
 
     bool get_has_shift() const;
 
@@ -277,6 +296,9 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    // n_kv of the full contexts, 0 = full size
+    uint32_t n_kv_full = 0;
+
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
     uint32_t n_rot_v = 0;
@@ -346,11 +368,15 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
     };
 
+    // cells of stream `strm` holding `seq_id` (any seq when -1) and sitting past `pos_min` (-1 keeps all)
+    // cells the SWA window no longer covers are left out, as a restore could not use them either
+    cell_ranges_t state_ranges(uint32_t strm, llama_seq_id seq_id, llama_pos pos_min, uint32_t & cell_count) const;
+
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, bool clear_seq = true);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
@@ -400,6 +426,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // first cache stream of the current slot info, the `s0` get_k/get_v offset their views by
+    uint32_t get_s0() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -437,6 +466,9 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // fork: the cells of the current ubatch, nullptr for a context without a batch (src/fork, qwen4exp QSA)
+    const llama_kv_cache::slot_info * get_sinfo() const { return sinfos.empty() ? nullptr : &sinfos[i_cur]; }
 
 private:
     llama_memory_status status;

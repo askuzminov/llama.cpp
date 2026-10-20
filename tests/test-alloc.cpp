@@ -5,6 +5,9 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <memory>
 #include <vector>
 
@@ -16,6 +19,12 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    enum ggml_backend_dev_type type = GGML_BACKEND_DEVICE_TYPE_CPU;
+    bool host = true;
+    bool pending = false;
+    bool saw_cold = false;
+    bool saw_overlap = false;
+    dummy_backend_context * peer = nullptr;
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -82,8 +91,8 @@ static size_t dummy_backend_buffer_type_get_alloc_size_n_custom(
     return 64;
 }
 
-static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t /*buft*/) {
-    return true;
+static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return ((dummy_backend_context *) buft->context)->host;
 }
 
 // ggml_backend_buffer interface
@@ -114,8 +123,8 @@ static void dummy_backend_buffer_clear(ggml_backend_buffer_t /*buft*/, uint8_t /
 
 // ggml_backend_device interface
 
-static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t /*dev*/) {
-    return GGML_BACKEND_DEVICE_TYPE_CPU;
+static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t device) {
+    return ((dummy_backend_context *) device->context)->type;
 }
 
 static bool dummy_backend_device_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor * /*x*/) {
@@ -677,6 +686,71 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void dummy_backend_synchronize(ggml_backend_t backend) {
+    ((dummy_backend_context *) backend->context)->pending = false;
+}
+
+static ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    auto * ctx = (dummy_backend_context *) backend->context;
+    if (ctx->type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        ctx->pending = true;
+    } else {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (strcmp(graph->nodes[i]->name, "cold") == 0) {
+                ctx->saw_cold = true;
+                ctx->saw_overlap = ctx->peer->pending;
+            }
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void test_cpu_device_overlap() {
+    const char * mode = getenv("GGML_SCHED_PARALLEL_CPU");
+    const bool enabled = mode == nullptr || atoi(mode) > 0;
+
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        const bool host = (scenario & 1) != 0;
+        const bool host_input = (scenario & 2) != 0;
+        dummy_backend gpu = dummy_backend_init(SIZE_MAX);
+        dummy_backend cpu = dummy_backend_init(SIZE_MAX);
+        gpu.context->type = GGML_BACKEND_DEVICE_TYPE_GPU;
+        gpu.context->host = host;
+        cpu.context->peer = gpu.context.get();
+        for (auto * b : { gpu.context.get(), cpu.context.get() }) {
+            b->backend.iface.synchronize = dummy_backend_synchronize;
+            b->backend.iface.graph_compute = dummy_backend_graph_compute;
+        }
+
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx, &gpu.buffer_type));
+        ggml_tensor * staged = ggml_dup(ctx, input);
+        ggml_tensor * hot = ggml_sqr(ctx, host_input ? staged : input);
+        ggml_tensor * cold = ggml_sqr(ctx, staged);
+        ggml_set_name(cold, "cold");
+        ggml_tensor * out = ggml_add(ctx, hot, cold);
+        ggml_build_forward_expand(graph, staged);
+        ggml_build_forward_expand(graph, hot);
+        ggml_build_forward_expand(graph, out);
+
+        ggml_backend_t backends[] = { &gpu.context->backend, &cpu.context->backend };
+        ggml_backend_buffer_type_t bufts[] = { &gpu.buffer_type, &cpu.buffer_type };
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 32, false, false));
+        ggml_backend_sched_set_tensor_backend(sched.get(), staged, backends[1]);
+        ggml_backend_sched_set_tensor_backend(sched.get(), hot, backends[0]);
+        ggml_backend_sched_set_tensor_backend(sched.get(), cold, backends[1]);
+        ggml_backend_sched_set_tensor_backend(sched.get(), out, backends[0]);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        for (int i = 0; i < 2; ++i) {
+            cpu.context->saw_cold = false;
+            GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph) == GGML_STATUS_SUCCESS);
+            GGML_ASSERT(cpu.context->saw_cold);
+            GGML_ASSERT(cpu.context->saw_overlap == (enabled && !host && !host_input));
+        }
+    }
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1121,6 +1195,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_cpu_device_overlap", test_cpu_device_overlap);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);

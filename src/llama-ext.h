@@ -108,6 +108,23 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// fork: the next decodes are MTP draft steps after the first of a round, whose QSA block takes the block scores of
+// that first step instead of running its indexer (as the reference reuses its top-k across MTP steps). Ignored unless
+// the MTP block attends through QSA (LLAMA_MTP_QSA=1) and LLAMA_MTP_QSA_REUSE is not 0. Default false
+LLAMA_API void llama_set_qsa_reuse(struct llama_context * ctx, bool value);
+
+// fork: the tokens the next decode call starts with, at positions pos0.. of seq_id, when a prompt goes on past it: the
+// inputs of its first ubatch that come from storage (the PLE rows of qwen4exp) are read while the last ubatch of that
+// call computes. Holds for the one decode call after it
+LLAMA_API void llama_set_next_tokens(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens,
+                                     llama_pos pos0, llama_seq_id seq_id);
+
+// fork: a coming decode will hold these tokens at positions pos0.. of seq_id, the cache holds the ones before pos0.
+// What their inputs read from storage (the PLE rows of qwen4exp) is read now by a worker, for the last n_new tokens;
+// the ones before them are context (n-gram predecessors). For the draft tokens of a speculative round
+LLAMA_API void llama_prefetch_tokens(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens,
+                                     int32_t n_new, llama_pos pos0, llama_seq_id seq_id);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

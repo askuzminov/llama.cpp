@@ -1,0 +1,39 @@
+#version 450
+
+// Checks that a workgroup owns all the shared memory it declares. Each workgroup fills SHMEM_WORDS words with a
+// pattern of its own, reads them back in reverse order after a barrier and counts the words that changed. Many
+// workgroups run at once, so a driver that gives each one less than declared lets them overwrite each other.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint SHMEM_WORDS = 16384;
+
+layout(binding = 0) buffer Errors { uint errors[]; };
+
+shared uint sh[SHMEM_WORDS];
+
+uint probe_pattern(uint i, uint wg, uint round) {
+    return (i * 2654435761u) ^ (wg * 40503u + round * 0x9E3779B9u + 1u);
+}
+
+void main() {
+    const uint wg = gl_WorkGroupID.x;
+    const uint t = gl_LocalInvocationID.x;
+    uint bad = 0;
+    for (uint round = 0; round < 4; round++) {
+        for (uint i = t; i < SHMEM_WORDS; i += 256) {
+            sh[i] = probe_pattern(i, wg, round);
+        }
+        barrier();
+        for (uint i = t; i < SHMEM_WORDS; i += 256) {
+            const uint j = SHMEM_WORDS - 1 - i;
+            if (sh[j] != probe_pattern(j, wg, round)) {
+                bad++;
+            }
+        }
+        barrier();
+    }
+    if (bad != 0) {
+        atomicAdd(errors[wg], bad);
+    }
+}

@@ -11,6 +11,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
+#include "fork/arg-fork.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -259,6 +260,7 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        common_fork_buft_list_add_extra(dev, buft_list);
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -543,6 +545,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         plan_spec.dspark = {};
     }
 
+    const bool spec_types_given = !spec_types_is_default(params);
+
     // infer the speculative type from the sidecar shipped by the draft repo when none is requested
     if (spec_types_is_default(params)) {
         if (!plan_spec.mtp.local_path.empty()) {
@@ -571,6 +575,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             params.speculative.types = types_gguf;
         }
     }
+
+    common_fork_spec_auto_apply(params, spec_types_given, spec_types_is_default(params));
 
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
     const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
@@ -1699,12 +1705,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
-        string_format("max number of context checkpoints to create per slot (default: %d)"
+        string_format("explicit count cap on context checkpoints per slot (default: %d; -1 = no count limit, 0 = disabled).\n"
+            "The footprint is bounded in bytes by the host RAM free at the moment a checkpoint is made, "
+            "less --cache-ram-reserve, so a count cap is normally unnecessary and does not help when RAM is short. "
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
         [](common_params & params, int value) {
             params.n_ctx_checkpoints = value;
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    common_fork_add_args(COMMON_ARG_FORK_AT_CTX_CHECKPOINTS, params, add_opt);
     add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
@@ -1717,13 +1726,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
+        string_format("set the maximum prompt cache size in MiB (default: %d, -1 - auto (fraction of total RAM), 0 - disable; decision models disable it unless it is given)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
             params.cache_ram_explicit = true;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    common_fork_add_args(COMMON_ARG_FORK_AT_CACHE_RAM, params, add_opt);
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -2714,12 +2724,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- auto: on, but only for tensors larger than 4 GiB\n"
+        "- auto: on, but only for tensors larger than 4 GiB; falls back to dio without mmap\n"
+        "- dio: on, but gather the rows one at a time from the file, no mmap needed\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
             else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
+            else if (value == "dio")  { params.lazy_mode = LLAMA_LAZY_MODE_DIO;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
@@ -2777,6 +2789,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    common_fork_add_args(COMMON_ARG_FORK_AT_N_CPU_MOE, params, add_opt);
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
@@ -4185,6 +4198,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4237,6 +4251,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
 
+    common_fork_add_args(COMMON_ARG_FORK_AT_SPEC_SYNTH_RATES, params, add_opt);
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),

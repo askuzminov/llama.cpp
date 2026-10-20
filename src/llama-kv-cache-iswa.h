@@ -63,6 +63,9 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    uint32_t get_n_kv_used() const override;
+    void     set_n_kv_full(uint32_t n_kv) override;
+
     bool get_can_shift() const override;
 
     void clear(bool data) override;
@@ -82,6 +85,19 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    // delta state: base and swa sub-caches each written as a delta (cells with pos > base_pos)
+    size_t state_write_delta(
+            llama_io_write_i & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) const override;
+
+    bool state_read_delta(
+            llama_io_read_i  & io,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags,
+            llama_pos base_pos) override;
 
     //
     // llama_kv_cache_iswa specific API

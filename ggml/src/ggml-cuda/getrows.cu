@@ -2,6 +2,8 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include "fork/getrows-fork.inc" // fork: GET_ROWS of short rows
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -249,6 +251,11 @@ static void get_rows_cuda_float(
     const size_t s11 = nb11 / sizeof(int32_t);
     const size_t s12 = nb12 / sizeof(int32_t);
     // const size_t s13 = nb13 / sizeof(int32_t);
+
+    // fork: rows of half a block or less, see fork/getrows-fork.inc
+    if (ggml_cuda_get_rows_flat_fork(src0_d, src1_d, dst_d, ne00, nb01, nb02, nb03, ne10, ne11, ne12, s10, s11, s12, s1, s2, s3, stream)) {
+        return;
+    }
 
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);

@@ -1,0 +1,96 @@
+#pragma once
+
+// fork: helpers of server_context for the speculative replay, the prompt cache setup and the
+// byte-bounded context checkpoints. server_context_impl and server_slot are local to
+// server-context.cpp, so these take what they need as arguments
+
+#include "common.h"
+#include "llama.h"
+#include "sampling.h"
+
+#include <cstdint>
+#include <list>
+#include <memory>
+#include <vector>
+
+struct server_prompt_cache;
+
+// host-RAM bounds of the prompt cache and the context checkpoints
+struct server_ckpt_limits {
+    // resolved host-RAM reserve for context checkpoints, in bytes (0 = disabled)
+    size_t reserve_bytes = 0;
+
+    // mapped model bytes; the OS reports them as available, but they are not free for checkpoints
+    size_t weights_bytes = 0;
+
+    // resolved count cap on context checkpoints per slot (0 = no count limit)
+    int32_t count_cap = 0;
+
+    // resolve the host-RAM reserve that bounds context-checkpoint memory
+    void init_reserve(const common_params & params);
+
+    // resolve the checkpoint bounds when context checkpoints are enabled
+    void init_ckpt(const common_params & params, const llama_model * model_tgt, const llama_model * model_dft);
+
+    // Per-slot byte budget for context checkpoints, measured when a checkpoint is created and not
+    // once at startup: host RAM comes and goes while the server runs. `held` is what the checkpoints
+    // of all slots hold now. 0 = the host cannot be probed, then only the count cap bounds the footprint.
+    size_t budget(size_t held, int n_parallel) const;
+};
+
+// LLAMA_CKPT_USER_BREAK (0 by default since 16.10, 1: upstream): with 0 the prompt batch does not stop at the start of the last user message
+// (or of a user message past checkpoint_min_step) for a checkpoint there. The new tokens of a chat turn (the last
+// answer as the client sends it back, the template, the new message) then go in one batch; the checkpoints near the
+// end of the prompt, which the next turn restores, stay. With the experts in RAM (-ncmoe) every prompt batch uploads
+// them: the part before the last user message ran on its own (3090, 15.10: 8 tokens 0.18 s, 60 tokens 0.51 s in the
+// generation layout; past 192 tokens it would be a second full upload of the experts, ~2.5 s). the 3090 (15.10 night,
+// chat to 213K): the part ran on its own in 63 of 65 turns, 69 tokens and 0.66 s on average; without the break PP of
+// the chat 756.1 against 647.4, turns of ~550 tokens after 29K 3.62 s against 4.41, TG the same
+bool server_ckpt_user_break_fork();
+
+// create the prompt cache for --cache-ram != 0, with the disk spill when it is configured
+void server_prompt_cache_init(
+        std::unique_ptr<server_prompt_cache> & prompt_cache,
+        const common_params & params,
+        int32_t n_ctx,
+        size_t reserve_bytes,
+        const llama_model * model_tgt,
+        const llama_context * ctx_tgt,
+        const llama_context * ctx_dft,
+        bool has_mtmd);
+
+// Identifies the model and context configuration that the cached states belong to. Spill files
+// of this model written under a different signature cannot be restored and are removed on startup.
+uint64_t server_prompt_cache_signature(
+        const common_params & params,
+        const llama_model * model_tgt,
+        const llama_context * ctx_tgt,
+        const llama_context * ctx_dft);
+
+// context checkpoints of a slot: a base and the deltas after it form a chain
+using server_ckpt_list = std::list<common_prompt_checkpoint>;
+
+// the checkpoint after `it` is a delta that depends on it, so `it` cannot be dropped
+bool server_ckpt_has_dependent_delta(const server_ckpt_list & ckpts, server_ckpt_list::const_iterator it);
+
+// Evict whole base->delta chains from the front. Deltas depend on all preceding
+// checkpoints in their chain, so eviction can only drop a chain as a unit (never a
+// checkpoint from the middle). Drops the oldest chain and its trailing deltas. Returns the bytes freed.
+size_t server_ckpt_evict_front_chain(server_ckpt_list & ckpts);
+
+// base_pos for the checkpoint about to be appended: -1 for a self-contained one, else the
+// pos_max of the last checkpoint, which the new delta hangs off
+llama_pos server_ckpt_next_base_pos(const server_ckpt_list & ckpts, const llama_model * model);
+
+// evict chains from the front while the list is over `budget`, but never the newest chain.
+// Returns the bytes freed.
+size_t server_ckpt_evict_over_budget(server_ckpt_list & ckpts, size_t budget);
+
+// restore the checkpoint at `it_cur`: its base, then the deltas up to it, then the draft state.
+// Returns the checkpoint whose state is now in the context, nullptr on failure
+const common_prompt_checkpoint * server_ckpt_restore(
+        const server_ckpt_list & ckpts,
+        server_ckpt_list::const_iterator it_cur,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id);

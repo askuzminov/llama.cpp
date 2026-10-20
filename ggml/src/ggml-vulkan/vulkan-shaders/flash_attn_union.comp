@@ -1,0 +1,384 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#ifndef EMULATE
+#extension GL_KHR_cooperative_matrix : enable
+#endif
+
+// fork: sparse attention of a prompt with a tile of R neighbouring tokens x G heads of one KV head (48 rows: 4 x 12 for
+// qwen4exp), walking the union of the token selections (the sparse compact pass with R mask rows per group). each row
+// still adds its own mask value, so a cell its token did not pick reads -inf and the result is that of the exact list.
+// the tile with the heads of one token (flash_attn_cm1.comp with the heads folded) reads the K/V of every cell once per
+// token; neighbouring tokens pick almost the same cells (gufo measured 846 blocks for the union of 4 selections of 512
+// at 16K), so the tile of 4 reads 2.4 times less and keeps the coopmat rows full (48 of 48 against 12 of 16).
+// one subgroup per block of 16 rows: its Q stays in A fragments, S and P of its rows in shared memory; K and V are
+// staged in chunks of 64 dims. EMULATE runs the same steps with the products done by every lane from shared memory,
+// for devices without coopmat (tests).
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint WG_SIZE = 192; // NSG * SG
+layout(constant_id = 1) const uint SG = 64;       // subgroup size, 16, 32 or 64
+layout(constant_id = 2) const uint HSK = 256;     // head size of K and V, a multiple of 64
+layout(constant_id = 3) const uint Bc = 64;       // list slots per step, 32 or 64
+
+const uint NSG  = 3;           // subgroups, one per block of 16 rows
+const uint ROWS = NSG * 16;    // rows of the tile, R tokens x G heads
+const uint DC   = 64;          // dims per staged chunk of K, V and Q
+const uint NDC  = HSK / DC;
+const uint NCB  = Bc / 16;     // cell blocks per step
+const uint LPR  = SG / 16;     // lanes per row in the softmax and in the output
+const uint DPL  = DC / LPR;    // dims per lane per chunk
+const uint RMAX = 8;           // tokens per tile at most (G >= 6)
+const uint EPL  = 256 / SG;    // EMULATE: accumulator elements per lane, element e of lane l at (l * EPL + e) / 16, % 16
+
+layout (push_constant) uniform parameter {
+    uint N;          // tokens
+    uint KV;
+    uint n_head;
+    uint G;          // query heads per KV head
+    uint R;          // tokens per tile, ROWS / G
+    uint q_nb1;      // strides in elements
+    uint q_nb2;
+    uint q_nb3;
+    uint k_nb1;
+    uint k_nb2;
+    uint k_nb3;
+    uint v_nb1;
+    uint v_nb2;
+    uint v_nb3;
+    uint m_nb1;
+    uint m_nb3;
+    uint nem3;
+    uint rk3;        // neq3 / nek3
+    uint rv3;        // neq3 / nev3
+    uint capacity;   // list slots per tile
+    uint n_groups;   // tiles of the sparse compact pass (CEIL_DIV(nem1, R))
+    float scale;
+} p;
+
+layout (binding = 0) readonly buffer Q {float data_q[];};
+layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
+layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
+layout (binding = 3) readonly buffer M {float16_t data_m[];};
+layout (binding = 4) readonly buffer L {int data_list[];};
+layout (binding = 5) writeonly buffer OV4 {vec4 data_ov4[];};
+
+const uint KST = DC + 8;                        // f16 per staged row, padded off the bank of the next
+const uint KSH_ROWS = Bc > ROWS ? Bc : ROWS;    // Q of the tile goes through it too
+shared f16vec4 kvsh[KSH_ROWS * KST / 4];
+
+const uint SST = (Bc > DC ? Bc : DC) + 4;       // floats per row: S of the step, then a PV chunk
+shared float ssh[ROWS * SST];
+
+const uint PST = Bc + 8;                        // f16 per row of P
+shared float16_t psh[ROWS * PST];
+
+shared float16_t masksh[RMAX * Bc];             // mask value of each token of the tile for each slot
+shared int cellsh[Bc];                          // cell of each slot, -1 for none
+shared float redsh[NSG * SG];                   // row reductions over the LPR lanes of a row
+
+// as flash_attn_base.glsl: P below 1/4, in fp16 range
+const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
+
+// the S, P and PV rows of a block are written and read by its own subgroup, but a workgroup barrier syncs them:
+// MoltenVK on Intel has no subgroup barrier, and all subgroups reach these points together anyway
+void subgroup_sync() {
+    barrier();
+}
+
+// the value of the LPR lanes of a row combined, through shared memory (no subgroup shuffle needed)
+float row_reduce(const float x, const bool is_max, const uint sg, const uint lane) {
+    subgroup_sync();
+    redsh[sg * SG + lane] = x;
+    subgroup_sync();
+    const uint first = lane - lane % LPR;
+    float r = redsh[sg * SG + first];
+    [[unroll]] for (uint i = 1; i < LPR; ++i) {
+        const float y = redsh[sg * SG + first + i];
+        r = is_max ? max(r, y) : r + y;
+    }
+    return r;
+}
+
+#ifdef EMULATE
+// Q of the tile, one chunk of DC dims at a time
+shared f16vec4 qsh[ROWS * KST / 4];
+
+#endif
+
+void main() {
+    // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
+    // A local: a function call is not a constant initializer of a global (glslc of SDK 1.4.350 rejects it).
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+    const uint tid  = gl_LocalInvocationIndex;
+#ifndef EMULATE
+    const uint sg   = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+#else
+    // subgroups of SG invocations by index: Metal on Intel picks its SIMD width per kernel, below the one asked for
+    const uint sg   = tid / SG;
+    const uint lane = tid % SG;
+#endif
+    const uint ti   = gl_WorkGroupID.x;
+    const uint g    = gl_WorkGroupID.y;
+    const uint iq3  = gl_WorkGroupID.z;
+    const uint t0   = ti * p.R;
+
+    const uint q_base = iq3 * p.q_nb3;
+    const uint k_base = g * p.k_nb2 + (iq3 / p.rk3) * p.k_nb3;
+    const uint v_base = g * p.v_nb2 + (iq3 / p.rv3) * p.v_nb3;
+    const uint m_base = (iq3 % p.nem3) * p.m_nb3;
+    const uint l_base = ((iq3 % p.nem3) * p.n_groups + ti) * p.capacity;
+
+    // this lane's row in the softmax and the output
+    const uint row  = lane / LPR;
+    const uint part = lane % LPR;
+    const uint grow = sg * 16 + row;
+    const uint tok  = grow / p.G;
+
+#ifndef EMULATE
+    // Q of the row block in A fragments, f16 and scaled, staged through kvsh
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Qf[HSK / 16];
+    [[unroll]] for (uint c = 0; c < NDC; ++c) {
+        barrier();
+        for (uint idx = tid; idx < ROWS * DC / 4; idx += WG_SIZE) {
+            const uint r  = idx / (DC / 4);
+            const uint d4 = idx % (DC / 4);
+            const uint t  = t0 + r / p.G;
+            vec4 qv = vec4(0.0);
+            if (t < p.N) {
+                const uint h = g * p.G + r % p.G;
+                qv = data_qv4[(q_base + t * p.q_nb1 + h * p.q_nb2) / 4 + c * (DC / 4) + d4] * p.scale;
+            }
+            kvsh[r * (KST / 4) + d4] = f16vec4(qv);
+        }
+        barrier();
+        [[unroll]] for (uint d = 0; d < DC / 16; ++d) {
+            coopMatLoad(Qf[c * (DC / 16) + d], kvsh, (sg * 16) * (KST / 4) + d * 4, KST / 4, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+#endif
+
+    vec4 Of[NDC][DPL / 4];
+    [[unroll]] for (uint c = 0; c < NDC; ++c) {
+        [[unroll]] for (uint i = 0; i < DPL / 4; ++i) {
+            Of[c][i] = vec4(0.0);
+        }
+    }
+    float Mr = NEG_FLT_MAX_OVER_2;
+    float Lr = 0.0;
+
+    [[dont_unroll]]
+    for (uint s0 = 0; s0 < p.capacity; s0 += Bc) {
+        // the list is ascending and -1 padded: a step that starts on padding ends the walk (the same for all)
+        if (data_list[l_base + s0] < 0) {
+            break;
+        }
+
+        barrier();
+        for (uint idx = tid; idx < Bc; idx += WG_SIZE) {
+            cellsh[idx] = s0 + idx < p.capacity ? data_list[l_base + s0 + idx] : -1;
+        }
+        for (uint idx = tid; idx < RMAX * Bc; idx += WG_SIZE) {
+            const uint tt = idx / Bc;
+            const uint c  = idx % Bc;
+            const int cell = s0 + c < p.capacity ? data_list[l_base + s0 + c] : -1;
+            float mv = uintBitsToFloat(0xFF800000); // -inf
+            if (tt < p.R && t0 + tt < p.N && cell >= 0) {
+                mv = float(data_m[m_base + (t0 + tt) * p.m_nb1 + uint(cell)]);
+            }
+            masksh[idx] = float16_t(mv);
+        }
+
+        // S = Q K^T of the row block over the cells of the step, K in chunks of DC dims
+#ifndef EMULATE
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Sacc[NCB];
+        [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+            Sacc[cb] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+#else
+        float Sacc[NCB][256 / SG];
+        [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+            [[unroll]] for (uint e = 0; e < EPL; ++e) {
+                Sacc[cb][e] = 0.0;
+            }
+        }
+#endif
+        [[unroll]] for (uint c = 0; c < NDC; ++c) {
+            barrier();
+            for (uint idx = tid; idx < Bc * DC / 4; idx += WG_SIZE) {
+                const uint cc = idx / (DC / 4);
+                const uint d4 = idx % (DC / 4);
+                const int cell = cellsh[cc];
+                f16vec4 kv = f16vec4(0.0);
+                if (cell >= 0) {
+                    kv = data_kv4[(k_base + uint(cell) * p.k_nb1) / 4 + c * (DC / 4) + d4];
+                }
+                kvsh[cc * (KST / 4) + d4] = kv;
+            }
+#ifdef EMULATE
+            for (uint idx = tid; idx < ROWS * DC / 4; idx += WG_SIZE) {
+                const uint r  = idx / (DC / 4);
+                const uint d4 = idx % (DC / 4);
+                const uint t  = t0 + r / p.G;
+                vec4 qv = vec4(0.0);
+                if (t < p.N) {
+                    const uint h = g * p.G + r % p.G;
+                    qv = data_qv4[(q_base + t * p.q_nb1 + h * p.q_nb2) / 4 + c * (DC / 4) + d4] * p.scale;
+                }
+                qsh[r * (KST / 4) + d4] = f16vec4(qv);
+            }
+#endif
+            barrier();
+#ifndef EMULATE
+            [[unroll]] for (uint d = 0; d < DC / 16; ++d) {
+                [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Kt;
+                    coopMatLoad(Kt, kvsh, (cb * 16) * (KST / 4) + d * 4, KST / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                    Sacc[cb] = coopMatMulAdd(Qf[c * (DC / 16) + d], Kt, Sacc[cb]);
+                }
+            }
+#else
+            // the EPL elements of a lane are one row m, columns n0 .. n0 + EPL - 1
+            {
+                const uint m  = lane * EPL / 16;
+                const uint n0 = lane * EPL % 16;
+                for (uint k4 = 0; k4 < DC / 4; ++k4) {
+                    const vec4 qv = vec4(qsh[(sg * 16 + m) * (KST / 4) + k4]);
+                    [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+                        [[unroll]] for (uint e = 0; e < EPL; ++e) {
+                            Sacc[cb][e] += dot(qv, vec4(kvsh[(cb * 16 + n0 + e) * (KST / 4) + k4]));
+                        }
+                    }
+                }
+            }
+#endif
+        }
+
+        // S of the row block to shared memory, its rows only
+#ifndef EMULATE
+        [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+            coopMatStore(Sacc[cb], ssh, (sg * 16) * SST + cb * 16, SST, gl_CooperativeMatrixLayoutRowMajor);
+        }
+#else
+        [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+            [[unroll]] for (uint e = 0; e < EPL; ++e) {
+                ssh[(sg * 16 + lane * EPL / 16) * SST + cb * 16 + lane * EPL % 16 + e] = Sacc[cb][e];
+            }
+        }
+#endif
+        subgroup_sync();
+
+        // softmax of this lane's row: cells part, part + LPR, ...
+        float sv[Bc / LPR];
+        float smax = NEG_FLT_MAX_OVER_2;
+        [[unroll]] for (uint i = 0; i < Bc / LPR; ++i) {
+            const uint c = part + i * LPR;
+            const float s = ssh[grow * SST + c] + float(masksh[tok * Bc + c]);
+            sv[i] = s;
+            smax = max(smax, s);
+        }
+        smax = row_reduce(smax, true, sg, lane);
+        const float Mnew = max(Mr, smax + FATTN_KQ_MAX_OFFSET);
+        const float eM = exp(Mr - Mnew);
+        Mr = Mnew;
+        float lsum = 0.0;
+        [[unroll]] for (uint i = 0; i < Bc / LPR; ++i) {
+            const float pv = exp(sv[i] - Mnew);
+            lsum += pv;
+            psh[grow * PST + part + i * LPR] = float16_t(pv);
+        }
+        // each lane keeps the sum of its own cells, the LPR lanes of a row rescale theirs by the same eM
+        Lr = Lr * eM + lsum;
+        [[unroll]] for (uint c = 0; c < NDC; ++c) {
+            [[unroll]] for (uint i = 0; i < DPL / 4; ++i) {
+                Of[c][i] *= eM;
+            }
+        }
+        subgroup_sync();
+
+#ifndef EMULATE
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Pf[NCB];
+        [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+            coopMatLoad(Pf[cb], psh, (sg * 16) * PST + cb * 16, PST, gl_CooperativeMatrixLayoutRowMajor);
+        }
+#endif
+
+        // O += P V, V in chunks of DC dims; the PV of a chunk goes through ssh into the lanes of its rows
+        [[unroll]] for (uint c = 0; c < NDC; ++c) {
+            barrier();
+            for (uint idx = tid; idx < Bc * DC / 4; idx += WG_SIZE) {
+                const uint cc = idx / (DC / 4);
+                const uint d4 = idx % (DC / 4);
+                const int cell = cellsh[cc];
+                f16vec4 vv = f16vec4(0.0);
+                if (cell >= 0) {
+                    vv = data_vv4[(v_base + uint(cell) * p.v_nb1) / 4 + c * (DC / 4) + d4];
+                }
+                kvsh[cc * (KST / 4) + d4] = vv;
+            }
+            barrier();
+#ifndef EMULATE
+            [[unroll]] for (uint dt = 0; dt < DC / 16; ++dt) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Oacc =
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                [[unroll]] for (uint cb = 0; cb < NCB; ++cb) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vf;
+                    coopMatLoad(Vf, kvsh, (cb * 16) * (KST / 4) + dt * 4, KST / 4, gl_CooperativeMatrixLayoutRowMajor);
+                    Oacc = coopMatMulAdd(Pf[cb], Vf, Oacc);
+                }
+                coopMatStore(Oacc, ssh, (sg * 16) * SST + dt * 16, SST, gl_CooperativeMatrixLayoutRowMajor);
+            }
+#else
+            {
+                const uint m  = lane * EPL / 16;
+                const uint n0 = lane * EPL % 16;
+                [[unroll]] for (uint dt = 0; dt < DC / 16; ++dt) {
+                    vec4 acc[EPL / 4];
+                    [[unroll]] for (uint e4 = 0; e4 < EPL / 4; ++e4) {
+                        acc[e4] = vec4(0.0);
+                    }
+                    for (uint k = 0; k < Bc; ++k) {
+                        const float pk = float(psh[(sg * 16 + m) * PST + k]);
+                        [[unroll]] for (uint e4 = 0; e4 < EPL / 4; ++e4) {
+                            acc[e4] += pk * vec4(kvsh[k * (KST / 4) + (dt * 16 + n0) / 4 + e4]);
+                        }
+                    }
+                    [[unroll]] for (uint e4 = 0; e4 < EPL / 4; ++e4) {
+                        [[unroll]] for (uint i = 0; i < 4; ++i) {
+                            ssh[(sg * 16 + m) * SST + dt * 16 + n0 + e4 * 4 + i] = acc[e4][i];
+                        }
+                    }
+                }
+            }
+#endif
+            subgroup_sync();
+            [[unroll]] for (uint i = 0; i < DPL / 4; ++i) {
+                const uint d = part * DPL + i * 4;
+                Of[c][i] += vec4(ssh[grow * SST + d], ssh[grow * SST + d + 1], ssh[grow * SST + d + 2], ssh[grow * SST + d + 3]);
+            }
+        }
+    }
+
+    Lr = row_reduce(Lr, false, sg, lane);
+    const float inv = Lr > 0.0 ? 1.0 / Lr : 0.0;
+
+    const uint t = t0 + tok;
+    if (t < p.N) {
+        const uint h = g * p.G + grow % p.G;
+        const uint o_base = ((iq3 * p.N + t) * p.n_head + h) * HSK;
+        [[unroll]] for (uint c = 0; c < NDC; ++c) {
+            [[unroll]] for (uint i = 0; i < DPL / 4; ++i) {
+                data_ov4[(o_base + c * DC + part * DPL + i * 4) / 4] = Of[c][i] * inv;
+            }
+        }
+    }
+}

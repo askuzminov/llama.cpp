@@ -278,6 +278,10 @@ static void top_k_argsort_cuda(
     }
 }
 
+#if defined(GGML_CUDA_USE_CUB)
+#include "fork/top-k-fork.inc"
+#endif // defined(GGML_CUDA_USE_CUB)
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -293,6 +297,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+#if defined(GGML_CUDA_USE_CUB)
+    if (ggml_cuda_fork_topk_radix(nrows)) {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+#endif // defined(GGML_CUDA_USE_CUB)
 
     const int device = ggml_cuda_get_device();
 

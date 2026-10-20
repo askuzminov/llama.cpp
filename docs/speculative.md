@@ -221,6 +221,12 @@ Use exactly one of these options:
 - `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
 - `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
 
+### Automatic Draft Length
+
+`--spec-auto` selects the draft length on each cycle. A draft position stays while the chance that it and all positions before it are accepted is above `R * c`. `R` is the measured token rate. `c` is the measured cost of one more verified token, plus one draft step for `draft-mtp`. For `draft-mtp`, the chance comes from the head probability of the drafted token, calibrated online against the observed acceptance. For other types, the chance comes from the observed acceptance per position. `--spec-draft-n-max` stays as the cap. If it is not given, the cap is 3. `--spec-draft-p-min` and `--spec-draft-n-min` are not necessary. The draft types are the ones given with `--spec-type`, or the type inferred from the draft model. The first 64 cycles and one cycle in 32 after them try different draft lengths to keep the estimates current. The draft length depends on timing, so it is not repeatable between runs. The output does not change.
+
+The server prints the fitted cost, the thresholds and the calibration when a slot is released. `LLAMA_SPEC_TRACE=<file>` writes one CSV line per draft cycle, with or without `--spec-auto`.
+
 ### General Speculative Parameters
 
 ```

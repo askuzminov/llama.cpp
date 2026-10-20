@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "fork/speculative-fork.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -198,6 +199,8 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+
+    common_speculative_auto * ctl = nullptr; // set when --spec-auto or the trace is on
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -1520,7 +1523,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // ctx_other links two kinds of draft: one with no trunk of its own, which runs on the target
+        // memory (gemma4), and one that only borrows weights and keeps its own memory (a shared head)
+        const bool has_trunk = llama_model_n_layer(llama_get_model(ctx_dft)) > 0;
+
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && !has_trunk;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -1619,7 +1626,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
+            const bool timeline = ggml_timeline_on(); // fork: the parts of the catch-up on the timeline (GGML_TIMELINE)
+            int64_t t_part_us = timeline ? ggml_time_us() : 0;
+
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+            if (timeline) {
+                ggml_timeline_event("spec", "mtp hidden", t_part_us, ggml_time_us());
+                t_part_us = ggml_time_us();
+            }
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -1638,10 +1653,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
             }
 
+            if (timeline) {
+                ggml_timeline_event("spec", "mtp rows", t_part_us, ggml_time_us());
+            }
+
             auto * mem_dft = llama_get_memory(ctx_dft);
 
+            // fork: in chunks of the draft ubatch (common_speculative_fork_catchup), else one call
+            const int32_t n_all   = batch.size();
+            const int32_t n_chunk = common_speculative_fork_catchup() ? std::max<int32_t>(1, (int32_t) llama_n_ubatch(ctx_dft)) : n_all;
+
             bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
+            for (int head = 0; head < n_mtp_layers && ok; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1653,12 +1676,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
-                    break;
+                for (int32_t off = 0; off < n_all; off += n_chunk) {
+                    const int32_t n = std::min(n_chunk, n_all - off);
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE,
+                                                     n == n_all ? batch.get() : batch.get_sub_batch(off, n));
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[off].pos[0]);
+                        ok = false;
+                        break;
+                    }
                 }
             }
 
@@ -1670,22 +1697,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const int64_t t_keep_us = ggml_timeline_on() ? ggml_time_us() : 0; // fork: GGML_TIMELINE
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            // fork: a batch longer than any verify (a prompt) keeps its last row only (common_speculative_fork_catchup)
+            const int32_t n_keep = common_speculative_fork_catchup() && n_rows > 256 ? 1 : n_rows;
+            verify_h_rows[seq_id] = n_keep;
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+            for (int32_t i = 0; i < n_keep; ++i) {
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + (n_rows - n_keep) + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (n_keep - 1) * n_embd, row_bytes);
+        }
+
+        if (t_keep_us != 0) {
+            ggml_timeline_event("spec", "mtp keep", t_keep_us, ggml_time_us());
         }
 
         return true;
@@ -1693,6 +1728,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        const int64_t t_start = ggml_time_us();
+        int n_steps = 0;
 
         batch.clear();
 
@@ -1729,6 +1767,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             i_last[seq_id] = idx;
 
+            // fork: the verify batch starts with id_last at pos0; what its inputs read from storage (the PLE rows of
+            // qwen4exp) is read while the tokens after it are drafted
+            if (params.ctx_tgt) {
+                llama_prefetch_tokens(params.ctx_tgt, &dp.id_last, 1, 1, dp.pos0, seq_id);
+            }
+
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
@@ -1753,11 +1797,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            // fork: a step after the first selects from the block scores of the first (a QSA MTP block, see
+            // llama_set_qsa_reuse); the steps of chained heads and of shared memory decode other rows
+            llama_set_qsa_reuse(ctx_dft, i > 0 && !chain_heads && !is_mem_shared);
+
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
             }
+            n_steps++;
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
@@ -1786,7 +1835,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                bool more = true;
+                if (cur_p->data[0].p < params.p_min || (ctl && !ctl->keep(seq_id, cur_p, more))) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1800,11 +1850,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                // fork: the new draft token is the next one of the verify batch: its PLE rows (qwen4exp) are read
+                // while the next step drafts, with id_last and the drafts before it as its n-gram context
+                if (params.ctx_tgt) {
+                    std::vector<llama_token> window;
+                    window.reserve(result.size() + 1);
+                    window.push_back(dp.id_last);
+                    window.insert(window.end(), result.begin(), result.end());
+                    llama_prefetch_tokens(params.ctx_tgt, window.data(), (int32_t) window.size(), 1, dp.pos0, seq_id);
+                }
+
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                const int n_cap = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+
+                if (!more || n_cap <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1844,6 +1906,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
         }
+        llama_set_qsa_reuse(ctx_dft, false);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1854,6 +1917,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+        }
+
+        if (ctl) {
+            ctl->on_steps(n_steps, ggml_time_us() - t_start);
         }
     }
 
@@ -1982,6 +2049,17 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
+    // a draft that is almost all wrong costs a full target pass, so stop drafting for a few
+    // calls. the pause doubles while the drafts stay bad and is cleared by a good one
+    static constexpr int n_skip_base = 4;
+    static constexpr int n_skip_max  = 256;
+
+    // acceptance below f_acc_low is bad. below f_acc_bad one round is enough to pause,
+    // otherwise it takes n_low_max rounds in a row
+    static constexpr double f_acc_low = 0.25;
+    static constexpr double f_acc_bad = 0.10;
+    static constexpr int    n_low_max = 5;
+
     struct seq_info {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
@@ -1989,8 +2067,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.5)
+        // consecutive accept rounds with low acceptance fraction (< f_acc_low)
         int n_low = 0;
+
+        // calls left to skip, and the length of the next pause
+        int n_skip      = 0;
+        int n_skip_next = n_skip_base;
     };
 
     std::vector<seq_info> sinfos;
@@ -2018,15 +2100,42 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfos.resize(n_seq);
     }
 
+    // the container is shared by every sequence, so a reset drops their ngrams too:
+    // they all have to index their prompt again and start a new streak
+    void reset_shared() {
+        mod.reset();
+
+        for (auto & si : sinfos) {
+            si.n_low  = 0;
+            si.i_last = 0;
+        }
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_low = 0;
+        sinfo.n_skip = 0;
+        sinfo.n_skip_next = n_skip_base;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
             return;
+        }
+
+        // check the occupancy before indexing - a reset after it would drop this prompt
+        // while i_last still claims that it is indexed
+        {
+            const double f = (double)mod.get_used() / (double)mod.size();
+
+            constexpr double f_thold = 0.25;
+            if (f > f_thold) {
+                SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
+
+                reset_shared();
+            }
         }
 
         for (size_t i = 0; i < prompt.size() - n; ++i) {
@@ -2035,15 +2144,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = prompt.size() - n;
 
-        const double f = (double)mod.get_used() / (double)mod.size();
-        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
-
-        constexpr double f_thold = 0.25;
-        if (f > f_thold) {
-            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
-
-            mod.reset();
-        }
+        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n",
+                mod.get_used(), mod.size(), (double)mod.get_used() / (double)mod.size());
     }
 
     void draft_one(
@@ -2072,6 +2174,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
+        // paused after a bad draft. keep indexing, but do not draft
+        if (sinfo.n_skip > 0) {
+            sinfo.n_skip--;
+            return;
+        }
+
         result.resize(n + params.n_max);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
@@ -2098,8 +2206,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result.resize(result.size() - n);
 
-        // store length of drafted n-gram for later acceptance analysis
-        sinfo.n_draft_last = result.size();
+        // store length of drafted n-gram for later acceptance analysis. the caller truncates
+        // the draft to n_max, so measure that length and not the generated one
+        sinfo.n_draft_last = dparams.n_max > 0 ? std::min(result.size(), (size_t) dparams.n_max) : result.size();
     }
 
     bool process(const common_batch & /*batch*/) override {
@@ -2127,22 +2236,32 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
-        // compute acceptance fraction if we have a recorded draft length
+        // compute acceptance fraction if we have a recorded draft length. the length is consumed
+        // here: the server can report the same draft twice, once on a rollback and once on the
+        // replay of the accepted part
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
-            if (f_acc < 0.25) {
-                sinfo.n_low++;
-                if (sinfo.n_low >= 5) {
-                    if (verbose) {
-                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
-                    }
 
-                    mod.reset();
-                    sinfo.n_low = 0;
-                    sinfo.i_last = 0;
+            sinfo.n_draft_last = 0;
+
+            if (f_acc >= f_acc_low) {
+                sinfo.n_low       = 0;
+                sinfo.n_skip_next = n_skip_base;
+
+                return;
+            }
+
+            sinfo.n_low++;
+
+            // the pool is left alone: it is shared, and the other sequences still match in it
+            if (f_acc < f_acc_bad || sinfo.n_low >= n_low_max) {
+                sinfo.n_skip      = sinfo.n_skip_next;
+                sinfo.n_skip_next = std::min(2*sinfo.n_skip_next, n_skip_max);
+                sinfo.n_low       = 0;
+
+                if (verbose) {
+                    SPC_TRC("low acceptance (%.3f) - pausing ngram_mod for %d calls\n", f_acc, sinfo.n_skip);
                 }
-            } else {
-                sinfo.n_low = 0;
             }
         }
     }
@@ -2231,7 +2350,13 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
-        sinfos[seq_id].cache_size = 0;
+        auto & sinfo = sinfos[seq_id];
+
+        sinfo.cache_size = 0;
+        // fork: the context cache belongs to the previous prompt, keep the static and dynamic ones (LLAMA_NGRAM_CACHE_KEEP)
+        if (!common_speculative_fork_ngram_cache_keep()) {
+            sinfo.ngram_cache_context.clear();
+        }
     }
 
     void draft_one(
@@ -2306,6 +2431,8 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    common_speculative_auto ctl;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2659,6 +2786,8 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        // fork: a smaller ubatch, see common_speculative_fork_mtp_ubatch
+        cparams.n_ubatch = common_speculative_fork_mtp_ubatch(cparams.n_ubatch);
     }
 
     // the draft context holds as many tokens per sequence as the target context
@@ -2674,7 +2803,10 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        llama_model * model_dft = common_speculative_fork_take_draft(model_path); // fork: LLAMA_DRAFT_LOAD_FIRST
+        if (model_dft == nullptr) {
+            model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        }
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
@@ -2842,7 +2974,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .ctl         = */ {},
     });
+
+    result->ctl.init(params.auto_n, n_seq, params.draft.n_max, std::getenv("LLAMA_SPEC_TRACE"));
+    if (result->ctl.active()) {
+        for (auto & impl : result->impls) {
+            impl->ctl = &result->ctl;
+        }
+        SPC_INF("draft length: %s%s\n", params.auto_n ? "auto, n_max is the cap" : "fixed",
+                result->ctl.trace ? ", per-cycle trace in LLAMA_SPEC_TRACE" : "");
+    }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
@@ -2894,6 +3036,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    // the time since the last draft includes the prompt
+    spec->ctl.cancel();
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
@@ -2938,12 +3083,21 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    auto & ctl = spec->ctl;
+
+    const int64_t t_start = ctl.draft_begin(dparams);
+
     for (auto & impl : spec->impls) {
+        // the auto mode caps the draft of each implementation, 0 skips it for this cycle
+        const int32_t cap = ctl.cap_begin(impl->type, dparams);
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
         }
+
+        ctl.cap_drafted(cap, dparams);
 
         int n_drafting = 0;
 
@@ -2990,6 +3144,8 @@ void common_speculative_draft(common_speculative * spec) {
             }
         }
 
+        ctl.cap_end(cap, dparams);
+
         if (n_drafting == 0) {
             break;
         }
@@ -3003,9 +3159,15 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+
+    ctl.draft_done(dparams, spec->impl_last, t_start);
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    if (spec->ctl.active()) {
+        spec->ctl.on_accept(seq_id, n_accepted);
+    }
+
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3066,9 +3228,29 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
 }
 
+common_speculative_type common_speculative_impl_type(const common_speculative_impl * impl) {
+    return impl->type;
+}
+
+bool common_speculative_need_verify(const common_speculative * spec) {
+    return spec != nullptr && spec->ctl.trace != nullptr;
+}
+
+void common_speculative_verify(common_speculative * spec, llama_seq_id seq_id, size_t i, const llama_token_data_array * cur_p, llama_token id_draft, float temp) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    spec->ctl.on_verify(seq_id, i, cur_p, id_draft, temp);
+}
+
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
+    }
+
+    if (spec->ctl.active()) {
+        spec->ctl.print();
     }
 
     for (const auto & impl : spec->impls) {

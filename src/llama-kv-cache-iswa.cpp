@@ -244,6 +244,15 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_full() {
     return std::make_unique<llama_kv_cache_iswa_context>(this);
 }
 
+uint32_t llama_kv_cache_iswa::get_n_kv_used() const {
+    return kv_base->get_n_kv_used();
+}
+
+void llama_kv_cache_iswa::set_n_kv_full(uint32_t n_kv) {
+    // the SWA cache is small and keeps its full size
+    kv_base->set_n_kv_full(n_kv);
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
 }

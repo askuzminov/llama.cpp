@@ -11635,6 +11635,11 @@ void ggml_compute_forward_dsv4_hc_pre(
             {
                 ggml_compute_forward_dsv4_hc_pre_f32(params, dst);
             } break;
+        case GGML_TYPE_F16:
+            {
+                // fork: the f16 hc read of qwen4exp (LLAMA_HC_F16), ggml-cpu/fork/ops-fork.inc
+                ggml_compute_forward_dsv4_hc_pre_f16_fork(params, dst);
+            } break;
         default:
             {
                 GGML_ABORT("fatal error");
@@ -12523,3 +12528,5 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+#include "fork/ops-fork.inc" // fork: the CPU ops the fork adds to ggml

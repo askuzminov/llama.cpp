@@ -1722,6 +1722,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // a short prompt is cheap to recompute, while the recurrent part of a hybrid state costs the
+    // same no matter how long the prompt is - caching one only takes room from the long prompts
+    if (min_tokens > 0 && prompt.tokens.size() < min_tokens) {
+        SRV_TRC(" - prompt has %zu tokens, below the cache minimum of %zu, skipping\n",
+                prompt.tokens.size(), min_tokens);
+        return nullptr;
+    }
+
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
@@ -1737,31 +1745,43 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    // remove any cached prompts that are fully contained in the current prompt
+    // remove any cached prompts that are fully contained in the current prompt. One that is on disk
+    // only gives up its RAM: its file already holds the front of the new state, so keeping it lets
+    // write_behind skip the rewrite, and a branch off that prefix is still restorable
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const size_t len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+        if (len == it->prompt.tokens.size()) {
+            if (it->on_disk) {
+                SRV_TRC(" - obsolete cached prompt with length %zu stays on disk\n", len);
 
+                evict_state(*it);
+                ++it;
+                continue;
+            }
+
+            SRV_TRC(" - removing obsolete cached prompt with length %zu\n", len);
+
+            erase_spill(*it);
             it = states.erase(it);
         } else {
             ++it;
         }
     }
 
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+    const size_t size_cur = size();
 
-            states.pop_front();
-        }
+    if (limit_size > 0 && size_cur + state_size_new > limit_size) {
+        // make room before allocating the new vectors to avoid breaching the RAM limit; with a
+        // spill dir this moves cold states to disk instead of dropping them
+        free_ram(size_cur + state_size_new - limit_size);
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    // make room so the new state keeps host RAM above the reserve
+    evict_for_reserve(state_size_new);
+
+    server_state_buf state_data_tgt;
+    server_state_buf state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
@@ -1783,6 +1803,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.n_used      =*/ prompt.n_used,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1793,10 +1814,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new) {
+    const int lcp_best = tokens_cur.get_common_prefix(tokens_new);
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_keep_best = tokens_cur.size() > 0 ? float(lcp_best) / tokens_cur.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
@@ -1827,6 +1848,31 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    }
+
+    return it_best;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    auto it_best = find_best(prompt.tokens, tokens_new);
+
+    if (it_best != states.end()) {
+        // pull the state back from disk if it was spilled
+        if (it_best->on_disk && !unspill_state(*it_best)) {
+            SRV_ERR("%s", "failed to load spilled prompt-cache state\n");
+            erase_spill(*it_best);
+            states.erase(it_best);
+            return false;
+        }
+
+        // an entry with no state blob would restore nothing while the slot believes its tokens are
+        // in the KV cache - drop it instead
+        if (it_best->data.main.empty()) {
+            SRV_ERR("%s", "prompt-cache entry holds no state, dropping it\n");
+            erase_spill(*it_best);
+            states.erase(it_best);
+            return false;
+        }
 
         {
             auto & data = it_best->data.main;
@@ -1835,6 +1881,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
+
+                // the target context is half-written and the entry cannot be trusted either
+                erase_spill(*it_best);
+                states.erase(it_best);
 
                 return false;
             }
@@ -1854,6 +1904,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
+                    // the main blob was consumed above, so what is left could never be restored again
+                    erase_spill(*it_best);
+                    states.erase(it_best);
+
                     return false;
                 }
 
@@ -1863,39 +1917,93 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(it_best->prompt);
+        prompt.n_used++;
 
-        states.erase(it_best);
+        if (it_best->on_disk) {
+            // the blobs went into the slot but the file is untouched and costs nothing to keep, so
+            // the entry stays as a disk-only record: the budget still accounts for it, a branch off
+            // this prefix can still be restored, and the slot does not have to write it all again
+            it_best->prompt        = server_prompt();
+            it_best->prompt.tokens = prompt.tokens.clone();
+            it_best->prompt.n_used = prompt.n_used;
+        } else {
+            states.erase(it_best);
+        }
     }
 
     return true;
 }
 
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
+    if (limit_size > 0 && size() > limit_size) {
+        // spill cold states to disk (or drop them without a spill dir) to fit the RAM limit
+        free_ram(size() - limit_size);
     }
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    // keep the on-disk spill within its budget
+    enforce_disk_limit();
+
+    // keep host RAM above the reserve (adapts to memory taken by other processes over time)
+    evict_for_reserve(0);
+
+    // size() walks the whole list, so it is taken once and kept up to date
+    size_t size_cur = size();
+
+    // a state that lives only on disk holds no RAM. With a disk budget set that budget bounds it,
+    // so the token limit only has to bound what is resident; without one this limit is still the
+    // only thing that stops the directory from growing, so it keeps counting
+    const bool disk_bounded = !spill_dir.empty() && spill_limit > 0;
+
+    const auto off_disk = [&](const server_prompt_cache_state & state) {
+        return state.on_disk && state.data.size() == 0;
+    };
+
+    // average size per token - a state that is only on disk contributes its file, otherwise the
+    // estimate collapses and the token limit stops bounding the cache. A clean state sits in both
+    // places and must be counted once
+    size_t n_tokens_cur = 0;
+    size_t size_off     = 0;
+
+    for (const auto & state : states) {
+        if (disk_bounded && off_disk(state)) {
+            continue;
+        }
+
+        n_tokens_cur += state.prompt.n_tokens();
+        size_off     += off_disk(state) ? state.disk_bytes : 0;
+    }
+
+    const float size_per_token = std::max<float>(1.0f, float(size_cur + size_off) / (std::max<size_t>(1, n_tokens_cur)));
 
     // dynamically increase the token limit if it can fit in the memory limit
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+        while (n_tokens_cur > limit_tokens_cur) {
+            auto it = states.begin();
 
-            states.pop_front();
+            while (disk_bounded && it != states.end() && off_disk(*it)) {
+                ++it; // the disk budget owns this one
+            }
+            if (it == states.end()) {
+                break;
+            }
+
+            const size_t size_front = it->size();
+
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur, size_front / (1024.0 * 1024.0));
+
+            n_tokens_cur -= std::min<size_t>(n_tokens_cur, (size_t) it->prompt.n_tokens());
+            size_cur     -= std::min(size_cur, size_front);
+
+            erase_spill(*it);
+            states.erase(it);
         }
     }
 
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+            states.size(), size_cur / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",

@@ -372,6 +372,35 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Snapshot of the splits of the allocated graph, to compute this graph again after other graphs without a new split and allocation
+    // The graph and its tensors must not change while the snapshot is in use
+    // After the save, the graph nodes use the input copies of the snapshot: free the snapshot only together with the graph
+    typedef struct ggml_backend_sched_snapshot * ggml_backend_sched_snapshot_t;
+
+    // Call after ggml_backend_sched_alloc_graph. Returns NULL if the scheduler cannot restore graphs (pipeline parallelism, compute buffers that reset the tensors)
+    GGML_API ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_save(ggml_backend_sched_t sched);
+    // Makes the graph of the snapshot the allocated graph. Returns false if the compute buffers were reallocated after the save, then allocate the graph again
+    GGML_API bool                          ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snapshot);
+    GGML_API void                          ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snapshot);
+
+    // Number of buffer plans made: by ggml_backend_sched_reserve, and by ggml_backend_sched_alloc_graph for a graph that did not fit the last plan
+    GGML_API size_t                        ggml_backend_sched_get_n_reserve(ggml_backend_sched_t sched);
+
+    // fork: the weights in host memory that a split copies to its device are uploaded while the split depth splits before it computes,
+    // on a second instance of its backend (0: off; the default is GGML_SCHED_PREFETCH, else 3). Call before the first reserve or graph: the
+    // allocation of the input copies depends on it. A copy callback that maps the weights itself (the MoE cache of llama.cpp) needs 0
+    GGML_API void                          ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, int depth);
+
+    // fork: a timeline of host and device spans in the trace event format of Perfetto and chrome://tracing, written to the file
+    // GGML_TIMELINE names while on (llama-server turns it on for LLAMA_TRACE_REQUESTS). Times are those of ggml_time_us()
+    GGML_API bool                          ggml_timeline_on(void);
+    GGML_API void                          ggml_timeline_enable(bool enable);
+    GGML_API void                          ggml_timeline_event(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us);
+    // fork: the same with the members of the span's args object, as "op":"MUL_MAT","bytes":1024 (NULL: none)
+    GGML_API void                          ggml_timeline_event_args(const char * track, const char * name, int64_t t_start_us, int64_t t_end_us, const char * args);
+    // fork: n spans of a device clock (start and end in us from any zero of that clock) with the host time each was issued at
+    // (the device cannot start one before), shifted onto ggml_time_us() and written to the timeline as "gpu" spans of track
+    GGML_API void                          ggml_timeline_device_spans(const char * track, size_t n, const double * start_us, const double * end_us, const double * issued_us);
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 

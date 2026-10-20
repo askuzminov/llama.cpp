@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "fork/llama-moecache-fork.h"
 #include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
@@ -14,6 +15,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -326,6 +328,12 @@ private:
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
+    // MoE expert cache measurement, created only for LLAMA_MOE_CACHE_STATS
+    std::unique_ptr<llama_moe_stats_fork> moe_stats;
+
+    // device cache of host MoE experts, created only for n_moe_cache != 0
+    std::unique_ptr<llama_moe_cache_fork> moe_cache_fork;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -411,8 +419,14 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // graphs of recent ubatch shapes, the most recently used first
+    // a graph with a scheduler snapshot is computed again without a new build, split and allocation
+    // separate arenas also give batches with and without outputs distinct CUDA graph cache keys
+    struct graph_entry {
+        llm_graph_result_ptr            res;
+        ggml_backend_sched_snapshot_ptr snapshot; // the graph uses the memory of the snapshot, free the snapshot only with the graph
+    };
+    std::vector<graph_entry> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
@@ -444,4 +458,82 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    //
+    // fork: the members the fork adds (src/fork/llama-context-fork.cpp), kept in one block
+    //
+
+public:
+    // the MTP draft steps after the first take the block scores of the first (llama_set_qsa_reuse); ignored unless
+    // the model's MTP block attends through QSA and LLAMA_MTP_QSA_REUSE is not 0
+    void set_qsa_reuse(bool value);
+
+    // the tokens the next decode call starts with (llama_set_next_tokens), and the tokens a coming decode will hold
+    // whose inputs are read from storage now (llama_prefetch_tokens)
+    void set_next_tokens(const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id);
+    void prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new, llama_pos pos0, llama_seq_id seq_id);
+
+    // serialize only the cells added after base_pos (0 = the memory cannot produce a delta)
+    size_t state_seq_get_delta(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
+
+    // apply a delta on top of an already loaded BASE state
+    int32_t state_seq_apply_delta(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
+
+private:
+    // before the graph of a ubatch runs: the fork's work that overlaps it (llama_fork_before_compute)
+    void fork_before_compute(llama_memory_context_i * mctx);
+
+    // set_next_tokens: the tokens, the position of the first and its sequence; decode calls that saw them
+    std::vector<llama_token> next_tokens;
+    llama_pos                next_pos0  = 0;
+    llama_seq_id             next_seq   = 0;
+    int32_t                  next_calls = 0;
+
+    // the graph of an entry that can compute the ubatch of gparams, moved to the front, nullptr if there is none
+    llm_graph_result * get_gf_res_reuse(const llm_graph_params & gparams);
+
+    // drop the graphs, keep the entries
+    void gf_res_prev_reset();
+
+    // max tokens per ubatch, smaller than n_ubatch in the phases of phase_mem
+    uint32_t n_ubatch_split() const;
+
+    // phase_mem: switch the layout for a batch of n_tokens tokens
+    void phase_update(uint32_t n_tokens);
+    void phase_gen();
+    void phase_prompt(uint32_t n_tokens);
+
+    // KV cells used after n_tokens more tokens, plus n_pad cells of headroom
+    uint32_t phase_kv_end(uint32_t n_tokens, uint32_t n_pad = 0) const;
+
+    // add the compute buffer size of each device for ubatches of n_ub tokens after n_tokens (+ n_pad) more tokens, return the graph splits
+    int  phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, std::map<ggml_backend_dev_t, size_t> & sizes);
+
+    // replace the scheduler with one that has no compute buffers
+    void sched_free();
+
+    // phase_mem: the compute buffers and the moe-cache slots follow the phase of the batches
+    enum llama_phase {
+        LLAMA_PHASE_NONE,
+        LLAMA_PHASE_GEN,    // small batches: small compute buffers, the free memory goes to the moe-cache
+        LLAMA_PHASE_PROMPT, // large batches: no moe-cache slots, the largest ubatch that fits at the KV depth
+    };
+
+    llama_phase phase = LLAMA_PHASE_NONE;
+
+    uint32_t phase_n_gen     = 0; // batches of at most this many tokens are generation
+    uint32_t phase_n_reserve = 0; // generation workspace, grown before a larger generation batch
+    uint32_t phase_n_tokens  = 0; // max tokens per ubatch of the reserved graphs, 0 = n_ubatch
+    uint32_t phase_n_kv      = 0; // KV cells of the reserved graphs, 0 = all
+    bool     phase_cache     = false; // the moe-cache slots were allocated in this generation phase
+
+    // a draft context follows the phase switches of its target
+    llama_context *              phase_owner = nullptr;
+    std::vector<llama_context *> phase_followers;
+
+    // env: LLAMA_GRAPH_CACHE, max graphs in gf_res_prev, 0 disables the scheduler snapshots
+    uint32_t graph_cache_size = 8;
+
+    // node count of a graph that did not fit the buffer plan at the full KV either (see process_ubatch)
+    int replan_failed_n_nodes = -1;
 };

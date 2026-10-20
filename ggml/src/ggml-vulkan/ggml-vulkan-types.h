@@ -259,10 +259,14 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    // matmul_id of the experts' gate and up projections in one pass, silu(gate) * up out (FUSED_GLU)
+    bool glu = false;
+    // the heads of the qwen4exp indexer in one matmul, relu and head sum at the store (MUL_MAT_HEADSUM)
+    bool headsum = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, glu, headsum)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.glu, o.headsum);
     }
 };
 
@@ -297,6 +301,8 @@ typedef std::weak_ptr<vk_buffer_struct> vk_buffer_ref;
 struct ggml_backend_vk_buffer_type_context {
     std::string name;
     vk_device device;
+    // memory the host sees and that is not device local, as the shared gpu memory of a UMA device
+    bool shared = false;
 };
 
 struct vk_command_buffer {
@@ -787,6 +793,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_f16; // fork: from an f16 source (qwen4exp, LLAMA_HC_F16)
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -835,6 +842,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_roll_f32;
     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_repeat_i16;
+    vk_pipeline pipeline_repeat_scalar_i16, pipeline_repeat_scalar_i32; // fork: one source element into a contiguous dst
     vk_pipeline pipeline_cpy_32, pipeline_cpy_f32_f16, pipeline_cpy_16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_bf16_f32, pipeline_cpy_bf16_f16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
     vk_pipeline pipeline_contig_cpy_32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_bf16_f32, pipeline_contig_cpy_bf16_f16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
@@ -942,6 +950,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
+    vk_pipeline pipeline_dsv4_hc_pre_f16;       // fork: f16 streams (qwen4exp, LLAMA_HC_F16)
+    vk_pipeline pipeline_dsv4_hc_pre_gated_f16;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1014,6 +1024,32 @@ struct vk_device_struct {
 
     ~vk_device_struct();
 
+    // fork: see fork/ggml-vulkan-fork.h
+    // the ops that take the int8 coopmat path: bit 0 MUL_MAT, bit 1 MUL_MAT_ID
+    uint32_t coopmat_int_ops;
+    // rows shorter than the workgroup (f32, f16, bf16, i32 sources)
+    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_concat_transpose_16, pipeline_concat_transpose_32;
+    vk_pipeline pipeline_dsv4_hc_post_norm_f32;
+    vk_pipeline pipeline_dsv4_hc_post_norm_f16n; // fork: the normalized streams stored in f16
+    // RMS norm of rows up to 512 columns, several rows per workgroup: [weight][sigmoid gate]
+    vk_pipeline pipeline_rms_norm_rows_f32[2][2];
+    // SSM_CONV (+ SILU) over CONCAT(state, x) without the concat: [silu]
+    vk_pipeline pipeline_ssm_conv_concat_f32[2];
+    // MUL_MAT_ID with the codes decoded into f16 A fragments (mul_mmid_f16reg.comp): 0 off, 1 coopmat, 2 emulated
+    int mmid_f16reg_mode;
+    // [q4_K, q5_K, q5_1, q8_0][fused gate/up]
+    vk_pipeline pipeline_mmid_f16reg[4][2];
+    // the sparse prompt attention over the union of neighbouring tokens (flash_attn_union.comp, GGML_VK_FA_UNION): 0 off,
+    // 1 coopmat, 2 emulated; pipelines per (head size, list slots per step)
+    int fa_union_mode;
+    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_union;
+    // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
+    ggml_backend_buffer_type buffer_type_shared;
+    ggml_backend_buffer_type_t extra_bufts[2] = {};
+    // matmuls with a small A split their columns so that A and the part of B in use stay in this many bytes of cache, 0 = off
+    uint64_t mm_chunk_bytes;
 };
 
 inline void vk_command_pool::init(vk_device& device, vk_queue *q_) {
@@ -1293,6 +1329,30 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // fork: see fork/ggml-vulkan-fork.h
+    // HC_POST_GATE + the RMS_NORM and MUL of the next hc mix
+    bool fused_hc_post_norm {};
+    bool fused_hc_post_norm_f16 {}; // fork: with the cpy of the normalized streams to f16 fused in
+    bool fused_mm_relu {};
+    // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
+    bool fused_mm_headsum {};
+    const ggml_tensor * fused_mm_headsum_bias {};
+    // gated_delta_net + the cpy of its state into the recurrent cache: the cache view the op writes to
+    const ggml_tensor * fused_gdn_cache {};
+    // RMS_NORM by rms_norm_rows.comp: 0 not fused beyond upstream's modes, 1 + SCALE, 2 + MUL, SIGMOID, MUL
+    int fused_rms_norm_rows {};
+    // CONCAT, SSM_CONV (+ SILU) by ssm_conv_concat.comp
+    bool fused_concat_ssm_conv {};
+    // for GGML_VK_GRAPH_TIMING: a timestamp at the start and one at the end of each graph, read at the next graph
+    vk::QueryPool gt_pool;
+    bool gt_recording {};
+    bool gt_pending {};
+    int64_t gt_enter_us {};
+    uint32_t gt_n {};
+    double gt_gpu_ms {};
+    double gt_host_ms {};
+    double gt_period_ms {};
 };
 
 struct ggml_backend_vk_buffer_context {

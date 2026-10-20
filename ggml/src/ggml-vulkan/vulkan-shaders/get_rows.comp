@@ -5,7 +5,42 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
+// FLAT_ROWS: rows shorter than the workgroup. x walks the elements of all ne10 rows of a batch, so the
+// invocations of a workgroup are not idle past the row end
+layout(constant_id = 1) const uint FLAT_ROWS = 0;
+
+void copy_row_element(uint i00, uint i10, uint i11, uint i12) {
+    const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+
+    const uint a_offset = get_aoffset() + i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+    const uint d_offset = get_doffset() + i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
+
+#if defined(DATA_A_BF16)
+    TEMP_TYPE v = TEMP_TYPE(bf16_to_fp32(data_a[a_offset + i00]));
+#else
+    TEMP_TYPE v = TEMP_TYPE(data_a[a_offset + i00]);
+#endif
+#ifndef OPTIMIZATION_ERROR_WORKAROUND
+    data_d[d_offset + i00] = D_TYPE(v);
+#else
+    data_d[d_offset + i00] = D_TYPE(v);
+#endif
+}
+
 void main() {
+    if (FLAT_ROWS != 0) {
+        const uint n = p.ne00 * p.ne10;
+        for (uint gid_z = gl_GlobalInvocationID.y; gid_z < p.ne11 * p.ne12; gid_z += gl_NumWorkGroups.y) {
+            const uint i11 = gid_z / p.ne12;
+            const uint i12 = gid_z % p.ne12;
+            for (uint idx = gl_GlobalInvocationID.x; idx < n; idx += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
+                const uint i10 = idx / p.ne00;
+                copy_row_element(idx - i10 * p.ne00, i10, i11, i12);
+            }
+        }
+        return;
+    }
+
     const uint i00 = gl_GlobalInvocationID.x;
 
     if (i00 >= p.ne00) {
@@ -16,25 +51,7 @@ void main() {
     while (gid_z < p.ne11 * p.ne12) {
         uint gid_y = gl_GlobalInvocationID.y;
         while (gid_y < p.ne10) {
-            const uint i10 = gid_y;
-            const uint i11 = gid_z / p.ne12;
-            const uint i12 = gid_z % p.ne12;
-
-            const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
-
-            const uint a_offset = get_aoffset() + i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
-            const uint d_offset = get_doffset() + i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
-
-#if defined(DATA_A_BF16)
-            TEMP_TYPE v = TEMP_TYPE(bf16_to_fp32(data_a[a_offset + i00]));
-#else
-            TEMP_TYPE v = TEMP_TYPE(data_a[a_offset + i00]);
-#endif
-#ifndef OPTIMIZATION_ERROR_WORKAROUND
-            data_d[d_offset + i00] = D_TYPE(v);
-#else
-            data_d[d_offset + i00] = D_TYPE(v);
-#endif
+            copy_row_element(i00, gid_y, gid_z / p.ne12, gid_z % p.ne12);
             gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
         }
         gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;

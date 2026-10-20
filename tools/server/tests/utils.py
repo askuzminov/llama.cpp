@@ -28,6 +28,8 @@ from typing import (
 from re import RegexFlag
 import wget
 
+from utils_fork import ServerProcessFork
+
 
 DEFAULT_HTTP_TIMEOUT = 60
 
@@ -47,7 +49,7 @@ class ServerError(Exception):
         self.body = body
 
 
-class ServerProcess:
+class ServerProcess(ServerProcessFork):
     # default options
     debug: bool = False
     server_port: int = 8080
@@ -309,6 +311,7 @@ class ServerProcess:
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
             env["AIP_HTTP_PORT"] = str(self.server_port)
+        server_args.extend(self.fork_server_args())
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")

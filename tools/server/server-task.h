@@ -11,6 +11,8 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
+#include "fork/server-task-fork.h"
+
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -627,6 +629,7 @@ struct server_prompt {
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        n_used = 0;
     }
 
     int n_tokens() const {
@@ -637,13 +640,19 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            n_used,
         };
     }
+
+    // fork: how many times this prompt was restored from the prompt cache. Travels with the prompt in
+    // and out of the cache and survives a restart via the spill file, so the disk budget can keep
+    // the most frequently used prompts.
+    uint32_t n_used = 0;
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_buf main;
+    server_state_buf drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -663,13 +672,31 @@ struct server_prompt_cache_state {
 
         return res;
     }
+
+    // fork: spill bookkeeping. size() counts RAM-resident bytes: a spilled state contributes 0 for
+    // `data` (written out and freed), but its checkpoints stay in RAM until free_ram drops them.
+
+    // on_disk means a file named after `uid` holds this exact state and disk_bytes is what it
+    // occupies there. `data` may be freed from RAM or kept alongside it.
+    uint64_t uid        = 0;
+    bool     on_disk    = false;
+    size_t   disk_bytes = 0;
+
+    // context checkpoints the file holds. The RAM copy is complete only when the list matches it,
+    // and only then is dropping the list free
+    size_t   ckpt_on_disk = 0;
+
+    // the disk copy is up to date and the blobs are still in RAM: dropping the RAM costs no I/O,
+    // and a cache hit needs no read back
+    bool is_clean() const { return on_disk && data.size() > 0; }
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    // limit_size_mib 0 = no size limit; --cache-ram -1 (auto) is resolved to a positive size by the
+    // caller, and --cache-ram 0 means the cache is never created
+    server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes = 0,
+                        const std::string & spill_dir = "", size_t spill_limit_bytes = 0,
+                        uint64_t signature = 0, uint64_t owner = 0, bool has_mtmd = false);
 
     std::list<server_prompt_cache_state> states;
 
@@ -688,6 +715,73 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // fork: host-RAM reserve and disk spill, defined in fork/server-task-fork.cpp
+    ~server_prompt_cache();
+
+    // the smallest piece of work worth a disk write: prompts shorter than this are not cached at
+    // all, and a state whose front is already on disk is not written again until it grows this much
+    // past it (0 = no minimum)
+    size_t min_tokens = 0;
+
+    // keep at least this much host RAM free by evicting cached prompts, in bytes (0 = disabled)
+    size_t reserve_size = 0;
+
+    // [experimental] disk spill: when spill_dir is set, cold states are written to disk instead of
+    // being dropped under memory pressure; spill_limit caps total on-disk bytes (0 = unlimited).
+    std::string spill_dir;
+    size_t      spill_limit = 0;
+    uint64_t    next_uid    = 1;
+
+    // identifies the model / context configuration the spilled states belong to. Only files with
+    // this signature can be restored.
+    uint64_t signature = 0;
+
+    // identifies the model file. A file of this owner with another signature is this model under an
+    // old configuration and is removed on load; files of other owners are left alone
+    uint64_t owner = 0;
+
+    // an mmproj is loaded, so a spilled prompt may hold media chunks and can be restored with them
+    bool has_mtmd = false;
+
+    size_t disk_size() const; // bytes currently spilled to disk
+
+    // the cached state that load() restores for tokens_new: it keeps more of itself and of tokens_new than tokens_cur does. states.end() when there is none
+    std::list<server_prompt_cache_state>::iterator find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new);
+
+    // evict oldest cached prompts until host RAM stays above the reserve, assuming `extra`
+    // more bytes are about to be allocated. No-op when the reserve is disabled/unknown.
+    void evict_for_reserve(size_t extra);
+
+    // spill support (no-ops when spill_dir is empty)
+    // paths are std::filesystem::path rather than std::string: spill_dir arrives as UTF-8, and the
+    // narrow filesystem APIs on Windows interpret narrow strings in the ANSI codepage instead
+    std::filesystem::path spill_dir_path() const;
+    std::filesystem::path spill_path(uint64_t uid) const;
+    // RAM -> disk, keeps st.data (the state becomes clean). `cancel` is polled between device
+    // transfers: when it fires the partial file is removed and the state stays dirty. A state whose
+    // file would not fit in `disk_free` bytes is skipped
+    bool write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel = nullptr, size_t disk_free = SIZE_MAX);
+    void evict_state(server_prompt_cache_state & st);   // free st.data of a clean state, no I/O
+    bool spill_state(server_prompt_cache_state & st, size_t disk_free = SIZE_MAX); // write_state + evict_state, keeps st in the list
+    bool unspill_state(server_prompt_cache_state & st); // disk -> RAM (reads st.data back, keeps the file)
+
+    // write-behind: copy dirty states to disk while nothing else runs, without freeing their RAM.
+    // `interrupted` is polled between states so a request that arrives does not wait for the rest.
+    // Returns the number of states written.
+    size_t write_behind(const std::function<bool()> & interrupted);
+    void erase_spill(const server_prompt_cache_state & st); // delete the backing file, if any
+    void enforce_disk_limit(); // drop the least-used on-disk states over spill_limit
+
+    // cold start: adopt the spill files left by a previous run whose signature matches. Returns
+    // the number of states adopted.
+    size_t restore_spilled();
+
+    // shutdown: push everything still resident to disk and keep the files for the next run
+    void persist();
+    // spill oldest resident states (and, if there is no spill dir, drop them) until at least `need`
+    // RAM bytes are relieved; then enforce the disk budget. Returns RAM bytes relieved.
+    size_t free_ram(size_t need);
 };
 
 // used exclusively by router mode

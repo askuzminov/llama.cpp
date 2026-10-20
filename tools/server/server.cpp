@@ -5,6 +5,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "fork/server-trace-fork.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -25,6 +26,24 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+// a router child shuts down gracefully once it reported ready. Before that it has nothing to save,
+// so the exit command ends it at once, as the router's force-kill of a loading child does
+static std::atomic<bool> child_ready(false);
+
+#if defined(_WIN32)
+// windows ends the process as soon as a close, logoff or shutdown handler returns, and the prompt
+// cache is written on the way out. The handler waits on this instead of returning right away
+static std::atomic<bool> has_exited(false);
+
+// a router child is shut down by the router, over its stdin. Its monitor thread blocks on that
+// stdin and is joined before the prompt cache is written, so a shutdown started here would hang
+static bool handle_close_events = false;
+
+struct exit_notifier {
+    ~exit_notifier() { has_exited.store(true); }
+};
+#endif
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -206,6 +225,12 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         params.server_connect_code.clear();
     }
 
+#if defined(_WIN32)
+    // declared before ctx_server, so it is destroyed after it: the prompt cache is written by
+    // ~server_context, and the console handler must wait for that
+    exit_notifier notify_exit;
+#endif
+
     // note: this is guaranteed to out-live ctx_http and tools
     server_mcp mcp_mgr;
 
@@ -285,8 +310,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
+    // fork: server_trace_fork, the requests that LLAMA_TRACE_REQUESTS names run under the profiler
+    ctx_http.post("/chat/completions",         ex_wrapper(server_trace_fork(routes.post_chat_completions)));
+    ctx_http.post("/v1/chat/completions",      ex_wrapper(server_trace_fork(routes.post_chat_completions)));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
@@ -436,6 +462,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     //
 
     std::function<void()> clean_up;
+    std::thread monitor_thread; // router child only, reads the commands of the router on stdin
 
     if (is_router_server) {
         SRV_INF("%s", "starting server in router mode. models will be automatically loaded on-demand\n");
@@ -499,6 +526,14 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
         // setup communication child --> router if necessary
         if (child.is_child()) {
+            // watch the router before the memory wait and the load, they can take minutes
+            monitor_thread = child.setup([](int) {
+                if (!child_ready.load()) {
+                    server_child::exit_now();
+                }
+                shutdown_handler(0);
+            });
+            child.wait_mem(params);
             ctx_server.set_state_callback([&](server_state state, json payload) {
                 child.notify_to_router(server_state_to_str(state), payload);
             });
@@ -507,6 +542,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         if (!ctx_server.load_model(params)) {
             clean_up();
             ctx_http.join();
+            if (monitor_thread.joinable()) {
+                monitor_thread.detach(); // it waits on stdin, the process exit ends it
+            }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
         }
@@ -533,8 +571,34 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         sigaction(SIGINT, &sigint_action, NULL);
         sigaction(SIGTERM, &sigint_action, NULL);
 #elif defined (_WIN32)
+        handle_close_events = !child.is_child();
+
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+            switch (ctrl_type) {
+                case CTRL_C_EVENT:
+                case CTRL_BREAK_EVENT:
+                    signal_handler(SIGINT);
+                    return TRUE;
+                case CTRL_CLOSE_EVENT:    // console window closed
+                case CTRL_LOGOFF_EVENT:   // user logs off
+                case CTRL_SHUTDOWN_EVENT: // system shuts down
+                    // these used to be unhandled, which killed the server at once and lost the prompt
+                    // cache. Returning from here also ends the process, so ask for the shutdown and
+                    // then wait. Windows still kills us after HungAppTimeout, 5 s by default
+                    if (!handle_close_events) {
+                        return FALSE;
+                    }
+                    SRV_INF("console event %lu, shutting down...\n", (unsigned long) ctrl_type);
+                    if (!is_terminating.test_and_set()) {
+                        shutdown_handler(SIGINT);
+                    }
+                    while (!has_exited.load()) {
+                        Sleep(10);
+                    }
+                    return TRUE;
+                default:
+                    return FALSE;
+            }
         };
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
@@ -566,10 +630,11 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         clean_up();
     } else {
         // optionally, notify router server that this instance is ready
-        std::thread monitor_thread;
         if (child.is_child()) {
-            monitor_thread = child.setup(shutdown_handler);
-            child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
+            child_ready.store(true);
+            json info = routes.get_model_info();
+            info["mem"] = child.mem_report();
+            child.notify_to_router(server_state_to_str(SERVER_STATE_READY), info);
         }
 
         // this call blocks the main thread until queue_tasks.terminate() is called

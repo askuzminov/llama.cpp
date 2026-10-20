@@ -18,8 +18,13 @@ struct llama_cparams {
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+    int32_t  n_moe_cache;     // slots per layer of the device cache of host experts, 0 = off, -1 = auto
 
     int32_t  nextn_layer_offset = 0;
+
+    // fork: an MTP draft step after the first selects from the block scores of the first (qwen4exp QSA, see
+    // llama_set_qsa_reuse)
+    bool     qsa_reuse = false;
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -52,6 +57,7 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    bool phase_mem;          // size the compute buffers per phase (prompt / generation)
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 

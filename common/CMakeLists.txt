@@ -127,6 +127,16 @@ add_library(${TARGET}
     jinja/caps.h
     )
 
+# fork: the fork's own sources
+target_sources(${TARGET} PRIVATE
+    fork/arg-fork.cpp
+    fork/arg-fork.h
+    fork/common-fork.cpp
+    fork/common-fork.h
+    fork/speculative-fork.cpp
+    fork/speculative-fork.h
+    )
+
 set_target_properties(${TARGET} PROPERTIES
     VERSION ${LLAMA_VERSION_BASE}
     SOVERSION ${LLAMA_VERSION_MAJOR}

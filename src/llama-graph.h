@@ -786,6 +786,7 @@ public:
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
 class llm_graph_result;
+class llama_moe_cache_fork;
 
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -832,6 +833,8 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    const llama_moe_cache_fork * moe_cache_fork; // nullptr when the graph does not use the MoE expert cache
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -896,6 +899,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // fork: a reused-score step builds no indexer query
+        if (cparams.qsa_reuse != other.cparams.qsa_reuse) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -905,7 +913,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            moe_cache_fork == other.moe_cache_fork;
     }
 };
 
@@ -973,6 +982,22 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // routing ids and the first expert matmul of every MoE layer, recorded only for LLAMA_MOE_CACHE_STATS
+    std::vector<ggml_tensor *> t_moe_topk;
+    std::vector<ggml_tensor *> t_moe_mm;
+    std::vector<int>           t_moe_topk_il;
+
+    // the top ids that the router of a MoE layer gives for the router input of a layer d before it (d = 1, 2), the
+    // routing a prefetch could know one or two layers ahead; LLAMA_MOE_CACHE_STATS, decode steps
+    std::vector<ggml_tensor *> t_moe_pred;
+    std::vector<int>           t_moe_pred_il; // the layer of the router
+    std::vector<int>           t_moe_pred_d;
+    ggml_tensor * moe_pred_inp[2] = { nullptr, nullptr }; // the router inputs of the last two MoE layers, newest first
+
+    // MoE layers that use the expert cache and the number of routing ids they copy to the cache
+    std::vector<int>     moe_cache_il;
+    std::vector<int64_t> moe_cache_n_ids;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -981,7 +1006,8 @@ public:
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    // not zeroed, so the pages that the graph does not use are not in memory
+    std::unique_ptr<uint8_t[]> buf_compute_meta;
 
     ggml_cgraph * gf;
 
@@ -1068,6 +1094,8 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    const llama_moe_cache_fork * moe_cache_fork;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1221,6 +1249,32 @@ struct llm_graph_context {
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
+                     int   il) const;
+
+    // the predictions of the routing of layer il from the router inputs of the layers before it (t_moe_pred)
+    void build_moe_pred(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+                     int   il) const;
+
+    // activation between the up/gate and the down projections of the experts
+    ggml_tensor * build_moe_ffn_act(
+             ggml_tensor * cur,
+             ggml_tensor * up,
+         llm_ffn_op_type   type_op,
+                    bool   has_gate,
+                    bool   has_gate_exps,
+                     int   il) const;
+
+    // computes the cached experts of the host mul_mat_id nodes on the device and makes the host nodes skip them
+    // returns the device result of the down projection, or nullptr when the layer does not use the cache
+    ggml_tensor * build_moe_cache(
+             ggml_tensor * mm_up,
+             ggml_tensor * mm_gate,
+             ggml_tensor * mm_down,
+         llm_ffn_op_type   type_op,
+                    bool   has_gate,
+                    bool   has_gate_exps,
                      int   il) const;
 
     //

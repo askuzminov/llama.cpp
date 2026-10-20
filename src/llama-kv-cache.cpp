@@ -1,5 +1,7 @@
 #include "llama-kv-cache.h"
 
+#include "fork/llama-fork.h"
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -218,6 +220,23 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // LLAMA_KV_SHARED=1: the K/V of the attention (not the caches with a name tag, as the indexer keys) in the
+            // shared buffer type of the device, the host memory a UMA gpu reads in place (Vulkan0_Shared). sparse
+            // attention reads only the selected cells, and the device memory of the 395 is at its edge at 262144
+            static const bool kv_shared = getenv("LLAMA_KV_SHARED") != nullptr && atoi(getenv("LLAMA_KV_SHARED")) != 0;
+            if (kv_shared && (name_tag == nullptr || name_tag[0] == '\0')) {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto get_extra_bufts = reg ? (ggml_backend_dev_get_extra_bufts_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+                for (auto * extra = get_extra_bufts ? get_extra_bufts(dev) : nullptr; extra && *extra; ++extra) {
+                    const std::string name = ggml_backend_buft_name(*extra);
+                    if (name.size() > 7 && name.compare(name.size() - 7, 7, "_Shared") == 0) {
+                        buft = *extra;
+                        break;
+                    }
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -1232,6 +1251,30 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+uint32_t llama_kv_cache::get_n_kv_used() const {
+    uint32_t res = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        res = std::max(res, v_cells[s].used_max_p1());
+    }
+
+    return res;
+}
+
+void llama_kv_cache::set_n_kv_full(uint32_t n_kv) {
+    n_kv_full = n_kv;
+}
+
+uint32_t llama_kv_cache::get_n_kv_full() const {
+    if (n_kv_full == 0) {
+        return get_size();
+    }
+
+    // same padding as get_n_kv()
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    return std::min(get_size(), std::max(n_pad_cur, GGML_PAD(n_kv_full, n_pad_cur)));
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1719,10 +1762,16 @@ skip:
     }
 }
 
+// fork: see the file
+#include "fork/llama-kv-cache-mask-fork.inc"
+
 template<typename T, bool causal, bool swa, bool is_2d>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
     const bool alibi = args.hparams.use_alibi;
-    if (alibi) {
+    static const bool fork = !llama_fork_upstream("kq-mask");
+    if (fork) {
+        alibi ? set_input_kq_mask_impl_fork<T, causal, swa, is_2d, true>(args, data) : set_input_kq_mask_impl_fork<T, causal, swa, is_2d, false>(args, data);
+    } else if (alibi) {
         set_input_kq_mask_impl<T, causal, swa, is_2d, true> (args, data);
     } else {
         set_input_kq_mask_impl<T, causal, swa, is_2d, false>(args, data);
@@ -2070,6 +2119,60 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+llama_kv_cache::cell_ranges_t llama_kv_cache::state_ranges(uint32_t strm, llama_seq_id seq_id, llama_pos pos_min, uint32_t & cell_count) const {
+    cell_ranges_t cr { strm, {} };
+
+    cell_count = 0;
+
+    const auto & cells = v_cells[strm];
+
+    // Count the number of cells with the specified seq_id
+    // Find all the ranges of cells with this seq id (or all, when -1)
+    uint32_t cell_range_begin = cells.size();
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        bool add_cell = true;
+
+        add_cell = add_cell && !cells.is_empty(i);
+        add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+
+        // a delta holds only what came after the base checkpoint; pos_min = -1 keeps everything
+        add_cell = add_cell && cells.pos_get(i) > pos_min;
+
+        // check the cell is not SWA-masked
+        if (add_cell && seq_id != -1) {
+            const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+
+            add_cell = !is_masked;
+        }
+
+        if (add_cell) {
+            ++cell_count;
+            if (cell_range_begin == cells.size()) {
+                cell_range_begin = i;
+            }
+        } else {
+            if (cell_range_begin != cells.size()) {
+                cr.data.emplace_back(cell_range_begin, i);
+                cell_range_begin = cells.size();
+            }
+        }
+    }
+
+    if (cell_range_begin != cells.size()) {
+        cr.data.emplace_back(cell_range_begin, cells.size());
+    }
+
+    // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
+    uint32_t cell_count_check = 0;
+    for (const auto & range : cr.data) {
+        cell_count_check += range.second - range.first;
+    }
+    GGML_ASSERT(cell_count == cell_count_check);
+
+    return cr;
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2083,52 +2186,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        cell_ranges_t cr { s, {} };
-
         uint32_t cell_count = 0;
 
-        const auto & cells = v_cells[s];
-
-        // Count the number of cells with the specified seq_id
-        // Find all the ranges of cells with this seq id (or all, when -1)
-        uint32_t cell_range_begin = cells.size();
-
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            bool add_cell = true;
-
-            add_cell = add_cell && !cells.is_empty(i);
-            add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
-
-            // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
-
-                add_cell = !is_masked;
-            }
-
-            if (add_cell) {
-                ++cell_count;
-                if (cell_range_begin == cells.size()) {
-                    cell_range_begin = i;
-                }
-            } else {
-                if (cell_range_begin != cells.size()) {
-                    cr.data.emplace_back(cell_range_begin, i);
-                    cell_range_begin = cells.size();
-                }
-            }
-        }
-
-        if (cell_range_begin != cells.size()) {
-            cr.data.emplace_back(cell_range_begin, cells.size());
-        }
-
-        // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
-        uint32_t cell_count_check = 0;
-        for (const auto & range : cr.data) {
-            cell_count_check += range.second - range.first;
-        }
-        GGML_ASSERT(cell_count == cell_count_check);
+        const cell_ranges_t cr = state_ranges(s, seq_id, -1, cell_count);
 
         io.write(&cell_count, sizeof(cell_count));
 
@@ -2354,7 +2414,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool clear_seq) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2365,7 +2425,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        seq_rm(dest_seq_id, -1, -1);
+        if (clear_seq) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2816,7 +2878,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    n_kv = kv->get_n_kv_full();
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2887,6 +2949,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_s0() const {
+    return sinfos[i_cur].s0;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

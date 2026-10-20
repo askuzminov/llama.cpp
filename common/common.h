@@ -7,6 +7,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
+#include "fork/common-fork.h"
 
 #include <array>
 #include <list>
@@ -354,6 +355,9 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // fork:
+    bool n_max_set = false; // n_max was given explicitly, --spec-auto then keeps it as the cap
 };
 
 struct common_params_speculative_ngram_mod {
@@ -405,6 +409,9 @@ struct common_params_speculative {
 
         return needs_rs_seq ? draft.n_max : 0u;
     }
+
+    // fork:
+    bool auto_n = false; // pick the draft length per cycle from the measured cost and acceptance, n_max is the cap
 };
 
 struct common_params_diffusion {
@@ -636,10 +643,10 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
-    int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t n_ctx_checkpoints   = -1;    // explicit count cap on context checkpoints per slot; -1 = no count limit (bounded by available host RAM), 0 = disabled
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_ram_mib       = -1;    // -1 = auto (fraction of total RAM), 0 = disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
     // llama-connect params
@@ -772,6 +779,16 @@ struct common_params {
     std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
+
+    // fork:
+    int32_t n_moe_cache = 0;     // device cache of host MoE experts: slots per layer, 0 = off, -1 = auto
+    bool    phase_mem   = false; // size the compute buffers per phase (prompt / generation), n_parallel == 1
+
+    // fork: server prompt cache
+    int32_t cache_ram_reserve_mib = -1;  // keep at least this much host RAM free by evicting checkpoints; -1 = auto (fraction of total RAM), 0 = disabled
+    std::string cache_spill_dir   = "";  // [experimental] spill cold prompt-cache states to this dir (on disk) instead of dropping them ("" = disabled)
+    int32_t cache_disk_mib        = 0;   // disk budget (MiB) for spilled prompt-cache states; least-recently-used dropped over this (0 = unlimited)
+    int32_t cache_min_tokens      = 0;   // do not cache prompts shorter than this many tokens (0 = no minimum)
 };
 
 // call once at the start of a program if it uses libcommon
@@ -1279,13 +1296,13 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 
 struct common_prompt_checkpoint {
-    int64_t n_tokens;
+    int64_t n_tokens = 0;
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
-    llama_pos pos_min;
-    llama_pos pos_max;
+    llama_pos pos_min = 0;
+    llama_pos pos_max = 0;
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
@@ -1307,7 +1324,8 @@ struct common_prompt_checkpoint {
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            llama_pos base_pos = -1);
 
     void update_dft(
             llama_context * ctx,
@@ -1327,4 +1345,23 @@ struct common_prompt_checkpoint {
 
     void clear_tgt();
     void clear_dft();
+
+    // fork: delta checkpoints (common/fork/common-fork.cpp)
+
+    // Base position for delta checkpoints (-1 = BASE checkpoint)
+    llama_pos base_pos = -1;
+
+    bool is_delta() const { return base_pos >= 0; }
+
+    // Apply checkpoint: full restore (base_pos < 0) or delta (base_pos >= 0)
+    // Returns true if checkpoint was successfully applied
+    bool apply(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    bool apply_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
 };

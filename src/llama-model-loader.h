@@ -9,6 +9,8 @@
 
 #include "ggml-cpp.h"
 
+#include "fork/llama-tensor-range-fork.h"
+
 #include <cstddef>
 #include <cstring>
 #include <map>
@@ -68,6 +70,8 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_READ_CACHE      = 1 << 6; // with TENSOR_READ_LAZY: the arch can gather the rows itself, see llama_row_cache
+    static const int TENSOR_BORROWED        = 1 << 7; // a draft head can read this out of the model it drafts for, see create_tensor
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -85,12 +89,37 @@ struct llama_model_loader {
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {
+        // how the rows of a lazy tensor are reached
+        enum kind {
+            NONE  = 0, // not lazy, the tensor is loaded in full
+            MMAP  = 1, // kept in a CPU buffer over the mapped file, gathered by ggml_get_rows
+            CACHE = 2, // not created at all, the arch gathers rows through a llama_row_cache
+        };
+
+        // where a CACHE tensor lives in the file
+        struct location {
+            uint32_t  idx  = 0;
+            size_t    offs = 0;
+            ggml_type type = GGML_TYPE_F32;
+            int64_t   ne0  = 0;
+            int64_t   ne1  = 0;
+        };
+
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
 
-        // decide whether this tensor is read lazily
+        // keep the AUTO size limit after AUTO resolved to another mode
+        bool auto_size = false;
+
+        // decide how this tensor is read
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        kind add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool can_cache);
+
+        // location of a CACHE tensor, or nullptr if it was not recorded
+        const location * get_location(const std::string & name) const {
+            const auto it = locations.find(name);
+            return it == locations.end() ? nullptr : &it->second;
+        }
 
         bool any() const {
             return !ranges.empty();
@@ -113,9 +142,11 @@ struct llama_model_loader {
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
+        std::map<std::string, location>        locations;
     } lazy;
 
     llama_files files;
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -259,12 +290,15 @@ struct llama_model_loader {
     const void * load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
 
     // Returns false if cancelled by progress_callback
+    // ranges, when given, feeds the tensors in as their buffers are allocated instead of taking
+    // the whole context at once
     bool load_all_data(
             struct ggml_context * ctx,
             std::vector<ggml_backend_buffer_t> & bufs,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
-            void * progress_callback_user_data);
+            void * progress_callback_user_data,
+            llama_tensor_range_queue * ranges = nullptr);
 
     std::string ftype_name() const;
 

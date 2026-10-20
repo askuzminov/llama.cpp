@@ -279,6 +279,8 @@ static const char * lazy_mode_str(llama_lazy_mode mode) {
             return "auto";
         case LLAMA_LAZY_MODE_ON:
             return "on";
+        case LLAMA_LAZY_MODE_DIO:
+            return "dio";
         default:
             GGML_ABORT("invalid lazy mode");
     }
@@ -338,6 +340,7 @@ struct cmd_params {
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
     bool                             offline;
+    int                              n_ctx;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
     std::vector<std::pair<int, int>> n_pg;
@@ -384,6 +387,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_file              */ {},
     /* hf_token             */ "",
     /* offline              */ false,
+    /* n_ctx                */ 0,
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -464,6 +468,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  -c, --ctx-size <n>                                smallest context of every test, the compute buffers are reserved\n");
+    printf("                                                    for it as llama-server does for its -c (default: %d = the test size)\n", cmd_params_defaults.n_ctx);
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -478,7 +484,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
-    printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
+    printf("  -lzm, --lazy-mode <on|auto|dio|off>               (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
@@ -539,6 +545,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.n_ctx                = cmd_params_defaults.n_ctx;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -625,6 +632,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_batch.insert(params.n_batch.end(), p.begin(), p.end());
+            } else if (arg == "-c" || arg == "--ctx-size") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.n_ctx = std::stoi(argv[i]);
             } else if (arg == "-ub" || arg == "--ubatch-size") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -823,6 +836,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_LAZY_MODE_AUTO;
                     } else if (m == "off") {
                         mode = LLAMA_LAZY_MODE_OFF;
+                    } else if (m == "dio") {
+                        mode = LLAMA_LAZY_MODE_DIO;
                     } else {
                         invalid_param = true;
                         break;
@@ -952,6 +967,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         auto * buft = ggml_backend_dev_buffer_type(dev);
                         if (buft) {
                             buft_list[ggml_backend_buft_name(buft)] = buft;
+                        }
+                        // and its extra buffer types, as Vulkan0_Shared
+                        auto * reg = ggml_backend_dev_backend_reg(dev);
+                        auto get_extra_bufts = reg ? (ggml_backend_dev_get_extra_bufts_t)
+                            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+                        for (auto * extra = get_extra_bufts ? get_extra_bufts(dev) : nullptr; extra && *extra; ++extra) {
+                            buft_list[ggml_backend_buft_name(*extra)] = *extra;
                         }
                     }
                 }
@@ -1315,6 +1337,10 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        // a prompt batch and a decode step read the logits of their last token only (llama_batch_get_one). the default
+        // (0 = n_batch) reserves the logits of every token of a ubatch, 4 GB at 248320 x 4096, which runs on the CPU in
+        // the reserved graph when that is over the buffer limit of the gpu; llama-server sets the outputs it needs too
+        cparams.n_outputs_max   = embeddings ? 0 : 1;
 
         return cparams;
     }
@@ -2373,6 +2399,10 @@ int llama_bench(int argc, char ** argv) {
                 return 1;
             }
             prev_inst = &inst;
+        }
+
+        if (params.n_ctx > 0) {
+            cparams.n_ctx = std::max<uint32_t>(cparams.n_ctx, (uint32_t) params.n_ctx);
         }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);

@@ -3038,15 +3038,19 @@ class TensorNameMap:
             MODEL_TENSOR.HC_HEAD_UP: (
                 "model.hyper_connection_mixer.input_mix_weight_up",
             ),
-            # the MTP block's own mixer, renamed to its layer by the converter
+            # the MTP block's own mixer, renamed to its layer by the converter (the fork's converter keeps the
+            # checkpoint name hyper_connection_mixer, the upstream one renames it to nextn_hc_head)
             MODEL_TENSOR.NEXTN_HC_HEAD_NORM: (
                 "model.layers.{bid}.nextn_hc_head.hc_norm",
+                "model.layers.{bid}.hyper_connection_mixer.hc_norm",
             ),
             MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: (
                 "model.layers.{bid}.nextn_hc_head.input_mix_weight_down",
+                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_down",
             ),
             MODEL_TENSOR.NEXTN_HC_HEAD_UP: (
                 "model.layers.{bid}.nextn_hc_head.input_mix_weight_up",
+                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_up",
             ),
             MODEL_TENSOR.INDEXER_Q_NORM: (
                 "model.layers.{bid}.self_attn.indexer.q_layernorm",

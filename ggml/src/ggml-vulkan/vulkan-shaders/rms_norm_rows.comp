@@ -1,0 +1,98 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// fork: RMS norm of short rows (up to ROW_THREADS * MAX_ITERS columns), ROWS rows per workgroup. rms_norm.comp runs a
+// 512-invocation workgroup per row: on the 128-column heads of the qwen4exp GDN layers three quarters of it idle and a
+// row pays 9 barriers. optional: * weight[col % w_ne0] (RMS_NORM, MUL), * sigmoid(gate) (the gated norm of the GDN
+// output: RMS_NORM, MUL, SIGMOID, MUL), and a scale of the result (the GDN l2 norm: RMS_NORM, SCALE)
+
+layout(constant_id = 0) const uint ROW_THREADS = 32;
+layout(constant_id = 1) const uint ROWS = 8;
+layout(constant_id = 2) const bool DO_MUL = false;
+layout(constant_id = 3) const bool DO_GATE = false;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A { float data_a[]; };
+layout(binding = 1) readonly  buffer W { float data_w[]; };
+layout(binding = 2) readonly  buffer G { float data_g[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint ncols;
+    uint ne01;
+    uint ne02;
+    uint nrows;
+    uint a_nb1; uint a_nb2; uint a_nb3;
+    uint g_nb1; uint g_nb2; uint g_nb3;
+    uint d_nb1; uint d_nb2; uint d_nb3;
+    uint w_ne0;
+    uint a_off; uint w_off; uint g_off; uint d_off;
+    float eps;
+    float scale;
+} p;
+
+#define MAX_ITERS 16
+
+shared float sumsh[ROWS][ROW_THREADS];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lr  = gl_LocalInvocationID.y;
+    const uint row = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * ROWS + lr;
+
+    const bool valid = row < p.nrows;
+
+    const uint i1  = row % p.ne01;
+    const uint i23 = row / p.ne01;
+    const uint i2  = i23 % p.ne02;
+    const uint i3  = i23 / p.ne02;
+
+    const uint a_base = p.a_off + i3*p.a_nb3 + i2*p.a_nb2 + i1*p.a_nb1;
+
+    // the row stays in registers between the sum and the store
+    float v[MAX_ITERS];
+    float sum = 0.0f;
+    [[unroll]] for (uint k = 0; k < MAX_ITERS; ++k) {
+        const uint col = tid + k*ROW_THREADS;
+        v[k] = 0.0f;
+        if (valid && col < p.ncols) {
+            v[k] = data_a[a_base + col];
+        }
+        sum += v[k]*v[k];
+    }
+
+    sumsh[lr][tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = ROW_THREADS/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sumsh[lr][tid] += sumsh[lr][tid + s];
+        }
+        barrier();
+    }
+
+    if (!valid) {
+        return;
+    }
+
+    const float rs = inversesqrt(sumsh[lr][0] / float(p.ncols) + p.eps) * p.scale;
+
+    const uint g_base = p.g_off + i3*p.g_nb3 + i2*p.g_nb2 + i1*p.g_nb1;
+    const uint d_base = p.d_off + i3*p.d_nb3 + i2*p.d_nb2 + i1*p.d_nb1;
+
+    [[unroll]] for (uint k = 0; k < MAX_ITERS; ++k) {
+        const uint col = tid + k*ROW_THREADS;
+        if (col >= p.ncols) {
+            continue;
+        }
+        float x = v[k] * rs;
+        if (DO_MUL) {
+            x *= data_w[p.w_off + col % p.w_ne0];
+        }
+        if (DO_GATE) {
+            x *= 1.0f / (1.0f + exp(-data_g[g_base + col]));
+        }
+        data_d[d_base + col] = x;
+    }
+}

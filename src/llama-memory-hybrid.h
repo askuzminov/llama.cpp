@@ -39,7 +39,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                     bool   host_attn = false);
 
     ~llama_memory_hybrid() = default;
 
@@ -55,6 +56,9 @@ public:
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+
+    uint32_t get_n_kv_used() const override;
+    void     set_n_kv_full(uint32_t n_kv) override;
 
     bool get_can_shift() const override;
 

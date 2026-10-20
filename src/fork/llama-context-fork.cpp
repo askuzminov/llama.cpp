@@ -1,0 +1,525 @@
+// the fork's members of llama_context: the phase memory (--phase-mem), the ubatch split it sets, the graph cache
+// and the delta state of a sequence. llama-context.h declares them in its fork block
+
+#include "llama-context.h"
+
+#include "ggml.h"
+#include "llama-arch.h"
+#include "llama-graph.h"
+#include "llama-impl.h"
+#include "llama-batch.h"
+#include "fork/llama-fork.h"
+#include "fork/llama-memory-hybrid-idx-fork.h"
+#include "llama-io.h"
+#include "llama-memory.h"
+#include "llama-mmap.h"
+#include "llama-model.h"
+#include "llama-ext.h"
+#include "llama.h"
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <stdexcept>
+#include <string>
+
+// phase_mem: device memory that the prompt compute buffers leave free
+static const size_t PHASE_MEM_MARGIN = 1024ull*1024*1024;
+
+uint32_t llama_context::n_ubatch_split() const {
+    return phase_n_tokens > 0 ? std::min(phase_n_tokens, cparams.n_ubatch) : cparams.n_ubatch;
+}
+
+void llama_context::sched_free() {
+    synchronize();
+
+    const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+
+    gf_res_prev.clear();
+    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_prev_active = nullptr;
+
+    // the old scheduler frees its buffers, the new one allocates them only in a reserve
+    sched_new(max_nodes, cparams.pipeline_parallel);
+
+    sched_need_reserve = true;
+}
+
+uint32_t llama_context::phase_kv_end(uint32_t n_tokens, uint32_t n_pad) const {
+    return memory ? std::min(cparams.n_ctx, GGML_PAD(memory->get_n_kv_used() + n_tokens, 256) + n_pad) : 0;
+}
+
+int llama_context::phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, std::map<ggml_backend_dev_t, size_t> & sizes) {
+    if (!memory) {
+        return 0;
+    }
+
+    memory->set_n_kv_full(phase_kv_end(n_tokens, n_pad));
+    const auto mctx = memory->init_full();
+    memory->set_n_kv_full(0);
+
+    std::vector<size_t> s(backend_ptrs.size(), 0);
+
+    // a follower (the MTP head) splits its batches at its own n_ubatch (1024 on the 3090), as n_ubatch_split() and its
+    // reserve do: sized at the ubatch of the target, its dense KQ mask of n_kv x n_ub counted 1.4 GiB at 214K x 3584
+    // instead of 0.4, and the plan took a smaller ubatch for the target than the memory held (3072 at 214K, 15.10)
+    n_ub = std::min(n_ub, cparams.n_ubatch);
+
+    // the scheduler has no buffers, so the query does not change them
+    graph_reserve(n_ub, cparams.n_seq_max, std::min(n_ub, cparams.n_outputs_max), mctx.get(), true, s.data());
+
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        sizes[ggml_backend_get_device(backend_ptrs[i])] += s[i];
+    }
+
+    return ggml_backend_sched_get_n_splits(sched.get());
+}
+
+void llama_context::phase_update(uint32_t n_tokens) {
+    // a non-causal batch must be one ubatch, it uses the static layout
+    if (!cparams.causal_attn) {
+        if (phase != LLAMA_PHASE_NONE) {
+            if (moe_cache_fork) {
+                moe_cache_fork->release();
+            }
+            phase_cache        = false;
+            phase              = LLAMA_PHASE_NONE;
+            phase_n_tokens     = 0;
+            phase_n_kv         = 0;
+            sched_need_reserve = true;
+        }
+        return;
+    }
+
+    // a short prompt runs in the generation layout, in ubatches of its workspace: the moe-cache stays, and the host
+    // experts are not streamed to the device for a few tokens. on the 3090 (06.10) an 82-token prompt took 1.6 s so
+    // (about 0.53 s per 31-token ubatch) against 2.7 s in the prompt layout and 0.73 s to fill the moe-cache again
+    // after it; the prompt layout costs about 2.5 s + 1.8 ms per token, so the two meet near 200 tokens.
+    // LLAMA_PHASE_SMALL_PROMPT sets the limit, 0 turns it off
+    static const uint32_t n_small = [] {
+        const char * s = getenv("LLAMA_PHASE_SMALL_PROMPT");
+        return s ? (uint32_t) std::max(0, atoi(s)) : 192u;
+    }();
+    const bool small = n_tokens > phase_n_gen && n_tokens <= n_small;
+    const bool gen   = n_tokens <= phase_n_gen || small;
+
+    if (gen && (phase != LLAMA_PHASE_GEN || (!small && n_tokens > phase_n_reserve))) {
+        if (!small && n_tokens > phase_n_reserve) {
+            phase_n_reserve = n_tokens;
+        }
+        if (moe_cache_fork) {
+            moe_cache_fork->release();
+        }
+        phase_cache = false;
+        phase_gen();
+    }
+
+    if (!gen && (phase != LLAMA_PHASE_PROMPT || phase_kv_end(n_tokens) > phase_n_kv)) {
+        phase_prompt(n_tokens);
+    }
+
+    // as in the static layout: the warmup of common and the first batch of a prompt start at position 0, the draft contexts
+    // are created after the warmup
+    if (gen && moe_cache_fork && !phase_cache && !cparams.warmup && balloc->get_batch().pos[0] > 0) {
+        phase_cache = true;
+
+        if (!moe_cache_fork->is_init()) {
+            moe_cache_fork->init(sched.get());
+        }
+        moe_cache_fork->alloc();
+
+        if (moe_stats && moe_cache_fork->ready()) {
+            moe_stats->set_cache(moe_cache_fork->get_n_slots(), moe_cache_fork->get_max_ins(), moe_cache_fork->uses_frequency_admission());
+        }
+
+        // the graphs keep the tensors of the old slots
+        gf_res_prev_reset();
+        gf_res_prev_active = nullptr;
+    }
+}
+
+void llama_context::phase_gen() {
+    const int64_t t_start_us = ggml_time_us();
+
+    // the followers first, so that the moe-cache gets all the memory that is left
+    for (auto * f : phase_followers) {
+        f->phase_n_reserve     = std::max(f->phase_n_reserve, std::min(phase_n_reserve, f->phase_n_gen));
+        f->phase              = LLAMA_PHASE_GEN;
+        f->phase_n_tokens     = f->phase_n_reserve;
+        f->phase_n_kv         = 0;
+        f->sched_need_reserve = true;
+        f->sched_reserve();
+    }
+
+    phase              = LLAMA_PHASE_GEN;
+    phase_n_tokens     = phase_n_reserve;
+    phase_n_kv         = 0;
+    sched_need_reserve = true;
+    sched_reserve();
+
+    LLAMA_LOG_INFO("%s: phase_mem: generation, ubatch %u, %.2f s\n", __func__, phase_n_tokens, 1e-6*(ggml_time_us() - t_start_us));
+}
+
+void llama_context::phase_prompt(uint32_t n_tokens) {
+    const int64_t t_start_us = ggml_time_us();
+
+    if (moe_cache_fork) {
+        moe_cache_fork->release();
+    }
+    phase_cache = false;
+
+    // the size queries need schedulers without buffers, and the free memory must not count the old buffers
+    for (auto * f : phase_followers) {
+        f->sched_free();
+    }
+    sched_free();
+
+    const int64_t t_free_us = ggml_time_us();
+
+    // free memory of each device that runs the graphs
+    std::map<ggml_backend_dev_t, size_t> budget;
+    size_t free_all = 0;
+
+    auto add_devs = [&](const llama_context * c) {
+        for (auto * b : c->backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(b);
+            const auto type = ggml_backend_dev_type(dev);
+            if ((type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) || budget.count(dev) > 0) {
+                continue;
+            }
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            if (total > 0) {
+                budget[dev] = free > PHASE_MEM_MARGIN ? free - PHASE_MEM_MARGIN : 0;
+                free_all += free;
+            }
+        }
+    };
+    add_devs(this);
+    for (auto * f : phase_followers) {
+        add_devs(f);
+    }
+
+    const uint32_t n_step = 256;
+    const uint32_t n_max  = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+    // KV headroom of the plan: the next batches of a long prompt fit it and keep the buffers, without a new plan per
+    // batch (on the 3090, 09.10: 0.19 s at 25K cells to 0.48 s at 120K per 4096-token batch, about 10 s of a 118K
+    // prompt). taken only when it leaves the ubatch as large. LLAMA_PHASE_KV_STEP=<cells>, 0 (default): no headroom
+    static const uint32_t kv_step = [] {
+        const char * s = getenv("LLAMA_PHASE_KV_STEP");
+        return s ? (uint32_t) std::max(0, atoi(s)) : 0u;
+    }();
+    uint32_t n_pad = kv_step;
+
+    int n_query = 0;
+
+    int64_t e_last = 0; // bytes over the budget on the worst device
+    int     s_last = 0; // graph splits
+
+    const char * func = __func__;
+
+    auto query = [&](uint32_t n_ub) {
+        std::map<ggml_backend_dev_t, size_t> sizes;
+        s_last = phase_size(n_ub, n_tokens, n_pad, sizes);
+        for (auto * f : phase_followers) {
+            s_last += f->phase_size(n_ub, n_tokens, n_pad, sizes);
+        }
+        e_last = std::numeric_limits<int64_t>::min();
+        for (const auto & [dev, b] : budget) {
+            e_last = std::max(e_last, (int64_t) sizes[dev] - (int64_t) b);
+        }
+        n_query++;
+        LLAMA_LOG_DEBUG("%s: phase_mem: ubatch %u, %.0f MiB over the free memory, %d graph splits\n", func, n_ub, e_last/1024.0/1024.0, s_last);
+    };
+
+    // a device can reject an op with a large tensor (Vulkan buffer limits), then the op runs on the CPU in an extra split
+    int s_max = std::numeric_limits<int>::max();
+    if (n_max > n_step) {
+        query(n_step);
+        s_max = s_last;
+    }
+
+    auto fits = [&](uint32_t n_ub) {
+        query(n_ub);
+        return e_last <= 0 && s_last <= s_max;
+    };
+
+    uint32_t n_lo = n_max;
+    bool     ok   = fits(n_max);
+
+    if (!ok && n_pad > 0) {
+        n_pad = 0;
+        ok    = fits(n_max);
+    }
+
+    if (!ok && n_max > n_step) {
+        uint32_t n_hi = n_max;
+
+        // halve until a size fits
+        while (!ok && n_lo > n_step) {
+            n_hi = n_lo;
+            n_lo = std::max(n_step, n_lo/2/n_step*n_step);
+            ok   = fits(n_lo);
+        }
+
+        // then bisect between the size that fits and the size that does not
+        while (ok && n_hi - n_lo > n_step) {
+            const uint32_t n = (n_lo + n_hi)/2/n_step*n_step;
+            if (n <= n_lo) {
+                break;
+            }
+            if (fits(n)) {
+                n_lo = n;
+            } else {
+                n_hi = n;
+            }
+        }
+    }
+
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: phase_mem: a %u-token ubatch does not fit: %.0f MiB over the free memory, %d graph splits of %d\n",
+                __func__, n_lo, e_last/1024.0/1024.0, s_last, s_max);
+    }
+
+    const int64_t t_query_us = ggml_time_us();
+
+    // the allocation can fail although the sizes fit, e.g. when a driver refuses a large buffer
+    while (true) {
+        try {
+            for (auto * f : phase_followers) {
+                f->phase          = LLAMA_PHASE_PROMPT;
+                f->phase_n_tokens = n_lo;
+                f->phase_n_kv     = f->phase_kv_end(n_tokens, n_pad);
+                f->sched_reserve();
+            }
+
+            phase          = LLAMA_PHASE_PROMPT;
+            phase_n_tokens = n_lo;
+            phase_n_kv     = phase_kv_end(n_tokens, n_pad);
+            sched_reserve();
+            break;
+        } catch (const std::exception & err) {
+            if (n_lo <= n_step) {
+                throw;
+            }
+            LLAMA_LOG_WARN("%s: phase_mem: %s at ubatch %u, trying a smaller one\n", __func__, err.what(), n_lo);
+            n_lo = std::max(n_step, n_lo/2/n_step*n_step);
+            for (auto * f : phase_followers) {
+                f->sched_free();
+            }
+            sched_free();
+        }
+    }
+
+    // compute buffers on the devices
+    auto dev_size = [](const llama_context * c) {
+        size_t res = 0;
+        for (auto * b : c->backend_ptrs) {
+            const auto type = ggml_backend_dev_type(ggml_backend_get_device(b));
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                res += ggml_backend_sched_get_buffer_size(c->sched.get(), b);
+            }
+        }
+        return res;
+    };
+    size_t size_f = 0;
+    for (auto * f : phase_followers) {
+        size_f += dev_size(f);
+    }
+
+    const int64_t t_end_us = ggml_time_us();
+
+    LLAMA_LOG_INFO("%s: phase_mem: prompt, batch %u tokens, KV cells %u, ubatch %u of %u, compute %.0f + %.0f MiB (drafts), %.0f MiB were free, %d queries, %.2f s (free %.2f, queries %.2f, reserve %.2f)\n",
+            __func__, n_tokens, phase_n_kv, n_lo, n_max, dev_size(this)/1024.0/1024.0, size_f/1024.0/1024.0, free_all/1024.0/1024.0,
+            n_query, 1e-6*(t_end_us - t_start_us), 1e-6*(t_free_us - t_start_us), 1e-6*(t_query_us - t_free_us), 1e-6*(t_end_us - t_query_us));
+}
+
+llm_graph_result * llama_context::get_gf_res_reuse(const llm_graph_params & gparams) {
+    if (graph_reuse_disable) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < gf_res_prev.size(); ++i) {
+        auto & entry = gf_res_prev[i];
+        auto * res   = entry.res.get();
+
+        const bool active = res == gf_res_prev_active;
+        if (!active && !entry.snapshot) {
+            continue;
+        }
+        if (!res->can_reuse(gparams)) {
+            continue;
+        }
+        if (!active) {
+            if (!ggml_backend_sched_snapshot_restore(sched.get(), entry.snapshot.get())) {
+                // the compute buffers were reallocated, the tensors of the graph are not valid
+                entry.snapshot.reset();
+                res->reset();
+                continue;
+            }
+            gf_res_prev_active = res;
+        }
+
+        std::rotate(gf_res_prev.begin(), gf_res_prev.begin() + i, gf_res_prev.begin() + i + 1);
+
+        return res;
+    }
+
+    return nullptr;
+}
+
+void llama_context::gf_res_prev_reset() {
+    for (auto & entry : gf_res_prev) {
+        entry.snapshot.reset();
+        entry.res->reset();
+    }
+}
+
+size_t llama_context::state_seq_get_delta(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos) {
+    if (memory) {
+        return memory->state_write_delta(io, seq_id, flags, base_pos);
+    }
+
+    // no memory, no delta: 0 makes the caller take a full checkpoint
+    return 0;
+}
+
+int32_t llama_context::state_seq_apply_delta(
+        const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos) {
+    // Create a temporary io_read wrapper for the delta data
+    struct memory_buffer_io : llama_io_read_i {
+        const uint8_t * data;
+        size_t pos = 0;
+        size_t len;
+
+        memory_buffer_io(const uint8_t * src, size_t size) : data(src), len(size) {}
+
+        void read(void * dst, size_t n) override {
+            if (n > len - pos) {
+                throw std::runtime_error("buffer overflow in memory_buffer_io::read");
+            }
+            memcpy(dst, data + pos, n);
+            pos += n;
+        }
+
+        void read_tensor(ggml_tensor * tensor, size_t offset, size_t size_read) override {
+            if (size_read > len - pos) {
+                throw std::runtime_error("buffer overflow in memory_buffer_io::read_tensor");
+            }
+            ggml_backend_tensor_set(tensor, data + pos, offset, size_read);
+            pos += size_read;
+        }
+
+        size_t n_bytes() override {
+            return pos;
+        }
+    };
+
+    memory_buffer_io io(src, size);
+
+    if (memory) {
+        bool success = memory->state_read_delta(io, seq_id, flags, base_pos);
+        return success && io.n_bytes() == size ? 0 : -1;
+    }
+
+    return -1;
+}
+
+void llama_context::set_qsa_reuse(bool value) {
+    // only an MTP block that attends through QSA has a score to take: anything else would just lose its graph
+    // reuse between the first draft step and the next ones. LLAMA_MTP_QSA_REUSE=0 runs the indexer at every step
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_MTP_QSA_REUSE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const auto & hp = model.hparams;
+    const bool qsa_mtp = model.arch == LLM_ARCH_QWEN4EXP && hp.n_layer_nextn > 0 &&
+        hp.dsv4_compress_ratios[hp.n_layer()] > 0;
+
+    cparams.qsa_reuse = value && enabled && qsa_mtp;
+}
+
+void llama_set_qsa_reuse(llama_context * ctx, bool value) {
+    ctx->set_qsa_reuse(value);
+}
+
+// a ubatch of tokens of one sequence at consecutive positions, for the fork's reads ahead (the PLE rows need the tokens,
+// their positions and their sequence)
+static llama_ubatch llama_fork_tokens_ubatch(const llama_token * tokens, uint32_t n, llama_pos pos0, llama_seq_id seq_id) {
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.assign(tokens, tokens + n);
+    data->pos.resize(n);
+    data->n_seq_id.assign(n, 1);
+    data->seq_id_data.assign(n, seq_id);
+    data->seq_id.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        data->pos[i]    = pos0 + (llama_pos) i;
+        data->seq_id[i] = &data->seq_id_data[i];
+    }
+    data->seq_id_unq.assign(1, seq_id);
+
+    llama_ubatch ub = {};
+    ub.b_equal_seqs = 1;
+    ub.n_tokens     = n;
+    ub.n_seq_tokens = n;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = 1;
+    ub.token        = data->token.data();
+    ub.pos          = data->pos.data();
+    ub.n_seq_id     = data->n_seq_id.data();
+    ub.seq_id       = data->seq_id.data();
+    ub.seq_id_unq   = data->seq_id_unq.data();
+    ub.data         = data;
+    return ub;
+}
+
+void llama_context::set_next_tokens(const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id) {
+    next_tokens.assign(tokens, tokens + std::max(0, n_tokens));
+    next_pos0  = pos0;
+    next_seq   = seq_id;
+    next_calls = 0;
+}
+
+void llama_context::prefetch_tokens(const llama_token * tokens, int32_t n_tokens, int32_t n_new, llama_pos pos0, llama_seq_id seq_id) {
+    if (n_tokens <= 0 || n_new <= 0 || !memory) {
+        return;
+    }
+    const llama_ubatch ub = llama_fork_tokens_ubatch(tokens, (uint32_t) n_tokens, pos0, seq_id);
+    llama_fork_prefetch_tokens(model, memory.get(), ub, n_new);
+}
+
+void llama_context::fork_before_compute(llama_memory_context_i * mctx) {
+    const auto * hyb = dynamic_cast<const llama_memory_hybrid_idx_fork_context *>(mctx);
+    if (hyb == nullptr) {
+        next_tokens.clear();
+        llama_fork_before_compute(model, mctx, nullptr);
+        return;
+    }
+    // the tokens of set_next_tokens hold for the decode call right after it: a second call drops them
+    if (!next_tokens.empty() && hyb->is_first() && ++next_calls > 1) {
+        next_tokens.clear();
+    }
+    if (next_tokens.empty() || hyb->peek_next() != nullptr) {
+        llama_fork_before_compute(model, mctx, nullptr);
+        return;
+    }
+    // the last ubatch of this call: the next call starts with a ubatch of up to the split size of these tokens
+    const uint32_t n = std::min<uint32_t>((uint32_t) next_tokens.size(), n_ubatch_split());
+    const llama_ubatch hint = llama_fork_tokens_ubatch(next_tokens.data(), n, next_pos0, next_seq);
+    llama_fork_before_compute(model, mctx, &hint);
+    next_tokens.clear();
+}
+
+void llama_set_next_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id) {
+    ctx->set_next_tokens(tokens, n_tokens, pos0, seq_id);
+}
+
+void llama_prefetch_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_new, llama_pos pos0, llama_seq_id seq_id) {
+    ctx->prefetch_tokens(tokens, n_tokens, n_new, pos0, seq_id);
+}

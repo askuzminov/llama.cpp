@@ -147,6 +147,13 @@ private:
     // for worker_t
     void worker_loop();
     void worker_stop();
+
+public:
+    // fork: whether work is waiting, so that a job running on the idle path can yield to it
+    bool has_new_task() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return !queue_tasks.empty();
+    }
 };
 
 // struct for managing server responses

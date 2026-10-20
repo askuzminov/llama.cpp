@@ -1,0 +1,44 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// fork: which element of an f16 16x16 A fragment an invocation holds. mul_mmid_f16reg.comp writes A fragments element
+// by element (the 4-bit codes decoded in registers, no f16 copy of A in shared memory) and takes the RDNA3 wave32
+// layout: element e of invocation l is row l % 16, column e, the upper half of the subgroup holding the same rows.
+// one subgroup of 32 sets A[l % 16][e] = 16 * (l % 16) + e that way, multiplies it by the identity and stores the
+// product: the host checks d[16 * r + c] == 16 * r + c and d[256] == 16 (the fragment length)
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) writeonly buffer D { float data_d[]; };
+
+shared float16_t ident[16 * 16];
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+
+    for (uint i = lane; i < 16 * 16; i += 32) {
+        ident[i] = float16_t((i / 16) == (i % 16) ? 1.0 : 0.0);
+    }
+    barrier();
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    for (uint e = 0; e < a.length(); ++e) {
+        a[e] = float16_t(float(16 * (lane % 16) + e));
+    }
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    coopMatLoad(b, ident, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    c = coopMatMulAdd(a, b, c);
+
+    coopMatStore(c, data_d, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    if (lane == 0) {
+        data_d[256] = float(a.length());
+    }
+}

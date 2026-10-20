@@ -193,6 +193,9 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        if (fa_sparse_tail(j * Bc)) {
+            break;
+        }
         if (MASK_ENABLE) {
             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                 mask_opt_idx = j / 16;
@@ -216,7 +219,7 @@ void main() {
                         uint32_t kcol;
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
                         if (kv_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + kcol]);
+                            FLOAT_TYPE m = FLOAT_TYPE(SPARSE_LIST ? data_m[sparse_base + j * Bc + c] : data_m[m_offset + (i * Br + r) * m_stride + kcol]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {

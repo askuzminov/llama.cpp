@@ -63,6 +63,23 @@ set_target_properties(llama PROPERTIES
 set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
+# the fork's sources (fork/llama-fork.h), kept apart from the upstream lists above. the copies of upstream files repeat
+# the file-local names of the files they copy, which one unity batch would merge
+set(LLAMA_FORK_SOURCES
+    fork/llama-fork.cpp
+    fork/llama-context-fork.cpp
+    fork/llama-impl-fork.cpp
+    fork/llama-load-watch-fork.cpp
+    fork/llama-state-delta-fork.cpp
+    fork/llama-graph-fork.cpp
+    fork/llama-moecache-fork.cpp
+    fork/llama-row-cache-fork.cpp
+    fork/llama-memory-hybrid-idx-fork.cpp
+    fork/qwen4exp-fork.cpp
+)
+target_sources(llama PRIVATE ${LLAMA_FORK_SOURCES})
+set_source_files_properties(${LLAMA_FORK_SOURCES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})

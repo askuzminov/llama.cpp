@@ -502,6 +502,10 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+
+    // fork: GGML_TIMELINE, the compute call and the start of each thread (fork/timeline-fork.inc)
+    int64_t fork_t_call;
+    int64_t fork_t_enter[GGML_MAX_N_THREADS];
 };
 
 // Per-thread state
@@ -1337,7 +1341,8 @@ UseGgmlGemm1:;
         // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
         const bool widen = src1->type != GGML_TYPE_F32;
 
-        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        // fork: or packed from F16 into a quantized vec_dot_type through F32 (the f16 hc read of qwen4exp)
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     #if 0
@@ -1363,7 +1368,15 @@ UseGgmlGemm1:;
 
                     const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
 
-                    if (src1->type == GGML_TYPE_F16) {
+                    if (src1->type == GGML_TYPE_F16 && vec_dot_type != GGML_TYPE_F32) {
+                        // fork: through F32 in pieces of whole blocks
+                        float tmp[1024];
+                        for (int64_t k = 0; k < ne10_block_size; k += 1024) {
+                            const int64_t nk = MIN(1024, ne10_block_size - k);
+                            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row + k, tmp, nk);
+                            from_float(tmp, (char *) wdata_row + (k/bs)*nbw0, nk);
+                        }
+                    } else if (src1->type == GGML_TYPE_F16) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else if (src1->type == GGML_TYPE_BF16) {
                         ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
@@ -1559,6 +1572,8 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
 
+    const int32_t * skip = dst->src[3] ? (const int32_t *) dst->src[3]->data : NULL;
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
@@ -1653,6 +1668,11 @@ static void ggml_compute_forward_mul_mat_id(
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
+
+                if (skip && skip[i02]) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
@@ -2029,6 +2049,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
+            } break;
+        case GGML_OP_FLASH_ATTN_LIST: // fork
+            {
+                ggml_compute_forward_flash_attn_list(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
@@ -2426,6 +2450,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_LIST: // fork
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -2984,6 +3009,12 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
+                case GGML_OP_FLASH_ATTN_LIST: // fork: K, V rows and the V accumulator per thread
+                    {
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
+                        cur += sizeof(float)*(DK + 2*DV + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
@@ -3098,6 +3129,8 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+#include "fork/timeline-fork.inc" // fork: GGML_TIMELINE spans of the nodes
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3125,6 +3158,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #else
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
+
+    struct ggml_cpu_timeline_fork tl; // fork
+    ggml_cpu_timeline_fork_begin(&tl, state);
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3156,6 +3192,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+        ggml_cpu_timeline_fork_node(&tl, state, node, node_n + 1 >= cgraph->n_nodes); // fork
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3165,6 +3202,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+    ggml_cpu_timeline_fork_end(&tl, state); // fork
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
@@ -3333,6 +3371,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->fork_t_call      = 0; // fork
+        memset(threadpool->fork_t_enter, 0, sizeof(threadpool->fork_t_enter));
     }
 
     // Allocate and init workers state
@@ -3415,6 +3455,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+
+    threadpool->fork_t_call = ggml_timeline_on() ? ggml_time_us() : 0; // fork: GGML_TIMELINE, fork/timeline-fork.inc
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {

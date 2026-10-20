@@ -756,9 +756,15 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// fork: GPU time of the compute calls for GGML_SCHED_PROF_GPU
+#include "fork/ggml-cuda-timing-fork.inc"
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    ggml_cuda_timing_fork_free(this);
+    ggml_cuda_op_timing_fork_free(this);
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -2142,7 +2148,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
                 }
             }
         }
@@ -2576,7 +2581,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        // a kernel fault reaches this check at its own node only with CUDA_LAUNCH_BLOCKING=1, GGML_CUDA_DISABLE_GRAPHS=1 and GGML_CUDA_DISABLE_FUSION=1
+        GGML_LOG_ERROR("%s: %s failed, node '%s' %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n", __func__, ggml_op_desc(dst),
+                dst->name, ggml_type_name(dst->type), dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * src = dst->src[i];
+            if (src != nullptr) {
+                GGML_LOG_ERROR("%s:   src%d '%s' %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n", __func__, i,
+                        src->name, ggml_type_name(src->type), src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+            }
+        }
         CUDA_CHECK(err);
     }
 
@@ -2971,6 +2985,24 @@ static int ggml_cuda_try_gdn_cache_fusion(
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
         dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
         return 0;
+    }
+
+    // the kernel does not write the snapshot tail, so only the cache cpy may read it
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_op_is_empty(n->op)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * t = n->src[s];
+            if (t == nullptr || (n == cpy && s == 0)) {
+                continue;
+            }
+            if (t == gdn || (t->view_src == gdn &&
+                (t->view_offs >= tail_off || ggml_nbytes(t) > tail_off - t->view_offs))) {
+                return 0;
+            }
+        }
     }
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
@@ -3770,10 +3802,20 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+#include "fork/fusion-fork.inc"
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
         return 0;
+    }
+
+    // fork: the hyper-connection fusions of qwen4exp
+    {
+        const int n_skip = ggml_cuda_fork_try_fuse(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
     }
 
     ggml_tensor * node = cgraph->nodes[i];
@@ -4708,9 +4750,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_op_timing_fork_begin(cuda_ctx);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    ggml_cuda_op_timing_fork_end(cuda_ctx, cgraph, i, nodes_to_skip);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4742,6 +4786,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                ggml_cuda_op_timing_fork_end(cuda_ctx, cgraph, i, 0);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4808,6 +4853,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    ggml_cuda_timing_fork_begin(cuda_ctx);
+    ggml_cuda_op_timing_fork_call(cuda_ctx);
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4851,6 +4899,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // fork: GGML_CUDA_OP_TIMING puts timing events around every op, which a captured graph cannot hold
+    if (ggml_cuda_op_timing_fork_on()) {
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4862,6 +4916,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_timing_fork_end(cuda_ctx);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5617,6 +5673,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                     return false;
                 }
+                if (op->op == GGML_OP_MUL_MAT_ID && op->src[3]) {
+                    return false;
+                }
+                // MMF assumes that a token uses each expert at most once
+                if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 1) == GGML_HINT_IDS_REPEAT && !ggml_is_quantized(a->type)) {
+                    return false;
+                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -6184,6 +6247,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#ifdef GGML_CUDA_TIMING_FORK
+    if (strcmp(name, "ggml_backend_timing_enable_fork") == 0) {
+        return (void *)ggml_backend_cuda_timing_enable_fork;
+    }
+    if (strcmp(name, "ggml_backend_timing_take_fork") == 0) {
+        return (void *)ggml_backend_cuda_timing_take_fork;
+    }
+    if (strcmp(name, "ggml_backend_profiler_fork") == 0) {
+        return (void *)ggml_backend_cuda_profiler_fork;
+    }
+#endif
     return nullptr;
 }
 

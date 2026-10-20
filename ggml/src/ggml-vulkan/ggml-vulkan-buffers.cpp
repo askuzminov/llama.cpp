@@ -32,13 +32,14 @@ ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .is_host             = */ NULL,
 };
 
-static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags) {
+static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags,
+                                                            vk::MemoryPropertyFlags exclude_flags = {}) {
     std::vector<uint32_t> indices;
 
     for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
         vk::MemoryType memory_type = mem_props->memoryTypes[i];
         if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
-            (flags & memory_type.propertyFlags) == flags &&
+            (flags & memory_type.propertyFlags) == flags && !(exclude_flags & memory_type.propertyFlags) &&
             mem_props->memoryHeaps[memory_type.heapIndex].size >= mem_req->size) {
             indices.push_back(i);
         }
@@ -47,7 +48,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 }
 
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
+                                       void *import_ptr = nullptr, vk::MemoryPropertyFlags exclude_flags = {}) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
@@ -143,7 +144,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
             const auto & req_flags = *it;
 
-            const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
+            const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags, exclude_flags);
 
             if (memory_type_indices.empty()) {
                 continue;
@@ -180,15 +181,22 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     buf->ptr = nullptr;
 
-    if (import_ptr) {
-        buf->ptr = import_ptr;
-    } else {
-        if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
-            buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
+    try {
+        if (import_ptr) {
+            buf->ptr = import_ptr;
+        } else {
+            if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+                buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
+            }
         }
-    }
 
-    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+        device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    } catch (const vk::SystemError & e) {
+        // buf->size is still 0, so the destructor frees neither the memory nor the buffer
+        device->device.freeMemory(buf->device_memory);
+        device->device.destroyBuffer(buf->buffer);
+        throw;
+    }
 
     buf->device = device;
     buf->size = size;
@@ -250,6 +258,17 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     }
 
     return buf;
+}
+
+vk_buffer ggml_vk_create_buffer_shared(vk_device& device, size_t size) {
+    try {
+        return ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent},
+                                     nullptr, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    } catch (const vk::SystemError& e) {
+        std::cerr << "ggml_vulkan: Shared memory allocation of size " << size << " failed." << std::endl;
+        std::cerr << "ggml_vulkan: " << e.what() << std::endl;
+        throw e;
+    }
 }
 
 void ggml_vk_destroy_buffer(vk_buffer& buf) {

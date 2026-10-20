@@ -1404,6 +1404,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
     inst.meta.status      = SERVER_MODEL_STATUS_LOADING;
     inst.meta.loaded_info = json{};
     inst.meta.last_used   = ggml_time_ms();
+    inst.alone            = opts.mode == SERVER_CHILD_MODE_NORMAL;
+    for (const auto & m : mapping) {
+        inst.alone = inst.alone && !m.second.meta.is_running();
+    }
 
     if (inst.meta.port <= 0) {
         throw std::runtime_error("failed to get a port number");
@@ -1418,6 +1422,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        child_env.push_back("LLAMA_SERVER_STOP_TIMEOUT=" + std::to_string(inst.meta.stop_timeout));
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
@@ -1440,6 +1445,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
             }
             set_child_env(child_env, "LLAMA_ARG_MMPROJ_AUTO", mmproj ? "1" : "0");
             set_child_env(child_env, "LLAMA_ARG_SPEC_TYPE", spec_types.empty() ? "none" : spec_types);
+        }
+
+        const std::string mem_wait = inst.alone ? mem_wait_env() : "";
+        if (!mem_wait.empty()) {
+            SRV_INF("previous instance exited recently, the new one waits for its memory: %s\n", mem_wait.c_str());
+            child_env.push_back("LLAMA_SERVER_MEM_WAIT=" + mem_wait);
         }
 
         SRV_INF("%s", "spawning server instance with args:\n");
@@ -1492,6 +1503,9 @@ void server_models::request_stop(const std::string & name, bool send_exit) {
 void server_models::on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code) {
     {
         std::lock_guard<std::mutex> lk(mutex);
+        if (mode == SERVER_CHILD_MODE_NORMAL) {
+            t_last_exit = ggml_time_ms();
+        }
         auto it = mapping.find(name);
         if (it == mapping.end() || it->second.subproc != proc) {
             stopping_models.erase(name);
@@ -1949,6 +1963,14 @@ void server_models::handle_child_state(const std::string & name, const std::stri
             } break;
         case SERVER_STATE_READY:
             {
+                if (payload.is_object() && payload.contains("mem")) {
+                    std::lock_guard<std::mutex> lk(mutex);
+                    auto it = mapping.find(name);
+                    if (it != mapping.end() && it->second.alone && payload["mem"].is_object()) {
+                        mem_last = payload["mem"];
+                    }
+                    payload.erase("mem");
+                }
                 update_status(name, {
                     SERVER_MODEL_STATUS_LOADED,
                     0,
@@ -2074,28 +2096,32 @@ int server_child::run_download(common_params & params) {
 }
 
 std::thread server_child::setup(const std::function<void(int)> & shutdown_handler) {
+    int stop_timeout = DEFAULT_STOP_TIMEOUT;
+    if (const char * env = std::getenv("LLAMA_SERVER_STOP_TIMEOUT")) {
+        stop_timeout = std::max(0, atoi(env));
+    }
     // setup thread for monitoring stdin
-    return std::thread([shutdown_handler]() {
+    return std::thread([shutdown_handler, stop_timeout]() {
         // wait for EOF on stdin
         SRV_INF("%s", "child server monitoring thread started, waiting for EOF on stdin...\n");
-        bool eof = false;
-        while (true) {
-            std::string line;
-            if (!std::getline(std::cin, line)) {
-                // EOF detected, that means the router server is unexpectedly exit or killed
-                eof = true;
-                break;
-            }
-            if (line.find(CMD_ROUTER_TO_CHILD_EXIT) != std::string::npos) {
+        std::string buf;
+        while (server_child_read_stdin(buf)) {
+            if (buf.find(CMD_ROUTER_TO_CHILD_EXIT) != std::string::npos) {
                 SRV_INF("%s", "exit command received, exiting...\n");
+                server_child_watch_router_after_exit(stop_timeout);
                 shutdown_handler(0);
-                break;
+                return;
+            }
+            // keep only the unfinished line
+            const size_t nl = buf.rfind('\n');
+            if (nl != std::string::npos) {
+                buf.erase(0, nl + 1);
             }
         }
-        if (eof) {
-            SRV_INF("%s", "EOF on stdin detected, forcing shutdown...\n");
-            exit(1);
-        }
+        // EOF detected, that means the router server is unexpectedly exit or killed
+        SRV_INF("%s", "EOF on stdin detected, forcing shutdown...\n");
+        // not exit(): it runs the static destructors while the main thread still uses them
+        exit_now();
     });
 }
 
@@ -2272,7 +2298,10 @@ void server_models_routes::init_routes() {
             return error_res;
         }
         if (autoload) {
-            models.ensure_model_ready(name, req.should_stop);
+            // a router shutdown waits for this handler, so it must not wait for the load
+            models.ensure_model_ready(name, [&]() {
+                return stopping.load() || (req.should_stop && req.should_stop());
+            });
         }
         return models.proxy_request(req, method, name, false);
     };
@@ -2292,8 +2321,11 @@ void server_models_routes::init_routes() {
         // this request instead of leaving an orphan generation
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
         uint64_t ticket = models.conv_models.remember(conv_id, name);
-        // a dead socket must not cancel a session request, only a stop does (checked right below)
-        auto should_stop = ticket == 0 ? req.should_stop : nullptr;
+        // a dead socket must not cancel a session request, only a stop does (checked right below).
+        // a router shutdown cancels both: it waits for this handler, so it must not wait for the load
+        auto should_stop = [&]() {
+            return stopping.load() || (ticket == 0 && req.should_stop && req.should_stop());
+        };
         bool waited = autoload && models.ensure_model_ready(name, should_stop);
         if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
             SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",

@@ -1721,6 +1721,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
+    cparams.n_moe_cache       = params.n_moe_cache;
     cparams.embeddings        = params.embedding;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.rope_freq_base    = params.rope_freq_base;
@@ -1740,6 +1741,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.phase_mem         = params.phase_mem;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
@@ -2367,6 +2369,7 @@ void common_prompt_checkpoint::clear() {
 
     pos_min = 0;
     pos_max = 0;
+    base_pos = -1;
 
     data_tgt.clear();
     data_dft.clear();
@@ -2385,19 +2388,48 @@ void common_prompt_checkpoint::update_pos(
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        llama_pos base_pos) {
     if (ctx == nullptr) {
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    this->base_pos = base_pos;
 
-    data_tgt.resize(ckpt_size);
+    // a memory implementation that does not support delta state returns 0 here - fall back to a
+    // full, self-contained checkpoint instead of failing
+    size_t ckpt_size = base_pos >= 0 ? llama_state_seq_get_delta_ext(ctx, nullptr, 0, seq_id, flags, base_pos) : 0;
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    if (ckpt_size == 0) {
+        if (base_pos >= 0) {
+            COM_DBG("delta state not available (base_pos = %d) - storing a full checkpoint\n", base_pos);
+            this->base_pos = -1;
+        }
+
+        ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
     }
+
+    if (ckpt_size == 0) {
+        COM_ERR("%s", "failed to determine checkpoint size\n");
+        data_tgt.clear();
+        return;
+    }
+
+    std::vector<uint8_t> raw_data(ckpt_size);
+
+    const size_t n = this->base_pos >= 0
+        ? llama_state_seq_get_delta_ext(ctx, raw_data.data(), ckpt_size, seq_id, flags, this->base_pos)
+        : llama_state_seq_get_data_ext (ctx, raw_data.data(), ckpt_size, seq_id, flags);
+
+    if (n != ckpt_size) {
+        // the caller treats an empty checkpoint as "not taken" and recomputes the prompt instead
+        COM_ERR("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        this->base_pos = -1;
+        data_tgt.clear();
+        return;
+    }
+
+    data_tgt = std::move(raw_data);
 }
 
 void common_prompt_checkpoint::update_dft(

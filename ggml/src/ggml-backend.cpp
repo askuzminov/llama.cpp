@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <unordered_map>
 #include <vector>
 
@@ -921,7 +923,12 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+    // fork: the split during which the weights in host memory of this one are uploaded, -1: none (ggml-backend-fork.inc)
+    int prefetch_at;
 };
+
+// fork: see the file
+#include "fork/ggml-backend-fork-decl.inc"
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -946,6 +953,9 @@ struct ggml_backend_sched {
 
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
+
+    // snapshot of the allocated graph after ggml_backend_sched_snapshot_restore, NULL after a split
+    struct ggml_backend_sched_snapshot * snapshot;
 
     // graph splits
     struct ggml_backend_sched_split * splits;
@@ -976,6 +986,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool parallel_cpu;
 
     int debug;
 
@@ -986,6 +997,22 @@ struct ggml_backend_sched {
     int prev_graph_size;
 
     int debug_realloc;
+
+    // buffer plans made, see ggml_backend_sched_get_n_reserve
+    size_t n_reserve;
+
+    // host time of the splits [GGML_SCHED_PROF=<report period in graphs>]
+    int     prof_period;
+    int     prof_id;
+    int     prof_last;   // bucket of the previous graph, -1 before the first graph
+    int64_t prof_t_last; // start of the previous graph
+    ggml_backend_dev_t prof_devs[GGML_SCHED_MAX_BACKENDS]; // the backends can go before the scheduler
+    ggml_backend_timing_take_fork_t prof_gpu[GGML_SCHED_MAX_BACKENDS]; // [GGML_SCHED_PROF_GPU]
+    struct ggml_backend_sched_prof prof[GGML_SCHED_PROF_BUCKETS];
+
+    // fork: uploads of the host weights of later splits [GGML_SCHED_PREFETCH]
+    struct ggml_backend_sched_prefetch prefetch;
+
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1216,6 +1243,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+    sched->snapshot = NULL;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1626,6 +1654,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
     }
 
+    // fork: which splits have their host weights uploaded during an earlier split
+    ggml_backend_sched_prefetch_plan(sched);
+
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
     int n_dep_nodes = 0;
     for (const auto & it : alloc_deps) {
@@ -1664,6 +1695,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             assert(graph_copy->size > (graph_copy->n_nodes + 1));
 
             struct ggml_tensor * input = split->inputs[j];
+
+            // fork: a weight uploaded during an earlier split is allocated at the start of that split
+            if (ggml_backend_sched_prefetch_input(split, input)) {
+                continue;
+            }
+
             const size_t input_id = hash_id(input);
             struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, sched->cur_copy);
 
@@ -1677,6 +1714,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
             graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
         }
+
+        // fork: the weights of later splits that this split uploads
+        ggml_backend_sched_prefetch_add_inputs(sched, i, graph_copy);
 
         for (int j = split->i_start; j < split->i_end; j++) {
             assert(graph_copy->size > graph_copy->n_nodes);
@@ -1758,6 +1798,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
+            if (ggml_backend_sched_log_realloc()) {
+                const struct ggml_tensor * t = sched->graph.nodes[i];
+                fprintf(stderr, "sched realloc: node %d %s (%s) moved from %s to %s\n", i, t->name, ggml_op_desc(t),
+                        ggml_backend_name(sched->backends[sched->prev_node_backend_ids[i]]), ggml_backend_name(sched->backends[sched->node_backend_ids[i]]));
+            }
             break;
         }
     }
@@ -1766,6 +1811,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
                 sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
+                if (ggml_backend_sched_log_realloc()) {
+                    fprintf(stderr, "sched realloc: leaf %d %s moved from %s to %s\n", i, sched->graph.leafs[i]->name,
+                            ggml_backend_name(sched->backends[sched->prev_leaf_backend_ids[i]]), ggml_backend_name(sched->backends[sched->leaf_backend_ids[i]]));
+                }
                 break;
             }
         }
@@ -1800,10 +1849,16 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        // fork: and the uploads of host weights into the buffers
+        ggml_backend_sched_prefetch_sync(sched);
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
+        }
+        sched->n_reserve++;
+        if (ggml_backend_sched_log_realloc()) {
+            ggml_backend_sched_log_splits(sched, "re-reserve");
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1867,39 +1922,154 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
+    bool pending_host[GGML_SCHED_MAX_BACKENDS];
+    std::fill_n(pending_host, GGML_SCHED_MAX_BACKENDS, true);
+
+    const bool prof = sched->prof_period > 0;
+
+    // the graphs of one bucket have the same split count, the wall time of a graph is known at the start of the next one
+    int bucket = -1;
+    if (prof) {
+        const int64_t t_now = ggml_time_us();
+        if (sched->prof_last >= 0) {
+            sched->prof[sched->prof_last].t_wall += t_now - sched->prof_t_last;
+            sched->prof[sched->prof_last].n_wall++;
+            ggml_backend_sched_prof_gpu_take(sched, sched->prof_last);
+        }
+        for (int i = 0; i < GGML_SCHED_PROF_BUCKETS && bucket < 0; i++) {
+            if (sched->prof[i].n_splits == sched->n_splits) {
+                bucket = i;
+            }
+        }
+        for (int i = 0; i < GGML_SCHED_PROF_BUCKETS && bucket < 0; i++) {
+            if (sched->prof[i].n_splits == 0) {
+                sched->prof[i].n_splits = sched->n_splits;
+                bucket = i;
+            }
+        }
+        if (bucket < 0) {
+            bucket = GGML_SCHED_PROF_BUCKETS - 1;
+            sched->prof[bucket].n_splits = -1;
+        }
+        sched->prof_last   = bucket;
+        sched->prof_t_last = t_now;
+    }
+
+    int64_t t_wait = 0; // of the current split
+
+    // fork: the waits and the CPU splits on the timeline (GGML_TIMELINE), see ggml_backend_sched_timeline_split
+    const bool timeline = ggml_timeline_on();
+
+    auto sync_backend = [&](ggml_backend_t backend) {
+        const int64_t t_start = prof || timeline ? ggml_time_us() : 0;
+        ggml_backend_synchronize(backend);
+        if (timeline && ggml_time_us() - t_start >= 20) {
+            ggml_timeline_event("sched wait", "wait", t_start, ggml_time_us()); // fork
+        }
+        if (sched->parallel_cpu) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                if (sched->backends[i] == backend) {
+                    pending_host[i] = false;
+                }
+            }
+        }
+        t_wait += prof ? ggml_time_us() - t_start : 0;
+    };
+
+    auto sync_event = [&](ggml_backend_event_t event) {
+        const int64_t t_start = prof || timeline ? ggml_time_us() : 0;
+        ggml_backend_event_synchronize(event);
+        if (timeline && ggml_time_us() - t_start >= 20) {
+            ggml_timeline_event("sched wait", "wait", t_start, ggml_time_us()); // fork
+        }
+        if (sched->parallel_cpu) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                if (sched->events[i][sched->cur_copy] == event) {
+                    pending_host[i] = false;
+                }
+            }
+        }
+        t_wait += prof ? ggml_time_us() - t_start : 0;
+    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-        // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
+        const int64_t t_split_start = prof ? ggml_time_us() : 0;
+        t_wait = 0;
+
+        // fork: the work before this split, which the uploads of later splits during it wait for
+        ggml_backend_sched_prefetch_begin(sched, split_id);
+
+        // Device-only work cannot access the CPU buffers reused by this split.
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+            const bool overlap = sched->parallel_cpu && !pending_host[prev_backend_id] &&
+                ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (overlap) {
+                if (prof) {
+                    sched->prof[bucket].n_overlap[split_backend_id]++;
+                }
+            } else if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                sync_event(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                sync_backend(sched->backends[prev_backend_id]);
             }
         }
+
+        // fork: the host syncs of ggml_backend_sched_copy_input are done first through sync_backend/sync_event,
+        // for the pending_host and wait accounting; the ones inside it then find the backend idle
+        auto copy_input = [&](ggml_tensor * input) {
+            ggml_backend_event_t ev = sched->events[split_backend_id][sched->cur_copy];
+            // a backend without async copies takes the synchronous copy, which waits for both sides
+            const bool sync_copy = !(input->flags & GGML_TENSOR_FLAG_INPUT) && !ggml_backend_sched_is_host_weight(input) &&
+                !split_backend->iface.cpy_tensor_async;
+            if (sync_copy) {
+                sync_backend(ggml_backend_sched_get_tensor_backend(sched, input));
+            }
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || sync_copy) {
+                if (ev != NULL) {
+                    sync_event(ev);
+                } else {
+                    sync_backend(split_backend);
+                }
+            } else if (ev == NULL) {
+                sync_backend(split_backend);
+            }
+            ggml_backend_sched_copy_input(sched, split, input);
+        };
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                copy_input(split->inputs[input_id]);
             }
         }
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        // fork: or the backend waits for their upload during an earlier split
+        const bool prefetched = ggml_backend_sched_prefetch_wait(sched, split_id);
+        for (int input_id = 0; input_id < split->n_inputs && !prefetched; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                copy_input(split->inputs[input_id]);
             }
         }
 
+        const int64_t t_run_start = prof ? ggml_time_us() : 0;
+
+        if (sched->parallel_cpu) {
+            pending_host[split_backend_id] = pending_host[split_backend_id] || ggml_backend_sched_split_uses_host_buffer(split);
+        }
+
         if (!sched->callback_eval) {
+            const int64_t t_compute_us = timeline ? ggml_time_us() : 0; // fork
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_prefetch_sync(sched); // fork
                 return ec;
+            }
+            if (timeline) {
+                ggml_backend_sched_timeline_split(split_backend, split, t_compute_us); // fork
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1921,6 +2091,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_prefetch_sync(sched); // fork
                     return ec;
                 }
 
@@ -1940,7 +2111,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        // fork: upload the host weights of later splits while this one computes
+        ggml_backend_sched_prefetch_issue(sched, split_id);
+
+        if (prof) {
+            struct ggml_backend_sched_prof * p = &sched->prof[bucket];
+            p->n_split[split_backend_id]++;
+            p->t_in   [split_backend_id] += t_run_start - t_split_start;
+            p->t_wait [split_backend_id] += t_wait;
+            p->t_run  [split_backend_id] += ggml_time_us() - t_run_start;
+        }
+
         prev_backend_id = split_backend_id;
+    }
+
+    if (prof && ++sched->prof[bucket].n_graphs >= sched->prof_period) {
+        ggml_backend_sched_prof_print(sched, bucket);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1968,6 +2154,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+
+    static std::atomic<int> prof_count { 0 };
+    const char * GGML_SCHED_PROF = getenv("GGML_SCHED_PROF");
+    sched->prof_period = GGML_SCHED_PROF ? atoi(GGML_SCHED_PROF) : 0;
+    // on by default: it only changes a CPU split without inputs after a device split that touches no host buffer,
+    // in llama.cpp the CPU experts next to the cached ones of --moe-cache. GGML_SCHED_PARALLEL_CPU=0 turns it off
+    const char * parallel_cpu = getenv("GGML_SCHED_PARALLEL_CPU");
+    sched->parallel_cpu = parallel_cpu == nullptr || atoi(parallel_cpu) > 0;
+    sched->prof_id     = sched->prof_period > 0 ? prof_count++ : 0;
+    sched->prof_last   = -1;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
@@ -2000,6 +2196,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
+        sched->prof_devs[b] = ggml_backend_get_device(backends[b]);
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
@@ -2009,6 +2206,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
             }
         }
     }
+
+    ggml_backend_sched_prof_gpu_init(sched);
+    ggml_backend_sched_prefetch_init(sched); // fork
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
@@ -2022,6 +2222,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    for (int i = 0; i < GGML_SCHED_PROF_BUCKETS; i++) {
+        if (sched->prof_period > 0 && sched->prof[i].n_graphs > 0) {
+            ggml_backend_sched_prof_print(sched, i);
+        }
+    }
+    ggml_backend_sched_prefetch_free(sched); // fork
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2057,6 +2263,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->snapshot = NULL;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2083,6 +2290,10 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
+    }
+    sched->n_reserve++;
+    if (ggml_backend_sched_log_realloc()) {
+        ggml_backend_sched_log_splits(sched, "reserve");
     }
 
     ggml_backend_sched_reset(sched);
@@ -2132,8 +2343,14 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const int64_t t_sync_us = ggml_timeline_on() ? ggml_time_us() : 0; // fork: the host waits for the devices
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    ggml_backend_sched_prefetch_sync(sched); // fork
+    // fork: the waits that took time, not the calls that found the devices idle
+    if (t_sync_us != 0 && ggml_time_us() - t_sync_us >= 20) {
+        ggml_timeline_event("host", "sync", t_sync_us, ggml_time_us());
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -2209,7 +2426,7 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
 
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
     GGML_ASSERT(sched);
-    int backend_index = tensor_backend_id(node);
+    int backend_index = sched->snapshot ? ggml_backend_sched_snapshot_backend_id(sched->snapshot, node) : tensor_backend_id(node);
     if (backend_index == -1) {
         return NULL;
     }
@@ -2629,3 +2846,6 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
+
+// fork: see the file
+#include "fork/ggml-backend-fork.inc"

@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "fork/server-models-fork.h"
+
 /**
  * state diagram:
  *
@@ -173,6 +175,9 @@ private:
 
         // ask the child to exit (it handles the command on its stdin, see server_child::setup)
         void request_exit() const;
+
+        // fork: no other instance was running when this one was spawned
+        bool alone = false;
     };
 
     std::mutex mutex;
@@ -377,6 +382,18 @@ public:
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
 private:
+    // fork: memory wait of a child spawned alone, see fork/server-models-fork.cpp. The ready payload
+    // of a child also carries "mem" from server_child::mem_report
+
+    // memory per device reported by the last child that was spawned alone, see server_child::mem_report
+    json mem_last = json::object();
+    // time of the last child exit, the driver can release the memory of that child some time later
+    int64_t t_last_exit = 0;
+
+    // LLAMA_SERVER_MEM_WAIT value for a child spawned alone, empty if it has nothing to wait for
+    // not thread-safe, caller must hold mutex
+    std::string mem_wait_env() const;
+
     // one thread watching every child; keep last, the destructor joins the thread
     std::unique_ptr<server_monitor> monitor;
 };
@@ -404,8 +421,25 @@ struct server_child {
     // message will be handled by server_models::handle_child_state() on the router side
     void notify_to_router(const std::string & state_name, const json & payload);
 
+    // fork: router watch and memory wait, defined in fork/server-models-fork.cpp
+    // EOF on stdin (router gone) calls exit_now(); the monitoring thread of setup() ends after the exit
+    // command, and EOF after it ends the process when the router's stop timeout is over
+
+    // end the process at once, without destructors or atexit handlers, as the router's force-kill does
+    [[noreturn]] static void exit_now();
+
+    // call before the model is loaded: if the router set LLAMA_SERVER_MEM_WAIT, wait until the previous
+    // instance released its memory, then record the free memory per device
+    void wait_mem(const common_params & params);
+
+    // free memory per device before the load and how much the load took
+    json mem_report();
+
 private:
     FILE * cmd_out = nullptr; // the stdout the router reads the commands from
+
+    std::vector<ggml_backend_dev_t> mem_devs;
+    std::map<std::string, std::pair<size_t, size_t>> mem_start; // device name -> free, total
 };
 
 struct server_models_routes {
