@@ -111,9 +111,9 @@ def stable_folder():
 
 
 class Arm:
-    """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft] [@d=depth,...] [tool
-    arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
-    @draft loads SPECDRAFT with -md, @d= limits the arm to these depths of 02 and 05, @p= to these prefixes of 04
+    """One variant of a measurement: "name [VAR=value ...] [@stable | @<bin folder>] [@draft | @dflash] [@d=depth,...]
+    [tool arguments ...]". VAR=value goes to the environment of the tool, @stable runs the build of 00-build.bat stable,
+    @draft loads SPECDRAFT with -md (the MTP head), @dflash loads DFLASHDRAFT (a DFlash draft), @d= limits the arm to these depths of 02 and 05, @p= to these prefixes of 04
     (DECPREFIX), @c= and @ub= set the -c and the -ub of 02 and 05 for this arm, @pp= the prompt of 02, @o=OP,... limits
     it to these ops of 01 and 06, the rest goes to the tool."""
 
@@ -127,7 +127,7 @@ class Arm:
         self.args = []
         self.build = None
         self.stable = False
-        self.draft = False
+        self.draft = None  # the variable of the -md model: SPECDRAFT (@draft) or DFLASHDRAFT (@dflash)
         self.depths = None
         self.prefixes = None
         self.ctx = None
@@ -135,8 +135,8 @@ class Arm:
         self.pp = None
         self.ops = None
         for t in tokens[1:]:
-            if t == "@draft":
-                self.draft = True
+            if t in DRAFT_VARS:
+                self.draft = DRAFT_VARS[t]
             elif t.startswith("@o="):
                 self.ops = {o for o in t[3:].split(",") if o}
             elif t.startswith("@ub="):
@@ -181,6 +181,25 @@ class Arm:
         if not path.is_file():
             raise Skip(f"no {path}" + (", run 00-build.bat stable" if self.stable else ", run 00-build.bat"))
         return path.resolve()
+
+
+# the -md model of an arm: @draft takes the MTP head, @dflash a DFlash draft (--spec-type draft-dflash in the arm)
+DRAFT_VARS = {"@draft": "SPECDRAFT", "@dflash": "DFLASHDRAFT"}
+
+
+def arm_drafts(arms):
+    """the draft models the arms ask for that are set, by variable"""
+    return {v: model_path(v) for v in sorted({a.draft for a in arms if a.draft}) if env(v)}
+
+
+def arm_draft(arm, drafts):
+    """the -md model of the arm, None without @draft / @dflash"""
+    if not arm.draft:
+        return None
+    if arm.draft not in drafts:
+        tok = next(t for t, v in DRAFT_VARS.items() if v == arm.draft)
+        raise Skip(f"{arm.draft} is not set, it is the draft model of {tok}")
+    return drafts[arm.draft]
 
 
 def parse_arms(name, default=""):
@@ -1218,7 +1237,7 @@ def cmd_decode():
     run = Run("decode")
     model = model_path()
     arms = parse_arms("DECARMS", "none")
-    draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
+    drafts = arm_drafts(arms)
     ctx, ngen, port = env_int("DECCTX", 262144), env_int("DECNGEN", 1024), env_int("DECPORT", 8097)
     seeds = env_ints("DECSEEDS", "1 2")
     try:
@@ -1259,21 +1278,20 @@ def cmd_decode():
                 continue
             label = f"{arm.name}-p{prefix}"
             try:
-                if arm.draft and not draft:
-                    raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+                draft = arm_draft(arm, drafts)
                 exe = arm.binary("llama-server")
             except Skip as e:
                 results[arm.name, prefix] = f"skip: {e}"
                 continue
             folders[arm.name] = exe.parent
-            args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1,
+            args = [str(a) for a in ["-m", model, *(["-md", draft] if draft else []), "-c", ctx, "-np", 1,
                     "-fa", "on", "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")),
                     *warmup_args(), *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
             # the timing of every ubatch (one stderr line each) for the table of the prompt ubatches
             run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1"})
             identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
-                        "draft": model_identity(draft) if arm.draft else None, "sampling": sampling,
+                        "draft": model_identity(draft) if draft else None, "sampling": sampling,
                         "requests": [[name, text_digest(text), seed, n] for name, text, seed, n in requests],
                         "rows": text_digest(rows_text), "machine": machine()}
             try:
@@ -1300,14 +1318,13 @@ def cmd_decode():
                 continue
             label = f"{arm.name}-chat"
             try:
-                if arm.draft and not draft:
-                    raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+                draft = arm_draft(arm, drafts)
                 exe = arm.binary("llama-server")
             except Skip as e:
                 results[arm.name, "chat"] = f"skip: {e}"
                 continue
             folders[arm.name] = exe.parent
-            args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1,
+            args = [str(a) for a in ["-m", model, *(["-md", draft] if draft else []), "-c", ctx, "-np", 1,
                     "-fa", "on", "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")),
                     *warmup_args(), *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
             # the timing of every ubatch (one stderr line each), for the host share of the verify and draft steps at
@@ -1315,7 +1332,7 @@ def cmd_decode():
             run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1"})
             identity = {"v": VERSION, "kind": "decode-chat", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
-                        "draft": model_identity(draft) if arm.draft else None, "sampling": sampling,
+                        "draft": model_identity(draft) if draft else None, "sampling": sampling,
                         "chats": [[c, [[text_digest(t), n] for t, n in turns]] for c, turns in chats], "machine": machine()}
             try:
                 results[arm.name, "chat"] = run.measure(label, identity,
@@ -1519,7 +1536,7 @@ def cmd_profile():
     model = model_path()
     vulkan = env("BACKEND") == "vulkan"
     arms = parse_arms("PROFARMS", "default")
-    draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
+    drafts = arm_drafts(arms)
     prefixes = env_ints("PROFPREFIX", "0 500000")
     part, ntg = env_int("PROFPART", 16000), env_int("PROFTG", 16)
     ctx, port = env_int("DECCTX", 262144), env_int("DECPORT", 8097)
@@ -1530,8 +1547,7 @@ def cmd_profile():
     results = {}
     for arm in arms:
         try:
-            if arm.draft and not draft:
-                raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+            draft = arm_draft(arm, drafts)
             exe = arm.binary("llama-server")
         except Skip as e:
             run.add("", f"{arm.name}: skip: {e}")
@@ -1541,7 +1557,7 @@ def cmd_profile():
         if not arm_prefixes:
             run.add("", f"{arm.name}: skip: none of its depths {sorted(arm.depths)} is in PROFPREFIX")
             continue
-        args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1, "-fa", "on",
+        args = [str(a) for a in ["-m", model, *(["-md", draft] if draft else []), "-c", ctx, "-np", 1, "-fa", "on",
                 "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
                 *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
         run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1",
@@ -1549,7 +1565,7 @@ def cmd_profile():
         identity = {"v": VERSION, "kind": "profile-server", "build": build_id(exe.parent), "args": args,
                     "env": env_identity(run_env), "model": model_identity(model), "prefixes": arm_prefixes, "part": part,
                     "tg": ntg, "corpus": text_digest(corpus[:max(arm_prefixes) + part]), "machine": machine(),
-                    "draft": model_identity(draft) if arm.draft else None}
+                    "draft": model_identity(draft) if draft else None}
 
         def go(log):
             proc, log = start_server(exe, args, run_env, log)
@@ -2020,7 +2036,7 @@ def cmd_trace():
     nsys = nsys_path() if cuda else None
     model = model_path()
     arms = parse_arms("TRACEARMS", "default")
-    draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
+    drafts = arm_drafts(arms)
     ctx, port, gen = env_int("DECCTX", 262144), env_int("DECPORT", 8097), env_int("TRACEGEN", 64)
     gap = float(env("TRACEGAP", "20"))
     corpus = Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
@@ -2046,8 +2062,7 @@ def cmd_trace():
     base_turns = turns
     for arm in arms:
         try:
-            if arm.draft and not draft:
-                raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+            draft = arm_draft(arm, drafts)
             exe = arm.binary("llama-server")
         except Skip as e:
             run.add("", f"{arm.name}: skip: {e}")
@@ -2057,7 +2072,7 @@ def cmd_trace():
         if arm.env.get("TRACECHAT"):
             turns, spec = chat_turns(arm.env["TRACECHAT"])
             run.add("", f"{arm.name}: a conversation of {spec[0]} chars and {spec[1]} turns of {spec[2]}")
-        args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1, "-fa", "on",
+        args = [str(a) for a in ["-m", model, *(["-md", draft] if draft else []), "-c", ctx, "-np", 1, "-fa", "on",
                 "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
                 *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
         run_env = arm_env(arm, {"LLAMA_TRACE_REQUESTS": f"2:{1 + len(turns)}", "LLAMA_INPUT_TIMING": "1"})
@@ -2067,7 +2082,7 @@ def cmd_trace():
         nsys_arm = cuda and arm.env.get("TRACE_TIMELINE") != "1"
         identity = {"v": VERSION, "kind": "trace", "build": build_id(exe.parent), "args": args,
                     "env": env_identity(run_env), "model": model_identity(model),
-                    "draft": model_identity(draft) if arm.draft else None, "turns": [text_digest(t) for t in turns],
+                    "draft": model_identity(draft) if draft else None, "turns": [text_digest(t) for t in turns],
                     "gen": gen, "gap": gap, "tool": nsys.parent.parent.name if nsys_arm else "timeline",
                     "analysis": 3, "machine": machine()}  # 2: CUDA graphs and the CPU splits counted (14.10), 3: CPU nodes
         base = run.dir / arm.name
@@ -2167,24 +2182,23 @@ def cmd_starts():
     run = Run("starts")
     model = model_path()
     arms = parse_arms("STARTARMS", "default @draft --spec-auto")
-    draft = model_path("SPECDRAFT") if env("SPECDRAFT") and any(a.draft for a in arms) else None
+    drafts = arm_drafts(arms)
     n_starts, ctx, port = env_int("STARTS", 10), env_int("DECCTX", 262144), env_int("DECPORT", 8097)
     run.add(f"starts: {n_starts} starts of llama-server per arm, one try each, {model.name}, build {current_build()}", "")
     rows = []
     for arm in arms:
         try:
-            if arm.draft and not draft:
-                raise Skip("SPECDRAFT is not set, it is the draft model of @draft")
+            draft = arm_draft(arm, drafts)
             exe = arm.binary("llama-server")
         except Skip as e:
             run.add(f"{arm.name}: skip: {e}")
             continue
-        args = [str(a) for a in ["-m", model, *(["-md", draft] if arm.draft else []), "-c", ctx, "-np", 1, "-fa", "on",
+        args = [str(a) for a in ["-m", model, *(["-md", draft] if draft else []), "-c", ctx, "-np", 1, "-fa", "on",
                 "--repeat-penalty", "1.0", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(),
                 *split_args(env("DECARGS")), *arm.args, "--host", "127.0.0.1", "--port", port, "-lv", 4]]
         run_env = arm_env(arm, {"LLAMA_LOAD_WATCH_EXIT": env("STARTWATCH", "45")})
         identity = {"v": VERSION, "kind": "starts", "build": build_id(exe.parent), "args": args, "env": env_identity(run_env),
-                    "model": model_identity(model), "draft": model_identity(draft) if arm.draft else None,
+                    "model": model_identity(model), "draft": model_identity(draft) if draft else None,
                     "starts": n_starts, "machine": machine()}
         url = f"http://127.0.0.1:{port}"
 

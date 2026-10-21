@@ -19,6 +19,10 @@ set "MODEL=C:\models\qwen3-next.gguf"
 rem the MTP draft gguf, for the arms of 04-decode with @draft
 set "SPECDRAFT="
 
+rem the DFlash draft gguf, for the arms with @dflash (dflash-Qwen3.8-Flash-Next-Q8_0.gguf of
+rem ggml-org/Qwen3.8-Flash-Next-GGUF or incoai/Qwen3.8-Flash-Next-DFlash2-GGUF); an arm without it is skipped
+set "DFLASHDRAFT="
+
 rem plain text for 03-quality and the long prompts of 04-decode (get-wikitext.bat downloads one)
 set "PPLFILE=%~dp0wikitext-2-raw\wiki.test.raw"
 
@@ -349,7 +353,11 @@ rem stall in 20: the default since, and a failed buffer is asked for again after
 rem 16.10: auto after the merge of master, see CHECKOPS
 if not defined RUN_DECODE set "RUN_DECODE=1"
 rem 21.10: qsachk on a chat of its own (DECCHAT among the variables of the arm), see QARMS
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
+rem 22.10: DFlash2 (the draft of DFLASHDRAFT instead of the MTP head; upstream 18a0777a5 gives it the mean of the hc
+rem streams it was trained on) with 3 draft tokens as in the numbers of its authors (dflash) and with --spec-auto
+rem (dflashauto: the length from the acceptance per position, no per-token gate as for MTP), against auto
+rem [replaced 22.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflashauto @dflash --spec-type draft-dflash --spec-auto"
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -678,7 +686,11 @@ rem (2.29 against 1.26 per step, 2.59 tokens per step against 2.09), the texts a
 rem 16.10: auto after the merge of master, see QARMS
 if not defined RUN_DECODE set "RUN_DECODE=1"
 rem 21.10: qsachk on a chat of its own, see the 395
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
+rem 22.10: DFlash2 as on the 395, plus 2 draft tokens (dflash2, the best MTP length here): a verified token costs
+rem ~19 ms of cpu experts, the draft only pays with more tokens accepted per step; the 2 GB of the MTP head stay
+rem free, --moe-cache auto takes them for slots
+rem [replaced 22.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflash2 @dflash --spec-type draft-dflash --spec-draft-n-max 2;dflashauto @dflash --spec-type draft-dflash --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"

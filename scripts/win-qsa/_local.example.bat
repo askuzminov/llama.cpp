@@ -14,13 +14,15 @@ rem the first run on a machine measures everything, there are no kept results ye
 rem "stable @stable" needs 00-build.bat stable once (a build-stable of the old 35-build-stable.bat
 rem works as it is).
 
-rem ---- needed: the model and the MTP draft ----
+rem ---- needed: the model and the MTP draft (the DFlash draft for the arms with @dflash) ----
 rem 395:
 rem set "MODEL=C:\Users\AI\Downloads\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
 rem set "SPECDRAFT=C:\Users\AI\Downloads\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"
+rem set "DFLASHDRAFT=C:\Users\AI\Downloads\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\dflash-Qwen3.8-Flash-Next-Q8_0.gguf"
 rem 3090:
 rem set "MODEL=E:\ml\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
 rem set "SPECDRAFT=E:\ml\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"
+rem set "DFLASHDRAFT=E:\ml\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\dflash-Qwen3.8-Flash-Next-Q8_0.gguf"
 
 rem ---- needed on the 3090: -ncmoe that fits the card (the default is 30) ----
 rem the static layout of 03: llama-perplexity has no expert cache. 04-decode and 05-profile
