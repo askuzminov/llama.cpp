@@ -43,7 +43,8 @@ public:
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx);
 
-    ~llama_memory_hybrid_idx_fork() = default;
+    // reports the comparisons of LLAMA_QSA_CHECK
+    ~llama_memory_hybrid_idx_fork();
 
     //
     // llama_memory_i

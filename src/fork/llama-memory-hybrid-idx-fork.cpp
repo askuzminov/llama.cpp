@@ -7,6 +7,7 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -19,6 +20,20 @@
 //
 // llama_memory_hybrid_idx_fork
 //
+
+// LLAMA_QSA_CHECK: the carried groupings compared with a full one, and the kept pool prefixes compared with a full
+// comparison, so that a run shows the check ran (an arm of 03 / 04 that never takes the carried path proves nothing)
+static std::atomic<int64_t> g_qsa_check_groups{0};
+static std::atomic<int64_t> g_qsa_check_pools{0};
+
+llama_memory_hybrid_idx_fork::~llama_memory_hybrid_idx_fork() {
+    const int64_t n_groups = g_qsa_check_groups.exchange(0);
+    const int64_t n_pools  = g_qsa_check_pools.exchange(0);
+    if (n_groups > 0 || n_pools > 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_QSA_CHECK: %lld carried groupings and %lld kept pool prefixes compared, all equal\n",
+                __func__, (long long) n_groups, (long long) n_pools);
+    }
+}
 
 static bool qsa_kv_host(const llama_model & model, ggml_type type_k, ggml_type type_v, bool v_trans) {
     const char * value = getenv("LLAMA_QSA_KV_HOST");
@@ -981,6 +996,12 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
             if (!same) {
                 GGML_ABORT("qsa: the carried grouping differs from the full one (LLAMA_QSA_CHECK)");
             }
+            // at 1, 2, 4, ... so that a killed server leaves the count in its log; WARN, as llama-perplexity shows no INFO
+            const int64_t n = ++g_qsa_check_groups;
+            if ((n & (n - 1)) == 0) {
+                LLAMA_LOG_WARN("%s: LLAMA_QSA_CHECK: %lld carried groupings matched the full one, %lld kept pool prefixes so far\n",
+                        __func__, (long long) n, (long long) g_qsa_check_pools.load());
+            }
         }
 
         // how much of the pool still stands. a block is the same block while it pools the same
@@ -1018,6 +1039,10 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
 
         if (inc_check && g.n_keep != keep_from(0)) {
             GGML_ABORT("qsa: the pool prefix of the carried grouping differs from the full comparison (LLAMA_QSA_CHECK)");
+        }
+        // a full grouping starts the comparison at block 0 anyway: count the carried ones
+        if (inc_check && g.n_same > 0) {
+            g_qsa_check_pools++;
         }
     }
 

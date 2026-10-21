@@ -518,9 +518,9 @@ def retryable(code, text):
     return any(s in text for s in MEMORY_ERRORS) or (code & 0xffffffff >= 0xC0000000 and "error" not in text.lower())
 
 
-def execute(cmd, log, run_env, stdout=None, model=True, check=True):
-    """Run cmd with its output in log, its stdout in a separate file when given. A model run that fails on memory gets
-    two more tries after longer waits: the driver frees the memory of the previous process lazily."""
+def execute(cmd, log, run_env, stdout=None, model=True, check=True, cwd=None):
+    """Run cmd with its output in log, its stdout in a separate file when given, in cwd when given. A model run that
+    fails on memory gets two more tries after longer waits: the driver frees the memory of the previous process lazily."""
     cmd = [str(c) for c in cmd]
     if model:
         no_server_running()
@@ -533,7 +533,7 @@ def execute(cmd, log, run_env, stdout=None, model=True, check=True):
             f.flush()
             out = stdout.open("w", encoding="utf-8") if stdout else f
             try:
-                code = subprocess.run(cmd, stdout=out, stderr=f, env=run_env).returncode
+                code = subprocess.run(cmd, stdout=out, stderr=f, env=run_env, cwd=cwd).returncode
             finally:
                 if stdout:
                     out.close()
@@ -783,6 +783,32 @@ def cmd_check():
             # 0/0: the backend supports none of the cases
             rows.append([" ".join(op), arm.name, f"{r['passed']}/{r['total']}" + ("" if ok else " FAIL") + (" k" if kept else "")])
             fails.extend(f"  {op[0]} {arm.name}: {s}" for s in r["fails"])
+    # the fork's unit tests (tests/tests-fork.cmake) that build on this machine: an exit code of 0 passes. each runs in
+    # its own folder of the run, test-row-cache writes its table file next to it. CHECKUNITS=none: none
+    units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill"))
+    for name in units:
+        try:
+            exe = Arm("default").binary(name)
+        except Skip as e:
+            rows.append([name, "unit", f"skip: {e}"])
+            continue
+        work = run.dir / name
+        identity = {"v": VERSION, "kind": "unit", "build": build_id(exe.parent), "test": name, "machine": machine()}
+
+        def go_unit(log, exe=exe, work=work):
+            work.mkdir(parents=True, exist_ok=True)
+            code, text = execute([exe], log, os.environ.copy(), model=False, check=False, cwd=work)
+            return {"code": code, "error": "" if code == 0 else f"{exit_text(code)}: {last_error(text)}"}
+
+        try:
+            r, kept = run.measure(name, identity, go_unit)
+        except Fail as e:
+            run.failed = True
+            rows.append([name, "unit", f"FAIL {e}"])
+            continue
+        ok = r["code"] == 0
+        run.failed |= not ok
+        rows.append([name, "unit", ("passed" if ok else f"FAIL {r['error']}") + (" k" if kept else "")])
     run.add(f"check: test-backend-ops on {device} against the CPU, build {current_build()}", "",
             *table(["op", "arm", "passed"], rows))
     if fails:
@@ -918,7 +944,7 @@ def cmd_quality():
 # ---------------------------------------------------------------- decode
 
 # the server log lines a result keeps; DECGREP picks from them for the summary
-KEPT_LINES = r"moe_cache:|moe_stats|phase_mem:|sched_prof|buffer size|QSA KV"
+KEPT_LINES = r"moe_cache:|moe_stats|phase_mem:|sched_prof|buffer size|QSA KV|LLAMA_QSA_CHECK"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -1207,15 +1233,21 @@ def cmd_decode():
     # PPLFILE: the first turn is start chars and a question, then turns (DECCHATTURNS) turns of add (DECCHATADD) more
     # chars and a question each, DECCHATGEN tokens per answer. what a chat sees: the new part of a turn at the depth so
     # far; "0:30:16000" is a document read in parts of about 4K tokens up to about 120K, the speed against the length
-    chat_specs = []
-    for item in split_args(env("DECCHAT", "")):
-        parts = [int(x) for x in item.split(":")]
-        chat_specs.append((parts[0], parts[1] if len(parts) > 1 else env_int("DECCHATTURNS", 3),
-                           parts[2] if len(parts) > 2 else env_int("DECCHATADD", 2000)))
+    # an arm can have its own conversations: DECCHAT=... among its variables (as a check arm on a shorter chat)
+    def parse_chats(text):
+        specs = []
+        for item in split_args(text):
+            parts = [int(x) for x in item.split(":")]
+            specs.append((parts[0], parts[1] if len(parts) > 1 else env_int("DECCHATTURNS", 3),
+                          parts[2] if len(parts) > 2 else env_int("DECCHATADD", 2000)))
+        return specs
+
+    chat_specs = parse_chats(env("DECCHAT", ""))
+    arm_chat_specs = {arm.name: parse_chats(arm.env["DECCHAT"]) for arm in arms if arm.env.get("DECCHAT")}
     chat_starts = [c[0] for c in chat_specs]
     chat_gen = env_int("DECCHATGEN", 256)
     corpus = (Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
-              if max(prefixes, default=0) > 0 or chat_specs else "")
+              if max(prefixes, default=0) > 0 or chat_specs or arm_chat_specs else "")
     results = {}
     folders = {}
     for prefix in prefixes:
@@ -1250,15 +1282,22 @@ def cmd_decode():
             except Fail as e:
                 run.failed = True
                 results[arm.name, prefix] = f"FAIL {e}"
-    chats = []
-    for start, n_turns, add_chars in chat_specs:
-        turns = [((corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", chat_gen)]
-        for ti in range(n_turns):
-            add = corpus[start + ti*add_chars:start + (ti + 1)*add_chars]
-            turns.append((add + "\n\nAnd this part, in two sentences?", chat_gen))
-        chats.append((f"c{start}-{add_chars}", turns))  # two conversations from one start differ by their turns
-    if chats:
+    def build_chats(specs):
+        chats = []
+        for start, n_turns, add_chars in specs:
+            turns = [((corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", chat_gen)]
+            for ti in range(n_turns):
+                add = corpus[start + ti*add_chars:start + (ti + 1)*add_chars]
+                turns.append((add + "\n\nAnd this part, in two sentences?", chat_gen))
+            chats.append((f"c{start}-{add_chars}", turns))  # two conversations from one start differ by their turns
+        return chats
+
+    chats_of = {arm.name: build_chats(arm_chat_specs.get(arm.name, chat_specs)) for arm in arms}
+    if any(chats_of.values()):
         for arm in arms:
+            chats = chats_of[arm.name]
+            if not chats:
+                continue
             label = f"{arm.name}-chat"
             try:
                 if arm.draft and not draft:
@@ -1375,10 +1414,12 @@ def cmd_decode():
             other = [x["name"] for x, y in zip(ra[0]["rows"], rb[0]["rows"]) if x["answer"] != y["answer"]]
             run.failed |= bool(other)
             run.add(f"same answers {pair}: " + ("all" if not other else "differ in " + " ".join(other)))
-    if chats:
+    if any(chats_of.values()):
         # one row per turn: the depth is what the cache held plus the new part
         rows = []
         for arm in arms:
+            if not chats_of[arm.name]:
+                continue
             entry = results.get((arm.name, "chat"))
             if not isinstance(entry, tuple):
                 rows.append([arm.name, "", "", "", "", "", entry or "skip"])
@@ -1388,9 +1429,17 @@ def cmd_decode():
                 rows.append([arm.name, x["conv"][1:], x["turn"], x["cache_n"] + x["prompt_n"], x["prompt_n"],
                              f"{rate(x['prompt_n'], x['prompt_ms']):.1f}", f"{rate(x['n'], x['ms']):.2f}",
                              f"{x['draft_acc']}/{x['draft_n']}" if x["draft_n"] else "-"] + (["k"] if kept else []))
-        run.add("", f"chat: conversations (start:turns:chars) {' '.join(f'{a}:{b}:{c}' for a, b, c in chat_specs)} of "
+        own = "".join(f"; {name}: {' '.join(f'{a}:{b}:{c}' for a, b, c in specs)}" for name, specs in arm_chat_specs.items())
+        run.add("", f"chat: conversations (start:turns:chars) {' '.join(f'{a}:{b}:{c}' for a, b, c in chat_specs)}{own} of "
                 f"{Path(env('PPLFILE')).name}, {chat_gen} tokens per answer, prompt cache on",
                 *table(["arm", "start-chars", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
+        # an arm with LLAMA_QSA_CHECK: how many carried groupings it compared (the server aborts on a difference)
+        for arm in arms:
+            entry = results.get((arm.name, "chat"))
+            if isinstance(entry, tuple) and arm.env.get("LLAMA_QSA_CHECK"):
+                checks = [x for x in entry[0].get("extra", []) if "LLAMA_QSA_CHECK" in x]
+                run.add(f"{arm.name}: " + (re.sub(r"^.*?LLAMA_QSA_CHECK: ", "", checks[-1]) if checks
+                                           else "LLAMA_QSA_CHECK compared no carried grouping"))
     run.add(*details)
     return run.finish()
 
@@ -2343,6 +2392,51 @@ def cmd_build_stable():
     return run.finish()
 
 
+def config_dead_lines(path=None):
+    """The lines of _config.bat that never take effect: "if not defined X set" where an earlier line on the path of
+    every machine that runs it has set X already (the first set wins). A machine goes through the 395 / vulkan block or
+    jumps to :cuda_defaults, both end in the common block after :defaults_done. Variables set in any other way (set
+    without the condition, cleared by another test) are left out. Returns (line number, variable) pairs."""
+    path = path or HERE / "_config.bat"
+    try:
+        lines = path.read_text(encoding="ascii", errors="replace").splitlines()
+    except OSError:
+        return []
+    pattern = re.compile(r'^if not defined (\w+)\s+set "\1=')
+    other = set()
+    for line in lines:
+        m = re.match(r'^\s*(?:if .*?\s)?set "(\w+)=', line, re.I)
+        if m and not pattern.match(line):
+            other.add(m.group(1))
+    jump = next((i for i, l in enumerate(lines) if l.strip().lower().startswith('if /i "%backend%"=="cuda" goto :cuda_defaults')), None)
+    if jump is None or not any(l.strip() == ":cuda_defaults" for l in lines) or not any(l.strip() == ":defaults_done" for l in lines):
+        return []
+
+    def on_path(cuda):
+        skip = None
+        for i, line in enumerate(lines):
+            if skip:
+                if line.strip() == skip:
+                    skip = None
+                continue
+            yield i
+            if cuda and i == jump:
+                skip = ":cuda_defaults"
+            elif not cuda and line.strip().lower() == "goto :defaults_done":
+                skip = ":defaults_done"
+
+    dead = {}
+    for cuda in (False, True):
+        seen = set()
+        for i in on_path(cuda):
+            m = pattern.match(lines[i])
+            if not m or m.group(1) in other:
+                continue
+            dead.setdefault(i, []).append(m.group(1) in seen)
+            seen.add(m.group(1))
+    return [(i + 1, pattern.match(lines[i]).group(1)) for i in sorted(dead) if all(dead[i])]
+
+
 COMMANDS = {"starts": cmd_starts, "check": cmd_check, "quality": cmd_quality, "decode": cmd_decode,
             "profile": cmd_profile, "kernels": cmd_kernels, "trace": cmd_trace, "build-begin": cmd_build_begin,
             "build-end": cmd_build_end, "build-stable": cmd_build_stable}
@@ -2354,6 +2448,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=COMMANDS)
     command = parser.parse_args().command
+    # a line of _config.bat that an earlier one shadows changes nothing: editing it measures other arms than meant
+    for line, name in config_dead_lines():
+        print(f"warning: _config.bat:{line}: {name} is set by an earlier line on every path through it, this line has "
+              f"no effect", file=sys.stderr)
     try:
         return COMMANDS[command]()
     except (Fail, Skip) as e:

@@ -11,11 +11,36 @@ target_include_directories(test-prompt-cache-spill PRIVATE
     ${PROJECT_SOURCE_DIR}/tools/mtmd)
 target_link_libraries(test-prompt-cache-spill PRIVATE server-context)
 
-if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+# the row cache test calls internal functions of libllama. a Windows DLL exports LLAMA_API only, so there the test is
+# built from the sources of the row cache and llama_file, with the two helpers of llama-impl.cpp that they use
+# (test-row-cache-impl-fork.cpp). LLAMA_FORK_ROW_CACHE_STANDALONE=ON builds it that way on any platform
+if (WIN32 AND BUILD_SHARED_LIBS)
+    set(LLAMA_FORK_ROW_CACHE_STANDALONE_DEFAULT ON)
+else()
+    set(LLAMA_FORK_ROW_CACHE_STANDALONE_DEFAULT OFF)
+endif()
+option(LLAMA_FORK_ROW_CACHE_STANDALONE "fork: build test-row-cache from the sources it tests" ${LLAMA_FORK_ROW_CACHE_STANDALONE_DEFAULT})
+
+if (LLAMA_FORK_ROW_CACHE_STANDALONE)
+    add_executable(test-row-cache
+        test-row-cache.cpp
+        test-row-cache-impl-fork.cpp
+        ${PROJECT_SOURCE_DIR}/src/fork/llama-row-cache-fork.cpp
+        ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp)
+    target_include_directories(test-row-cache PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test-row-cache PRIVATE ggml)
+    target_compile_features(test-row-cache PRIVATE cxx_std_17)
+    add_test(NAME test-row-cache COMMAND $<TARGET_FILE:test-row-cache>)
+    set_property(TEST test-row-cache PROPERTY LABELS main)
+elseif (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # internal functions not exported with LLAMA_API (as the upstream block of the same condition)
     llama_build_and_test(test-row-cache.cpp)
     target_include_directories(test-row-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # the models of this matrix come from test-llama-archs (the generate-models fixture), which upstream builds under
+    # the same condition: on a Windows DLL build there are none
     # partial (PARTIAL_ONLY) context checkpoints, one test per memory family:
     # plain attention, iSWA, hybrid (attention + recurrent) and pure recurrent
     foreach(CKPT_MODEL llama-dense gemma2-dense phi3-dense granitehybrid-dense nemotron_h-dense falcon-h1-dense mamba2-dense)

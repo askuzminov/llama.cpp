@@ -116,8 +116,8 @@ rem of transformers (f711c8f30), the ngram cache saved on exit (83c2d012a; ours 
 rem LLAMA_NGRAM_CACHE_KEEP=1 = upstream). the Mac: the ops of the model, f16reg emulated, KLD against the build before
 rem the merge 1e-6 (experts on the gpu, on the cpu, the moe cache). the same run again: 01, 03, 04 auto
 if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16"
-if not defined CHECKOPS    set "CHECKOPS=MUL_MAT type_a=q8_0,type_b=f16;MUL_MAT type_a=q4_K,type_b=f16;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;TOP_K;FLASH_ATTN_LIST"
-if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
+rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=MUL_MAT type_a=q8_0,type_b=f16;MUL_MAT type_a=q4_K,type_b=f16;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;TOP_K;FLASH_ATTN_LIST"
+rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
 rem 13.10 (19d20ba8): wide 53/53, but the attention at 122880 903.4 against 904.2 ms, PP 785.1 against 783.1: the
 rem staging is not what holds the tile either. off, the switch stays. the folded tile reads 17 GB of K/V per layer
 rem and ubatch at 229 GB/s, the DRAM rate, while each cell is read 66 times by different tokens. kv4/kv8/kv16
@@ -146,14 +146,20 @@ rem 15.10 (dabe4f1a): 01 with rows8 / rows16 ran the CHECKOPS above (all passed)
 rem this run came after them. the int8 path with GGML_VK_DMMV_ID_ROWS is not checked; the switch stays off (05)
 rem 16.10: the run after the merge of master, see CHECKOPS
 if not defined RUN_CHECK   set "RUN_CHECK=1"
-if not defined QARMS       set "QARMS=default"
+rem 21.10: qsachk (LLAMA_QSA_CHECK=1): each carried QSA grouping (the blocks of the last ubatch kept, only the new
+rem cells grouped) is compared with a full grouping, and the kept prefix of the key pool with a full comparison;
+rem a difference aborts (src/fork/llama-memory-hybrid-idx-fork.cpp). 03: the prompt ubatches of a chunk, the KLD
+rem must be the one of default (the check does not change the math; on CUDA within the spread of repeat). 04: a chat
+rem of 12 turns with MTP, the decode steps and the rollbacks of rejected drafts; its speed is not a result (a full
+rem grouping every step)
+if not defined QARMS       set "QARMS=default;qsachk LLAMA_QSA_CHECK=1"
 if not defined CHECKARMS   set "CHECKARMS=default;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_REPEAT,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 if not defined RUN_QUALITY set "RUN_QUALITY=1"
-if not defined RUN_CHECK   set "RUN_CHECK=0"
-if not defined QARMS       set "QARMS=default;hcf16 LLAMA_HC_F16=1"
-if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
-if not defined CHECKARMS   set "CHECKARMS=default"
-if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
+rem [no effect, an earlier line sets RUN_CHECK] if not defined RUN_CHECK   set "RUN_CHECK=0"
+rem [no effect, an earlier line sets QARMS] if not defined QARMS       set "QARMS=default;hcf16 LLAMA_HC_F16=1"
+rem [no effect, an earlier line sets QARMS] if not defined QARMS       set "QARMS=default;list LLAMA_QSA_FA_LIST=1"
+rem [no effect, an earlier line sets CHECKARMS] if not defined CHECKARMS   set "CHECKARMS=default"
+rem [no effect, an earlier line sets CHECKARMS] if not defined CHECKARMS  set "CHECKARMS=default;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 rem nofusion: the same math with other rounding, it shows how far rounding alone moves the model. upstream: the
 rem upstream qwen4exp and its QSA memory instead of the fork's copies (LLAMA_UPSTREAM, src/fork/llama-fork.h); it
 rem loads the PLE table whole if that version does not read it lazily, a FAIL on memory is then expected
@@ -164,7 +170,7 @@ rem arm is off. 09.10: pool32 (QSA key pool in f32, LLAMA_QSA_POOL_F32) KLD 0.01
 rem the arm is off
 rem 10.10 evening: f16reg (the experts on f16 activations, the default since 11.10) KLD 0.015735 against 0.016057 of
 rem the int8 path (nofusion 0.016073), same top 96.06 against 95.97 percent. int8: the int8 path (GGML_VK_MMID_F16REG=0)
-if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;int8 GGML_VK_MMID_F16REG=0"
+rem [no effect, an earlier line sets QARMS] if not defined QARMS      set "QARMS=default;nofusion GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1;upstream LLAMA_UPSTREAM=qwen4exp;int8 GGML_VK_MMID_F16REG=0"
 rem the server setup of models.ini: an agent turn is a prompt of one ubatch below 4096 tokens
 rem 13.10 (19d20ba8): -b 16384 took the 118K prompt at 814.6 t/s against 797.4 with -b 4096 (+2.2 percent, one build;
 rem the PLE rows of the next ubatch are gathered while one computes, the log line is there). the default since then
@@ -342,8 +348,10 @@ rem allocate once, a model buffer right at the start once), dfirst 9 of 10 (a mo
 rem stall in 20: the default since, and a failed buffer is asked for again after 2 s (GGML_ALLOC_RETRY, 3)
 rem 16.10: auto after the merge of master, see CHECKOPS
 if not defined RUN_DECODE set "RUN_DECODE=1"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
-if not defined RUN_DECODE set "RUN_DECODE=0"
+rem 21.10: qsachk on a chat of its own (DECCHAT among the variables of the arm), see QARMS
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
+rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
+rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
 if not defined RUN_TRACE  set "RUN_TRACE=0"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
@@ -365,12 +373,12 @@ if not defined PROFPREFIX set "PROFPREFIX=0 500000 800000"
 if not defined PROFTG     set "PROFTG=64"
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
 
-if not defined RUN_QUALITY set "RUN_QUALITY=0"
+rem [no effect, an earlier line sets RUN_QUALITY] if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem the sparse path starts at KV 4104 (2 x n_kv_max with f16 K/V, upstream). by the profiles of 13.10 it takes about
 rem 800 ms in its loop per 4096 prompt at any depth, the dense one 302 at depth 0 and grows with KV: 2048 to 16384
 rem against dense (GGML_VK_FA_SPARSE_DISABLE=1) find the crossing
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
-if not defined DECPREFIX  set "DECPREFIX=0 500000"
+rem [no effect, an earlier line sets DECPREFIX] if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 07.10, stable and default in one run after the warmup: PP +20 to +40 percent, TG from -1.6 to +4.5 percent. the 64x128
 rem int8 tile on the dense matmuls is the default since then (PP +1.5 percent at depth 0)
 rem 07.10, after the PLE warmup: default PP 843.7 at depth 0 against 838.1 without HC_POST_NORM and 836.0 without the
@@ -447,9 +455,9 @@ rem 13.10 night: hcf16, the GPU time of the HC ops with the normalized streams i
 rem 13.10 night (fdd7d181): hcf16 -1.2 percent of the prompt GPU time at 118K (4550 -> 4496 ms), but only 45 of 93
 rem combines fused: the f16 copy took the memory of the combine's dead inputs and Vulkan dropped the fusion; the cast
 rem keeps them alive since then (Mac: all fused). again
-if not defined PROFARMS   set "PROFARMS=default;hcf16 LLAMA_HC_F16=1"
+rem [no effect, an earlier line sets PROFARMS] if not defined PROFARMS   set "PROFARMS=default;hcf16 LLAMA_HC_F16=1"
 rem 14.10: hcf16 -2.8 / -3.0 / -2.7 percent at 0 / 15K / 118K with all 93 combines fused
-if not defined RUN_PROFILE set "RUN_PROFILE=1"
+rem [no effect, an earlier line sets RUN_PROFILE] if not defined RUN_PROFILE set "RUN_PROFILE=1"
 rem 06.10: the sweep of the int8 tiles is done (64x128 best on the dense shapes), 06-kernels waits for new kernels
 if not defined KERNARMS   set "KERNARMS=default"
 if not defined RUN_KERNELS set "RUN_KERNELS=0"
@@ -482,8 +490,9 @@ rem silu / expf (42b70032b, the experts in RAM). the Mac does not build CUDA. th
 if not defined CHECKOPS   set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT"
 if not defined RUN_CHECK  set "RUN_CHECK=1"
 if not defined RUN_QUALITY set "RUN_QUALITY=1"
-if not defined QARMS      set "QARMS=default"
-if not defined QARMS      set "QARMS=default;pf3 GGML_SCHED_PREFETCH=3"
+rem 21.10: qsachk, see the 395
+if not defined QARMS      set "QARMS=default;qsachk LLAMA_QSA_CHECK=1"
+rem [no effect, an earlier line sets QARMS] if not defined QARMS      set "QARMS=default;pf3 GGML_SCHED_PREFETCH=3"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 rem 10.10: -b 8192 -ub 8192 (n2ub8k): the 118K prompt at 607.0 t/s against 527.6 with 4096, --phase-mem took ubatch
 rem 6656 at 106K cells and 5888 at 120K (the memory); TG 26.86 against 27.40, acceptance 0.512 against 0.523 (text)
@@ -668,7 +677,9 @@ rem fit before the next one and the GPU waits; the acceptance 0.69 against 0.86 
 rem (2.29 against 1.26 per step, 2.59 tokens per step against 2.09), the texts are fine. off
 rem 16.10: auto after the merge of master, see QARMS
 if not defined RUN_DECODE set "RUN_DECODE=1"
-if not defined RUN_DECODE set "RUN_DECODE=0"
+rem 21.10: qsachk on a chat of its own, see the 395
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
+rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"
 rem 15.10 night: a turn of ~500 tokens at 29K took 3.7 s: the prompt ubatch 2.45 (the uploads of the experts), the
@@ -680,7 +691,7 @@ rem 15.10 night (285415bc): nobrk PP 756.1 against 647.4 in the chat to 213K (81
 rem at 0-40K / 80-120K / 200K+), turns of ~550 tokens after 29K 3.62 s against 4.41, TG 27.11 against 27.35; the
 rem part before the last user message ran on its own in 63 of 65 turns of auto, 69 tokens and 0.66 s on average.
 rem the default since (LLAMA_CKPT_USER_BREAK=1: upstream)
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
+rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
@@ -695,9 +706,9 @@ rem the run after the profile of 12.10 night: 01 GET_ROWS for the flat gather of
 rem new eval cases of the qwen4exp shapes), 02 default / maskdense / rowsup (GGML_CUDA_GET_ROWS_FLAT=0, upstream), 05
 rem optime / optimemd again
 rem 12.10 night (7c218166): GET_ROWS 224/224 with the new cases
-if not defined RUN_CHECK   set "RUN_CHECK=0"
+rem [no effect, an earlier line sets RUN_CHECK] if not defined RUN_CHECK   set "RUN_CHECK=0"
 rem 14.10: 03 for the uploads of the experts on a second stream (pf3 in QARMS): measured, see DECARMS
-if not defined RUN_QUALITY set "RUN_QUALITY=0"
+rem [no effect, an earlier line sets RUN_QUALITY] if not defined RUN_QUALITY set "RUN_QUALITY=0"
 rem 14.10: 07-trace, the timeline of a conversation in Nsight Systems: does the upload of pf3 run under the kernels,
 rem and where the GPU waits in a decode step. needs nsys (Nsight Systems, the CUDA toolkit has it; NSYS= its path)
 rem 15.10: 07 measured (see TRACEARMS), not in the next run
@@ -718,7 +729,7 @@ rem slowest thread holds the node). 256 tokens per answer
 if not defined TRACEARMS  set "TRACEARMS=tl TRACE_TIMELINE=1 @draft --spec-auto;tl8 TRACE_TIMELINE=1 @draft --spec-auto -t 8 -C 0x5555 --cpu-strict 1;tl24 TRACE_TIMELINE=1 @draft --spec-auto -t 24;pred TRACE_TIMELINE=1 LLAMA_MOE_CACHE_STATS=64 @draft --spec-auto;deep TRACE_TIMELINE=1 TRACECHAT=400000:2:16000 @draft --spec-auto;deepn TRACECHAT=400000:2:16000 @draft --spec-auto"
 if not defined TRACEGEN   set "TRACEGEN=256"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
-if not defined DECPREFIX  set "DECPREFIX=0 500000"
+rem [no effect, an earlier line sets DECPREFIX] if not defined DECPREFIX  set "DECPREFIX=0 500000"
 rem 09.10, pp8k / ub8k: a prompt of 8192 tokens in two ubatches of 4096 against one of 8192 (with the experts on the
 rem cpu every ubatch uploads nearly all of them over PCIe, a larger ubatch halves that per token): PP 684.7 against
 rem 757.0 at depth 0, 636.2 against 725.0 at 65536 (+14 percent). the arms are off; the server takes -b/-ub 8192 since 10.10
@@ -740,7 +751,7 @@ rem 490 ms: the positions of the selected cells, GET_ROWS [1,8404992] of rows of
 rem maskdense gathers its mask values per token, [1,2052,4096], 13 ms per call; the cells of the blocks [4,2101248]
 rem 7.4 ms in both. upstream gives every row a block of 256 threads, 1 of them busy here: about 450 ms of GET_ROWS per
 rem 4096 prompt with the mask from positions, 245 with maskdense. one thread per element since then (fork/getrows-fork.inc)
-if not defined RUN_PROFILE set "RUN_PROFILE=1"
+rem [no effect, an earlier line sets RUN_PROFILE] if not defined RUN_PROFILE set "RUN_PROFILE=1"
 if not defined PROFARMS    set "PROFARMS=default"
 if not defined KERNARMS   set "KERNARMS=default"
 if not defined RUN_KERNELS set "RUN_KERNELS=0"
@@ -751,7 +762,7 @@ rem from one process to the next on 05.10, the same within a process
 :defaults_done
 rem ---- the same on both ----
 rem 01-check: test-backend-ops ops, "OP [regex of the case parameters]", separated by ;
-if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
+rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
 rem 02-bench (llama-bench) is gone since 13.10: the speed comes from the server (04, DECCHAT), the BENCH* settings
 rem above are history
 rem 03-quality: llama-perplexity, KLD of each arm against QREF (empty: stable when built, else default).
@@ -762,11 +773,11 @@ if not defined QCHUNKS     set "QCHUNKS=2"
 if not defined QUB         set "QUB=2048"
 rem 04-decode: llama-server, one start per arm and DECPREFIX
 if not defined DECCTX      set "DECCTX=262144"
-if not defined DECPROMPTS  set "DECPROMPTS=os db code repeat"
-if not defined DECSEEDS    set "DECSEEDS=1 2"
+rem [no effect, an earlier line sets DECPROMPTS] if not defined DECPROMPTS  set "DECPROMPTS=os db code repeat"
+rem [no effect, an earlier line sets DECSEEDS] if not defined DECSEEDS    set "DECSEEDS=1 2"
 if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
-if not defined DECPREFIX   set "DECPREFIX=0"
+rem [no effect, an earlier line sets DECPREFIX] if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
 if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache: prefetch|moe_cache: [0-9]+ layers|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch|prefetch_issue"
 rem 1: the warmup run of llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds load time and
@@ -777,7 +788,7 @@ if not defined KERNOPS     set "KERNOPS=MUL_MAT_ID n_mats=512,n_used=10,b=0,m=[0
 rem 07-trace: llama-server under nsys profile, the profiler on for the requests of the conversation only: TRACECHAT
 rem start:turns:chars of PPLFILE (as DECCHAT; 120000 is a prompt of ~29K tokens in ubatches of -ub, then a turn of
 rem ~500 tokens), TRACEGEN tokens per answer, TRACEGAP ms of idle GPU that end a stretch of the table
-if not defined RUN_TRACE   set "RUN_TRACE=0"
+rem [no effect, an earlier line sets RUN_TRACE] if not defined RUN_TRACE   set "RUN_TRACE=0"
 rem 08-starts: STARTS starts of each arm of STARTARMS, one try each (the stalls of the load counted)
 if not defined RUN_STARTS  set "RUN_STARTS=0"
 if not defined STARTS      set "STARTS=10"
@@ -787,15 +798,15 @@ if not defined TRACEGEN    set "TRACEGEN=64"
 if not defined TRACEGAP    set "TRACEGAP=20"
 rem 05-profile: on the server, a chat at each depth of PROFPREFIX (chars of PPLFILE), then a part of PROFPART chars
 rem (pp, as a chat turn computes it there) and a reply of PROFTG tokens (tg, one decode step), per op
-if not defined PROFARMS    set "PROFARMS=default"
+rem [no effect, an earlier line sets PROFARMS] if not defined PROFARMS    set "PROFARMS=default"
 if not defined PROFPREFIX  set "PROFPREFIX=0 60000 500000"
 if not defined PROFPART    set "PROFPART=16000"
 if not defined PROFTG      set "PROFTG=16"
 rem run-all.bat
 if not defined RUN_BUILD   set "RUN_BUILD=1"
-if not defined RUN_CHECK   set "RUN_CHECK=1"
-if not defined RUN_QUALITY set "RUN_QUALITY=1"
-if not defined RUN_DECODE  set "RUN_DECODE=1"
+rem [no effect, an earlier line sets RUN_CHECK] if not defined RUN_CHECK   set "RUN_CHECK=1"
+rem [no effect, an earlier line sets RUN_QUALITY] if not defined RUN_QUALITY set "RUN_QUALITY=1"
+rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE  set "RUN_DECODE=1"
 
 rem multi-config generators (msvc) put the binaries in bin\Release, single-config in bin
 set "BIN=%BUILD%\bin\Release"
