@@ -119,6 +119,15 @@ rem 20.10, after the merge of master (df1170213): non-contiguous SUM on Vulkan (
 rem of transformers (f711c8f30), the ngram cache saved on exit (83c2d012a; ours still clears it per prompt,
 rem LLAMA_NGRAM_CACHE_KEEP=1 = upstream). the Mac: the ops of the model, f16reg emulated, KLD against the build before
 rem the merge 1e-6 (experts on the gpu, on the cpu, the moe cache). the same run again: 01, 03, 04 auto
+rem 22.10 (src-f6b60c1e): 01 all passed in both arms, test-row-cache passed, test-prompt-cache-spill crashed with
+rem 0xc0000094 (the test did not call ggml_time_init, ggml_time_us divides by the counter frequency on Windows; fixed);
+rem 03 KLD 0.014951, qsachk 0.015122 (12 carried groupings compared); 04 the chat to 213K PP 768 against 766, TG 38.26
+rem against 38.83, acceptance 0.721 against 0.719 (16.10); qsachk 1024+ carried groupings and 1023 pool prefixes
+rem compared, all equal; dflash / dflashauto skipped, DFLASHDRAFT not set
+rem 22.10, after the merge of master (7170cad4d): GGML_OP_TOP_K_MASK of upstream (d454a204e, CPU and CUDA: the QSA
+rem mask of the upstream copy, ours keeps the mask from positions), the MoE down scale per expert token (8baabd53b,
+rem other archs), logprobs with speculative decoding (ead9f3205); nothing of Vulkan. the Mac: KLD against the build
+rem before the merge 0 (cpu, both gpus, the experts on the cpu), MTP and DFlash drafts the same. the same run again
 if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16"
 rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=MUL_MAT type_a=q8_0,type_b=f16;MUL_MAT type_a=q4_K,type_b=f16;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;TOP_K;FLASH_ATTN_LIST"
 rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
@@ -495,6 +504,12 @@ rem of qwen4exp (ff5a23376; ours is tried first, GGML_CUDA_FORK_FUSION=0 leaves 
 rem experts top-k fusion (f2f667b02), the MMQ Stream-K cap (4c1004c49), the fix of a shared-memory hazard in
 rem flash_attn_ext_vec (99db719bd, the decode attention), faster MMVQ of low-bit types (2744e48d1); the CPU vectorized
 rem silu / expf (42b70032b, the experts in RAM). the Mac does not build CUDA. the same run again: 01, 03, 04 auto
+rem 22.10: the build failed with LNK2019 on ggml_backend_cuda_context::new_pool_for_device: msbuild kept ssm-scan.obj
+rem built against the common.cuh before 13786fbb3 (merge of 20.10); since then 00-build removes the objects of
+rem ggml-cuda when its headers changed (README, 00-build)
+rem 22.10, after the merge of master (7170cad4d): CUDA got GGML_OP_TOP_K_MASK (d454a204e, used by the upstream copy
+rem only, LLAMA_UPSTREAM=qwen4exp) and ssm_conv of kernel 7 (39da130fc); the new op moved the numbers of the ops
+rem after it, the headers check removes the objects of ggml-cuda once. the Mac does not build CUDA. the same run again
 if not defined CHECKOPS   set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT"
 if not defined RUN_CHECK  set "RUN_CHECK=1"
 if not defined RUN_QUALITY set "RUN_QUALITY=1"
