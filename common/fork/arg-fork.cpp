@@ -135,7 +135,7 @@ void common_fork_spec_auto_apply(common_params & params, bool spec_types_given, 
         if (!spec.draft.n_max_set) {
             spec.draft.n_max = std::max(spec.draft.n_max, COMMON_SPECULATIVE_AUTO_N_MAX);
 
-            // a DFlash block is one decode of the draft: the gate picks the length, up to the block (22.10)
+            // a DFlash draft: its own cap, see COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH
             const bool dflash = std::any_of(spec.types.begin(), spec.types.end(), [](auto t) {
                 return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
             });

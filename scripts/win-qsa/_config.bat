@@ -379,13 +379,23 @@ rem 22.10 evening: --spec-auto gates DFlash by the probability of each drafted t
 rem calibrated like the MTP head, and its cap is 7 without --spec-draft-n-max (a block of 8 is one decode); the
 rem fixed dflash and qsachk measured (see above). dflashauto: gate and cap 7, dflashauto3: gate and cap 3
 rem [replaced 22.10 evening] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflashauto @dflash --spec-type draft-dflash --spec-auto"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
+rem 22.10 night (src-80e338ab, chats to 213K): auto PP 768.7 TG 38.62; dflashauto (gate, cap 7) 781.5 / 36.91,
+rem acceptance 0.634; dflashauto3 (gate, cap 3) 780.2 / 36.60, 0.658. the gate cut the verified drafts 3.0 -> 2.0
+rem per cycle and the cycle 69.7 -> 63.3 ms, but the tokens per cycle 2.55 -> 2.32 (MTP: 2.55 at 2.16 drafts, 66.2 ms);
+rem its calibration is as monotonic as that of the MTP head (0.89-0.95 in the top bin), the selector is less often
+rem sure at the far positions. the block of 8 (cap 7) drafts in 10.8 against 7.2 ms. MTP stays ahead by ~4 percent
+rem here; the cap of a DFlash draft is 3 again (COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH). next: the os / code prompts
+rem (DECPREFIX 0), the code is where the authors of DFlash2 measured their lead
+rem [replaced 22.10 night] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto"
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
 if not defined RUN_TRACE  set "RUN_TRACE=0"
 if not defined TRACEARMS  set "TRACEARMS=auto @draft --spec-auto"
-if not defined DECPREFIX  set "DECPREFIX=none"
+rem 22.10 night: the requests of DECPROMPTS from prefix 0 next to the chats, see DECARMS
+if not defined DECPREFIX  set "DECPREFIX=0"
+rem [no effect, an earlier line sets DECPREFIX] if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 if not defined DECPROMPTS set "DECPROMPTS=os code"
 if not defined DECSEEDS   set "DECSEEDS=1"
@@ -721,7 +731,13 @@ rem [replaced 22.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-a
 rem 22.10 evening: DFlash under the gate of --spec-auto as on the 395 (dflashauto cap 7, dflashauto3 cap 3) instead
 rem of the fixed lengths; qsachk stays for the run after the merge
 rem [replaced 22.10 evening] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflash2 @dflash --spec-type draft-dflash --spec-draft-n-max 2;dflashauto @dflash --spec-type draft-dflash --spec-auto"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
+rem 22.10 night (src-1ca9f38f): auto PP 752.2 TG 28.08 (16.10: 748.2 / 27.61); dflashauto3 (gate, cap 3) 757.7 /
+rem 28.02, 53 expert slots per layer against 45 (the MTP head took 1.8 GB); dflashauto (cap 7) 763.7 / 26.42 (49
+rem slots: the rollback states 900 against 450 MiB). the fixed dflash of 12:52 (before LLAMA_DFLASH_UBATCH): 14.4 t/s,
+rem the draft context reserved 8320 MiB of VRAM (the logits of 8192 tokens). qsachk: 12 groupings in 03, 1024+ in 04,
+rem all equal. the first start of qsachk at 12:52 ended 0xc0000005 before any output, the retry ran
+rem [replaced 22.10 night] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"
@@ -735,7 +751,9 @@ rem at 0-40K / 80-120K / 200K+), turns of ~550 tokens after 29K 3.62 s against 4
 rem part before the last user message ran on its own in 63 of 65 turns of auto, 69 tokens and 0.66 s on average.
 rem the default since (LLAMA_CKPT_USER_BREAK=1: upstream)
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
-if not defined DECPREFIX  set "DECPREFIX=none"
+rem 22.10 night: the requests of DECPROMPTS from prefix 0 next to the chats, see DECARMS
+if not defined DECPREFIX  set "DECPREFIX=0"
+rem [no effect, an earlier line sets DECPREFIX] if not defined DECPREFIX  set "DECPREFIX=none"
 if not defined DECCHAT    set "DECCHAT=0:56:16000 120000:6:2000"
 rem 13.10, the user: one long prompt and the server's own speed lines instead of separate depths. the prompt of
 rem 500000 chars (~118K tokens) from 0: PP of every -b batch along it (the table "PP along the prompt") and TG

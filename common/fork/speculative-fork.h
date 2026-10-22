@@ -16,10 +16,11 @@
 // its recurrent state 788 MiB against 450; the user's own test on the 3090 also had 3 ahead. ngram-mod drafts are not
 // bound by it
 #define COMMON_SPECULATIVE_AUTO_N_MAX 3
-// the cap of --spec-auto for a DFlash / DSpark draft without --spec-draft-n-max: a block of 8 is one decode of the draft
-// whatever the number of positions read from it, so the length is left to the gate (keep). the draft clamps it to its
-// block size - 1
-#define COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH 7
+// the cap of --spec-auto for a DFlash / DSpark draft without --spec-draft-n-max (the draft clamps it to its block size
+// - 1). 7 measured 22.10 with the gate (chats to 213K): the 395 36.91 against 36.60 t/s at 3 (the block of 8 drafts in
+// 10.8 against 7.2 ms), the 3090 26.42 against 28.02 (the 7 rollback states of the target take 450 MiB more VRAM from
+// the expert cache, 49 slots per layer against 53, and the verifies get longer). so 3, as the MTP head
+#define COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH 3
 
 struct common_speculative_impl;
 
