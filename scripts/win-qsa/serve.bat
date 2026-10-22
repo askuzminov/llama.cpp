@@ -73,13 +73,13 @@ echo.
   --log-timestamps ^
   %SRVARGS%
 
-set "RC=%ERRORLEVEL%"
+set "SRVRC=%ERRORLEVEL%"
 
 rem Ctrl+C makes cmd ask "Terminate batch job (Y/N)?" and Y skips the rest of this file. the server
 rem has already exited by then, so nothing is cut short - only this summary. the log file has it all
 echo.
-echo === llama-server exited with %RC%
+echo === llama-server exited with %SRVRC%
 powershell -NoProfile -Command "$f = @(Get-ChildItem -LiteralPath '%CACHEDIR%' -Filter state-*.bin -ErrorAction SilentlyContinue); '=== prompt cache: {0} files, {1:N1} MiB' -f $f.Count, ([double](($f | Measure-Object Length -Sum).Sum) / 1MB)"
 
-if not "%RC%"=="0" pause
-exit /b %RC%
+if not "%SRVRC%"=="0" pause
+exit /b %SRVRC%

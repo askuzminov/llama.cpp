@@ -25,13 +25,14 @@ if "%RUN_QUALITY%"=="1" if not exist "%PPLFILE%" call "%~dp0get-wikitext.bat"
 
 rem 00-build waits for a key after a failure, run-all goes on by itself
 set "QSA_UNATTENDED=1"
-set "RC=0"
+rem not RC: cmake takes RC from the environment as the resource compiler of a fresh configure
+set "STEPRC=0"
 set "RESULTS="
 for %%s in (%STEPS%) do (
     echo === %%s
     call "%~dp0%%s.bat"
     set "EC=!ERRORLEVEL!"
-    if not "!EC!"=="0" set "RC=!EC!"
+    if not "!EC!"=="0" set "STEPRC=!EC!"
     set "RESULTS=!RESULTS! %%s=!EC!"
     echo.
     rem the steps after a failed build would measure the old binaries
@@ -41,4 +42,4 @@ for %%s in (%STEPS%) do (
 :done
 echo === exit codes:%RESULTS%
 echo the summary of each step is in its folder in %LOGS%
-exit /b %RC%
+exit /b %STEPRC%
