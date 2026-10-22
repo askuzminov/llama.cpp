@@ -812,7 +812,11 @@ def cmd_check():
             rows.append([name, "unit", f"skip: {e}"])
             continue
         work = run.dir / name
-        identity = {"v": VERSION, "kind": "unit", "build": build_id(exe.parent), "test": name, "machine": machine()}
+        # the source id leaves tests/ out (a test change keeps the measurements), so the test's own source is part
+        # of its identity: a fixed test runs again on the same build id (test-prompt-cache-spill, 22.10)
+        src = ROOT / "tests" / f"{name}.cpp"
+        identity = {"v": VERSION, "kind": "unit", "build": build_id(exe.parent), "test": name, "machine": machine(),
+                    "src": digest(src) if src.is_file() else None}
 
         def go_unit(log, exe=exe, work=work):
             work.mkdir(parents=True, exist_ok=True)
@@ -2324,9 +2328,42 @@ def cmd_kernels():
 
 # ---------------------------------------------------------------- builds
 
+# msbuild does not rebuild a .cu file when only a header it includes changed: after the merge of 20.10 ssm-scan.obj on
+# the 3090 kept the old ggml_backend_cuda_context::new_pool_for_device (LNK2019), and an object that still links can
+# carry an old struct layout. so the objects of ggml-cuda go when the headers changed since the last good build
+CUDA_HEADERS_RECORD = "qsa-cuda-headers.json"
+
+
+def cuda_headers_digest():
+    """the headers a .cu file of ggml-cuda can include: its own (with the fork's .inc), ggml/src and ggml/include"""
+    h = hashlib.sha256()
+    files = [p for p in (ROOT / "ggml" / "src" / "ggml-cuda").rglob("*") if p.suffix in (".cuh", ".h", ".inc")]
+    files += [p for d in ("ggml/src", "ggml/include") for p in (ROOT / d).glob("*.h")]
+    for p in sorted(f for f in files if f.is_file()):
+        h.update(f"{p.relative_to(ROOT).as_posix()} {digest(p)}\n".encode())
+    return h.hexdigest()[:16]
+
+
+def cuda_objects_check(build):
+    """removes the msbuild objects of ggml-cuda when the headers differ from the last good build (or it has no record)"""
+    objs = build / "ggml" / "src" / "ggml-cuda" / "ggml-cuda.dir"
+    if env("BACKEND") != "cuda" or not objs.is_dir():
+        return
+    record = build / CUDA_HEADERS_RECORD
+    try:
+        before = json.loads(record.read_text(encoding="utf-8"))["headers"]
+    except (OSError, ValueError, KeyError):
+        before = None
+    if before != cuda_headers_digest():
+        print(f"the headers of ggml-cuda changed since the last good build ({before or 'no record'}): removing {objs}, "
+              f"msbuild would keep objects built against the old ones")
+        shutil.rmtree(objs, ignore_errors=True)
+
+
 def cmd_build_begin():
     build = Path(env("BUILD")).resolve()
     build.mkdir(parents=True, exist_ok=True)
+    cuda_objects_check(build)
     for folder in (build / "bin" / "Release", build / "bin"):
         (folder / BUILD_RECORD).unlink(missing_ok=True)
     try:
@@ -2350,6 +2387,9 @@ def cmd_build_end():
         record = dict(json.loads(pending.read_text(encoding="utf-8")), time=now())
         (build_folder(build) / BUILD_RECORD).write_text(json.dumps(record) + "\n", encoding="utf-8")
         pending.unlink()
+    if env("BACKEND") == "cuda":
+        (build / CUDA_HEADERS_RECORD).write_text(json.dumps({"headers": cuda_headers_digest(), "time": now()}) + "\n",
+                                                 encoding="utf-8")
     return 0
 
 

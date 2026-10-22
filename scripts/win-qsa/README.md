@@ -12,7 +12,7 @@
 
 | Файл | Модель | Что делает |
 | --- | --- | --- |
-| `00-build.bat` | нет | сборка в `build-win`; после удачной сборки кладёт рядом с бинарниками id исходников. `00-build.bat stable` собирает тег `stable` в отдельной worktree (`build-stable-src` -> `build-stable`) для плеч `@stable` |
+| `00-build.bat` | нет | сборка в `build-win`; после удачной сборки кладёт рядом с бинарниками id исходников. На CUDA удаляет объекты ggml-cuda, если его заголовки изменились с последней удачной сборки: msbuild не пересобирает `.cu` по изменённому заголовку (22.10, LNK2019 на `new_pool_for_device`). `00-build.bat stable` собирает тег `stable` в отдельной worktree (`build-stable-src` -> `build-stable`) для плеч `@stable` |
 | `01-check.bat` | нет | test-backend-ops: операции, которые менял форк, на GPU против CPU (`CHECKOPS` x `CHECKARMS`); модульные тесты форка (`CHECKUNITS`) |
 | `03-quality.bat` | да | llama-perplexity: отношение PPL и KLD каждого плеча против опорного `QREF` |
 | `04-decode.bat` | да | llama-server: генерация с MTP, кэшем экспертов, overlap CPU и GPU; длинный промпт через `DECPREFIX` |

@@ -440,6 +440,10 @@ static void test_truncated(const std::string & dir) {
 }
 
 int main() {
+    // write_behind times itself: on Windows ggml_time_us divides by the counter frequency that ggml_time_init
+    // sets, and no model load does it here (0xc0000094 on the 395, 22.10)
+    ggml_time_init();
+
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() / "llama-spill-test";
 
