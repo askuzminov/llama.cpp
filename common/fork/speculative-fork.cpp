@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_WRN(fmt, ...) LOG_WRN("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -17,6 +18,14 @@
 static bool common_speculative_type_is_model(common_speculative_type type) {
     return type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
            type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+           type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+// the drafts that pass each token through keep(): the gate and the calibration by draft probability.
+// DFlash since 22.10: on the 395 it verified all 3 positions with a position-only cap (0.726 / 0.496 / 0.327 accepted),
+// where the MTP head stopped at the doubtful ones (4 tokens verified against ~3.2, the cycle 69.9 against 68.2 ms)
+static bool common_speculative_type_is_gated(common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
            type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
 }
 
@@ -77,7 +86,7 @@ int32_t common_speculative_auto::impl_cap(common_speculative_type type) const {
     if (mode == MODE_PROBE) {
         return common_speculative_type_is_model(type) ? cap : -1;
     }
-    if (mode != MODE_GATE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+    if (mode != MODE_GATE || common_speculative_type_is_gated(type)) {
         return -1;
     }
     double p = 1.0;
@@ -196,7 +205,7 @@ void common_speculative_auto::draft_end(const draft_params_vec & dparams, const 
         }
 
         s.type = impl_last[seq_id] ? common_speculative_impl_type(impl_last[seq_id]) : COMMON_SPECULATIVE_TYPE_NONE;
-        if (s.type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        if (!common_speculative_type_is_gated(s.type)) {
             s.hp.clear();
             s.q.clear();
         } else {
@@ -276,7 +285,7 @@ void common_speculative_auto::on_accept(llama_seq_id seq_id, uint16_t n_accepted
 
     const int n_test = std::min<int>(n_accepted + 1, s.n_drf);
 
-    if (s.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && (int) s.hp.size() == s.n_drf) {
+    if (common_speculative_type_is_gated(s.type) && (int) s.hp.size() == s.n_drf) {
         for (int j = 0; j < n_test; ++j) {
             const int d = std::min(j, n_depth - 1);
             const int b = std::clamp((int) (s.hp[j] * n_bins), 0, n_bins - 1);
@@ -500,9 +509,36 @@ void common_speculative_auto::print() const {
     }
 }
 
+bool common_speculative_fork_lattice_keep(common_speculative_auto * ctl, llama_seq_id seq_id, const float * ids,
+        const float * scores, int32_t top_k, int32_t chosen) {
+    std::vector<llama_token_data> cand((size_t) top_k);
+    float sum = 0.0f;
+    for (int32_t k = 0; k < top_k; ++k) {
+        const float p = std::exp(scores[k] - scores[chosen]);
+        cand[k] = { (llama_token) ids[k], scores[k], p };
+        sum += p;
+    }
+    for (auto & c : cand) {
+        c.p /= sum;
+    }
+    // the pick is the argmax, so it leads the order keep() and the trace read
+    std::swap(cand[0], cand[chosen]);
+    std::sort(cand.begin() + 1, cand.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+
+    llama_token_data_array cur_p = { cand.data(), cand.size(), 0, true };
+    bool more = true;
+    return ctl->keep(seq_id, &cur_p, more);
+}
+
 uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch) {
     const char * env = std::getenv("LLAMA_MTP_UBATCH");
     const long   cap = env ? std::strtol(env, nullptr, 10) : 1024;
+    return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
+}
+
+uint32_t common_speculative_fork_dflash_ubatch(uint32_t n_ubatch) {
+    const char * env = std::getenv("LLAMA_DFLASH_UBATCH");
+    const long   cap = env ? std::strtol(env, nullptr, 10) : 512;
     return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
 }
 

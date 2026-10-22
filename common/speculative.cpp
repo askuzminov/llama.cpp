@@ -1359,6 +1359,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             break;
                         }
                     }
+                    // fork: --spec-auto gates the lattice picks by their selector probability, as the MTP head tokens
+                    if (ctl && !common_speculative_fork_lattice_keep(ctl, seq_id, row, scores, top_k, predecessor)) {
+                        break;
+                    }
                     result.push_back((llama_token) row[predecessor]);
                 }
 
@@ -1392,6 +1396,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
+                    // fork: the gate of --spec-auto, see common_speculative_auto::keep
+                    bool more = true;
+                    if (ctl && !ctl->keep(seq_id, cur_p, more)) {
+                        break;
+                    }
+
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
@@ -1412,6 +1422,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_token id = cur_p->data[0].id;
 
                     if (cur_p->data[0].p < params.p_min) {
+                        break;
+                    }
+
+                    // fork: the gate of --spec-auto, see common_speculative_auto::keep
+                    bool more = true;
+                    if (ctl && !ctl->keep(seq_id, cur_p, more)) {
                         break;
                     }
 
@@ -2788,6 +2804,14 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         // fork: a smaller ubatch, see common_speculative_fork_mtp_ubatch
         cparams.n_ubatch = common_speculative_fork_mtp_ubatch(cparams.n_ubatch);
+    }
+
+    // fork: the same for a DFlash / DSpark draft, see common_speculative_fork_dflash_ubatch
+    const bool spec_dflash = std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto t) {
+        return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+    if (spec_dflash) {
+        cparams.n_ubatch = common_speculative_fork_dflash_ubatch(cparams.n_ubatch);
     }
 
     // the draft context holds as many tokens per sequence as the target context

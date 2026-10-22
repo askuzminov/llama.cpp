@@ -16,6 +16,10 @@
 // its recurrent state 788 MiB against 450; the user's own test on the 3090 also had 3 ahead. ngram-mod drafts are not
 // bound by it
 #define COMMON_SPECULATIVE_AUTO_N_MAX 3
+// the cap of --spec-auto for a DFlash / DSpark draft without --spec-draft-n-max: a block of 8 is one decode of the draft
+// whatever the number of positions read from it, so the length is left to the gate (keep). the draft clamps it to its
+// block size - 1
+#define COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH 7
 
 struct common_speculative_impl;
 
@@ -27,6 +31,13 @@ common_speculative_type common_speculative_impl_type(const common_speculative_im
 // of the MTP context 2800 MiB on the device and 2248 MiB pinned on the host). the catch-up over a prompt goes in
 // chunks of this size, llama_decode splits the target ubatch. LLAMA_MTP_UBATCH: tokens (default 1024), 0 = the target's
 uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
+
+// the ubatch of a DFlash / DSpark draft context. its decoder graph is reserved for n_ubatch tokens and computes the
+// logits of all of them, [n_vocab, n_ubatch] f32: 3.8 GiB at 248320 x 4096, while a draft decodes one block (8
+// positions per sequence) and the KV injection of the target features goes in chunks of this size anyway. on the 395
+// (22.10) the reserve put the LM head of the draft on the CPU, with a 644 MiB copy of the target's output.weight and a
+// 4564 MiB host compute buffer. LLAMA_DFLASH_UBATCH: tokens (default 512), 0 = the target's (or --spec-draft-n-ubatch)
+uint32_t common_speculative_fork_dflash_ubatch(uint32_t n_ubatch);
 
 // the catch-up of the MTP head over a decoded batch (process of the MTP implementation): in chunks of the draft
 // ubatch, so that the rows of the next chunk are rendered while the GPU computes the last one, and a batch longer than
@@ -85,7 +96,7 @@ struct common_speculative_auto {
 
         common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
 
-        std::vector<float> hp; // head probability of each drafted token, MTP only
+        std::vector<float> hp; // draft probability of each drafted token: the MTP head, the DFlash selector or sampler
 
         // trace only
         std::vector<std::vector<llama_token_data>> q; // draft candidates per position
@@ -181,8 +192,8 @@ struct common_speculative_auto {
 
     void draft_end(const draft_params_vec & dparams, const std::vector<common_speculative_impl *> & impl_last, int64_t t_us);
 
-    // MTP: called for each drafted head token. false drops the token and ends the draft,
-    // `more` = false keeps the token but ends the draft
+    // MTP and DFlash: called for each drafted token. false drops the token and ends the draft,
+    // `more` = false keeps the token but ends the draft (MTP: no next head step; a DFlash block costs one decode)
     bool keep(llama_seq_id seq_id, const llama_token_data_array * cur_p, bool & more);
 
     void on_steps(int n_steps, int64_t t_us);
@@ -197,3 +208,8 @@ struct common_speculative_auto {
 
     void print() const;
 };
+
+// a DFlash2 / LiLiCorr lattice position for the gate of --spec-auto: the candidate ids and their scores given the
+// pick at the position before, the softmax over them as the draft probabilities (the pick first). false ends the draft
+bool common_speculative_fork_lattice_keep(common_speculative_auto * ctl, llama_seq_id seq_id, const float * ids,
+        const float * scores, int32_t top_k, int32_t chosen);

@@ -128,6 +128,15 @@ rem 22.10, after the merge of master (7170cad4d): GGML_OP_TOP_K_MASK of upstream
 rem mask of the upstream copy, ours keeps the mask from positions), the MoE down scale per expert token (8baabd53b,
 rem other archs), logprobs with speculative decoding (ead9f3205); nothing of Vulkan. the Mac: KLD against the build
 rem before the merge 0 (cpu, both gpus, the experts on the cpu), MTP and DFlash drafts the same. the same run again
+rem 22.10, the run after the merge (src-714ca138): 01 all passed, test-prompt-cache-spill past the timer, then
+rem assert(f) in test_legacy_names (fopen of a UTF-8 name, Windows reads it in the ANSI codepage; fixed); 03 KLD
+rem 0.015433, qsachk 0.015055; 04 auto PP 765.7 TG 37.88 acceptance 0.714 (the run before the merge 768.3 / 38.26),
+rem qsachk 1024+ groupings equal. DFlash2 (dflash-Qwen3.8-Flash-Next-Q8_0): dflash PP 778.5 TG 36.63 acceptance 0.518,
+rem dflashauto 781.7 / 36.69; accepted by position 0.726 / 0.496 / 0.327 against 0.764 / 0.688 / 0.638 of MTP, ~2.55
+rem tokens per cycle both, the draft 7.5 against 11.8 ms, the cycle 69.9 against 68.2 ms (4 tokens verified against
+rem ~3.2); on the device 1.6 GiB less, but the reserve of the draft decoder for 4096 tokens put its LM head on the
+rem cpu (4564 MiB host compute buffer): LLAMA_DFLASH_UBATCH (512) since. the first start of dflash failed to
+rem allocate a 1.5 GiB model buffer right after 03 (the retry started)
 if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16"
 rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=MUL_MAT type_a=q8_0,type_b=f16;MUL_MAT type_a=q4_K,type_b=f16;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;TOP_K;FLASH_ATTN_LIST"
 rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
@@ -366,7 +375,11 @@ rem 22.10: DFlash2 (the draft of DFLASHDRAFT instead of the MTP head; upstream 1
 rem streams it was trained on) with 3 draft tokens as in the numbers of its authors (dflash) and with --spec-auto
 rem (dflashauto: the length from the acceptance per position, no per-token gate as for MTP), against auto
 rem [replaced 22.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+rem 22.10 evening: --spec-auto gates DFlash by the probability of each drafted token (the selector softmax of DFlash2),
+rem calibrated like the MTP head, and its cap is 7 without --spec-draft-n-max (a block of 8 is one decode); the
+rem fixed dflash and qsachk measured (see above). dflashauto: gate and cap 7, dflashauto3: gate and cap 3
+rem [replaced 22.10 evening] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -705,7 +718,10 @@ rem 22.10: DFlash2 as on the 395, plus 2 draft tokens (dflash2, the best MTP len
 rem ~19 ms of cpu experts, the draft only pays with more tokens accepted per step; the 2 GB of the MTP head stay
 rem free, --moe-cache auto takes them for slots
 rem [replaced 22.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflash2 @dflash --spec-type draft-dflash --spec-draft-n-max 2;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+rem 22.10 evening: DFlash under the gate of --spec-auto as on the 395 (dflashauto cap 7, dflashauto3 cap 3) instead
+rem of the fixed lengths; qsachk stays for the run after the merge
+rem [replaced 22.10 evening] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflash @dflash --spec-type draft-dflash --spec-draft-n-max 3;dflash2 @dflash --spec-type draft-dflash --spec-draft-n-max 2;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"

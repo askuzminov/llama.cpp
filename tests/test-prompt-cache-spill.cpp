@@ -9,6 +9,7 @@
 #include "server-task.h"
 
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -380,11 +381,11 @@ static void test_legacy_names(const std::string & dir) {
 
     char name[96];
 
+    // through the path, not fopen of its UTF-8 bytes: Windows reads a narrow name in the ANSI codepage
     const auto touch = [&](const char * n) {
-        FILE * f = fopen(fs_utf8(root / n).c_str(), "wb");
+        std::ofstream f(root / n, std::ios::binary);
         assert(f);
-        fputs("x", f);
-        fclose(f);
+        f << "x";
     };
 
     snprintf(name, sizeof(name), "state-%016llx-7.bin", (unsigned long long) (SIG ^ 1ull));
