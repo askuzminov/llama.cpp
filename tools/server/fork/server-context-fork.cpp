@@ -309,3 +309,11 @@ bool server_ckpt_user_break_fork() {
     }();
     return brk;
 }
+
+bool server_evict_save_fork() {
+    static const bool save = [] {
+        const char * env = getenv("LLAMA_EVICT_SAVE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return save;
+}

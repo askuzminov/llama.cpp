@@ -20,6 +20,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -284,7 +285,7 @@ def source_id(backend):
     directories of the other backends are left out, so a change there keeps the results of this machine. Returns the
     id and whether there were uncommitted changes or untracked files in those sources."""
     entries = ["CMakeLists.txt", "cmake", "common", "include", "src", "tools", "vendor", "tests/test-backend-ops.cpp",
-               "ggml/CMakeLists.txt", "ggml/cmake", "ggml/include"]
+               "tests/test-backend-ops-fork.inc", "ggml/CMakeLists.txt", "ggml/cmake", "ggml/include"]
     own = {"ggml-cpu", "ggml-" + backend}
     for line in git("ls-tree", "HEAD", "ggml/src/").decode().splitlines():
         meta, path = line.split("\t", 1)
@@ -1119,12 +1120,14 @@ def segments(curve, start=0, least=2048):
     return out
 
 
-def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats=()):
+def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats=(), par=1):
     """Start llama-server, send the warmup and the requests one after another, stop it. The answers stay next to
     the log. rows_text, one token long and not measured, reads the PLE rows of the prompts into the page cache first:
     otherwise the arm that runs first reads them from the drive. chats: conversations as a
     client keeps them, (name, [(user text, tokens), ...]), each turn sent with the messages before it and the prompt
-    cache on, so a turn after the first computes only its new part at the depth of the conversation"""
+    cache on, so a turn after the first computes only its new part at the depth of the conversation. par > 1: the
+    conversations run at once, one client each (the slots of -np), and "par" gives their tokens over the wall time;
+    the log lines of the requests interleave then, so no prompt curve is read out of them"""
     timeout = env_int("DECTIMEOUT", 1800)
     url = f"http://127.0.0.1:{port}"
     run_env = dict(run_env, LLAMA_SPEC_TRACE=str(log.with_suffix(".trace.csv")))
@@ -1163,7 +1166,9 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats
                          "draft_acc": t.get("draft_n_accepted", 0),
                          "answer": text_digest(f"{message.get('content')}\0{message.get('reasoning_content')}")[:16]})
         chat_rows = []
-        for conv, turns in chats:
+        lock = threading.Lock()
+
+        def run_chat(conv, turns):
             messages = []
             for ti, (text, n) in enumerate(turns):
                 messages.append({"role": "user", "content": text})
@@ -1184,14 +1189,45 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats
                 t = answer["timings"]
                 message = answer["choices"][0]["message"]
                 messages.append({"role": "assistant", "content": message.get("content") or ""})
-                time.sleep(0.5)
-                with log.open("rb") as f:
-                    f.seek(before)
-                    pp_curve, tg3 = progress(f.read().decode("utf-8", errors="replace"))
-                chat_rows.append({"conv": conv, "turn": ti, "pp_curve": pp_curve, "tg3": tg3,
-                                  "cache_n": t.get("cache_n", 0), "prompt_n": t["prompt_n"],
-                                  "prompt_ms": t["prompt_ms"], "n": t["predicted_n"], "ms": t["predicted_ms"],
-                                  "draft_n": t.get("draft_n", 0), "draft_acc": t.get("draft_n_accepted", 0)})
+                pp_curve, tg3 = [], None
+                if par <= 1:
+                    time.sleep(0.5)
+                    with log.open("rb") as f:
+                        f.seek(before)
+                        pp_curve, tg3 = progress(f.read().decode("utf-8", errors="replace"))
+                with lock:
+                    chat_rows.append({"conv": conv, "turn": ti, "pp_curve": pp_curve, "tg3": tg3,
+                                      "cache_n": t.get("cache_n", 0), "prompt_n": t["prompt_n"],
+                                      "prompt_ms": t["prompt_ms"], "n": t["predicted_n"], "ms": t["predicted_ms"],
+                                      "draft_n": t.get("draft_n", 0), "draft_acc": t.get("draft_n_accepted", 0)})
+
+        par_info = None
+        if par <= 1:
+            for conv, turns in chats:
+                run_chat(conv, turns)
+        else:
+            errors = []
+
+            def guarded(conv, turns):
+                try:
+                    run_chat(conv, turns)
+                except Exception as e:  # noqa: BLE001 - reported below, the other conversations go on
+                    errors.append(e)
+
+            t_start = time.time()
+            threads = [threading.Thread(target=guarded, args=(conv, turns)) for conv, turns in chats]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            wall = time.time() - t_start
+            if errors:
+                raise errors[0] if isinstance(errors[0], Fail) else Fail(f"parallel chats: {errors[0]}")
+            # the turns of each conversation in their order, the conversations in the order given
+            order = {conv: k for k, (conv, _) in enumerate(chats)}
+            chat_rows.sort(key=lambda x: (order[x["conv"]], x["turn"]))
+            par_info = {"par": par, "wall_s": wall, "n": sum(x["n"] for x in chat_rows),
+                        "prompt_n": sum(x["prompt_n"] for x in chat_rows)}
         # the slot prints its timings as it is released
         time.sleep(2)
     finally:
@@ -1204,7 +1240,8 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats
     starts = [i for i, s in enumerate(spec) if re.search(r"print: auto: (on|trace only),", s)]
     extra = [s.strip() for s in lines if re.search(KEPT_LINES, s)]
     return {"rows": rows, "spec": spec[starts[-1]:] if starts else [], "extra": extra[-60:],
-            "graph_timing": graph_timing(lines), **({"chat": chat_rows} if chats else {})}
+            "graph_timing": graph_timing(lines), **({"chat": chat_rows} if chats else {}),
+            **({"par": par_info} if chats and par_info else {})}
 
 
 def graph_timing(lines):
@@ -1267,6 +1304,18 @@ def cmd_decode():
 
     chat_specs = parse_chats(env("DECCHAT", ""))
     arm_chat_specs = {arm.name: parse_chats(arm.env["DECCHAT"]) for arm in arms if arm.env.get("DECCHAT")}
+
+    # an arm can sample in its own way: DECSAMP=temperature:top_k:top_p among its variables (22.10: the settings of
+    # another engine next to ours in one run)
+    def samp_of(arm):
+        if not arm.env.get("DECSAMP"):
+            return sampling
+        try:
+            t, k, p = arm.env["DECSAMP"].split(":")
+            return [float(t), int(k), float(p)]
+        except ValueError:
+            raise Fail(f"arm {arm.name}: DECSAMP must be temperature:top_k:top_p, got {arm.env['DECSAMP']!r}")
+    arm_samp = {arm.name: samp_of(arm) for arm in arms}
     chat_starts = [c[0] for c in chat_specs]
     chat_gen = env_int("DECCHATGEN", 256)
     corpus = (Path(env("PPLFILE")).read_text(encoding="utf-8", errors="replace")
@@ -1295,26 +1344,39 @@ def cmd_decode():
             run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1"})
             identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
-                        "draft": model_identity(draft) if draft else None, "sampling": sampling,
+                        "draft": model_identity(draft) if draft else None, "sampling": arm_samp[arm.name],
                         "requests": [[name, text_digest(text), seed, n] for name, text, seed, n in requests],
                         "rows": text_digest(rows_text), "machine": machine()}
             try:
                 results[arm.name, prefix] = run.measure(label, identity,
-                                                        lambda log: serve(exe, args, run_env, log, requests, sampling, port, rows_text))
+                                                        lambda log: serve(exe, args, run_env, log, requests, arm_samp[arm.name],
+                                                                          port, rows_text))
             except Fail as e:
                 run.failed = True
                 results[arm.name, prefix] = f"FAIL {e}"
-    def build_chats(specs):
+    def build_chats(specs, base=0, tag=""):
+        text = corpus[base:]
         chats = []
         for start, n_turns, add_chars in specs:
-            turns = [((corpus[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", chat_gen)]
+            turns = [((text[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", chat_gen)]
             for ti in range(n_turns):
-                add = corpus[start + ti*add_chars:start + (ti + 1)*add_chars]
+                add = text[start + ti*add_chars:start + (ti + 1)*add_chars]
                 turns.append((add + "\n\nAnd this part, in two sentences?", chat_gen))
-            chats.append((f"c{start}-{add_chars}", turns))  # two conversations from one start differ by their turns
+            chats.append((f"{tag}c{start}-{add_chars}", turns))  # two conversations from one start differ by their turns
         return chats
 
-    chats_of = {arm.name: build_chats(arm_chat_specs.get(arm.name, chat_specs)) for arm in arms}
+    # DECPAR=N among the variables of an arm: N copies of its conversations at once, copy k on the text from
+    # k*DECPARSHIFT chars on (the slots of -np, 23.10); the arm gives -np N itself
+    par_of = {arm.name: int(arm.env.get("DECPAR", "1")) for arm in arms}
+    par_shift = env_int("DECPARSHIFT", 250000)
+
+    def chats_for(arm):
+        specs = arm_chat_specs.get(arm.name, chat_specs)
+        if par_of[arm.name] <= 1:
+            return build_chats(specs)
+        return [c for k in range(par_of[arm.name]) for c in build_chats(specs, k*par_shift, f"p{k}-")]
+
+    chats_of = {arm.name: chats_for(arm) for arm in arms}
     if any(chats_of.values()):
         for arm in arms:
             chats = chats_of[arm.name]
@@ -1336,16 +1398,19 @@ def cmd_decode():
             run_env = arm_env(arm, {"LLAMA_INPUT_TIMING": "1"})
             identity = {"v": VERSION, "kind": "decode-chat", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
-                        "draft": model_identity(draft) if draft else None, "sampling": sampling,
-                        "chats": [[c, [[text_digest(t), n] for t, n in turns]] for c, turns in chats], "machine": machine()}
+                        "draft": model_identity(draft) if draft else None, "sampling": arm_samp[arm.name],
+                        "chats": [[c, [[text_digest(t), n] for t, n in turns]] for c, turns in chats], "machine": machine(),
+                        **({"par": par_of[arm.name]} if par_of[arm.name] > 1 else {})}
             try:
                 results[arm.name, "chat"] = run.measure(label, identity,
-                                                        lambda log: serve(exe, args, run_env, log, [], sampling, port, "", chats))
+                                                        lambda log: serve(exe, args, run_env, log, [], arm_samp[arm.name],
+                                                                          port, "", chats, par_of[arm.name]))
             except Fail as e:
                 run.failed = True
                 results[arm.name, "chat"] = f"FAIL {e}"
+    own_samp = "".join(f"; {a.name}: {a.env['DECSAMP'].replace(':', ' ')}" for a in arms if a.env.get("DECSAMP"))
     run.add(f"decode: llama-server -c {ctx}, prompts {' '.join(n for n, _ in prompts)} x seeds "
-            f"{' '.join(map(str, seeds))}, {ngen} tokens, sampling {temp} {top_k} {top_p}, {model.name}, "
+            f"{' '.join(map(str, seeds))}, {ngen} tokens, sampling {temp} {top_k} {top_p}{own_samp}, {model.name}, "
             f"build {current_build()}")
     details = []
     for prefix in prefixes:
@@ -1447,13 +1512,25 @@ def cmd_decode():
                 continue
             r, kept = entry
             for x in r.get("chat", []):
-                rows.append([arm.name, x["conv"][1:], x["turn"], x["cache_n"] + x["prompt_n"], x["prompt_n"],
+                rows.append([arm.name, x["conv"][1:] if x["conv"].startswith("c") else x["conv"], x["turn"],
+                             x["cache_n"] + x["prompt_n"], x["prompt_n"],
                              f"{rate(x['prompt_n'], x['prompt_ms']):.1f}", f"{rate(x['n'], x['ms']):.2f}",
                              f"{x['draft_acc']}/{x['draft_n']}" if x["draft_n"] else "-"] + (["k"] if kept else []))
         own = "".join(f"; {name}: {' '.join(f'{a}:{b}:{c}' for a, b, c in specs)}" for name, specs in arm_chat_specs.items())
         run.add("", f"chat: conversations (start:turns:chars) {' '.join(f'{a}:{b}:{c}' for a, b, c in chat_specs)}{own} of "
                 f"{Path(env('PPLFILE')).name}, {chat_gen} tokens per answer, prompt cache on",
                 *table(["arm", "start-chars", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
+        # DECPAR arms: the conversations at once over the wall time; the TG of a turn counts the time the slot shared
+        for arm in arms:
+            entry = results.get((arm.name, "chat"))
+            if not isinstance(entry, tuple) or not entry[0].get("par"):
+                continue
+            pi = entry[0]["par"]
+            tgs = [rate(x["n"], x["ms"]) for x in entry[0].get("chat", []) if x["n"]]
+            run.add(f"{arm.name}: {pi['par']} conversations at once, {pi['n']} tokens generated and {pi['prompt_n']} read in "
+                    f"{pi['wall_s']:.1f} s: {pi['n']/pi['wall_s']:.2f} t/s generated together, "
+                    f"{(pi['n'] + pi['prompt_n'])/pi['wall_s']:.1f} t/s with the prompts; a turn's TG "
+                    f"{statistics.median(tgs) if tgs else 0:.2f} (median)")
         # an arm with LLAMA_QSA_CHECK: how many carried groupings it compared (the server aborts on a difference)
         for arm in arms:
             entry = results.get((arm.name, "chat"))

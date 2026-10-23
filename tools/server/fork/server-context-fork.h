@@ -48,6 +48,13 @@ struct server_ckpt_limits {
 // the chat 756.1 against 647.4, turns of ~550 tokens after 29K 3.62 s against 4.41, TG the same
 bool server_ckpt_user_break_fork();
 
+// LLAMA_EVICT_SAVE (1 by default since 23.10, 0: upstream): when a unified KV cache is full, the idle slot used least
+// recently is cleared, and the prompt cache keeps its state first; upstream clears the first idle slot and keeps
+// nothing. with every slot allowed the whole cache (agents, no --kv-unified-per-slot) and --no-cache-idle-slots, the
+// idle conversations stay in the cache while they fit, and the one that has to give way comes back from RAM on its
+// next turn instead of a new prefill. without --cache-ram it is cleared only
+bool server_evict_save_fork();
+
 // create the prompt cache for --cache-ram != 0, with the disk spill when it is configured
 void server_prompt_cache_init(
         std::unique_ptr<server_prompt_cache> & prompt_cache,

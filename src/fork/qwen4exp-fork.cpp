@@ -59,6 +59,34 @@ struct llama_model_qwen4exp_fork::ple_warmer {
 
 llama_model_qwen4exp_fork::llama_model_qwen4exp_fork(const struct llama_model_params & params) : llama_model_base(params) {}
 
+int64_t llama_model_qwen4exp_fork::mtp_window() {
+    static const int64_t value = [] {
+        const char * env = std::getenv("LLAMA_MTP_WINDOW");
+        return env ? (int64_t) std::atoll(env) : (int64_t) 16384;
+    }();
+    return value;
+}
+
+bool llama_model_qwen4exp_fork::mtp_window_kv(const llama_cparams & cparams, uint32_t & kv_size, uint32_t & n_swa, llama_swa_type & swa_type) {
+    static const int mode = [] {
+        const char * env = std::getenv("LLAMA_MTP_WINDOW_KV");
+        return env ? std::atoi(env) : -1;
+    }();
+    const int64_t window = mtp_window();
+    if (window <= 0 || mode == 0 || (mode < 0 && cparams.n_seq_max <= 1)) {
+        return false;
+    }
+    // as llama_kv_cache_iswa sizes its SWA cache: the window of every sequence plus a ubatch
+    const int64_t size = window*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch;
+    if (size >= (int64_t) cparams.n_ctx_seq) {
+        return false;
+    }
+    kv_size  = (uint32_t) size;
+    n_swa    = (uint32_t) window;
+    swa_type = LLAMA_SWA_TYPE_STANDARD;
+    return true;
+}
+
 llama_model_qwen4exp_fork::~llama_model_qwen4exp_fork() {
     if (ple_pf && ple_pf->n_started > 0) {
         LLAMA_LOG_INFO("%s: PLE rows of %" PRId64 " ubatches gathered ahead, %" PRId64 " of them used\n", __func__,
@@ -893,13 +921,16 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         // cells of the draft memory follow the positions (one sequence, filled in order), so the last ones are the
         // nearest. the 395 (15.10 night, chats to 213K): 16384 against the whole context TG 38.64 / 36.39 / 36.84
         // against 37.08 / 34.76 / 35.37 at 120-160K / 160-200K / 200K+, acceptance 0.719 against 0.723
-        static const int64_t mtp_window = [] {
-            const char * env = std::getenv("LLAMA_MTP_WINDOW");
-            return env ? (int64_t) std::atoll(env) : (int64_t) 16384;
-        }();
+        // with several slots (or LLAMA_MTP_WINDOW_KV=1) the cache itself is the window (mtp_window_kv) and its mask
+        // has the positions; its cells are reused out of order, so the last ones are not the nearest
+        const int64_t mtp_window = llama_model_qwen4exp_fork::mtp_window();
+        uint32_t       wkv_size = 0;
+        uint32_t       wkv_swa  = 0;
+        llama_swa_type wkv_type = LLAMA_SWA_TYPE_NONE;
+        const bool window_kv = llama_model_qwen4exp_fork::mtp_window_kv(cparams, wkv_size, wkv_swa, wkv_type);
         ggml_tensor * k_all = inp_attn->mctx->get_k(ctx0, il);
         ggml_tensor * v_all = inp_attn->mctx->get_v(ctx0, il);
-        const bool windowed = mtp_window > 0 && manual_ok && cparams.n_seq_max == 1 && kq_mask->ne[0] > mtp_window &&
+        const bool windowed = mtp_window > 0 && !window_kv && manual_ok && cparams.n_seq_max == 1 && kq_mask->ne[0] > mtp_window &&
             k_all->ne[2] == kq_mask->ne[0] && v_all->nb[1] <= v_all->nb[2];
 
         rows_only = manual_ok && ((!rows_all && inp_out_ids != nullptr && inp_out_ids->ne[0] < n_tokens) || windowed);
@@ -1135,11 +1166,15 @@ public:
 // 2D rule (is_pos_2d is true for every ubatch of such a model) only where a cell and the token share the temporal
 // position; a text token shares it with its own cell alone (its x and y equal it), which the rule keeps visible, while
 // the tokens of an image share one temporal position
-// and one sequence per stream: every stream of a split cache holds one, a unified one only while the ubatch has one
-// (the reserve ubatch of a unified cache has one, a ubatch of two server slots at once takes the dense mask)
-static bool qsa_mask_pos_ubatch(const llama_cparams & cparams, const llama_ubatch & ubatch) {
-    return ubatch.token != nullptr && ubatch.embd == nullptr && !ubatch.is_mixed() &&
-        (!cparams.kv_unified || ubatch.n_seqs_unq == 1);
+// every stream of a split cache holds one sequence; a unified one can take the tokens of several server slots in one
+// ubatch, and then each sequence gets a range of positions of its own (qsa_pos_multi, 23.10), unless a cell is held by
+// two sequences (llama_memory_hybrid_idx_fork::qsa_pos_multi_ok: the dense mask then)
+static bool qsa_mask_pos_ubatch(const llama_ubatch & ubatch) {
+    return ubatch.token != nullptr && ubatch.embd == nullptr && !ubatch.is_mixed();
+}
+
+static bool qsa_pos_multi(const llama_cparams & cparams, const llama_ubatch & ubatch) {
+    return cparams.kv_unified && ubatch.n_seqs_unq > 1;
 }
 
 // the mask values of the cells QSA picks, from positions instead of the dense KQ mask (see build_attn_qsa): the position
@@ -1151,7 +1186,7 @@ public:
     virtual ~llm_graph_input_qsa_pos() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
-        mctx->set_input_qsa_pos(cell_pos, tok_pos, ubatch);
+        mctx->set_input_qsa_pos(cell_pos, tok_pos, tok_half, ubatch);
 
         // with LLAMA_QSA_FA_LIST no mask is filled and nothing reads the -inf, so it is never allocated
         if (neg_inf->buffer) {
@@ -1165,7 +1200,12 @@ public:
 
         const int64_t n_stream = mctx->get_n_stream();
 
-        bool res = qsa_mask_pos_ubatch(params.cparams, params.ubatch); // an image ubatch needs the dense mask
+        bool res = qsa_mask_pos_ubatch(params.ubatch); // an image ubatch needs the dense mask
+
+        // the ranges of several sequences in one stream take one more input and two more ops
+        const bool multi = qsa_pos_multi(params.cparams, params.ubatch);
+        res &= multi == (tok_half != nullptr);
+        res &= !multi || mctx->qsa_pos_multi_ok(&params.ubatch);
 
         res &= params.ubatch.n_tokens % n_stream == 0;
         res &= cell_pos->ne[1] == (int64_t) mctx->get_attn()->get_n_kv();
@@ -1176,7 +1216,8 @@ public:
     }
 
     ggml_tensor * cell_pos = nullptr; // F32 [1, n_kv, 1, n_stream]
-    ggml_tensor * tok_pos  = nullptr; // F32 [1, 1, n_tokens/n_stream, n_stream]
+    ggml_tensor * tok_pos  = nullptr; // F32 [1, 1, n_tokens/n_stream, n_stream]; the mid of a range with several sequences
+    ggml_tensor * tok_half = nullptr; // F32 [1, 1, n_tokens/n_stream, n_stream]: the half width, only with several sequences
     ggml_tensor * neg_inf  = nullptr; // F16 [1, 1, 1, 1]
 
     const llama_memory_hybrid_idx_fork_context * mctx;
@@ -1737,8 +1778,9 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     const int64_t n_str_m = kq_mask->ne[3];
 
     // the mask values of the selected cells. from positions (LLAMA_QSA_MASK_POS, default 1): a cell is visible to a token
-    // when the stream's sequence holds it and its position is not above the token's, which is what the KQ mask says
-    // for a ubatch of tokens (qsa_mask_pos_ubatch), causal, without ALiBi or SWA, with one sequence per stream. the dense mask then is never
+    // when the token's sequence holds it and its position is not above the token's, which is what the KQ mask says
+    // for a ubatch of tokens (qsa_mask_pos_ubatch), causal, without ALiBi or SWA; several sequences in one stream (the
+    // slots of a unified cache) through a range of positions per sequence (qsa_pos_multi). the dense mask then is never
     // built: it took n_kv x n_batch f16 twice, pinned on the host and as its copy on the device (2 GiB each at
     // 262144 x 4096, the 395 11.10), and as much host time to fill and copy per ubatch. otherwise, and with 0, the
     // values are read out of the KQ mask
@@ -1746,8 +1788,9 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         const char * env = std::getenv("LLAMA_QSA_MASK_POS");
         return env == nullptr || std::atoi(env) != 0;
     }();
-    const bool from_pos = pos_mode && cparams.causal_attn && !hparams.use_alibi && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
-        qsa_mask_pos_ubatch(cparams, ubatch);
+    const bool pos_multi = qsa_pos_multi(cparams, ubatch);
+    const bool from_pos  = pos_mode && cparams.causal_attn && !hparams.use_alibi && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
+        qsa_mask_pos_ubatch(ubatch) && (!pos_multi || mctx_hyb->qsa_pos_multi_ok(&ubatch));
 
     // fork: on Vulkan the attention can take the selected cells and their values as a list (GGML_OP_FLASH_ATTN_LIST):
     // no -inf mask of n_kv x n_batch (2 GiB at 262144 x 4096), no set_rows into it and no pre-pass of the sparse path
@@ -1790,6 +1833,11 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
             ggml_set_input(pos_inp->tok_pos);
             ggml_set_input(pos_inp->neg_inf);
 
+            if (pos_multi) {
+                pos_inp->tok_half = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, n_tps_m, n_str_m);
+                ggml_set_input(pos_inp->tok_half);
+            }
+
             qsa_pos_inp = pos_inp.get();
             res->add_input(std::move(pos_inp));
         }
@@ -1802,8 +1850,15 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         cell_pos = ggml_reshape_4d(ctx0, cell_pos, 1, top_k->ne[0], top_k->ne[1], top_k->ne[3]);
 
         // 0 where the cell is not after the token, -inf where it is (or holds another sequence, or nothing):
-        // log(1 - step(cell - token))
-        kept = ggml_sub(ctx0, cell_pos, qsa_pos_inp->tok_pos);
+        // log(1 - step(cell - token)). with several sequences in the stream: log(1 - step(|cell - mid| - half)), 0 inside
+        // the range of the token's sequence up to the token, -inf outside it
+        if (qsa_pos_inp->tok_half) {
+            kept = ggml_sub(ctx0, cell_pos, qsa_pos_inp->tok_pos);
+            kept = ggml_abs(ctx0, kept);
+            kept = ggml_sub(ctx0, kept, qsa_pos_inp->tok_half);
+        } else {
+            kept = ggml_sub(ctx0, cell_pos, qsa_pos_inp->tok_pos);
+        }
         kept = ggml_step(ctx0, kept);
         kept = ggml_scale_bias(ctx0, kept, -1.0f, 1.0f);
         kept = ggml_log(ctx0, kept);

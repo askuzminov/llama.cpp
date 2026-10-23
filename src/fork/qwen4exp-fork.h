@@ -44,6 +44,15 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
     mutable std::unique_ptr<ple_warmer> ple_wm;
     void ple_warm(const llama_ubatch & next, const llama_kv_cache & kv, int64_t n_new) const;
 
+    // LLAMA_MTP_WINDOW: the cells the dense MTP head attends to, 0 for the whole context
+    static int64_t mtp_window();
+
+    // whether the draft context keeps the KV of the dense MTP head as a window of mtp_window() positions per sequence
+    // (a SWA cache of window*n_seq + n_ubatch cells). with several slots the last cells of a shared cache are not
+    // the last positions of each slot, which the window over the last cells needs. LLAMA_MTP_WINDOW_KV: -1 (default)
+    // with several sequences, 1 always, 0 never. when true, sets the size and the SWA of the cache
+    static bool mtp_window_kv(const llama_cparams & cparams, uint32_t & kv_size, uint32_t & n_swa, llama_swa_type & swa_type);
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:

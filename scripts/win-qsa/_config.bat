@@ -174,7 +174,9 @@ rem a difference aborts (src/fork/llama-memory-hybrid-idx-fork.cpp). 03: the pro
 rem must be the one of default (the check does not change the math; on CUDA within the spread of repeat). 04: a chat
 rem of 12 turns with MTP, the decode steps and the rollbacks of rejected drafts; its speed is not a result (a full
 rem grouping every step)
-if not defined QARMS       set "QARMS=default;qsachk LLAMA_QSA_CHECK=1"
+rem [replaced 23.10] if not defined QARMS       set "QARMS=default;qsachk LLAMA_QSA_CHECK=1"
+rem 23.10: qsachk measured after the merge, no int8 KV (the user: rather nothing quantized)
+if not defined QARMS       set "QARMS=default"
 if not defined CHECKARMS   set "CHECKARMS=default;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_REPEAT,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"
 if not defined RUN_QUALITY set "RUN_QUALITY=1"
 rem [no effect, an earlier line sets RUN_CHECK] if not defined RUN_CHECK   set "RUN_CHECK=0"
@@ -387,7 +389,22 @@ rem sure at the far positions. the block of 8 (cap 7) drafts in 10.8 against 7.2
 rem here; the cap of a DFlash draft is 3 again (COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH). next: the os / code prompts
 rem (DECPREFIX 0), the code is where the authors of DFlash2 measured their lead
 rem [replaced 22.10 night] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+rem [replaced 22.10 night] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+rem 23.10: Strata here runs about as fast as we do; it samples at 0.6 / top-k 40 / top-p 0.95 (auto06: ours at
+rem those settings). its int8 KV is not taken (the user: rather nothing quantized). dflashauto for the os / code prompts
+rem 23.10: par4: 4 conversations at once in 4 slots of the unified 262K cache (-np 4), 15 turns each (~61K tokens a
+rem conversation, ~240K together), MTP: the slots of a server ubatch now keep the sparse QSA path (a range of positions
+rem per sequence, FORK.md) instead of the dense mask of n_kv x n_batch; the TG of one conversation over the same turns
+rem is in auto
+rem 23.10 evening: par4 with the QSA block order that keeps the pool rows, the grouping carried between ubatches
+rem (over the rollbacks of rejected drafts too) and the MTP head windowed per slot (a SWA cache of 16384
+rem positions a slot, LLAMA_MTP_WINDOW_KV); par4w0: the same without the window of the head (the whole unified
+rem cache). mtpkv: one slot with the window as the cache too (the exact window, the head KV 16384 + ubatch cells
+rem instead of 262144: -478 MiB), against auto. par4 and par4w0 with --no-cache-idle-slots: by default the server
+rem saves every idle slot to the RAM prompt cache and clears it from the unified KV whenever a task starts, so a
+rem conversation between its turns went RAM -> VRAM again (on the Mac 18 of 28 turns of 4 agents); when the 4
+rem conversations outgrow the 262K, the idle slot used least recently goes to the prompt cache (LLAMA_EVICT_SAVE)
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4w0 LLAMA_MTP_WINDOW_KV=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto"
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -537,7 +554,9 @@ if not defined CHECKOPS   set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL
 if not defined RUN_CHECK  set "RUN_CHECK=1"
 if not defined RUN_QUALITY set "RUN_QUALITY=1"
 rem 21.10: qsachk, see the 395
-if not defined QARMS      set "QARMS=default;qsachk LLAMA_QSA_CHECK=1"
+rem [replaced 23.10] if not defined QARMS      set "QARMS=default;qsachk LLAMA_QSA_CHECK=1"
+rem 23.10: qsachk measured after the merge, no int8 KV (the user: rather nothing quantized)
+if not defined QARMS      set "QARMS=default"
 rem [no effect, an earlier line sets QARMS] if not defined QARMS      set "QARMS=default;pf3 GGML_SCHED_PREFETCH=3"
 rem the server setup of models.ini: the VRAM cache of hot experts and the memory layout per phase
 rem 10.10: -b 8192 -ub 8192 (n2ub8k): the 118K prompt at 607.0 t/s against 527.6 with 4096, --phase-mem took ubatch
@@ -737,7 +756,15 @@ rem slots: the rollback states 900 against 450 MiB). the fixed dflash of 12:52 (
 rem the draft context reserved 8320 MiB of VRAM (the logits of 8192 tokens). qsachk: 12 groupings in 03, 1024+ in 04,
 rem all equal. the first start of qsachk at 12:52 ended 0xc0000005 before any output, the retry ran
 rem [replaced 22.10 night] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;qsachk LLAMA_QSA_CHECK=1 DECCHAT=0:12:16000 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;dflashauto3 @dflash --spec-type draft-dflash --spec-auto --spec-draft-n-max 3"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+rem [replaced 22.10 night] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto"
+rem 23.10: Strata does 30-45 t/s here at 0.6 / top-k 40 / top-p 0.95, a context of 128K and seemingly an int8 KV:
+rem its KV ~1.8 GB of VRAM against our 7.4, ~38 expert slots more. no int8 KV here (the user: rather nothing
+rem quantized); auto06: ours at the Strata sampling, s128: also at 128K (f16 KV, a chat of 30 turns, ~115K tokens),
+rem against auto06 over the same turns: how much of the gap the context and the sampling make
+rem 23.10: par4 as on the 395 (4 slots at once, MTP); dflashauto measured as even with MTP here, left out
+rem 23.10 evening: mtpkv: the head KV as a window of 16384 positions (LLAMA_MTP_WINDOW_KV=1, 512 -> ~34 MiB of
+rem VRAM, which goes to the expert slots), against auto; par4 with the changes of the 395 and --no-cache-idle-slots (see there)
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"

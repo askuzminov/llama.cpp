@@ -1876,6 +1876,8 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                evict_for_load_fork(*ret, task.tokens); // fork
+
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
@@ -1889,6 +1891,64 @@ private:
         return ret;
     }
 
+    // fork: clear the idle slot used least recently, other than `keep`, and keep its state in the prompt cache first
+    // (server_evict_save_fork). `update` lets the cache fit its limit after the save; the load path leaves that to
+    // its own update, which runs after the load. false when no idle slot holds tokens
+    bool evict_idle_lru_fork(const server_slot * keep, bool update) {
+        server_slot * lru = nullptr;
+        for (auto & slot : slots) {
+            if (&slot != keep && !slot.is_processing() && slot.prompt.n_tokens() > 0 &&
+                    (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
+                lru = &slot;
+            }
+        }
+        if (lru == nullptr) {
+            return false;
+        }
+
+        // false when the cache holds this prompt already or cannot take it
+        const bool saved = prompt_cache && lru->prompt_save(*prompt_cache);
+        if (saved && update) {
+            prompt_cache->update();
+        }
+
+        SRV_WRN("purging slot %d with %zu tokens, the least recently used idle one%s\n", lru->id, lru->prompt.tokens.size(),
+                saved ? ", saved to the prompt cache" : "");
+
+        lru->prompt_clear();
+
+        return true;
+    }
+
+    // fork: a unified cache must have free cells for the state the prompt cache restores into `dst`: a load that does
+    // not fit fails and erases its entry, and the conversation is computed again from the start. the idle slots used
+    // least recently give way until the cells of the other slots and the restored ones fit (server_evict_save_fork)
+    void evict_for_load_fork(const server_slot & dst, const server_tokens & tokens) {
+        if (!params_base.kv_unified || !server_evict_save_fork() || !prompt_cache) {
+            return;
+        }
+
+        const auto it = prompt_cache->find_best(dst.prompt.tokens, tokens);
+        if (it == prompt_cache->states.end()) {
+            return;
+        }
+
+        const int64_t n_ctx = llama_n_ctx(ctx_tgt);
+        const int64_t need  = (int64_t) it->prompt.tokens.size();
+
+        while (true) {
+            int64_t held = 0;
+            for (const auto & slot : slots) {
+                if (&slot != &dst) {
+                    held += slot.prompt.n_tokens();
+                }
+            }
+            if (held + need <= n_ctx || !evict_idle_lru_fork(&dst, false)) {
+                break;
+            }
+        }
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
@@ -1899,6 +1959,11 @@ private:
 
         if (!params_base.kv_unified) {
             return res;
+        }
+
+        // fork: the idle slot used least recently, kept in the prompt cache first (server_evict_save_fork)
+        if (server_evict_save_fork()) {
+            return evict_idle_lru_fork(nullptr, true);
         }
 
         for (auto & slot : slots) {

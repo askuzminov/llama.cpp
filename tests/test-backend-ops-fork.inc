@@ -221,9 +221,10 @@ struct test_flash_attn_list : public test_case {
     const int64_t n_list;
     const int64_t blk;
     const int64_t ns;   // streams (ne3)
+    const ggml_type type_kv;
 
     std::string vars() override {
-        return VARS_TO_STR9(hsk, hsv, nh, gqa, kv, nb, n_list, blk, ns);
+        return VARS_TO_STR10(hsk, hsv, nh, gqa, kv, nb, n_list, blk, ns, type_kv);
     }
 
     double max_nmse_err() override {
@@ -231,15 +232,16 @@ struct test_flash_attn_list : public test_case {
     }
 
     test_flash_attn_list(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 1, int64_t gqa = 8, int64_t kv = 4096,
-                         int64_t nb = 16, int64_t n_list = 512, int64_t blk = 4, int64_t ns = 1)
-        : hsk(hsk), hsv(hsv), nh(nh), gqa(gqa), kv(kv), nb(nb), n_list(n_list), blk(blk), ns(ns) {}
+                         int64_t nb = 16, int64_t n_list = 512, int64_t blk = 4, int64_t ns = 1,
+                         ggml_type type_kv = GGML_TYPE_F16)
+        : hsk(hsk), hsv(hsv), nh(nh), gqa(gqa), kv(kv), nb(nb), n_list(n_list), blk(blk), ns(ns), type_kv(type_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*gqa, ns);
         ggml_set_name(q, "q");
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, kv, nh, ns);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_kv, hsk, kv, nh, ns);
         ggml_set_name(k, "k");
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsv, kv, nh, ns);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_kv, hsv, kv, nh, ns);
         ggml_set_name(v, "v");
         ggml_tensor * vals = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_list, nb, 1, ns);
         ggml_set_name(vals, "vals");
@@ -563,6 +565,11 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
     test_cases.emplace_back(new test_flash_attn_list(128, 128, 4, 1, 4096, 33, 300, 1));
     test_cases.emplace_back(new test_flash_attn_list(256, 256, 2, 12, 4096, 16, 1024, 4, 2));
     test_cases.emplace_back(new test_flash_attn_list(64, 64, 1, 4, 256, 8, 512, 4));
+    // a q8_0 KV cache (-ctk / -ctv q8_0, 22.10): the qwen4exp shape at decode and in a prompt ubatch
+    for (int64_t nb : {1, 64}) {
+        test_cases.emplace_back(new test_flash_attn_list(256, 256, 2, 12, 8192, nb, 2052, 4, 1, GGML_TYPE_Q8_0));
+    }
+    test_cases.emplace_back(new test_flash_attn_list(128, 128, 1, 8, 4096, 37, 512, 4, 1, GGML_TYPE_Q8_0));
 
     // GET_ROWS of short rows (CUDA: one thread per element, fork/getrows-fork.inc): the qwen4exp attention gathers of
     // a 64-token ubatch, the positions of the selected cells (rows of 1, flat), the mask values (rows of 1, per token)

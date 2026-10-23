@@ -101,12 +101,26 @@ public:
                        bool causal_attn) const;
 
     // the attention mask of QSA at the cells top_k picks, computed on the device from positions instead of read out
-    // of the dense KQ mask (LLAMA_QSA_MASK_POS): for a ubatch of tokens, causal, without ALiBi or SWA and with one
-    // sequence per stream, cell j is visible to a token when the stream's sequence holds it and its temporal position
-    // is not above the token's, as set_input_kq_mask decides
+    // of the dense KQ mask (LLAMA_QSA_MASK_POS): for a ubatch of tokens, causal, without ALiBi or SWA, cell j is visible
+    // to a token when the token's sequence holds it and its temporal position is not above the token's, as
+    // set_input_kq_mask decides. with one sequence per stream:
     //   cell_pos F32 [1, n_kv, 1, ns]          position of each attention cell of the stream's sequence, +inf otherwise
     //   tok_pos  F32 [1, 1, n_tokens/ns, ns]   position of each token
-    void set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, const llama_ubatch * ubatch, uint32_t n_kv) const;
+    // with several sequences in one stream (tok_half given: the slots of a unified cache in one ubatch, 23.10), each
+    // sequence of the stream gets its own range of positions, rank*2^QSA_POS_STRIDE_LOG2 on, so a cell is visible when it
+    // lies in [rank*stride, rank*stride + pos] of the token, i.e. |cell - mid| <= half:
+    //   cell_pos F32                           rank of the cell's sequence * stride + its position, +inf when empty
+    //   tok_pos  F32                           mid  = rank of the token's sequence * stride + pos/2
+    //   tok_half F32 [1, 1, n_tokens/ns, ns]   half = pos/2
+    // a cell that two sequences hold has no single range: qsa_pos_multi_ok then says no and the dense mask is used
+    void set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, ggml_tensor * tok_half, const llama_ubatch * ubatch,
+                           uint32_t n_kv) const;
+
+    static constexpr int QSA_POS_STRIDE_LOG2 = 18;
+
+    // whether the ranges of set_input_qsa_pos can describe this ubatch's stream: no cell held by two sequences, every
+    // position below the stride and all the values exact in f32 (up to 32 sequences). checked once per ubatch
+    bool qsa_pos_multi_ok(const llama_ubatch * ubatch, uint32_t n_kv) const;
 
     // what one pass has to rebuild of the pooled block keys
     struct qsa_plan {
@@ -185,6 +199,27 @@ private:
         int32_t      n_spare   = 0;
         int32_t      n_same    = 0;       // leading blocks the last update left as they were
         llama_pos    dirty_pos = std::numeric_limits<llama_pos>::max();
+
+        // carried forward by qsa_group_update_multi: several sequences, one per cell, the groups of the last
+        // grouping keyed on (sequence, bucket) and the tail rollbacks since: m_cut[q] the first position a
+        // rollback of q took, m_cut_hi[q] the last position q had then
+        bool                   inc_multi = false;
+        uint64_t               m_epoch   = 0;       // the ubatch the groups describe
+        int64_t                m_n_cells = 0;       // the cells in groups
+        bool                   m_any_cut = false;
+        std::vector<int32_t>   m_cell_grp;          // n_kv: the group of a cell, -1 for none
+        std::vector<int32_t>   m_head;              // per bucket: the first group of its chain
+        std::vector<int32_t>   m_next;              // per group
+        std::vector<int32_t>   m_seq;               // per group: its sequence
+        std::vector<int32_t>   m_pb;                // per group: its bucket
+        std::vector<uint64_t>  m_slots;             // per group: the slots it has a cell for
+        std::vector<int32_t>   m_cell;              // ratio per group: the cell of each slot, -1 for none
+        std::vector<int32_t>   m_bid;               // per group: its block id, -1 for none
+        std::vector<uint8_t>   m_in_open;           // per group: listed in m_open
+        std::vector<int32_t>   m_bid_grp;           // per block id: its group
+        std::vector<int32_t>   m_open;              // the groups that may be incomplete
+        std::vector<llama_pos> m_cut;               // per sequence
+        std::vector<llama_pos> m_cut_hi;
     };
 
     // regroup only the blocks of g that can have changed since the last ubatch: those from the first incomplete
@@ -192,6 +227,13 @@ private:
     // the caller then groups every cell
     bool qsa_group_update(qsa_group & g, const llama_kv_cells & cells, const std::vector<uint32_t> & new_cells,
                           int64_t n_kv, int64_t r) const;
+
+    // the same for several sequences in one stream: the rollbacks since the last ubatch, then its new cells. the
+    // blocks keep their ids up to the first one a rollback took, the ones after it keep their order, and the blocks
+    // completed now follow by their last cell, as the full grouping orders them (group_full). false when g cannot
+    // be carried. on the Mac, 4 slots at 8K each: 13 us per decode pass against 1260 for the full grouping
+    bool qsa_group_update_multi(qsa_group & g, const llama_kv_cells & cells, const std::vector<uint32_t> & new_cells,
+                                int64_t n_kv, int64_t r) const;
 
     mutable std::vector<int32_t> qsa_scratch;
 
@@ -205,11 +247,12 @@ private:
         std::vector<qsa_group> grp;       // per ubatch stream
     };
 
-    // the block tables each cache stream's pool rows were built from
+    // the block tables each cache stream's pool rows were built from. a trim keeps the rows past n: several
+    // sequences order their blocks by them (group_full)
     struct qsa_pool_stream {
-        std::vector<int32_t> cells;       // ratio*n
-        std::vector<int32_t> pos;         // 4*n
-        int32_t n = 0;
+        std::vector<int32_t> cells;       // ratio per row, at least n rows
+        std::vector<int32_t> pos;         // 4 per row
+        int32_t n = 0;                    // the rows that hold the keys of their blocks
     };
 
     // layers can differ in ratio, so everything below is kept per ratio
@@ -217,6 +260,11 @@ private:
     mutable std::map<uint32_t, std::vector<qsa_pool_stream>> qsa_pool;
 
     mutable uint64_t qsa_epoch = 1;
+
+    // qsa_pos_multi_ok of the ubatch of qsa_pos_ok_epoch
+    mutable uint64_t qsa_pos_ok_epoch = 0;
+    mutable uint32_t qsa_pos_ok_n_kv  = 0;
+    mutable bool     qsa_pos_ok       = false;
 
     std::map<int32_t, ggml_tensor *> pool_tensors;
     std::map<int32_t, ggml_tensor *> score_tensors;
@@ -286,7 +334,10 @@ public:
                              uint32_t ratio) const;
 
     // see llama_memory_hybrid_idx_fork::set_input_qsa_pos, over the attention cells of this ubatch
-    void set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, const llama_ubatch * ubatch) const;
+    void set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, ggml_tensor * tok_half, const llama_ubatch * ubatch) const;
+
+    // see llama_memory_hybrid_idx_fork::qsa_pos_multi_ok
+    bool qsa_pos_multi_ok(const llama_ubatch * ubatch) const;
 
     // this ubatch's streams of the stored block keys: F32 [indexer_head_size, kv_size/ratio, ns]
     ggml_tensor * get_pool(ggml_context * ctx, int32_t il) const;

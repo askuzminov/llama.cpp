@@ -3474,6 +3474,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // fork: the dense MTP head of the fork's qwen4exp can keep only its window (mtp_window_kv)
+                        uint32_t       kv_size  = cparams.n_ctx_seq;
+                        uint32_t       n_swa    = hparams.n_swa;
+                        llama_swa_type swa_type = hparams.swa_type;
+                        if (mtp_dense_fork && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            llama_model_qwen4exp_fork::mtp_window_kv(cparams, kv_size, n_swa, swa_type);
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3482,11 +3490,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                n_swa,
+                                swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
