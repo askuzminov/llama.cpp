@@ -249,6 +249,9 @@ struct test_flash_attn_list : public test_case {
         ggml_set_name(idx, "idx");
 
         ggml_tensor * out = ggml_flash_attn_list(ctx, q, k, v, vals, idx, 1.0f/sqrtf((float) hsk));
+        // the Vulkan FA picks f32 accumulators by ggml_prec_get_acc (8e5a58df8), which has to know this op, or the
+        // list runs with f16 accumulators where the device has fp16
+        GGML_ASSERT(ggml_prec_get_acc(out) == GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
     }

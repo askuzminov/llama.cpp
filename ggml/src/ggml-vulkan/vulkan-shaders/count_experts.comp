@@ -41,6 +41,10 @@ shared uint vals[EXPERTS_PER_CHUNK];
 shared uint offsets[EXPERTS_PER_CHUNK];
 shared uint cursors[EXPERTS_PER_CHUNK];
 
+// fork: set by the count when an id is -1, so that zero_skipped_rows runs only then. it walks every id in every
+// invocation: 15 of 95 ms of a qwen4exp MUL_MAT_ID (512 experts, 10 used) at -ub 4096 on the 5500M without a skip
+shared uint any_skipped;
+
 // data_d[0] is the tile count. Each tile has (expert, valid rows).
 // Packed (token << 16) | slot row ids start at p.row_ids_offset, with each expert on a tile boundary.
 void write_tiles(uint expert, uint count, uint tile_begin, uint n_tiles) {
@@ -81,6 +85,10 @@ void main() {
     const bool prefix_subgroup = subgroupAny(tid == 0);
 #endif
 
+    if (tid == 0) {
+        any_skipped = 0; // fork
+    }
+
     for (uint expert_base = 0; expert_base < p.n_experts;) {
         const uint n_experts = min(EXPERTS_PER_CHUNK, p.n_experts - expert_base);
         for (uint e = tid; e < n_experts; e += BLOCK_SIZE) {
@@ -94,6 +102,8 @@ void main() {
             const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00] - expert_base;
             if (expert < n_experts) {
                 atomicAdd(vals[expert], 1);
+            } else if (int(expert + expert_base) == -1) {
+                atomicOr(any_skipped, 1); // fork
             }
         }
         barrier();
@@ -148,5 +158,8 @@ void main() {
         data_d[0] = total_tiles;
     }
 
-    zero_skipped_rows();
+    // fork: the last write of any_skipped is before the barrier that follows each count
+    if (any_skipped != 0) {
+        zero_skipped_rows();
+    }
 }

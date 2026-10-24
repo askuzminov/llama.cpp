@@ -3317,6 +3317,7 @@ bool ggml_prec_set_acc(
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_LIST: // fork: its precision is where FLASH_ATTN_EXT keeps it
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 3, prec_i32);
@@ -3361,6 +3362,7 @@ enum ggml_prec ggml_prec_get_acc(
         case GGML_OP_MUL_MAT_ID:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_LIST: // fork: the F32 of ggml_flash_attn_list, the Vulkan FA reads it here since 8e5a58df8
             return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
         default:
             return GGML_PREC_UNDEFINED;
