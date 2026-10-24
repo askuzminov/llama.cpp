@@ -246,6 +246,8 @@ struct common_speculative_auto {
 };
 
 // a DFlash2 / LiLiCorr lattice position for the gate of --spec-auto: the candidate ids and their scores given the
-// pick at the position before, the softmax over them as the draft probabilities (the pick first). false ends the draft
+// pick at the position before, the softmax over them as the draft probabilities (the pick first). sampled: the pick was
+// drawn from the softmax of the scores at the target temperature (--spec-draft-sampling probabilistic), so they are the
+// token distribution of the drafter, and the gate judges the argmax of the row instead of the draw. false ends the draft
 bool common_speculative_fork_lattice_keep(common_speculative_auto * ctl, llama_seq_id seq_id, const float * ids,
-        const float * scores, int32_t top_k, int32_t chosen);
+        const float * scores, int32_t top_k, int32_t chosen, bool sampled);

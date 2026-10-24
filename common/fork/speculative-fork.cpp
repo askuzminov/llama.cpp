@@ -556,7 +556,15 @@ void common_speculative_auto::print() const {
 }
 
 bool common_speculative_fork_lattice_keep(common_speculative_auto * ctl, llama_seq_id seq_id, const float * ids,
-        const float * scores, int32_t top_k, int32_t chosen) {
+        const float * scores, int32_t top_k, int32_t chosen, bool sampled) {
+    // a drawn pick is judged by the argmax of its row, as a sampled MTP token by the top candidate: rejection sampling
+    // returns the target distribution only when the draft takes a position whatever token the drafter drew there. a
+    // gate on the drawn token keeps the draws of the head, drops those of the tail, and the head comes out more often
+    // than the target has it
+    if (sampled) {
+        chosen = (int32_t) std::distance(scores, std::max_element(scores, scores + top_k));
+    }
+
     // a selector row of -inf only gives the pick no score (-inf - -inf is NaN): no probabilities then, keep() gets NaN,
     // which the gate drops and the calibration skips. a candidate without a number has none either
     const bool scored = std::isfinite(scores[chosen]);
@@ -582,9 +590,11 @@ bool common_speculative_fork_lattice_keep(common_speculative_auto * ctl, llama_s
     bool more = true;
     const bool keep = ctl->keep(seq_id, &cur_p, more);
 
-    // the scores of the selector are no token distribution of the drafter: no overlap with the target in the trace
+    // the scores of a greedy walk are no token distribution of the drafter (it takes the argmax): no overlap with the
+    // target in the trace. a sampled walk draws from their softmax at the target temperature, which is what the trace
+    // computes the overlap from
     auto & s = ctl->seqs[seq_id];
-    if (keep && !s.q_dist.empty()) {
+    if (keep && !sampled && !s.q_dist.empty()) {
         s.q_dist.back() = 0;
     }
     return keep;

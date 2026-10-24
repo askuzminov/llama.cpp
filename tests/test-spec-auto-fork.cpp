@@ -92,7 +92,7 @@ int main() {
         ctl.mode     = common_speculative_auto::MODE_OFF;
         ctl.drafting = DFLASH;
         ctl.seqs[0]  = {};
-        CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 4, 0));
+        CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 4, 0, false));
         CHECK(ctl.seqs[0].hp.size() == 1 && std::isnan(ctl.seqs[0].hp[0]));
 
         // the gate drops it
@@ -100,7 +100,7 @@ int main() {
         ctl.thr_keep = 0.01;
         ctl.thr_step = 0.01;
         ctl.seqs[0]  = {};
-        CHECK(!common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 4, 0));
+        CHECK(!common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 4, 0, false));
         CHECK(ctl.seqs[0].hp.empty());
     }
 
@@ -114,9 +114,43 @@ int main() {
 
         const float ids   [4] = { 11, 12, 13, 14 };
         const float scores[4] = { 0.0f, 2.0f, -inf, nan };
-        CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 4, 1));
+        CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 4, 1, false));
         const float want = 1.0f / (1.0f + std::exp(-2.0f));
         CHECK(ctl.seqs[0].hp.size() == 1 && std::fabs(ctl.seqs[0].hp[0] - want) < 1e-6f);
+    }
+
+    // a sampled walk (--spec-draft-sampling probabilistic): the gate judges the argmax of the row, whatever pick was
+    // drawn. rejection sampling returns the target distribution only when the draft takes a position independently of
+    // the draw; a gate on the drawn pick would keep the draws of the head and drop those of the tail
+    {
+        common_speculative_auto ctl;
+        ctl.init(true, 1, 3, nullptr);
+
+        // the calibration: a draft p of 0.95 accepted, 0.15 rejected
+        for (int i = 0; i < 300; ++i) {
+            verify(ctl, DFLASH, { 0.95f }, 1);
+            verify(ctl, DFLASH, { 0.15f }, 0);
+        }
+        ctl.mode     = common_speculative_auto::MODE_GATE;
+        ctl.drafting = DFLASH;
+        ctl.thr_keep = 0.5;
+        ctl.thr_step = 0.0;
+
+        // shares 0.94, 0.05, 0.02: the pick of the tail alone would be dropped
+        const float ids   [3] = { 11, 12, 13 };
+        const float scores[3] = { 4.0f, 1.0f, 0.0f };
+        for (int32_t pick = 0; pick < 3; ++pick) {
+            ctl.seqs[0] = {};
+            CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 3, pick, true));
+            CHECK(ctl.seqs[0].hp.size() == 1 && ctl.seqs[0].hp[0] > 0.9f);
+        }
+
+        // the row decides the other way too: a flat row is dropped whatever the pick
+        const float flat[3] = { 0.0f, 0.0f, 0.0f };
+        for (int32_t pick = 0; pick < 3; ++pick) {
+            ctl.seqs[0] = {};
+            CHECK(!common_speculative_fork_lattice_keep(&ctl, 0, ids, flat, 3, pick, true));
+        }
     }
 
     // the trace: the overlap of the draft with the target (ov) needs a token distribution of the drafter. the candidates
@@ -138,7 +172,7 @@ int main() {
             ctl.drafting = DFLASH;
             ctl.seqs[0]  = {};
             ctl.seqs[0].st = 1;
-            CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 3, 0));
+            CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 3, 0, false));
             ctl.on_verify(0, 0, &tgt_p, 11, 1.0f);
             CHECK(ctl.seqs[0].pt.size() == 1 && ctl.seqs[0].pt[0] == 0.5f);
             CHECK(ctl.seqs[0].ov.size() == 1 && ctl.seqs[0].ov[0] == -1.0f);
@@ -151,6 +185,15 @@ int main() {
             ctl.seqs[0].st = 1;
             CHECK(ctl.keep(0, &head_p, more));
             ctl.on_verify(0, 0, &tgt_p, 11, 1.0f);
+            CHECK(ctl.seqs[0].ov.size() == 1 && ctl.seqs[0].ov[0] > 0.0f && ctl.seqs[0].ov[0] <= 1.0f);
+
+            // a sampled walk (--spec-draft-sampling probabilistic) draws from the softmax of the scores at the target
+            // temperature: that is the token distribution of the drafter, and the overlap is computed
+            ctl.drafting = DFLASH;
+            ctl.seqs[0]  = {};
+            ctl.seqs[0].st = 1;
+            CHECK(common_speculative_fork_lattice_keep(&ctl, 0, ids, scores, 3, 1, true));
+            ctl.on_verify(0, 0, &tgt_p, 12, 1.0f);
             CHECK(ctl.seqs[0].ov.size() == 1 && ctl.seqs[0].ov[0] > 0.0f && ctl.seqs[0].ov[0] <= 1.0f);
         }
         std::remove(path);
