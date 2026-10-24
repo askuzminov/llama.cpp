@@ -965,8 +965,11 @@ void server_prompt_cache::evict_state(server_prompt_cache_state & st) {
 }
 
 bool server_prompt_cache::spill_state(server_prompt_cache_state & st, size_t disk_free) {
-    if (!st.on_disk && !write_state(st, nullptr, disk_free)) {
-        return false;
+    if (!st.on_disk) {
+        if (!write_state(st, nullptr, disk_free)) {
+            return false;
+        }
+        SRV_TRC(" - spilled a prompt-cache state of %d tokens to disk (%.3f MiB)\n", st.prompt.n_tokens(), st.disk_bytes / (1024.0 * 1024.0));
     }
 
     evict_state(st);
@@ -1148,7 +1151,7 @@ void server_prompt_cache::enforce_disk_limit() {
     }
 }
 
-size_t server_prompt_cache::free_ram(size_t need) {
+size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
     size_t freed = 0;
 
     if (!spill_dir.empty()) {
@@ -1173,7 +1176,7 @@ size_t server_prompt_cache::free_ram(size_t need) {
         }
 
         for (auto & st : states) {
-            if (freed >= need) {
+            if (freed >= need || !may_write) {
                 break;
             }
             if (st.on_disk || st.data.size() == 0) {

@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "fork/env-fork.h" // fork: LLAMA_SAMPLER_FAST_TOP_K
 
 #include "ggml.h"
 
@@ -144,8 +145,7 @@ struct common_sampler {
     bool set_logits_top_k(struct llama_context * ctx, int idx) {
         if (fast_state < 0) {
             fast_state = 0;
-            const char * env = getenv("LLAMA_SAMPLER_FAST_TOP_K");
-            if ((env == nullptr || atoi(env) != 0) && params.mirostat == 0 && params.n_probs == 0 && !params.backend_sampling) {
+            if (common_fork_env_int("LLAMA_SAMPLER_FAST_TOP_K", 1) != 0 && params.mirostat == 0 && params.n_probs == 0 && !params.backend_sampling) {
                 for (const auto & type : params.samplers) {
                     if (type == COMMON_SAMPLER_TYPE_TOP_K) {
                         if (params.top_k > 0 && params.top_k <= 256) {

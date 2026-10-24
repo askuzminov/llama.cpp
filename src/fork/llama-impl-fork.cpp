@@ -1,6 +1,7 @@
 // the fork's helpers declared in llama-impl.h
 
 #include "llama-impl.h"
+#include "llama-fork.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -10,9 +11,10 @@
 
 void llama_parallel_for(int64_t n, int64_t work, const std::function<void(int64_t, int64_t)> & fn) {
     static const int64_t n_threads = [] {
-        const char * env = getenv("LLAMA_INPUT_THREADS");
-        if (env) {
-            return (int64_t) std::max(1, atoi(env));
+        // set: at least one thread
+        const int64_t n = llama_fork_env_int("LLAMA_INPUT_THREADS", -1);
+        if (n >= 0) {
+            return std::max<int64_t>(1, n);
         }
         return (int64_t) std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
     }();

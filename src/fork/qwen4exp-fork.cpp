@@ -1,6 +1,7 @@
 #include "qwen4exp-fork.h"
 #include "llama-fork.h"
 #include "llama-impl.h"
+#include "llama-mtp-window-fork.h"
 #include "llama-memory-hybrid-idx-fork.h"
 #include "llama-memory-recurrent.h"
 
@@ -61,28 +62,22 @@ llama_model_qwen4exp_fork::llama_model_qwen4exp_fork(const struct llama_model_pa
 
 int64_t llama_model_qwen4exp_fork::mtp_window() {
     static const int64_t value = [] {
-        const char * env = std::getenv("LLAMA_MTP_WINDOW");
-        return env ? (int64_t) std::atoll(env) : (int64_t) 16384;
+        return llama_fork_env_int("LLAMA_MTP_WINDOW", 16384);
     }();
     return value;
 }
 
 bool llama_model_qwen4exp_fork::mtp_window_kv(const llama_cparams & cparams, uint32_t & kv_size, uint32_t & n_swa, llama_swa_type & swa_type) {
     static const int mode = [] {
-        const char * env = std::getenv("LLAMA_MTP_WINDOW_KV");
-        return env ? std::atoi(env) : -1;
+        return (int) llama_fork_env_int("LLAMA_MTP_WINDOW_KV", -1);
     }();
-    const int64_t window = mtp_window();
-    if (window <= 0 || mode == 0 || (mode < 0 && cparams.n_seq_max <= 1)) {
+    const llama_mtp_window_kv_fork res = llama_mtp_window_kv_rule_fork(mtp_window(), mode, cparams.n_seq_max,
+            cparams.kv_unified, cparams.n_ubatch, cparams.n_ctx_seq);
+    if (!res.on) {
         return false;
     }
-    // as llama_kv_cache_iswa sizes its SWA cache: the window of every sequence plus a ubatch
-    const int64_t size = window*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch;
-    if (size >= (int64_t) cparams.n_ctx_seq) {
-        return false;
-    }
-    kv_size  = (uint32_t) size;
-    n_swa    = (uint32_t) window;
+    kv_size  = res.kv_size;
+    n_swa    = res.n_swa;
     swa_type = LLAMA_SWA_TYPE_STANDARD;
     return true;
 }
@@ -175,8 +170,7 @@ void llama_model_qwen4exp_fork::load_arch_hparams(llama_model_loader & ml) {
     // the upstream one the trunk ratio. LLAMA_MTP_QSA=1: it takes the trunk ratio and attends through QSA like a
     // full-attention trunk layer, its draft context then holds a llama_memory_hybrid_idx_fork (llama_model::create_memory)
     {
-        const char * env = std::getenv("LLAMA_MTP_QSA");
-        const bool mtp_qsa = env != nullptr && std::atoi(env) != 0;
+        const bool mtp_qsa = llama_fork_env_int("LLAMA_MTP_QSA", 0) != 0;
 
         uint32_t r_trunk = 0;
         for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
@@ -478,8 +472,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
     // the mean, and from 32 tokens, where that fusion runs. the 395 (14.10): -2.7 to -3.0 percent of the GPU time of a
     // prompt ubatch at 0 / 15K / 118K, KLD 0.015284 against 0.015465 (13.10)
     static const bool hc_f16 = [] {
-        const char * env = std::getenv("LLAMA_HC_F16");
-        return env == nullptr || std::atoi(env) != 0;
+        return llama_fork_env_int("LLAMA_HC_F16", 1) != 0;
     }();
     if (hc_f16 && il >= 0 && nt >= 32 && cparams.fused_dsv4_hc_pre &&
             std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "Vulkan") == 0) {
@@ -545,8 +538,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
         // ran it at 67 us, 96 times per token (cuda_op_timing 11.10); plain it is 4 rows of 1 column.
         // LLAMA_HC_INJECT_SWAP_MIN: tokens from which the order is swapped (5, 0 = always)
         static const int64_t swap_min = [] {
-            const char * env = std::getenv("LLAMA_HC_INJECT_SWAP_MIN");
-            return env ? (int64_t) atoi(env) : (int64_t) 5;
+            return llama_fork_env_int("LLAMA_HC_INJECT_SWAP_MIN", 5);
         }();
         if (w_inject->type == GGML_TYPE_F32 && nt >= swap_min) {
             ggml_tensor * inj = ggml_mul_mat(ctx0, xn, w_inject);
@@ -847,8 +839,7 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         // took the 395 prompt down 4 percent at 80-120K and 7 with a budget of 8192 (13.10 night, chats).
         // LLAMA_MTP_ROWS_ALL=1: attend for every row
         static const bool rows_all_qsa = [] {
-            const char * env = std::getenv("LLAMA_MTP_ROWS_ALL");
-            return env != nullptr && std::atoi(env) != 0;
+            return llama_fork_env_int("LLAMA_MTP_ROWS_ALL", 0) != 0;
         }();
         if (!rows_all_qsa && !cparams.training && inp_out_ids != nullptr && inp_out_ids->ne[0] == 0) {
             build_layer_attn(inp_hyb->get_attn(), mctx_hyb, cur, inp_pos, sections, il, true);
@@ -908,8 +899,7 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         // those. at a 118K prompt on the 395 the draft context took 55 s of attention for all rows (09.10).
         // LLAMA_MTP_ROWS_ALL=1: attend for every row, as before
         static const bool rows_all = [] {
-            const char * env = std::getenv("LLAMA_MTP_ROWS_ALL");
-            return env != nullptr && std::atoi(env) != 0;
+            return llama_fork_env_int("LLAMA_MTP_ROWS_ALL", 0) != 0;
         }();
         ggml_tensor * kq_mask = inp_attn->get_kq_mask();
         const bool manual_ok = !cparams.training && inp_attn->self_k_rot == nullptr && inp_attn->self_v_rot == nullptr &&
@@ -922,7 +912,12 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         // nearest. the 395 (15.10 night, chats to 213K): 16384 against the whole context TG 38.64 / 36.39 / 36.84
         // against 37.08 / 34.76 / 35.37 at 120-160K / 160-200K / 200K+, acceptance 0.719 against 0.723
         // with several slots (or LLAMA_MTP_WINDOW_KV=1) the cache itself is the window (mtp_window_kv) and its mask
-        // has the positions; its cells are reused out of order, so the last ones are not the nearest
+        // has the positions; its cells are reused out of order, so the last ones are not the nearest.
+        // n_kv is padded to a multiple of 256 (llama_kv_cache::get_n_kv, the graph stays the same across ubatches),
+        // so its last up to 255 cells are empty: the view starts that much earlier and takes the window and up to 255
+        // older cells. a view of the last <cells> of n_kv lost up to 255 cells of the window, and a window below the
+        // padding could hold no cell in use at all (24.10). an exact window is LLAMA_MTP_WINDOW_KV=1
+        static constexpr int64_t mtp_window_pad = 255;
         const int64_t mtp_window = llama_model_qwen4exp_fork::mtp_window();
         uint32_t       wkv_size = 0;
         uint32_t       wkv_swa  = 0;
@@ -930,7 +925,7 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         const bool window_kv = llama_model_qwen4exp_fork::mtp_window_kv(cparams, wkv_size, wkv_swa, wkv_type);
         ggml_tensor * k_all = inp_attn->mctx->get_k(ctx0, il);
         ggml_tensor * v_all = inp_attn->mctx->get_v(ctx0, il);
-        const bool windowed = mtp_window > 0 && !window_kv && manual_ok && cparams.n_seq_max == 1 && kq_mask->ne[0] > mtp_window &&
+        const bool windowed = mtp_window > 0 && !window_kv && manual_ok && cparams.n_seq_max == 1 && kq_mask->ne[0] > mtp_window + mtp_window_pad &&
             k_all->ne[2] == kq_mask->ne[0] && v_all->nb[1] <= v_all->nb[2];
 
         rows_only = manual_ok && ((!rows_all && inp_out_ids != nullptr && inp_out_ids->ne[0] < n_tokens) || windowed);
@@ -958,11 +953,12 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
                 ggml_tensor * k = k_all;
                 ggml_tensor * v = v_all;
                 if (windowed) {
-                    const int64_t n_kv = kq_mask->ne[0];
-                    const int64_t off  = n_kv - mtp_window;
-                    k = ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], mtp_window, k_all->ne[3], k_all->nb[1], k_all->nb[2], k_all->nb[3], off*k_all->nb[2]);
-                    v = ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], mtp_window, v_all->ne[3], v_all->nb[1], v_all->nb[2], v_all->nb[3], off*v_all->nb[2]);
-                    mask_out = ggml_cont(ctx0, ggml_view_2d(ctx0, mask_out, mtp_window, n_out, mask_out->nb[1], off*ggml_element_size(mask_out)));
+                    const int64_t n_kv  = kq_mask->ne[0];
+                    const int64_t n_win = mtp_window + mtp_window_pad;
+                    const int64_t off   = n_kv - n_win;
+                    k = ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_win, k_all->ne[3], k_all->nb[1], k_all->nb[2], k_all->nb[3], off*k_all->nb[2]);
+                    v = ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_win, v_all->ne[3], v_all->nb[1], v_all->nb[2], v_all->nb[3], off*v_all->nb[2]);
+                    mask_out = ggml_cont(ctx0, ggml_view_2d(ctx0, mask_out, n_win, n_out, mask_out->nb[1], off*ggml_element_size(mask_out)));
                 }
                 if (mask_out->type != GGML_TYPE_F16) {
                     mask_out = ggml_cast(ctx0, mask_out, GGML_TYPE_F16);
@@ -1236,12 +1232,12 @@ static bool qsa_use_lid(int64_t idx_dim, int64_t n_idx_h, int64_t n_tps, int64_t
     GGML_UNUSED(n_idx_h);
     GGML_UNUSED(n_stream);
     static const int mode = [] {
-        const char * env = std::getenv("LLAMA_QSA_LID");
-        return env == nullptr ? -1 : std::atoi(env) != 0;
+        // unset (or -1): the default of the backend
+        const int64_t v = llama_fork_env_int("LLAMA_QSA_LID", -1);
+        return v < 0 ? -1 : (int) (v != 0);
     }();
     static const int64_t vk_tokens = [] {
-        const char * env = std::getenv("LLAMA_QSA_LID_TOKENS");
-        return env == nullptr ? (int64_t) 64 : (int64_t) std::atoll(env);
+        return llama_fork_env_int("LLAMA_QSA_LID_TOKENS", 64);
     }();
     if (idx_dim != 128 || mode == 0) {
         return false;
@@ -1254,8 +1250,7 @@ static bool qsa_use_lid(int64_t idx_dim, int64_t n_idx_h, int64_t n_tps, int64_t
 // (09.10 on the 395 at 118K: acceptance 0.63 / 0.41 / 0.29 by position against 0.59 / 0.34 / 0.23)
 static int64_t qsa_top_k_tokens(const llama_hparams & hp, int il) {
     static const int64_t mtp = [] {
-        const char * env = std::getenv("LLAMA_MTP_QSA_TOPK");
-        return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+        return llama_fork_env_int("LLAMA_MTP_QSA_TOPK", 0);
     }();
     return il >= (int) hp.n_layer() && mtp > 0 ? mtp : (int64_t) hp.indexer_top_k;
 }
@@ -1263,8 +1258,7 @@ static int64_t qsa_top_k_tokens(const llama_hparams & hp, int il) {
 // LLAMA_MTP_QSA_REUSE=0: a QSA MTP block runs its indexer at every draft step (see llama_context::set_qsa_reuse)
 static bool qsa_mtp_reuse_enabled() {
     static const bool enabled = [] {
-        const char * env = std::getenv("LLAMA_MTP_QSA_REUSE");
-        return env == nullptr || std::atoi(env) != 0;
+        return llama_fork_env_int("LLAMA_MTP_QSA_REUSE", 1) != 0;
     }();
     return enabled;
 }
@@ -1551,12 +1545,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
 
     // Vulkan fuses split heads into one matmul with the sum at its store. Other backends batch the heads.
     const bool is_vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0;
-    bool split_heads = is_vulkan;
-    if (const char * env = std::getenv("LLAMA_QSA_SPLIT_HEADS")) {
-        if (std::strcmp(env, "0") == 0 || std::strcmp(env, "1") == 0) {
-            split_heads = std::strcmp(env, "1") == 0;
-        }
-    }
+    bool split_heads = llama_fork_env_int("LLAMA_QSA_SPLIT_HEADS", is_vulkan ? 1 : 0) != 0;
 
     // Use the full pool size so reserve and execution choose the same graph at every KV depth.
     const size_t max_size = ggml_backend_buft_get_max_size(ggml_backend_dev_buffer_type(dev));
@@ -1785,8 +1774,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     // 262144 x 4096, the 395 11.10), and as much host time to fill and copy per ubatch. otherwise, and with 0, the
     // values are read out of the KQ mask
     static const bool pos_mode = [] {
-        const char * env = std::getenv("LLAMA_QSA_MASK_POS");
-        return env == nullptr || std::atoi(env) != 0;
+        return llama_fork_env_int("LLAMA_QSA_MASK_POS", 1) != 0;
     }();
     const bool pos_multi = qsa_pos_multi(cparams, ubatch);
     const bool from_pos  = pos_mode && cparams.causal_attn && !hparams.use_alibi && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
@@ -1801,13 +1789,11 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     // 909 ms, the mask fill 52 -> 3 ms, TG 25.74 against 25.39, KLD 0.015593 against 0.015741, FLASH_ATTN_LIST 7/7;
     // the compute buffer stays (its peak is in the indexer). LLAMA_QSA_FA_LIST: 1 = on (default), 0 = the mask
     static const int list_mode = [] {
-        const char * env = std::getenv("LLAMA_QSA_FA_LIST");
-        return env ? std::atoi(env) : 1;
+        return (int) llama_fork_env_int("LLAMA_QSA_FA_LIST", 1);
     }();
     // LLAMA_QSA_FA_LIST_MIN: the KV size from which, -1 (default) = the sparse threshold of Vulkan above
     static const int64_t list_min = [] {
-        const char * env = std::getenv("LLAMA_QSA_FA_LIST_MIN");
-        return env ? (int64_t) std::atoll(env) : (int64_t) -1;
+        return llama_fork_env_int("LLAMA_QSA_FA_LIST_MIN", -1);
     }();
     bool use_list = false;
     if (list_mode == 1 && from_pos && cparams.flash_attn) {
@@ -1934,13 +1920,11 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     // 3090 measures it): the queries go in chunks whose mask fits, one chunk's mask alive at a time; each query attends
     // as before (CPU: the same attention output, Vulkan with LLAMA_QSA_FA_LIST=0: equal to float rounding)
     static const int64_t mask_mib = [] {
-        const char * env = std::getenv("LLAMA_QSA_MASK_MIB");
-        return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+        return llama_fork_env_int("LLAMA_QSA_MASK_MIB", 0);
     }();
     // LLAMA_QSA_MASK_CHUNK=<tokens>: the chunk itself (tests)
     static const int64_t mask_chunk = [] {
-        const char * env = std::getenv("LLAMA_QSA_MASK_CHUNK");
-        return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+        return llama_fork_env_int("LLAMA_QSA_MASK_CHUNK", 0);
     }();
     const int64_t n_tok_q = top_k->ne[1];
     const int64_t chunk   = mask_chunk > 0 ? mask_chunk :
@@ -2512,8 +2496,7 @@ static int qwen4exp_ple_rows_ahead(const llama_hparams & hp, const llama_ubatch 
 
 void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, const llama_kv_cache_context * mctx) const {
     static const bool enabled = [] {
-        const char * env = std::getenv("LLAMA_PLE_PREFETCH");
-        return env == nullptr || std::atoi(env) != 0;
+        return llama_fork_env_int("LLAMA_PLE_PREFETCH", 1) != 0;
     }();
     // why a prefetch did not start, once per reason: on the 395 (12.10 night, -b 16384 -ub 4096) the take never logged
     auto skip = [](int reason, const char * what) {
@@ -2562,8 +2545,7 @@ void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, co
 
 void llama_model_qwen4exp_fork::ple_warm(const llama_ubatch & next, const llama_kv_cache & kv, int64_t n_new) const {
     static const bool enabled = [] {
-        const char * env = std::getenv("LLAMA_PLE_WARM");
-        return env == nullptr || std::atoi(env) != 0;
+        return llama_fork_env_int("LLAMA_PLE_WARM", 1) != 0;
     }();
     if (!enabled || !ple_cached || !ple_cache || n_new <= 0) {
         return;

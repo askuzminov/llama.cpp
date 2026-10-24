@@ -588,6 +588,12 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
+    // fork: the cells of the KV cache of the dense MTP head of a draft context (the fork's qwen4exp) when it keeps only
+    // the last LLAMA_MTP_WINDOW positions of each sequence (LLAMA_MTP_WINDOW_KV), and that window in *n_window; 0 when
+    // the cache holds the whole context or the context has no such head. A sequence state saved with the whole cache
+    // does not fit a window one: a server keys the states it keeps across runs with these
+    LLAMA_API uint32_t llama_mtp_window_kv(const struct llama_context * ctx, uint32_t * n_window);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

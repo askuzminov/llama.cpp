@@ -103,11 +103,10 @@ llama_memory_recurrent::llama_memory_recurrent(
     // fork: deferred rollback of the gated delta net (rec_l), for qwen4exp's delta net (the state [S, S, H_v] a layer,
     // the key [S, H_k]) and only where drafts are rolled back, when every device of a recurrent layer runs its ops
     {
-        const char *  env = getenv("LLAMA_GDN_LAZY");
         const int32_t S   = (int32_t) hparams.ssm_d_state;
         const int32_t H_v = (int32_t) hparams.ssm_dt_rank;
         const int32_t H_k = (int32_t) hparams.ssm_n_group;
-        bool on = (!env || atoi(env) != 0) && n_rs_seq > 0 && llama_fork_gdn_lazy(model) && S > 0 && H_v > 0 &&
+        bool on = llama_fork_env_int("LLAMA_GDN_LAZY", 1) != 0 && n_rs_seq > 0 && llama_fork_gdn_lazy(model) && S > 0 && H_v > 0 &&
                   H_k > 0 && H_v % H_k == 0 && hparams.n_embd_s() == (uint32_t) (S * S * H_v);
         const int64_t floats = (int64_t) H_v * S + (int64_t) H_k * S + H_v;
         int n_kept = 0;

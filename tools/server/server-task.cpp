@@ -1805,8 +1805,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     if (limit_size > 0 && size_cur + state_size_new > limit_size) {
         // make room before allocating the new vectors to avoid breaching the RAM limit; with a
-        // spill dir this moves cold states to disk instead of dropping them
-        free_ram(size_cur + state_size_new - limit_size);
+        // spill dir this moves cold states to disk instead of dropping them (fork: not while
+        // the writes are deferred, see defer_writes)
+        free_ram(size_cur + state_size_new - limit_size, !defer_writes);
     }
 
     // make room so the new state keeps host RAM above the reserve
@@ -1966,10 +1967,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
-void server_prompt_cache::update() {
+void server_prompt_cache::update(bool may_write) {
     if (limit_size > 0 && size() > limit_size) {
         // spill cold states to disk (or drop them without a spill dir) to fit the RAM limit
-        free_ram(size() - limit_size);
+        free_ram(size() - limit_size, may_write);
     }
 
     // keep the on-disk spill within its budget

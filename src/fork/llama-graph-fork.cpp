@@ -3,6 +3,7 @@
 
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-fork.h"
 #include "llama-model.h"
 #include "llama-cparams.h"
 #include "llama-moecache-fork.h"
@@ -205,8 +206,7 @@ ggml_tensor * llm_graph_context::build_moe_cache(
     ggml_tensor * ids_host = ggml_cpy(ctx0, selected_experts, ids_dst);
 
     // the scheduler overlap is on unless GGML_SCHED_PARALLEL_CPU=0 (ggml_backend_sched_new)
-    const char * parallel_cpu = getenv("GGML_SCHED_PARALLEL_CPU");
-    if (parallel_cpu == nullptr || atoi(parallel_cpu) > 0) {
+    if (llama_fork_env_int("GGML_SCHED_PARALLEL_CPU", 1) > 0) {
         // Copy the CPU inputs before the device starts the cached experts.
         ggml_tensor * cur_host = ggml_dup(ctx0, cur);
         ggml_set_name(cur_host, "ffn_moe_cache_input_host");

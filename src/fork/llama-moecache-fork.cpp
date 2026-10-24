@@ -2,6 +2,7 @@
 
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-fork.h"
 #include "llama-model.h"
 
 #include <algorithm>
@@ -37,12 +38,9 @@ static const double MOE_STATS_BW_HOST = 35.0; // GB/s
 // read once: llama_moe_cache_fork::update() asks for it on every step
 static int moe_stats_period() {
     static const int period = [] {
-        const char * s = getenv("LLAMA_MOE_CACHE_STATS");
-        if (s == nullptr || s[0] == '\0' || s[0] == '0') {
-            return 0;
-        }
-        const int v = atoi(s);
-        return v > 1 ? v : 2048;
+        // 1: every 2048 steps
+        const int64_t v = llama_fork_env_int("LLAMA_MOE_CACHE_STATS", 0);
+        return v <= 0 ? 0 : v > 1 ? (int) std::min<int64_t>(v, INT_MAX) : 2048;
     }();
     return period;
 }
@@ -960,8 +958,10 @@ llama_moe_cache_fork::llama_moe_cache_fork(const llama_model & model, int32_t n_
     // LLAMA_MOE_CACHE_POLICY=lru admits every miss
     const char * policy = getenv("LLAMA_MOE_CACHE_POLICY");
     frequency_admission = policy == nullptr || strcmp(policy, "lru") != 0;
-    const char * async = getenv("LLAMA_MOE_CACHE_ASYNC");
-    async_table = async && atoi(async) != 0;
+    if (policy != nullptr && *policy != '\0' && strcmp(policy, "lru") != 0 && strcmp(policy, "lfu") != 0) {
+        LLAMA_LOG_ERROR("%s: LLAMA_MOE_CACHE_POLICY=\"%s\" is neither lru nor lfu, using lfu\n", __func__, policy);
+    }
+    async_table = llama_fork_env_int("LLAMA_MOE_CACHE_ASYNC", 0) != 0;
 }
 
 llama_moe_cache_fork::~llama_moe_cache_fork() {
@@ -1638,8 +1638,7 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
 
     // LLAMA_MOE_CACHE_REPORT=<steps>: the report of the cache alone, without the replays of LLAMA_MOE_CACHE_STATS
     static const int report_period = [] {
-        const char * env = getenv("LLAMA_MOE_CACHE_REPORT");
-        return env ? std::max(0, atoi(env)) : 0;
+        return (int) std::min<int64_t>(std::max<int64_t>(0, llama_fork_env_int("LLAMA_MOE_CACHE_REPORT", 0)), INT_MAX);
     }();
     const int period = report_period > 0 ? report_period : moe_stats_period();
     if (period > 0 && n_steps % period == 0) {

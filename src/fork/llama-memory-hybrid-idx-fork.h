@@ -123,6 +123,7 @@ public:
     void set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, ggml_tensor * tok_half, const llama_ubatch * ubatch,
                            uint32_t n_kv) const;
 
+    // LLAMA_QSA_POS_STRIDE_LOG2 lowers it for a test (qsa_pos_stride_log2)
     static constexpr int QSA_POS_STRIDE_LOG2 = 18;
 
     // whether the ranges of set_input_qsa_pos can describe this ubatch's stream: no cell held by two sequences, every

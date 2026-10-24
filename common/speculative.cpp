@@ -2914,6 +2914,11 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        // fork: the batch of a non-causal draft must stay one ubatch, see common_speculative_fork_dflash_fit
+        if (spec_dflash) {
+            common_speculative_fork_dflash_fit(model_dft, params.speculative.draft.n_max, cparams);
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);

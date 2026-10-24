@@ -1,6 +1,7 @@
 #include "server-common.h"
 #include "http.h"
 #include "server-models.h"
+#include "fork/env-fork.h" // fork: LLAMA_SERVER_STOP_TIMEOUT
 #include "server-context.h"
 #include "server-stream.h"
 
@@ -2176,8 +2177,8 @@ int server_child::run_download(common_params & params) {
 
 std::thread server_child::setup(const std::function<void(int)> & shutdown_handler) {
     int stop_timeout = DEFAULT_STOP_TIMEOUT;
-    if (const char * env = std::getenv("LLAMA_SERVER_STOP_TIMEOUT")) {
-        stop_timeout = std::max(0, atoi(env));
+    if (std::getenv("LLAMA_SERVER_STOP_TIMEOUT")) {
+        stop_timeout = (int) std::clamp<int64_t>(common_fork_env_int("LLAMA_SERVER_STOP_TIMEOUT", stop_timeout), 0, INT_MAX);
     }
     // setup thread for monitoring stdin
     return std::thread([shutdown_handler, stop_timeout]() {

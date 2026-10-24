@@ -10,7 +10,9 @@
 #include "llama-batch.h"
 #include "fork/llama-fork.h"
 #include "fork/llama-memory-hybrid-idx-fork.h"
+#include "fork/qwen4exp-fork.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -82,8 +84,7 @@ void llama_context::kv_elastic_init_fork() {
     // LLAMA_KV_ELASTIC: -1 (default) with --phase-mem and the moe-cache, where the device maps memory on demand (CUDA
     // with VMM); 1 also elsewhere, emulated in ordinary buffers (tests, LLAMA_KV_ELASTIC_POISON); 0 off
     static const int mode = [] {
-        const char * env = getenv("LLAMA_KV_ELASTIC");
-        return env ? atoi(env) : -1;
+        return (int) llama_fork_env_int("LLAMA_KV_ELASTIC", -1);
     }();
     if (!memory || mode == 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || (mode < 0 && !(cparams.phase_mem && moe_cache_fork))) {
         return;
@@ -97,10 +98,8 @@ void llama_context::kv_elastic_init_fork() {
 
     // LLAMA_KV_ELASTIC_STEP: cells mapped beyond the ones in use (8192 cells = a 2 MiB granule of 256-byte indexer rows)
     {
-        const char * env = getenv("LLAMA_KV_ELASTIC_STEP");
-        if (env) {
-            kv_elastic_step = std::max<uint32_t>(256, (uint32_t) std::max(0, atoi(env))/256*256);
-        }
+        const int64_t step = llama_fork_env_int("LLAMA_KV_ELASTIC_STEP", kv_elastic_step);
+        kv_elastic_step = std::max<uint32_t>(256, (uint32_t) std::min<int64_t>(std::max<int64_t>(0, step), UINT32_MAX)/256*256);
     }
 
     kv_elastic = true;
@@ -166,8 +165,7 @@ void llama_context::phase_update(uint32_t n_tokens) {
     // after it; the prompt layout costs about 2.5 s + 1.8 ms per token, so the two meet near 200 tokens.
     // LLAMA_PHASE_SMALL_PROMPT sets the limit, 0 turns it off
     static const uint32_t n_small = [] {
-        const char * s = getenv("LLAMA_PHASE_SMALL_PROMPT");
-        return s ? (uint32_t) std::max(0, atoi(s)) : 192u;
+        return (uint32_t) std::max<int64_t>(0, llama_fork_env_int("LLAMA_PHASE_SMALL_PROMPT", 192));
     }();
     const bool small = n_tokens > phase_n_gen && n_tokens <= n_small;
     const bool gen   = n_tokens <= phase_n_gen || small;
@@ -312,8 +310,7 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
     // batch (on the 3090, 09.10: 0.19 s at 25K cells to 0.48 s at 120K per 4096-token batch, about 10 s of a 118K
     // prompt). taken only when it leaves the ubatch as large. LLAMA_PHASE_KV_STEP=<cells>, 0 (default): no headroom
     static const uint32_t kv_step = [] {
-        const char * s = getenv("LLAMA_PHASE_KV_STEP");
-        return s ? (uint32_t) std::max(0, atoi(s)) : 0u;
+        return (uint32_t) std::max<int64_t>(0, llama_fork_env_int("LLAMA_PHASE_KV_STEP", 0));
     }();
     uint32_t n_pad = kv_step;
 
@@ -535,8 +532,7 @@ void llama_context::set_qsa_reuse(bool value) {
     // only an MTP block that attends through QSA has a score to take: anything else would just lose its graph
     // reuse between the first draft step and the next ones. LLAMA_MTP_QSA_REUSE=0 runs the indexer at every step
     static const bool enabled = [] {
-        const char * env = getenv("LLAMA_MTP_QSA_REUSE");
-        return env == nullptr || atoi(env) != 0;
+        return llama_fork_env_int("LLAMA_MTP_QSA_REUSE", 1) != 0;
     }();
     const auto & hp = model.hparams;
     const bool qsa_mtp = model.arch == LLM_ARCH_QWEN4EXP && hp.n_layer_nextn > 0 &&
@@ -547,6 +543,19 @@ void llama_context::set_qsa_reuse(bool value) {
 
 void llama_set_qsa_reuse(llama_context * ctx, bool value) {
     ctx->set_qsa_reuse(value);
+}
+
+uint32_t llama_mtp_window_kv(const llama_context * ctx, uint32_t * n_window) {
+    // the cache llama_model::create_memory made for the dense MTP head: a plain KV cache, of fewer cells than the
+    // context when mtp_window_kv gave it the window only
+    const auto & cparams = ctx->get_cparams();
+    const auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory());
+    const bool window = kv != nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+        dynamic_cast<const llama_model_qwen4exp_fork *>(&ctx->get_model()) != nullptr && kv->get_size() < cparams.n_ctx_seq;
+    if (n_window) {
+        *n_window = window ? (uint32_t) llama_model_qwen4exp_fork::mtp_window() : 0;
+    }
+    return window ? kv->get_size() : 0;
 }
 
 // a ubatch of tokens of one sequence at consecutive positions, for the fork's reads ahead (the PLE rows need the tokens,

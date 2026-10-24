@@ -40,6 +40,12 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
 // 4564 MiB host compute buffer. LLAMA_DFLASH_UBATCH: tokens (default 512), 0 = the target's (or --spec-draft-n-ubatch)
 uint32_t common_speculative_fork_dflash_ubatch(uint32_t n_ubatch);
 
+// a non-causal draft (DFlash, unless its model says dflash.attention.causal) decodes the blocks of all drafting
+// sequences as one batch, which llama_decode takes only as one ubatch: n_seq_max blocks of n_max + 1 tokens (LiliCorr:
+// of its block size). its context then gets at least that many tokens per ubatch and per batch, over the cap above and
+// over a smaller -ub; the assert of a larger batch was reached from 129 slots at n_max 3, from 33 at a block of 16
+void common_speculative_fork_dflash_fit(const llama_model * model_dft, int32_t n_max, llama_context_params & cparams);
+
 // the drafts of several generating slots (23.10, after Rulith Inference's apply_spec_draft_by_slots and
 // apply_spec_even_drafts). the hybrid memory splits a verify batch into ubatches of equal tokens per sequence, so
 // drafts of different lengths verify in two or three passes of the whole model (Rulith, three conversations at 4K:
@@ -96,7 +102,7 @@ struct common_speculative_auto {
     };
 
     static constexpr int    n_depth = 4;     // calibration rows: draft position 0, 1, 2, 3+
-    static constexpr int    n_bins  = 10;    // calibration columns: head probability in steps of 0.1
+    static constexpr int    n_bins  = 10;    // calibration columns: draft probability in steps of 0.1
     static constexpr double f_cal   = 0.99;  // forgetting factor of the acceptance estimates, per update
     static constexpr double f_cycle = 0.995; // forgetting factor of the cost and rate fits, per cycle
     static constexpr int    n_warm  = 64;    // valid probe cycles before the first gated one
@@ -115,23 +121,31 @@ struct common_speculative_auto {
 
         // trace only
         std::vector<std::vector<llama_token_data>> q; // draft candidates per position
+        std::vector<uint8_t> q_dist; // per position: 1 when the logits of q are a token distribution of the drafter
         std::vector<float> pt; // target probability of the drafted token
         std::vector<float> pm; // highest target probability
-        std::vector<float> ov; // sum of min(target, draft), the acceptance of exact speculative sampling
+        std::vector<float> ov; // sum of min(target, draft), the acceptance of exact speculative sampling with the drafter
+                               // sampling at the target temperature; -1 where the drafter has no token distribution (the
+                               // candidates of a DFlash2 lattice carry selector scores, not logits)
     };
 
     bool   enabled = false;
     FILE * trace   = nullptr;
 
-    double cal_acc[n_depth][n_bins] = {};
-    double cal_n  [n_depth][n_bins] = {};
+    // per draft type: the probabilities of the gated drafts mean different things (the MTP head: its confidence, the
+    // DFlash2 lattice: the share of the pick among the top_k of its selector row), so each type has its own table
+    double cal_acc[COMMON_SPECULATIVE_TYPE_COUNT][n_depth][n_bins] = {};
+    double cal_n  [COMMON_SPECULATIVE_TYPE_COUNT][n_depth][n_bins] = {};
 
     std::vector<double> pos_acc[COMMON_SPECULATIVE_TYPE_COUNT];
     std::vector<double> pos_n  [COMMON_SPECULATIVE_TYPE_COUNT];
 
-    // mean conditional acceptance of the MTP positions, predicts the next position before it is drafted
-    double acc_sum = 0.0;
-    double acc_n   = 0.0;
+    // mean conditional acceptance of the gated positions per type, predicts the next position before it is drafted
+    double acc_sum[COMMON_SPECULATIVE_TYPE_COUNT] = {};
+    double acc_n  [COMMON_SPECULATIVE_TYPE_COUNT] = {};
+
+    // the implementation whose draft keep() and pad() see, set by cap_begin
+    common_speculative_type drafting = COMMON_SPECULATIVE_TYPE_NONE;
 
     // verify time [us] = t0 + t1 * n_tokens, least squares with forgetting
     double s0 = 0.0, sx = 0.0, sxx = 0.0, sy = 0.0, sxy = 0.0;
@@ -179,11 +193,13 @@ struct common_speculative_auto {
         return r_us > 0.0 ? r_tok / r_us : 0.0;
     }
 
-    double acc_mean() const {
-        return acc_n > 0.0 ? acc_sum / acc_n : 0.5;
+    double acc_mean(common_speculative_type type) const {
+        return acc_n[type] > 0.0 ? acc_sum[type] / acc_n[type] : 0.5;
     }
 
-    double acc_head(int j, float p) const;
+    // the calibrated acceptance of a draft of this type at position j with probability p, 0 for a p that is not a
+    // number (a DFlash selector row of -inf only)
+    double acc_head(common_speculative_type type, int j, float p) const;
     double acc_pos(common_speculative_type type, int j) const;
 
     // draft cap for an implementation in this cycle: -1 keeps the caller's cap, 0 skips the implementation

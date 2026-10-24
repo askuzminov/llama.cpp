@@ -398,8 +398,7 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
 
-        const char * LLAMA_GRAPH_CACHE = getenv("LLAMA_GRAPH_CACHE");
-        graph_cache_size = LLAMA_GRAPH_CACHE ? (uint32_t) std::max(0, atoi(LLAMA_GRAPH_CACHE)) : graph_cache_size;
+        graph_cache_size = (uint32_t) std::min<int64_t>(std::max<int64_t>(0, llama_fork_env_int("LLAMA_GRAPH_CACHE", graph_cache_size)), UINT32_MAX);
         graph_cache_size = graph_reuse_disable ? 0 : graph_cache_size;
     }
 
@@ -592,8 +591,7 @@ llama_context::llama_context(
             phase          = LLAMA_PHASE_GEN;
             phase_n_gen    = (uint32_t) std::min<int64_t>(std::clamp<int64_t>(n_gen, 1, std::max<int64_t>(1, n_gen_max)), cparams.n_ubatch);
             phase_n_reserve = phase_n_gen;
-            const char * compact = getenv("LLAMA_PHASE_GEN_COMPACT");
-            if (compact && atoi(compact) != 0) {
+            if (llama_fork_env_int("LLAMA_PHASE_GEN_COMPACT", 0) != 0) {
                 uint64_t n_verify = uint64_t(cparams.n_seq_max)*(cparams.n_rs_seq > 0 ? uint64_t(cparams.n_rs_seq) + 2 : 1);
                 if (params.ctx_other && params.ctx_other->cparams.phase_mem) {
                     n_verify = std::max<uint64_t>(n_verify, params.ctx_other->phase_n_reserve);

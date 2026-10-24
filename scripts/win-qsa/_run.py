@@ -585,6 +585,15 @@ def decode_metrics(rs):
     return {"tg": rate(n, ms), "accept": da / dn if dn else None, "pp_short": pp[0], "pp_long": pp[1]}
 
 
+def par_metrics(pi, chat_rows):
+    """The conversations of a DECPAR arm at once: how many, the tokens generated together per second of the wall time,
+    with the prompts read, and the median TG of a turn (the time a slot shared with the others)."""
+    tgs = [rate(x["n"], x["ms"]) for x in chat_rows if x["n"]]
+    return {"par": pi["par"], "tg_all": pi["n"] / pi["wall_s"] if pi["wall_s"] else None,
+            "tps_all": (pi["n"] + pi["prompt_n"]) / pi["wall_s"] if pi["wall_s"] else None,
+            "tg_turn": statistics.median(tgs) if tgs else None}
+
+
 def history_from_cache(path):
     """Starts history.csv with the kept results of cache/results: the arm and the point come from the log name of the
     run that measured them, the head, dirty flag and spec of those builds are unknown."""
@@ -620,6 +629,9 @@ def history_from_cache(path):
             elif kind == "decode" and (m := re.fullmatch(r"(.+)-p(\d+)", stem)):
                 arm, point = m[1], f"p{m[2]}"
                 metrics = decode_metrics(res["rows"])
+            elif kind == "decode-chat" and res.get("par") and stem.endswith("-chat"):
+                arm, point = stem[:-5], "par"
+                metrics = par_metrics(res["par"], res.get("chat", []))
             elif kind == "profile" and (m := re.fullmatch(r"(pp\d*|tg)-d(\d+)-(.+)", stem)):
                 arm, point = m[3], f"{m[1]}@{m[2]}"
                 host = res.get("host")
@@ -805,7 +817,7 @@ def cmd_check():
             fails.extend(f"  {op[0]} {arm.name}: {s}" for s in r["fails"])
     # the fork's unit tests (tests/tests-fork.cmake) that build on this machine: an exit code of 0 passes. each runs in
     # its own folder of the run, test-row-cache writes its table file next to it. CHECKUNITS=none: none
-    units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill"))
+    units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill test-mtp-window-fork test-spec-auto-fork test-env-fork"))
     for name in units:
         try:
             exe = Arm("default").binary(name)
@@ -1168,7 +1180,7 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats
         chat_rows = []
         lock = threading.Lock()
 
-        def run_chat(conv, turns):
+        def run_chat(ci, conv, turns):
             messages = []
             for ti, (text, n) in enumerate(turns):
                 messages.append({"role": "user", "content": text})
@@ -1196,26 +1208,27 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats
                         f.seek(before)
                         pp_curve, tg3 = progress(f.read().decode("utf-8", errors="replace"))
                 with lock:
-                    chat_rows.append({"conv": conv, "turn": ti, "pp_curve": pp_curve, "tg3": tg3,
+                    chat_rows.append({"ci": ci, "conv": conv, "turn": ti, "pp_curve": pp_curve, "tg3": tg3,
                                       "cache_n": t.get("cache_n", 0), "prompt_n": t["prompt_n"],
                                       "prompt_ms": t["prompt_ms"], "n": t["predicted_n"], "ms": t["predicted_ms"],
                                       "draft_n": t.get("draft_n", 0), "draft_acc": t.get("draft_n_accepted", 0)})
 
         par_info = None
         if par <= 1:
-            for conv, turns in chats:
-                run_chat(conv, turns)
+            for ci, (conv, turns) in enumerate(chats):
+                run_chat(ci, conv, turns)
         else:
             errors = []
 
-            def guarded(conv, turns):
+            def guarded(ci, conv, turns):
                 try:
-                    run_chat(conv, turns)
+                    run_chat(ci, conv, turns)
                 except Exception as e:  # noqa: BLE001 - reported below, the other conversations go on
                     errors.append(e)
 
             t_start = time.time()
-            threads = [threading.Thread(target=guarded, args=(conv, turns)) for conv, turns in chats]
+            threads = [threading.Thread(target=guarded, args=(ci, conv, turns))
+                       for ci, (conv, turns) in enumerate(chats)]
             for th in threads:
                 th.start()
             for th in threads:
@@ -1223,10 +1236,11 @@ def serve(exe, args, run_env, log, requests, sampling, port, rows_text="", chats
             wall = time.time() - t_start
             if errors:
                 raise errors[0] if isinstance(errors[0], Fail) else Fail(f"parallel chats: {errors[0]}")
-            # the turns of each conversation in their order, the conversations in the order given
-            order = {conv: k for k, (conv, _) in enumerate(chats)}
-            chat_rows.sort(key=lambda x: (order[x["conv"]], x["turn"]))
-            par_info = {"par": par, "wall_s": wall, "n": sum(x["n"] for x in chat_rows),
+            # the turns of each conversation in their order, the conversations in the order given (by their index, a
+            # name is not a key)
+            chat_rows.sort(key=lambda x: (x["ci"], x["turn"]))
+            # the conversations that ran at once: DECPAR copies of every DECCHAT spec, not DECPAR
+            par_info = {"par": len(chats), "wall_s": wall, "n": sum(x["n"] for x in chat_rows),
                         "prompt_n": sum(x["prompt_n"] for x in chat_rows)}
         # the slot prints its timings as it is released
         time.sleep(2)
@@ -1274,6 +1288,17 @@ def graph_timing_text(gt):
             f"host in graph_compute {gt['host']:.2f} ms, gpu idle {gt['idle']:.2f} ms ({100 * gt['idle'] / gt['period']:.0f}%)")
 
 
+def parse_samp(text, where):
+    """DECSAMP: temperature, top_k and top_p, as "1.0 20 0.95" or 1.0:20:0.95. The variables of an arm are split by
+    spaces, so there it takes the second form; both work in both places."""
+    parts = [s for s in re.split(r"[\s:]+", text.strip()) if s]
+    try:
+        t, k, p = parts
+        return [float(t), int(k), float(p)]
+    except ValueError:
+        raise Fail(f"{where}DECSAMP must be temperature, top_k and top_p, as \"1.0 20 0.95\" or 1.0:20:0.95, got {text!r}")
+
+
 def cmd_decode():
     run = Run("decode")
     model = model_path()
@@ -1281,11 +1306,8 @@ def cmd_decode():
     drafts = arm_drafts(arms)
     ctx, ngen, port = env_int("DECCTX", 262144), env_int("DECNGEN", 1024), env_int("DECPORT", 8097)
     seeds = env_ints("DECSEEDS", "1 2")
-    try:
-        temp, top_k, top_p = split_args(env("DECSAMP", "1.0 20 0.95"))
-        sampling = [float(temp), int(top_k), float(top_p)]
-    except ValueError:
-        raise Fail(f"DECSAMP must be \"temperature top_k top_p\", got {env('DECSAMP')!r}")
+    sampling = parse_samp(env("DECSAMP", "1.0 20 0.95"), "")
+    temp, top_k, top_p = sampling
     prompts = [prompt(p) for p in split_args(env("DECPROMPTS", "os db code repeat"))]
     # DECPREFIX=none: only the conversations of DECCHAT
     prefixes = [] if env("DECPREFIX") == "none" else env_ints("DECPREFIX", "0")
@@ -1310,11 +1332,7 @@ def cmd_decode():
     def samp_of(arm):
         if not arm.env.get("DECSAMP"):
             return sampling
-        try:
-            t, k, p = arm.env["DECSAMP"].split(":")
-            return [float(t), int(k), float(p)]
-        except ValueError:
-            raise Fail(f"arm {arm.name}: DECSAMP must be temperature:top_k:top_p, got {arm.env['DECSAMP']!r}")
+        return parse_samp(arm.env["DECSAMP"], f"arm {arm.name}: ")
     arm_samp = {arm.name: samp_of(arm) for arm in arms}
     chat_starts = [c[0] for c in chat_specs]
     chat_gen = env_int("DECCHATGEN", 256)
@@ -1357,16 +1375,22 @@ def cmd_decode():
     def build_chats(specs, base=0, tag=""):
         text = corpus[base:]
         chats = []
-        for start, n_turns, add_chars in specs:
+        for i, spec in enumerate(specs):
+            start, n_turns, add_chars = spec
             turns = [((text[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", chat_gen)]
             for ti in range(n_turns):
                 add = text[start + ti*add_chars:start + (ti + 1)*add_chars]
                 turns.append((add + "\n\nAnd this part, in two sentences?", chat_gen))
-            chats.append((f"{tag}c{start}-{add_chars}", turns))  # two conversations from one start differ by their turns
+            # the name is the whole spec (two conversations from one start differ by their turns), and a spec given
+            # twice runs twice under two names: the answer files of a turn are named after it
+            repeat = specs[:i].count(spec)
+            chats.append((f"{tag}c{start}-{n_turns}-{add_chars}" + (f"-r{repeat + 1}" if repeat else ""), turns))
         return chats
 
     # DECPAR=N among the variables of an arm: N copies of its conversations at once, copy k on the text from
-    # k*DECPARSHIFT chars on (the slots of -np, 23.10); the arm gives -np N itself
+    # k*DECPARSHIFT chars on (the slots of -np, 23.10); the arm gives -np N itself. N copies of each DECCHAT spec run
+    # at once (two specs and DECPAR=4: 8 clients), so the summary counts the conversations, and a run with more of
+    # them than slots fails: the rest would wait for a slot inside the wall time and the rate would read low
     par_of = {arm.name: int(arm.env.get("DECPAR", "1")) for arm in arms}
     par_shift = env_int("DECPARSHIFT", 250000)
 
@@ -1400,7 +1424,31 @@ def cmd_decode():
                         "env": env_identity(run_env), "model": model_identity(model),
                         "draft": model_identity(draft) if draft else None, "sampling": arm_samp[arm.name],
                         "chats": [[c, [[text_digest(t), n] for t, n in turns]] for c, turns in chats], "machine": machine(),
-                        **({"par": par_of[arm.name]} if par_of[arm.name] > 1 else {})}
+                        **({"par": len(chats)} if par_of[arm.name] > 1 else {})}
+            # what the conversations need before a server starts: a slot each when they run at once, and their own text
+            # in PPLFILE. copy k reads [k*DECPARSHIFT, k*DECPARSHIFT + start + turns*add) of it; a slice past its end is
+            # empty without an error (the turns would ask about nothing, the rows look whole), and copies whose windows
+            # overlap read the same text
+            par = par_of[arm.name]
+            # the slots the server gets: the last -np of its arguments (the arm's own overrides the default 1)
+            n_slots = int([a for i, a in enumerate(args[1:]) if args[i] in ("-np", "--parallel")][-1])
+            reach = max(start + n_turns*add_chars for start, n_turns, add_chars in arm_chat_specs.get(arm.name, chat_specs))
+            last = max(par - 1, 0)*par_shift + reach
+            problems = []
+            if par > 1 and len(chats) > n_slots:
+                problems.append(f"DECPAR={par} runs {len(chats)} conversations at once ({par} x {len(chats) // par} "
+                                f"DECCHAT specs) for {n_slots} slots: give the arm its own DECCHAT or -np {len(chats)}")
+            if par > 1 and reach > par_shift:
+                problems.append(f"a conversation reads {reach} chars, more than DECPARSHIFT={par_shift}: the copies "
+                                f"would read the same text")
+            if last > len(corpus):
+                problems.append(f"the turns read up to char {last} of the {len(corpus)} of PPLFILE"
+                                + (f" (copy p{par - 1} from char {(par - 1)*par_shift})" if par > 1 else "")
+                                + ": the turns past its end would be empty")
+            if problems:
+                run.failed = True
+                results[arm.name, "chat"] = "FAIL " + "; ".join(problems)
+                continue
             try:
                 results[arm.name, "chat"] = run.measure(label, identity,
                                                         lambda log: serve(exe, args, run_env, log, [], arm_samp[arm.name],
@@ -1519,18 +1567,19 @@ def cmd_decode():
         own = "".join(f"; {name}: {' '.join(f'{a}:{b}:{c}' for a, b, c in specs)}" for name, specs in arm_chat_specs.items())
         run.add("", f"chat: conversations (start:turns:chars) {' '.join(f'{a}:{b}:{c}' for a, b, c in chat_specs)}{own} of "
                 f"{Path(env('PPLFILE')).name}, {chat_gen} tokens per answer, prompt cache on",
-                *table(["arm", "start-chars", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
+                *table(["arm", "start-turns-chars", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
         # DECPAR arms: the conversations at once over the wall time; the TG of a turn counts the time the slot shared
         for arm in arms:
             entry = results.get((arm.name, "chat"))
             if not isinstance(entry, tuple) or not entry[0].get("par"):
                 continue
             pi = entry[0]["par"]
-            tgs = [rate(x["n"], x["ms"]) for x in entry[0].get("chat", []) if x["n"]]
+            pm = par_metrics(pi, entry[0].get("chat", []))
             run.add(f"{arm.name}: {pi['par']} conversations at once, {pi['n']} tokens generated and {pi['prompt_n']} read in "
-                    f"{pi['wall_s']:.1f} s: {pi['n']/pi['wall_s']:.2f} t/s generated together, "
-                    f"{(pi['n'] + pi['prompt_n'])/pi['wall_s']:.1f} t/s with the prompts; a turn's TG "
-                    f"{statistics.median(tgs) if tgs else 0:.2f} (median)")
+                    f"{pi['wall_s']:.1f} s: {pm['tg_all'] or 0:.2f} t/s generated together, "
+                    f"{pm['tps_all'] or 0:.1f} t/s with the prompts; a turn's TG {pm['tg_turn'] or 0:.2f} (median)")
+            # the one number this mode is for: into history.csv as the point "par" (a kept result is there from its run)
+            run.record("decode", arm, "par", pm, entry[1], folders[arm.name])
         # an arm with LLAMA_QSA_CHECK: how many carried groupings it compared (the server aborts on a difference)
         for arm in arms:
             entry = results.get((arm.name, "chat"))

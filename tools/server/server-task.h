@@ -742,7 +742,8 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    void update();
+    // may_write = false (fork): the RAM limit kept only as far as no disk write is needed, see free_ram
+    void update(bool may_write = true);
 
     // fork: host-RAM reserve and disk spill, defined in fork/server-task-fork.cpp
     ~server_prompt_cache();
@@ -809,7 +810,14 @@ struct server_prompt_cache {
     void persist();
     // spill oldest resident states (and, if there is no spill dir, drop them) until at least `need`
     // RAM bytes are relieved; then enforce the disk budget. Returns RAM bytes relieved.
-    size_t free_ram(size_t need);
+    // may_write = false: only what needs no write (states write_behind already put on disk)
+    size_t free_ram(size_t need, bool may_write = true);
+
+    // fork: while set, a save keeps the RAM limit only as far as no disk write is needed - the cache can stay above it
+    // until the next update(), and write_behind writes the new states out while the server is idle. set around the
+    // saves of slots evicted while others run (server_slot_room_fork), which must not wait for the disk. the host
+    // RAM reserve still writes when it has to
+    bool defer_writes = false;
 };
 
 // used exclusively by router mode

@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid-idx-fork.h"
 
 #include "llama-impl.h"
+#include "llama-fork.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -37,8 +38,7 @@ llama_memory_hybrid_idx_fork::~llama_memory_hybrid_idx_fork() {
 }
 
 static bool qsa_kv_host(const llama_model & model, ggml_type type_k, ggml_type type_v, bool v_trans) {
-    const char * value = getenv("LLAMA_QSA_KV_HOST");
-    if (!value || atoi(value) == 0) {
+    if (llama_fork_env_int("LLAMA_QSA_KV_HOST", 0) == 0) {
         return false;
     }
     if (model.arch != LLM_ARCH_QWEN4EXP || type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16 || v_trans) {
@@ -167,8 +167,7 @@ llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
         // f16: the source keys in the indexer cache are f16 too, and the Vulkan lightning indexer rounds k to f16;
         // half the bytes for every score pass. LLAMA_QSA_POOL_F32=1: f32, as before 09.10
         static const bool pool_f32 = [] {
-            const char * env = getenv("LLAMA_QSA_POOL_F32");
-            return env != nullptr && atoi(env) != 0;
+            return llama_fork_env_int("LLAMA_QSA_POOL_F32", 0) != 0;
         }();
         ggml_tensor * t = ggml_new_tensor_3d(it->second.get(), pool_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, idx_dim, (n_cells + r - 1)/r, n_stream);
 
@@ -1032,8 +1031,8 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
     // the grouping of the last ubatch is carried forward when only this ubatch's cells changed since: every op
     // that moves a cell clears qsa_cur, and a rollback of a sequence tail marks the positions it took
     // (qsa_pool_trim). LLAMA_QSA_INC=0 groups every cell each time, LLAMA_QSA_CHECK=1 compares the two
-    static const bool inc_on    = getenv("LLAMA_QSA_INC") == nullptr || atoi(getenv("LLAMA_QSA_INC")) != 0;
-    static const bool inc_check = getenv("LLAMA_QSA_CHECK") != nullptr && atoi(getenv("LLAMA_QSA_CHECK")) != 0;
+    static const bool inc_on    = llama_fork_env_int("LLAMA_QSA_INC",   1) != 0;
+    static const bool inc_check = llama_fork_env_int("LLAMA_QSA_CHECK", 0) != 0;
     const bool inc = inc_on && sinfo != nullptr && st_carry && (int64_t) sinfo->idxs.size() == n_ns;
 
     for (int64_t s = 0; s < n_ns; ++s) {
@@ -1237,9 +1236,11 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
                 };
 
                 // a row is a block of this pass when all its cells are in one full group: the groups split the
-                // cells, so then they are the same cells. the rows past a trim count too: the pool rebuilds them,
-                // but their blocks keep their places (qsa_group_update_multi). whether the pool holds a row's key
-                // is for keep_from to say, from the cells and the positions
+                // cells, so then they are the same cells. the rows past a trim count too (qsa_pool_trim leaves them
+                // in the pool for this grouping, set_input_qsa_dirty writes the pool again after it): their blocks
+                // keep their order (as in qsa_group_update_multi), the rows after a block that is gone move up and
+                // are written again. whether the pool holds a row's key is for keep_from to say, from the cells and
+                // the positions
                 const qsa_pool_stream & ps = pool[g.strm];
                 const int32_t n_rows = (int32_t) (ps.cells.size()/r);
                 for (int32_t b = 0; b < n_rows; ++b) {
@@ -1488,6 +1489,17 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
     return { st.n_dirty, st.warm };
 }
 
+// the stride of the ranges of several sequences in one stream (set_input_qsa_pos). LLAMA_QSA_POS_STRIDE_LOG2 lowers it,
+// for a test: positions of QSA stay below n_kv (qsa_prepare asserts it), so the 2^18 of the default takes a cache of more
+// than 262144 cells to cross (tests/test-qsa-multi-fork.cpp)
+static int qsa_pos_stride_log2() {
+    static const int value = [] {
+        const int64_t v = llama_fork_env_int("LLAMA_QSA_POS_STRIDE_LOG2", llama_memory_hybrid_idx_fork::QSA_POS_STRIDE_LOG2);
+        return (int) std::min<int64_t>(std::max<int64_t>(v, 1), llama_memory_hybrid_idx_fork::QSA_POS_STRIDE_LOG2);
+    }();
+    return value;
+}
+
 bool llama_memory_hybrid_idx_fork::qsa_pos_multi_ok(const llama_ubatch * ubatch, uint32_t n_kv) const {
     if (qsa_pos_ok_epoch == qsa_epoch && qsa_pos_ok_n_kv == n_kv) {
         return qsa_pos_ok;
@@ -1495,29 +1507,29 @@ bool llama_memory_hybrid_idx_fork::qsa_pos_multi_ok(const llama_ubatch * ubatch,
 
     const auto & cells = get_mem_attn()->get_cells(ubatch->seq_id[0][0]);
 
+    const int stride_log2 = qsa_pos_stride_log2();
+
+    // no cell held by two sequences: a used cell carries one sequence at least, so the cells of the sequences add up
+    // to the used ones exactly when none carries two. counted on the attention cache itself, in O(sequences)
+    size_t n_seq_cells = 0;
+
     int  n_present = 0;
     bool ok        = true;
     for (int q = 0; q < LLAMA_MAX_SEQ && ok; ++q) {
         if (cells.seq_pos_min(q) >= 0) {
             n_present++;
-            ok = cells.seq_pos_max(q) < (llama_pos(1) << QSA_POS_STRIDE_LOG2);
+            n_seq_cells += cells.seq_pos_get(q).size();
+            ok = cells.seq_pos_max(q) < (llama_pos(1) << stride_log2);
         }
+    }
+    ok = ok && n_seq_cells == cells.get_used();
+    // the tokens too: the range [rank*stride, rank*stride + pos] of a token past the stride reaches into the next rank.
+    // the cells of an applied ubatch carry these positions, which this does not lean on
+    for (uint32_t i = 0; i < ubatch->n_tokens && ok; ++i) {
+        ok = ubatch->pos[i] < (llama_pos(1) << stride_log2);
     }
     // every value must stay exact in f32, the half-integer mid of a token included: below 2^23, up to 32 sequences
-    ok = ok && ((int64_t) n_present << QSA_POS_STRIDE_LOG2) <= (int64_t(1) << 23);
-
-    // the grouping of this ubatch (qsa_prepare) may know already: several sequences carried forward hold one per
-    // cell. the indexer cache has the cells of the attention cache (state_read), so its answer holds for both
-    bool single = false;
-    for (const auto & [ratio, st] : qsa_cur) {
-        for (const auto & g : st.grp) {
-            single |= st.epoch == qsa_epoch && g.inc_multi && g.m_epoch == qsa_epoch && g.m_cell_grp.size() >= n_kv;
-        }
-    }
-
-    for (uint32_t j = 0; j < n_kv && ok && !single; ++j) {
-        ok = cells.is_empty(j) || cells.seq_count(j) == 1;
-    }
+    ok = ok && ((int64_t) n_present << stride_log2) <= (int64_t(1) << 23);
 
     qsa_pos_ok_epoch = qsa_epoch;
     qsa_pos_ok_n_kv  = n_kv;
@@ -1552,7 +1564,7 @@ void llama_memory_hybrid_idx_fork::set_input_qsa_pos(
         GGML_ASSERT(ggml_are_same_shape(tok_half, tok_pos));
 
         float * dst_half = (float *) tok_half->data;
-        const float stride = (float) (1 << QSA_POS_STRIDE_LOG2);
+        const float stride = (float) (1 << qsa_pos_stride_log2());
 
         for (int64_t s = 0; s < n_ns; ++s) {
             const auto & cells = get_mem_attn()->get_cells(ubatch->seq_id[s*n_tps][0]);

@@ -3,6 +3,16 @@
 
 llama_build(test-checkpoint-partial.cpp)
 
+# the window KV of the dense MTP head (LLAMA_MTP_WINDOW_KV): the rule is header-only, every platform builds this
+llama_build_and_test(test-mtp-window-fork.cpp)
+target_include_directories(test-mtp-window-fork PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+# the gate of --spec-auto: a calibration per draft type, probabilities that are not a number (common/fork)
+llama_build_and_test(test-spec-auto-fork.cpp)
+
+# the fork's knobs of the environment: a value that is not a whole number gives the default, not the 0 of atoi
+llama_build_and_test(test-env-fork.cpp)
+
 # prompt-cache disk spill: block-aligned unbuffered file layout, cold-start adoption, rejection of
 # foreign or truncated files. server-context is a static library, so this links on Windows too.
 llama_build_and_test(test-prompt-cache-spill.cpp)
@@ -54,6 +64,32 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             FIXTURES_REQUIRED generate-models
         )
     endforeach()
+
+    # QSA with several sequences in one unified cache (the server's slots): the groupings carried across the rollbacks
+    # of drafts, checked by LLAMA_QSA_CHECK, the mask from positions per sequence, and the logits of every sequence
+    # against the same sequence alone, on the qwen4exp model of the matrix. the mask from positions must give the logits
+    # of the dense mask bit for bit, and LLAMA_QSA_MASK_POS is read once per process: a run with the dense mask writes
+    # its logits first
+    llama_build(test-qsa-multi-fork.cpp)
+    set(QSA_MULTI_DENSE "${CMAKE_CURRENT_BINARY_DIR}/test-qsa-multi-fork-dense.bin")
+    llama_test(
+        test-qsa-multi-fork
+        NAME test-qsa-multi-fork-dense
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --dense-out "${QSA_MULTI_DENSE}"
+    )
+    set_tests_properties(test-qsa-multi-fork-dense PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        FIXTURES_SETUP qsa-multi-dense
+    )
+    llama_test(
+        test-qsa-multi-fork
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --dense-in "${QSA_MULTI_DENSE}"
+    )
+    set_tests_properties(test-qsa-multi-fork PROPERTIES
+        FIXTURES_REQUIRED "generate-models;qsa-multi-dense"
+    )
 endif()
 
 # Test checkpoint delta encoding/decoding

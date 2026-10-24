@@ -1,19 +1,14 @@
 #include "llama-load-watch-fork.h"
 
+#include "llama-fork.h"
 #include "llama-impl.h"
 
 #include <cstdio>
 #include <cstdlib>
 
 llama_load_watch_fork::llama_load_watch_fork() {
-    static const int limit = [] {
-        const char * env = getenv("LLAMA_LOAD_WATCH");
-        return env ? atoi(env) : 15;
-    }();
-    static const int exit_after = [] {
-        const char * env = getenv("LLAMA_LOAD_WATCH_EXIT");
-        return env ? atoi(env) : 180;
-    }();
+    static const int limit      = (int) llama_fork_env_int("LLAMA_LOAD_WATCH", 15);
+    static const int exit_after = (int) llama_fork_env_int("LLAMA_LOAD_WATCH_EXIT", 180);
     limit_s = limit;
     exit_s  = exit_after;
     t_step  = clock::now();

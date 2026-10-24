@@ -12,6 +12,11 @@ bool llama_fork_upstream(const char * component);
 
 #include <cstdint>
 
+// a whole number of the environment, the fork's knobs: def when the variable is unset or empty, and def with an error
+// line (once per variable) when its value is not a whole number. atoi read such a value as 0, which for most knobs means
+// off or never: a typo in an arm changed the layout without a word
+int64_t llama_fork_env_int(const char * name, int64_t def);
+
 struct llama_model;
 struct llama_memory_context_i;
 struct llama_memory_i;

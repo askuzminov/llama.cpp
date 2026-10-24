@@ -1921,15 +1921,23 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // fork: while other slots run, the cache writes nothing to disk here, their next decode would wait for
+                // it: write_behind writes the states out once the server is idle (defer_writes)
+                const bool others_run = std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
+                    return &slot != ret && slot.is_processing();
+                });
+                prompt_cache->defer_writes = others_run;
+
                 ret->prompt_save(*prompt_cache);
 
-                evict_for_load_fork(*ret, task.tokens); // fork
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // fork: no load whose state cannot fit: it would fail and erase its entry. the slot keeps its prompt, as
+                // with no better entry in the cache
+                if (evict_for_load_fork(*ret, task.tokens) && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
-                prompt_cache->update();
+                prompt_cache->defer_writes = false;
+                prompt_cache->update(!others_run);
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -1939,9 +1947,10 @@ private:
     }
 
     // fork: clear the idle slot used least recently, other than `keep`, and keep its state in the prompt cache first
-    // (server_slot_room_fork). `update` lets the cache fit its limit after the save; the load path leaves that to
-    // its own update, which runs after the load. false when no idle slot holds tokens
-    bool evict_idle_lru_fork(const server_slot * keep, bool update) {
+    // (server_slot_room_fork). it runs while other slots generate or wait for a decode, so the save writes nothing to
+    // disk (defer_writes): the cache can stay above its RAM limit until the next update(), at a task launch, and
+    // write_behind writes the state out once the server is idle. false when no idle slot holds tokens
+    bool evict_idle_lru_fork(const server_slot * keep) {
         server_slot * lru = nullptr;
         for (auto & slot : slots) {
             if (&slot != keep && !slot.is_processing() && slot.prompt.n_tokens() > 0 &&
@@ -1953,10 +1962,14 @@ private:
             return false;
         }
 
-        // false when the cache holds this prompt already or cannot take it
-        const bool saved = prompt_cache && lru->prompt_save(*prompt_cache);
-        if (saved && update) {
-            prompt_cache->update();
+        // false when the cache holds this prompt already or cannot take it. the caller may have deferred the writes
+        // already (a task launch)
+        bool saved = false;
+        if (prompt_cache) {
+            const bool deferred = prompt_cache->defer_writes;
+            prompt_cache->defer_writes = true;
+            saved = lru->prompt_save(*prompt_cache);
+            prompt_cache->defer_writes = deferred;
         }
 
         SRV_WRN("purging slot %d with %zu tokens, the least recently used idle one%s\n", lru->id, lru->prompt.tokens.size(),
@@ -1969,29 +1982,35 @@ private:
 
     // fork: a unified cache must have free cells for the state the prompt cache restores into `dst`: a load that does
     // not fit fails and erases its entry, and the conversation is computed again from the start. the idle slots used
-    // least recently give way until the cells of the other slots and the restored ones fit (server_slot_room_fork)
-    void evict_for_load_fork(const server_slot & dst, const server_tokens & tokens) {
+    // least recently give way until the cells of the other slots and the restored ones fit (server_slot_room_fork).
+    // the entry is the one the load will take, found again after each eviction, which saves a prompt to the cache.
+    // false when it does not fit with every idle slot cleared (the running ones hold the room): no load then
+    bool evict_for_load_fork(const server_slot & dst, const server_tokens & tokens) {
         if (!params_base.kv_unified || !server_slot_room_fork() || !prompt_cache) {
-            return;
-        }
-
-        const auto it = prompt_cache->find_best(dst.prompt.tokens, tokens);
-        if (it == prompt_cache->states.end()) {
-            return;
+            return true;
         }
 
         const int64_t n_ctx = llama_n_ctx(ctx_tgt);
-        const int64_t need  = (int64_t) it->prompt.tokens.size();
 
         while (true) {
+            const auto it = prompt_cache->find_best(dst.prompt.tokens, tokens);
+            if (it == prompt_cache->states.end()) {
+                return true;
+            }
+
             int64_t held = 0;
             for (const auto & slot : slots) {
                 if (&slot != &dst) {
                     held += slot.prompt.n_tokens();
                 }
             }
-            if (held + need <= n_ctx || !evict_idle_lru_fork(&dst, false)) {
-                break;
+            if (held + (int64_t) it->prompt.tokens.size() <= n_ctx) {
+                return true;
+            }
+            if (!evict_idle_lru_fork(&dst)) {
+                SRV_WRN("the cached prompt of %zu tokens does not fit next to the %" PRId64 " tokens of the other slots, left in the cache\n",
+                        it->prompt.tokens.size(), held);
+                return false;
             }
         }
     }
@@ -2172,7 +2191,7 @@ private:
             oldest->room_paused = true;
             need = oldest->prompt.n_tokens() + (is_prompt ? std::min<int64_t>(need, llama_n_batch(ctx_tgt)) : need);
 
-            while (!fits(need) && evict_idle_lru_fork(nullptr, true)) {
+            while (!fits(need) && evict_idle_lru_fork(nullptr)) {
             }
             if (!fits(need) && n_running() > 0) {
                 break;
@@ -2184,7 +2203,7 @@ private:
         }
 
         while (!fits(0)) {
-            if (evict_idle_lru_fork(nullptr, true)) {
+            if (evict_idle_lru_fork(nullptr)) {
                 continue;
             }
 
@@ -2219,7 +2238,7 @@ private:
 
         // fork: the idle slot used least recently, kept in the prompt cache first (server_slot_room_fork)
         if (server_slot_room_fork()) {
-            return evict_idle_lru_fork(nullptr, true);
+            return evict_idle_lru_fork(nullptr);
         }
 
         for (auto & slot : slots) {
@@ -3859,6 +3878,10 @@ private:
                     }
 
                     prompt_cache->write_behind([this]() { return queue_tasks.has_new_task(); });
+
+                    // fork: the RAM limit the saves of evicted slots left behind (defer_writes), from the states now on
+                    // disk - no write, a request that arrives does not wait for one
+                    prompt_cache->update(false);
                 }
 
                 metrics_flush_idle();

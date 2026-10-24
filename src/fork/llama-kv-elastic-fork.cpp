@@ -7,6 +7,7 @@
 #include "llama-kv-cache.h"
 
 #include "llama-impl.h"
+#include "llama-fork.h"
 
 #include "ggml-backend.h"
 
@@ -112,10 +113,7 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
     }
 
     auto el = std::make_shared<llama_kv_elastic_fork>();
-    {
-        const char * env = getenv("LLAMA_KV_ELASTIC_POISON");
-        el->poison = emulate && env != nullptr && atoi(env) != 0;
-    }
+    el->poison = emulate && llama_fork_env_int("LLAMA_KV_ELASTIC_POISON", 0) != 0;
 
     for (size_t i = 0; i < plans.size(); ++i) {
         auto & p   = plans[i];

@@ -19,7 +19,15 @@ struct trace_range {
 trace_range trace_range_from_env() {
     trace_range r;
     const char * env = getenv("LLAMA_TRACE_REQUESTS");
-    if (env != nullptr && sscanf(env, "%d:%d", &r.first, &r.last) < 2) {
+    if (env == nullptr || *env == '\0') {
+        return r;
+    }
+    const int n = sscanf(env, "%d:%d", &r.first, &r.last);
+    if (n < 1) {
+        LOG_WRN("%s: LLAMA_TRACE_REQUESTS=\"%s\" is not first[:last], no trace\n", __func__, env);
+        return trace_range{};
+    }
+    if (n < 2) {
         r.last = r.first;
     }
     return r;

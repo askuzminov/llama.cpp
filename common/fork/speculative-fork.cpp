@@ -1,5 +1,6 @@
 #include "speculative-fork.h"
 
+#include "env-fork.h"
 #include "common.h"
 #include "ggml.h"
 #include "log.h"
@@ -44,11 +45,13 @@ void common_speculative_auto::init(bool enabled, uint32_t n_seq, int32_t n_cap, 
     n_cap_probe = std::max(1, n_cap);
     seqs.assign(n_seq, {});
 
-    // prior: the head probability is the acceptance, worth two observations
-    for (int d = 0; d < n_depth; ++d) {
-        for (int b = 0; b < n_bins; ++b) {
-            cal_acc[d][b] = 2.0 * (b + 0.5) / n_bins;
-            cal_n  [d][b] = 2.0;
+    // prior: the draft probability is the acceptance, worth two observations
+    for (int t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
+        for (int d = 0; d < n_depth; ++d) {
+            for (int b = 0; b < n_bins; ++b) {
+                cal_acc[t][d][b] = 2.0 * (b + 0.5) / n_bins;
+                cal_n  [t][d][b] = 2.0;
+            }
         }
     }
 
@@ -63,10 +66,18 @@ void common_speculative_auto::init(bool enabled, uint32_t n_seq, int32_t n_cap, 
     }
 }
 
-double common_speculative_auto::acc_head(int j, float p) const {
+// the calibration column of a draft probability, -1 for one that is not a number: (int) of a NaN is undefined
+static int common_speculative_auto_bin(float p) {
+    if (!std::isfinite(p)) {
+        return -1;
+    }
+    return std::clamp((int) (p * common_speculative_auto::n_bins), 0, common_speculative_auto::n_bins - 1);
+}
+
+double common_speculative_auto::acc_head(common_speculative_type type, int j, float p) const {
     const int d = std::min(j, n_depth - 1);
-    const int b = std::clamp((int) (p * n_bins), 0, n_bins - 1);
-    return cal_acc[d][b] / cal_n[d][b];
+    const int b = common_speculative_auto_bin(p);
+    return b < 0 ? 0.0 : cal_acc[type][d][b] / cal_n[type][d][b];
 }
 
 // prior 0.9 worth two observations: an ngram draft needs a long match to exist at all.
@@ -102,6 +113,8 @@ int32_t common_speculative_auto::impl_cap(common_speculative_type type) const {
 }
 
 int32_t common_speculative_auto::cap_begin(common_speculative_type type, draft_params_vec & dparams) {
+    drafting = type;
+
     const int32_t cap_impl = active() ? impl_cap(type) : -1;
     if (cap_impl >= 0) {
         n_max_save.resize(dparams.size());
@@ -180,6 +193,7 @@ void common_speculative_auto::cycle_begin(const draft_params_vec & dparams) {
         s.type  = COMMON_SPECULATIVE_TYPE_NONE;
         s.hp.clear();
         s.q.clear();
+        s.q_dist.clear();
         s.pt.clear();
         s.pm.clear();
         s.ov.clear();
@@ -208,6 +222,7 @@ void common_speculative_auto::draft_end(const draft_params_vec & dparams, const 
         if (!common_speculative_type_is_gated(s.type)) {
             s.hp.clear();
             s.q.clear();
+            s.q_dist.clear();
         } else {
             // the caller may truncate the draft
             if ((int32_t) s.hp.size() > s.n_drf) {
@@ -215,6 +230,9 @@ void common_speculative_auto::draft_end(const draft_params_vec & dparams, const 
             }
             if ((int32_t) s.q.size() > s.n_drf) {
                 s.q.resize(s.n_drf);
+            }
+            if ((int32_t) s.q_dist.size() > s.n_drf) {
+                s.q_dist.resize(s.n_drf);
             }
         }
     }
@@ -242,18 +260,19 @@ bool common_speculative_auto::keep(llama_seq_id seq_id, const llama_token_data_a
     const float p = cur_p->data[0].p;
 
     if (mode == MODE_GATE) {
-        const double pc = s.pcum * acc_head((int) s.hp.size(), p);
+        const double pc = s.pcum * acc_head(drafting, (int) s.hp.size(), p);
         if (pc < thr_keep) {
             return false;
         }
         s.pcum = pc;
-        more   = pc * acc_mean() >= thr_step;
+        more   = pc * acc_mean(drafting) >= thr_step;
     }
 
     s.hp.push_back(p);
 
     if (trace) {
         s.q.emplace_back(cur_p->data, cur_p->data + std::min<size_t>(cur_p->size, 10));
+        s.q_dist.push_back(1);
     }
 
     return true;
@@ -270,6 +289,7 @@ void common_speculative_auto::pad(llama_seq_id seq_id, const llama_token_data_ar
 
     if (trace) {
         s.q.emplace_back(cur_p->data, cur_p->data + std::min<size_t>(cur_p->size, 10));
+        s.q_dist.push_back(1);
     }
 }
 
@@ -300,16 +320,20 @@ void common_speculative_auto::on_accept(llama_seq_id seq_id, uint16_t n_accepted
     const int n_test = std::min<int>(n_accepted + 1, s.n_drf);
 
     if (common_speculative_type_is_gated(s.type) && (int) s.hp.size() == s.n_drf) {
+        const int t = s.type;
         for (int j = 0; j < n_test; ++j) {
             const int d = std::min(j, n_depth - 1);
-            const int b = std::clamp((int) (s.hp[j] * n_bins), 0, n_bins - 1);
+            const int b = common_speculative_auto_bin(s.hp[j]);
             const double a = j < n_accepted ? 1.0 : 0.0;
 
-            cal_acc[d][b] = cal_acc[d][b] * f_cal + a;
-            cal_n  [d][b] = cal_n  [d][b] * f_cal + 1.0;
+            // a probability that is not a number has no column: its acceptance still counts for the mean
+            if (b >= 0) {
+                cal_acc[t][d][b] = cal_acc[t][d][b] * f_cal + a;
+                cal_n  [t][d][b] = cal_n  [t][d][b] * f_cal + 1.0;
+            }
 
-            acc_sum = acc_sum * f_cal + a;
-            acc_n   = acc_n   * f_cal + 1.0;
+            acc_sum[t] = acc_sum[t] * f_cal + a;
+            acc_n  [t] = acc_n  [t] * f_cal + 1.0;
         }
     } else if (s.type != COMMON_SPECULATIVE_TYPE_NONE) {
         auto & a = pos_acc[s.type];
@@ -348,7 +372,7 @@ void common_speculative_auto::on_verify(llama_seq_id seq_id, size_t i, const lla
 
     // the draft candidates at the target temperature against the target distribution
     float ov = -1.0f;
-    if (i < s.q.size() && !s.q[i].empty()) {
+    if (i < s.q.size() && !s.q[i].empty() && i < s.q_dist.size() && s.q_dist[i]) {
         const auto & q = s.q[i];
         if (temp <= 0.0f) {
             ov = pt;
@@ -489,9 +513,9 @@ void common_speculative_auto::cycle_end(int64_t now) {
 }
 
 void common_speculative_auto::print() const {
-    SPC_INF("auto: %s, cycles %" PRId64 " (%" PRId64 " valid), rate %.2f t/s, verify %.2f ms + %.3f ms/token%s, draft step %.3f ms, keep > %.3f, step > %.3f, mean acc %.3f\n",
+    SPC_INF("auto: %s, cycles %" PRId64 " (%" PRId64 " valid), rate %.2f t/s, verify %.2f ms + %.3f ms/token%s, draft step %.3f ms, keep > %.3f, step > %.3f\n",
             enabled ? "on" : "trace only", n_cycle, n_valid, rate() * 1e6, t0 / 1e3, t1 / 1e3, fit_ok ? "" : " (no fit)",
-            t_step / 1e3, thr_keep, thr_step, acc_mean());
+            t_step / 1e3, thr_keep, thr_step);
 
     std::string str;
     for (int k = 0; k < n_hist; ++k) {
@@ -503,12 +527,20 @@ void common_speculative_auto::print() const {
         SPC_INF("auto: gated draft lengths:%s\n", str.c_str());
     }
 
-    for (int d = 0; d < n_depth && acc_n > 0.0; ++d) {
-        str.clear();
-        for (int b = 0; b < n_bins; ++b) {
-            str += string_format(" %.2f", cal_acc[d][b] / cal_n[d][b]);
+    for (int t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
+        if (acc_n[t] <= 0.0) {
+            continue;
         }
-        SPC_INF("auto: acceptance by head p (0.0..1.0 in steps of 0.1), pos %d%s:%s\n", d, d == n_depth - 1 ? "+" : "", str.c_str());
+        const std::string name = common_speculative_type_to_str((common_speculative_type) t);
+        SPC_INF("auto: %s: mean acc %.3f\n", name.c_str(), acc_mean((common_speculative_type) t));
+        for (int d = 0; d < n_depth; ++d) {
+            str.clear();
+            for (int b = 0; b < n_bins; ++b) {
+                str += string_format(" %.2f", cal_acc[t][d][b] / cal_n[t][d][b]);
+            }
+            SPC_INF("auto: %s: acceptance by draft p (0.0..1.0 in steps of 0.1), pos %d%s:%s\n", name.c_str(), d,
+                    d == n_depth - 1 ? "+" : "", str.c_str());
+        }
     }
 
     for (int t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
@@ -525,55 +557,89 @@ void common_speculative_auto::print() const {
 
 bool common_speculative_fork_lattice_keep(common_speculative_auto * ctl, llama_seq_id seq_id, const float * ids,
         const float * scores, int32_t top_k, int32_t chosen) {
+    // a selector row of -inf only gives the pick no score (-inf - -inf is NaN): no probabilities then, keep() gets NaN,
+    // which the gate drops and the calibration skips. a candidate without a number has none either
+    const bool scored = std::isfinite(scores[chosen]);
+
     std::vector<llama_token_data> cand((size_t) top_k);
     float sum = 0.0f;
     for (int32_t k = 0; k < top_k; ++k) {
-        const float p = std::exp(scores[k] - scores[chosen]);
+        const float p = scored && std::isfinite(scores[k]) ? std::exp(scores[k] - scores[chosen]) : 0.0f;
         cand[k] = { (llama_token) ids[k], scores[k], p };
         sum += p;
     }
+    // with a score the pick adds exp(0) = 1 to the sum
     for (auto & c : cand) {
-        c.p /= sum;
+        c.p = scored ? c.p / sum : NAN;
     }
-    // the pick is the argmax, so it leads the order keep() and the trace read
+    // the pick is the argmax, so it leads the order keep() and the trace read. a NaN breaks the order of a sort
     std::swap(cand[0], cand[chosen]);
-    std::sort(cand.begin() + 1, cand.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+    if (scored) {
+        std::sort(cand.begin() + 1, cand.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+    }
 
     llama_token_data_array cur_p = { cand.data(), cand.size(), 0, true };
     bool more = true;
-    return ctl->keep(seq_id, &cur_p, more);
+    const bool keep = ctl->keep(seq_id, &cur_p, more);
+
+    // the scores of the selector are no token distribution of the drafter: no overlap with the target in the trace
+    auto & s = ctl->seqs[seq_id];
+    if (keep && !s.q_dist.empty()) {
+        s.q_dist.back() = 0;
+    }
+    return keep;
 }
 
 uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch) {
-    const char * env = std::getenv("LLAMA_MTP_UBATCH");
-    const long   cap = env ? std::strtol(env, nullptr, 10) : 1024;
-    return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
+    const int64_t cap = common_fork_env_int("LLAMA_MTP_UBATCH", 1024);
+    return cap > 0 ? (uint32_t) std::min<int64_t>(n_ubatch, cap) : n_ubatch;
 }
 
 bool common_speculative_fork_even_drafts() {
     static const bool even = [] {
-        const char * env = getenv("LLAMA_SPEC_EVEN");
-        return env == nullptr || atoi(env) != 0;
+        return common_fork_env_int("LLAMA_SPEC_EVEN", 1) != 0;
     }();
     return even;
 }
 
 int32_t common_speculative_fork_draft_by_slots(int n_gen) {
     static const std::vector<int32_t> caps = [] {
+        static const char * def = "3,3,2,2,2,1";
+
+        // whole numbers separated by commas; an item that is not one would read as 0, a draft cap of 0
+        const auto parse = [](const std::string & text, std::vector<int32_t> & res) {
+            size_t pos = 0;
+            while (pos < text.size()) {
+                const size_t end = text.find(',', pos);
+                const std::string item = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                if (item.find_first_not_of(" \t") != std::string::npos) {
+                    errno = 0;
+                    char * e = nullptr;
+                    const long v = std::strtol(item.c_str(), &e, 10);
+                    while (*e == ' ' || *e == '\t') {
+                        e++;
+                    }
+                    if (e == item.c_str() || *e != '\0' || errno == ERANGE || v < INT32_MIN || v > INT32_MAX) {
+                        return false;
+                    }
+                    res.push_back((int32_t) v);
+                }
+                if (end == std::string::npos) {
+                    break;
+                }
+                pos = end + 1;
+            }
+            return true;
+        };
+
         const char * env = getenv("LLAMA_SPEC_DRAFT_BY_SLOTS");
         std::vector<int32_t> res;
-        const std::string text = env ? env : "3,3,2,2,2,1";
-        size_t pos = 0;
-        while (pos < text.size()) {
-            const size_t end = text.find(',', pos);
-            const std::string item = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-            if (!item.empty()) {
-                res.push_back((int32_t) atoi(item.c_str()));
+        if (env == nullptr || !parse(env, res)) {
+            if (env != nullptr) {
+                SPC_WRN("LLAMA_SPEC_DRAFT_BY_SLOTS=\"%s\" is not a list of whole numbers, using %s\n", env, def);
             }
-            if (end == std::string::npos) {
-                break;
-            }
-            pos = end + 1;
+            res.clear();
+            parse(def, res);
         }
         if (res.size() == 1 && res[0] == 0) {
             res.clear();
@@ -587,9 +653,32 @@ int32_t common_speculative_fork_draft_by_slots(int n_gen) {
 }
 
 uint32_t common_speculative_fork_dflash_ubatch(uint32_t n_ubatch) {
-    const char * env = std::getenv("LLAMA_DFLASH_UBATCH");
-    const long   cap = env ? std::strtol(env, nullptr, 10) : 512;
-    return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
+    const int64_t cap = common_fork_env_int("LLAMA_DFLASH_UBATCH", 512);
+    return cap > 0 ? (uint32_t) std::min<int64_t>(n_ubatch, cap) : n_ubatch;
+}
+
+void common_speculative_fork_dflash_fit(const llama_model * model_dft, int32_t n_max, llama_context_params & cparams) {
+    char buf[32] = {};
+    if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0 && std::string(buf) == "true") {
+        return; // a causal draft may split its batch
+    }
+
+    int32_t per_seq = std::max(1, n_max + 1);
+    if (llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", buf, sizeof(buf)) >= 0 && std::atoi(buf) > 0) {
+        int32_t block_size = 16;
+        if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
+            block_size = std::atoi(buf);
+        }
+        per_seq = std::max(per_seq, block_size);
+    }
+
+    const uint32_t need = (uint32_t) per_seq * std::max<uint32_t>(1, cparams.n_seq_max);
+    if (cparams.n_ubatch < need || cparams.n_batch < need) {
+        SPC_INF("dflash: the blocks of %u sequences (%d tokens each) decode as one ubatch, n_ubatch %u -> %u, n_batch %u -> %u\n",
+                cparams.n_seq_max, per_seq, cparams.n_ubatch, std::max(cparams.n_ubatch, need), cparams.n_batch, std::max(cparams.n_batch, need));
+        cparams.n_ubatch = std::max(cparams.n_ubatch, need);
+        cparams.n_batch  = std::max(cparams.n_batch, need);
+    }
 }
 
 static llama_model * g_draft_preloaded = nullptr;
@@ -597,8 +686,7 @@ static std::string   g_draft_preloaded_path;
 
 void common_speculative_fork_preload_draft(const common_params & params_base) {
     // on by default since 15.10 night (the 395: speed the same, see the header); LLAMA_DRAFT_LOAD_FIRST=0: upstream order
-    const char * env = getenv("LLAMA_DRAFT_LOAD_FIRST");
-    if ((env != nullptr && atoi(env) == 0) || !params_base.speculative.has_dft() || g_draft_preloaded != nullptr) {
+    if (common_fork_env_int("LLAMA_DRAFT_LOAD_FIRST", 1) == 0 || !params_base.speculative.has_dft() || g_draft_preloaded != nullptr) {
         return;
     }
     // the same parameters as common_speculative_init_result gets from the server
@@ -623,16 +711,14 @@ llama_model * common_speculative_fork_take_draft(const std::string & path) {
 
 bool common_speculative_fork_catchup() {
     static const bool enabled = [] {
-        const char * env = getenv("LLAMA_SPEC_CATCHUP_FORK");
-        return env == nullptr || atoi(env) != 0;
+        return common_fork_env_int("LLAMA_SPEC_CATCHUP_FORK", 1) != 0;
     }();
     return enabled;
 }
 
 bool common_speculative_fork_ngram_cache_keep() {
     static const bool keep = [] {
-        const char * env = getenv("LLAMA_NGRAM_CACHE_KEEP");
-        return env != nullptr && atoi(env) != 0;
+        return common_fork_env_int("LLAMA_NGRAM_CACHE_KEEP", 0) != 0;
     }();
     return keep;
 }

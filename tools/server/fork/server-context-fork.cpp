@@ -6,6 +6,7 @@
 #include "server-task.h"
 
 #include "common.h"
+#include "fork/env-fork.h"
 #include "llama.h"
 #include "sampling.h"
 
@@ -168,6 +169,14 @@ uint64_t server_prompt_cache_signature(
     s += "|" + std::to_string((int) params.kv_unified);
     s += "|" + std::to_string(ctx_dft != nullptr);
     s += "|" + std::to_string(LLAMA_STATE_SEQ_VERSION);
+    // the KV cache of the dense MTP head keeping only its window (LLAMA_MTP_WINDOW_KV): a state saved with the whole
+    // cache does not fit it ("not enough cells", the entry is dropped), one of another window holds other positions.
+    // Added only then, so that the files of every other configuration keep their signature
+    uint32_t n_window_dft = 0;
+    const uint32_t n_cells_dft = ctx_dft ? llama_mtp_window_kv(ctx_dft, &n_window_dft) : 0;
+    if (n_cells_dft > 0) {
+        s += "|mtp-window-kv " + std::to_string(n_window_dft) + " " + std::to_string(n_cells_dft);
+    }
 
     return (uint64_t) std::hash<std::string>{}(s);
 }
@@ -304,15 +313,13 @@ const common_prompt_checkpoint * server_ckpt_restore(
 bool server_ckpt_user_break_fork() {
     // off by default since 16.10 (the 3090, see the header); LLAMA_CKPT_USER_BREAK=1: upstream
     static const bool brk = [] {
-        const char * env = getenv("LLAMA_CKPT_USER_BREAK");
-        return env != nullptr && atoi(env) != 0;
+        return common_fork_env_int("LLAMA_CKPT_USER_BREAK", 0) != 0;
     }();
     return brk;
 }
 
 static int32_t server_env_int_fork(const char * name, int32_t def) {
-    const char * env = getenv(name);
-    return env ? (int32_t) atoi(env) : def;
+    return (int32_t) std::clamp<int64_t>(common_fork_env_int(name, def), INT32_MIN, INT32_MAX);
 }
 
 int32_t server_prefill_budget_fork() {
@@ -332,8 +339,7 @@ int32_t server_answer_room_fork() {
 
 bool server_slot_room_fork() {
     static const bool room = [] {
-        const char * env = getenv("LLAMA_SLOT_ROOM");
-        return env == nullptr || atoi(env) != 0;
+        return common_fork_env_int("LLAMA_SLOT_ROOM", 1) != 0;
     }();
     return room;
 }
