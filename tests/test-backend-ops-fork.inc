@@ -555,7 +555,206 @@ struct test_dsv4_hc_post_norm_f16 : public test_dsv4_hc {
     }
 };
 
+// GATED_DELTA_NET_LAZY, the qwen4exp delta net with deferred rollback (llama_memory_recurrent::rec_l). mode 1 runs the
+// net from the rows of its cells with their records and writes the records of its tokens, mode 2 replays records into
+// the rows the plain net reads. The info rows take the cases llama_memory_recurrent_context::lazy_info makes: a base
+// with records, a rolled-back plane without them, a state left as it is, a base copied to a plane. The state rows and
+// the records are read back after the op (each node runs alone, in graph order) and checked with its output
+struct test_gated_delta_net_lazy : public test_case {
+    const int     mode;
+    const int64_t head_size;
+    const int64_t H_v;
+    const int64_t H_k;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs; // the info rows: the sequences of mode 1
+    const int64_t R;      // the planes of a cell and the records of a set (1 + n_rs_seq)
+
+    ggml_tensor * info = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_LAZY";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(mode, head_size, H_v, H_k, n_seq_tokens, n_seqs, R);
+    }
+
+    test_gated_delta_net_lazy(int mode, int64_t head_size, int64_t H_v, int64_t H_k, int64_t n_seq_tokens, int64_t n_seqs,
+                              int64_t R = 4)
+        : mode(mode), head_size(head_size), H_v(H_v), H_k(H_k), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), R(R) {}
+
+    // one cell per info row and a spare one
+    int64_t n_cells() const { return n_seqs + 1; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S          = head_size;
+        const int64_t rec_floats = H_v * S + H_k * S + H_v;
+
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * S * H_v, n_cells() * R);
+        ggml_tensor * rec   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rec_floats, R, 2 * n_cells());
+        info = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 5, n_seqs);
+        ggml_set_name(state, "state");
+        ggml_set_name(rec,   "rec");
+        ggml_set_name(info,  "info");
+
+        ggml_tensor * res = nullptr;
+        if (mode == 1) {
+            ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, n_seq_tokens, n_seqs);
+            ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, n_seq_tokens, n_seqs);
+            ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, n_seq_tokens, n_seqs);
+            ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+            ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+            ggml_set_name(q, "q");
+            ggml_set_name(k, "k");
+            ggml_set_name(v, "v");
+            ggml_set_name(g, "g");
+            ggml_set_name(beta, "beta");
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+            res = ggml_gated_delta_net_lazy(ctx, q, k, v, g, beta, state, rec, info);
+        } else {
+            res = ggml_gated_delta_net_replay(ctx, state, rec, info, (int) S, (int) H_v, (int) H_k);
+        }
+        ggml_set_name(res, "res");
+
+        // the add visits its first source first, so the reads come after the op
+        ggml_tensor * st = ggml_cont(ctx, ggml_view_2d(ctx, state, state->ne[0], state->ne[1], state->nb[1], 0));
+        ggml_tensor * rc = ggml_cont(ctx, ggml_view_3d(ctx, rec, rec->ne[0], rec->ne[1], rec->ne[2], rec->nb[1], rec->nb[2], 0));
+        ggml_set_name(st, "state_after");
+        ggml_set_name(rc, "rec_after");
+        return ggml_add(ctx, ggml_sum(ctx, res), ggml_add(ctx, ggml_sum(ctx, st), ggml_sum(ctx, rc)));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t == info) {
+                const int64_t   C = n_cells();
+                std::vector<int32_t> inf(5 * n_seqs);
+                for (int64_t i = 0; i < n_seqs; i++) {
+                    const int32_t c   = (int32_t) i;
+                    const int32_t rho = (int32_t) (1 + i % (R - 1));
+                    const int32_t a   = (int32_t) (i & 1);
+                    int32_t *     r   = inf.data() + 5 * i;
+                    r[3] = 2 * c + a;
+                    r[4] = 2 * c + (a ^ 1);
+                    if (mode == 1) {
+                        // a base with records, the rolled-back plane of the plain net, a state without records
+                        r[1] = c;
+                        switch (i % 3) {
+                            case 0:  r[0] = c;                 r[2] = (int32_t) (1 + i % R); break;
+                            case 1:  r[0] = rho * (int32_t) C + c; r[2] = 0;                   break;
+                            default: r[0] = c;                 r[2] = 0;                   break;
+                        }
+                    } else {
+                        // records into a plane, records in place, nothing, a base copied to a plane
+                        r[0] = c;
+                        r[4] = r[3];
+                        switch (i % 4) {
+                            case 0:  r[1] = rho * (int32_t) C + c; r[2] = (int32_t) (1 + i % R); break;
+                            case 1:  r[1] = c;                 r[2] = (int32_t) (1 + i % R); break;
+                            case 2:  r[1] = c;                 r[2] = 0;                   break;
+                            default: r[1] = rho * (int32_t) C + c; r[2] = 0;                   break;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, inf.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "rec") == 0) {
+                // decays in (0, 1], keys and deltas of either sign do no harm over a few records
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// the replay of llama_memory_recurrent::rec_flatten: one graph, a replay per layer (two states, one info row), run as a
+// whole on the device of the layers
+struct test_gated_delta_net_replay_layers : public test_case {
+    const int64_t head_size;
+    const int64_t H_v;
+    const int64_t H_k;
+    const int64_t R = 4;
+
+    ggml_tensor * out1 = nullptr;
+    ggml_tensor * out2 = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_REPLAY_LAYERS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_size, H_v, H_k);
+    }
+
+    test_gated_delta_net_replay_layers(int64_t head_size, int64_t H_v, int64_t H_k) : head_size(head_size), H_v(H_v), H_k(H_k) {}
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return { out1, out2 };
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S          = head_size;
+        const int64_t rec_floats = H_v * S + H_k * S + H_v;
+        ggml_tensor * info = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 5, 1);
+        ggml_set_name(info, "info");
+        ggml_tensor * outs[2];
+        for (int l = 0; l < 2; l++) {
+            ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * S * H_v, 2 * R);
+            ggml_tensor * rec   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rec_floats, R, 4);
+            ggml_set_name(rec, "rec");
+            outs[l] = ggml_gated_delta_net_replay(ctx, state, rec, info, (int) S, (int) H_v, (int) H_k);
+        }
+        out1 = outs[0];
+        out2 = outs[1];
+        return ggml_add(ctx, ggml_sum(ctx, out1), ggml_sum(ctx, out2));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                const int32_t inf[5] = { 1, 1, 3, 3, 3 };
+                ggml_backend_tensor_set(t, inf, 0, sizeof(inf));
+            } else if (strcmp(t->name, "rec") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // the delta net with deferred rollback: the qwen4exp head sizes, grouped keys and not, a decode step and a verify
+    for (int64_t S : {16, 32, 64, 128}) {
+        for (auto hk : std::vector<std::array<int64_t, 2>>{{4, 2}, {2, 2}}) {
+            for (int64_t nt : {1, 2, 4}) {
+                for (int64_t ns : {1, 3, 7}) {
+                    test_cases.emplace_back(new test_gated_delta_net_lazy(1, S, hk[0], hk[1], nt, ns));
+                }
+            }
+            test_cases.emplace_back(new test_gated_delta_net_lazy(2, S, hk[0], hk[1], 1, 4));
+            test_cases.emplace_back(new test_gated_delta_net_lazy(2, S, hk[0], hk[1], 1, 7));
+        }
+        test_cases.emplace_back(new test_gated_delta_net_replay_layers(S, 4, 2));
+    }
+
     // FLASH_ATTN_LIST: the qwen4exp QSA shape (2 KV heads x 12, 256 dims, 2052 cells in blocks of 4), decode, MTP
     // checks and a prompt ubatch; GQA 8 and 1, two streams, a list longer than the cache
     for (int64_t nb : {1, 4, 64}) {

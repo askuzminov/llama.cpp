@@ -100,6 +100,15 @@ struct llama_memory_i {
     // n_kv of the attention caches in the next init_full() contexts, 0 = full size
     virtual void set_n_kv_full(uint32_t n_kv) { (void) n_kv; }
 
+    // fork: the elastic KV cache (src/fork/llama-kv-elastic-fork.cpp): its tensors in buffers the device maps on demand
+    // (emulate: ordinary buffers), the capacity in cells (0: not elastic), set as close to n_cells as the cells in use
+    // and the memory allow, the device bytes of a cell, the callback a cell search uses to grow the capacity
+    virtual bool     kv_elastic_init_fork(bool emulate) { (void) emulate; return false; }
+    virtual uint32_t kv_capacity_fork() const { return 0; }
+    virtual uint32_t kv_set_capacity_fork(uint32_t n_cells) { (void) n_cells; return 0; }
+    virtual size_t   kv_cell_bytes_fork() const { return 0; }
+    virtual void     kv_set_grow_fork(std::function<bool(uint32_t)> grow) { (void) grow; }
+
     // the last ubatch failed or was aborted: drop what the module derived from its compute
     // its positions are then removed with seq_rm
     virtual void ubatch_failed() {}

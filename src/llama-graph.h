@@ -299,6 +299,18 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // fork: deferred rollback of the gated delta net (llama_memory_recurrent::rec_l). 0 = off, 1 = the net that records
+    // instead of writing snapshots (a short batch: each sequence no longer than a verify, in its own cell), 2 = the plain
+    // net after a replay that brings the states with records up to date. Part of the graph, so it must match for reuse
+    int           lazy_mode = 0;
+    ggml_tensor * lazy_info = nullptr; // I32 [5, n_seqs] for the net, [5, n_rs] for the replay
+
+    static int lazy_mode_for(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch);
+
+    // fills lazy_info before s_copy consumes the rollback index; a hybrid input passes its own context (its can_reuse
+    // does not update this one's)
+    void set_lazy_input(const llama_ubatch * ubatch, const llama_memory_recurrent_context * mctx_cur) const;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

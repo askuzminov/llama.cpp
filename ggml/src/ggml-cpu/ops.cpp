@@ -11424,6 +11424,141 @@ void ggml_compute_forward_gated_delta_net(
 }
 
 
+// ggml_compute_forward_gated_delta_net_lazy (fork): the net with deferred rollback (op_params[0] 1) and the replay
+// alone (2), see ggml_gated_delta_net_lazy. the state goes through the steps of the plain net above - scale by the
+// gate, then add k * delta per column - so a replay gives the state the plain net would have left
+
+static void ggml_gated_delta_net_lazy_replay_rec(float * s, const float * rec_rd, int32_t n_rep, int64_t rec_floats,
+        int64_t S_v, int64_t H, int64_t H_k, int64_t h) {
+    const int64_t kh = h % H_k;
+    for (int32_t j = 0; j < n_rep; ++j) {
+        const float * rj = rec_rd + j * rec_floats;
+        const float * kk = rj + H * S_v + kh * S_v;
+        const float   gv = rj[H * S_v + H_k * S_v + h];
+        ggml_vec_scale_f32(S_v * S_v, s, gv);
+        for (int64_t c = 0; c < S_v; ++c) {
+            ggml_vec_mad_f32(S_v, &s[c * S_v], kk, rj[h * S_v + c]);
+        }
+    }
+}
+
+static void ggml_compute_forward_gated_delta_net_lazy_rows(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int64_t ir0,
+        int64_t ir1) {
+    const int mode = ggml_get_op_params_i32(dst, 0);
+
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_rec   = dst->src[6];
+    const ggml_tensor * src_info  = dst->src[7];
+
+    const int64_t S_v = mode == 2 ? ggml_get_op_params_i32(dst, 1) : dst->src[2]->ne[0];
+    const int64_t H   = mode == 2 ? ggml_get_op_params_i32(dst, 2) : dst->src[2]->ne[1];
+    const int64_t H_k = mode == 2 ? ggml_get_op_params_i32(dst, 3) : dst->src[1]->ne[1];
+
+    const int64_t D          = S_v * S_v * H;
+    const int64_t rec_floats = H * S_v + H_k * S_v + H;
+    const int64_t R          = src_rec->ne[1];
+
+    float *         state_all = (float *) src_state->data;
+    float *         rec       = (float *) src_rec->data;
+    const int32_t * info      = (const int32_t *) src_info->data;
+
+    float * work = mode == 1 ? (float *) params->wdata + params->ith * (S_v + S_v * S_v + CACHE_LINE_SIZE_F32) : nullptr;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t h   = ir % H;
+        const int64_t seq = ir / H;
+
+        const int32_t * inf     = info + 5 * seq;
+        const int64_t   row_in  = inf[0];
+        const int64_t   row_out = inf[1];
+        const int32_t   n_rep   = inf[2];
+        const float *   rec_rd  = rec + (int64_t) inf[3] * R * rec_floats;
+
+        float * s_in  = state_all + row_in  * D + h * S_v * S_v;
+        float * s_out = state_all + row_out * D + h * S_v * S_v;
+
+        // the state brought up to date: in place for the replay alone, in a work buffer for the net
+        if (mode == 2 && n_rep == 0 && row_in == row_out) {
+            continue;
+        }
+        float * s = mode == 2 ? s_out : work + S_v;
+        if (s != s_in) {
+            memcpy(s, s_in, S_v * S_v * sizeof(float));
+        }
+        ggml_gated_delta_net_lazy_replay_rec(s, rec_rd, n_rep, rec_floats, S_v, H, H_k, h);
+        if (mode == 2) {
+            continue;
+        }
+        if (n_rep > 0 || row_in != row_out) {
+            memcpy(s_out, s, S_v * S_v * sizeof(float));
+        }
+
+        const ggml_tensor * src_q    = dst->src[0];
+        const ggml_tensor * src_k    = dst->src[1];
+        const ggml_tensor * src_v    = dst->src[2];
+        const ggml_tensor * src_g    = dst->src[3];
+        const ggml_tensor * src_beta = dst->src[4];
+
+        const int64_t n_tokens = src_v->ne[2];
+        const int64_t rq3      = src_v->ne[3] / src_q->ne[3];
+        const int64_t iq3      = seq / rq3;
+        const int64_t kh       = h % H_k;
+        const float   scale    = 1.0f / sqrtf((float) S_v);
+        float *       delta    = work;
+        float *       rec_wr   = rec + (int64_t) inf[4] * R * rec_floats;
+        float *       attn     = (float *) dst->data + (seq * n_tokens * H + h) * S_v;
+
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const float * q_d = (const float *) ((const char *) src_q->data + iq3 * src_q->nb[3] + t * src_q->nb[2] + kh * src_q->nb[1]);
+            const float * k_d = (const float *) ((const char *) src_k->data + iq3 * src_k->nb[3] + t * src_k->nb[2] + kh * src_k->nb[1]);
+            const float * v_d = (const float *) ((const char *) src_v->data + seq * src_v->nb[3] + t * src_v->nb[2] + h * src_v->nb[1]);
+            const float beta_val = *(const float *) ((const char *) src_beta->data + seq * src_beta->nb[3] + t * src_beta->nb[2] + h * src_beta->nb[1]);
+            const float g_val    = expf(*(const float *) ((const char *) src_g->data + seq * src_g->nb[3] + t * src_g->nb[2] + h * src_g->nb[1]));
+
+            // the plain net's steps (ggml_compute_forward_gated_delta_net_one_chunk)
+            ggml_vec_scale_f32(S_v * S_v, s, g_val);
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s[j * S_v], 0, k_d, 0, 1);
+                delta[j] = (v_d[j] - sum) * beta_val;
+            }
+            for (int64_t j = 0; j < S_v; ++j) {
+                ggml_vec_mad_f32(S_v, &s[j * S_v], k_d, delta[j]);
+            }
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s[j * S_v], 0, q_d, 0, 1);
+                attn[j] = sum * scale;
+            }
+            attn += S_v * H;
+
+            float * rt = rec_wr + t * rec_floats;
+            memcpy(rt + h * S_v, delta, S_v * sizeof(float));
+            if (h < H_k) {
+                memcpy(rt + H * S_v + h * S_v, k_d, S_v * sizeof(float));
+            }
+            rt[H * S_v + H_k * S_v + h] = g_val;
+        }
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_lazy(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int     mode = ggml_get_op_params_i32(dst, 0);
+    const int64_t H    = mode == 2 ? ggml_get_op_params_i32(dst, 2) : dst->src[2]->ne[1];
+    const int64_t nr   = H * dst->src[7]->ne[1];
+    const int64_t dr   = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0  = dr * params->ith;
+    const int64_t ir1  = MIN(ir0 + dr, nr);
+    if (ir0 < ir1) {
+        ggml_compute_forward_gated_delta_net_lazy_rows(params, dst, ir0, ir1);
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_comb
 
 static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {

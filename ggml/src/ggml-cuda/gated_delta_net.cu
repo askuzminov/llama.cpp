@@ -391,3 +391,5 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
 }
+
+#include "fork/gated-delta-net-lazy-fork.inc" // fork: GATED_DELTA_NET_LAZY

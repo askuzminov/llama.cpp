@@ -1796,6 +1796,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        // fork: the drafts of this step the same length (common_speculative_fork_even_drafts): a sequence whose
+        // confident run ended drafts on while another one is still confident, and all are cut to the longest run.
+        // conf_len: the confident run of a sequence, -1 while it lasts
+        const bool even = common_speculative_fork_even_drafts() && n_drafting > 1;
+        std::vector<uint8_t> confident(n_seq, 0);
+        std::vector<int32_t> conf_len (n_seq, -1);
+        int n_confident = 0;
+        if (even) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    confident[seq_id] = 1;
+                    n_confident++;
+                }
+            }
+        }
+
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -1850,19 +1866,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
                 // only collect very high-confidence draft tokens
                 bool more = true;
-                if (cur_p->data[0].p < params.p_min || (ctl && !ctl->keep(seq_id, cur_p, more))) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
+                if (!even) {
+                    if (cur_p->data[0].p < params.p_min || (ctl && !ctl->keep(seq_id, cur_p, more))) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
 
-                    continue;
+                        continue;
+                    }
+                } else {
+                    // fork: past its confident run a sequence pads to the run of the others, and stops with them
+                    bool take = false;
+                    if (confident[seq_id]) {
+                        take = cur_p->data[0].p >= params.p_min && (!ctl || ctl->keep(seq_id, cur_p, more));
+                        if (!take || !more) {
+                            confident[seq_id] = 0;
+                            n_confident--;
+                            conf_len[seq_id] = (int32_t) result.size() + (take ? 1 : 0);
+                        }
+                    }
+                    if (!take) {
+                        if (n_confident == 0) {
+                            drafting[seq_id] = false;
+                            n_drafting--;
+
+                            continue;
+                        }
+                        if (ctl) {
+                            ctl->pad(seq_id, cur_p);
+                        }
+                    }
+                    more = true;
                 }
 
                 common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
 
                 result.push_back(id);
 
@@ -1912,11 +1953,46 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            // fork: the confident runs all ended in this step, the padding stops with them
+            if (even && n_confident == 0) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    drafting[seq_id] = false;
+                }
+                n_drafting = 0;
+                batch.clear();
+            }
+
             if (batch.size() == 0) {
                 break;
             }
 
             ++i;
+        }
+
+        // fork: every draft to the longest confident run; one that its cap stopped sooner bounds them all
+        if (even) {
+            int32_t n_even = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    const int32_t n = (int32_t) dparams[seq_id].result->size();
+                    n_even = std::max(n_even, conf_len[seq_id] < 0 ? n : conf_len[seq_id]);
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    n_even = std::min(n_even, (int32_t) dparams[seq_id].result->size());
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
+                dp.result->resize(n_even);
+                if (dp.result_q && dp.result_q->size() > (size_t) n_even) {
+                    dp.result_q->resize(n_even);
+                }
+            }
         }
 
         if (chain_heads) {
@@ -3091,14 +3167,20 @@ void common_speculative_draft(common_speculative * spec) {
 
     auto & dparams = spec->dparams;
 
+    // fork: the sequences that draft in this call, for the even drafts at the end
+    std::vector<llama_seq_id> was_drafting;
+
     {
         int n_drafting = 0;
 
-        for (auto & dp : dparams) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+
             GGML_ASSERT(!dp.drafting || dp.result->empty());
 
             if (dp.drafting) {
                 n_drafting++;
+                was_drafting.push_back(seq_id);
             }
         }
 
@@ -3181,6 +3263,23 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (dp.drafting) {
             dp.drafting = false;
+        }
+    }
+
+    // fork: the sequences that drafted in this call, all to the shortest draft (common_speculative_fork_even_drafts)
+    if (common_speculative_fork_even_drafts() && was_drafting.size() > 1) {
+        size_t n_even = SIZE_MAX;
+        for (llama_seq_id seq_id : was_drafting) {
+            n_even = std::min(n_even, dparams[seq_id].result->size());
+        }
+        for (llama_seq_id seq_id : was_drafting) {
+            auto & dp = dparams[seq_id];
+            if (dp.result->size() > n_even) {
+                dp.result->resize(n_even);
+                if (dp.result_q && dp.result_q->size() > n_even) {
+                    dp.result_q->resize(n_even);
+                }
+            }
         }
     }
 

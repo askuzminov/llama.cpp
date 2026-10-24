@@ -788,10 +788,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+// fork: elastic buffers, see fork/elastic-buffer-fork.inc
+struct ggml_cuda_elastic_fork;
+static void ggml_cuda_elastic_free_fork(ggml_cuda_elastic_fork * el);
+static void ggml_cuda_elastic_clear_fork(ggml_cuda_elastic_fork * el, uint8_t value);
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    ggml_cuda_elastic_fork * elastic = nullptr; // fork: a reserved range with memory mapped on demand
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -799,6 +805,11 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        if (elastic != nullptr) { // fork
+            ggml_cuda_set_device(device);
+            ggml_cuda_elastic_free_fork(elastic);
+            return;
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -912,6 +923,10 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->elastic != nullptr) { // fork: only the mapped memory
+        ggml_cuda_elastic_clear_fork(ctx->elastic, value);
+        return;
+    }
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -945,6 +960,8 @@ static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_t
 static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
+
+#include "fork/elastic-buffer-fork.inc" // fork: elastic buffers
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
@@ -2545,6 +2562,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_LAZY: // fork: deferred rollback
+            ggml_cuda_op_gated_delta_net_lazy(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -6046,6 +6066,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_GATED_DELTA_NET_LAZY: // fork: deferred rollback
+            return ggml_cuda_gated_delta_net_lazy_supported(op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -6253,6 +6275,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // fork: elastic buffers (fork/elastic-buffer-fork.inc)
+    if (strcmp(name, "ggml_backend_buft_alloc_elastic_fork") == 0) {
+        return (void *)ggml_backend_cuda_buft_alloc_elastic_fork;
+    }
+    if (strcmp(name, "ggml_backend_buffer_commit_fork") == 0) {
+        return (void *)ggml_backend_cuda_buffer_commit_fork;
+    }
+    if (strcmp(name, "ggml_backend_buffer_decommit_fork") == 0) {
+        return (void *)ggml_backend_cuda_buffer_decommit_fork;
+    }
+#endif
 #ifdef GGML_CUDA_TIMING_FORK
     if (strcmp(name, "ggml_backend_timing_enable_fork") == 0) {
         return (void *)ggml_backend_cuda_timing_enable_fork;

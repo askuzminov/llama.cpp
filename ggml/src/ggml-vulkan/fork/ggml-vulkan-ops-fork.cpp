@@ -347,3 +347,93 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
     }
     return pipeline;
 }
+
+// GATED_DELTA_NET_LAZY: one workgroup row per head of each info row, laid out as the plain net (gated_delta_net.comp);
+// the replay alone (op_params[0] 2) has no q, k, v, g and beta and binds the state in their place
+static int ggml_vk_gdn_size_idx(uint32_t S_v) {
+    switch (S_v) {
+        case 16:  return 0;
+        case 32:  return 1;
+        case 64:  return 2;
+        case 128: return 3;
+        default:  return -1;
+    }
+}
+
+bool ggml_vk_gated_delta_net_lazy_supported(const ggml_tensor * op) {
+    const int      mode = ggml_get_op_params_i32(op, 0);
+    const uint32_t S_v  = mode == 2 ? (uint32_t) ggml_get_op_params_i32(op, 1) : (uint32_t) op->src[2]->ne[0];
+    if (ggml_vk_gdn_size_idx(S_v) < 0 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (op->src[5]->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_F32 || op->src[7]->type != GGML_TYPE_I32) {
+        return false;
+    }
+    for (int i = 0; mode == 1 && i < 5; i++) {
+        if (op->src[i]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_vk_gated_delta_net_lazy(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const int mode = ggml_get_op_params_i32(dst, 0);
+
+    const ggml_tensor * src_q    = dst->src[0];
+    const ggml_tensor * src_k    = dst->src[1];
+    const ggml_tensor * src_v    = dst->src[2];
+    const ggml_tensor * src_beta = dst->src[4];
+    const ggml_tensor * state    = dst->src[5];
+    const ggml_tensor * rec      = dst->src[6];
+    const ggml_tensor * info     = dst->src[7];
+
+    const uint32_t S_v = mode == 2 ? (uint32_t) ggml_get_op_params_i32(dst, 1) : (uint32_t) src_v->ne[0];
+    const uint32_t H   = mode == 2 ? (uint32_t) ggml_get_op_params_i32(dst, 2) : (uint32_t) src_v->ne[1];
+    const uint32_t H_k = mode == 2 ? (uint32_t) ggml_get_op_params_i32(dst, 3) : (uint32_t) src_k->ne[1];
+
+    const int si = ggml_vk_gdn_size_idx(S_v);
+    GGML_ASSERT(si >= 0);
+    vk_pipeline pipeline = ctx->device->pipeline_gated_delta_net_lazy[si][mode - 1];
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer state_buf = ggml_vk_tensor_subbuffer(ctx, state);
+    const vk_subbuffer rec_buf   = ggml_vk_tensor_subbuffer(ctx, rec);
+    const vk_subbuffer info_buf  = ggml_vk_tensor_subbuffer(ctx, info);
+    const vk_subbuffer dst_buf   = mode == 2 ? state_buf : ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer src_buf[5];
+    for (int i = 0; i < 5; i++) {
+        src_buf[i] = mode == 2 ? state_buf : ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+
+    vk_op_gated_delta_net_lazy_push_constants pc = {};
+    pc.H          = H;
+    pc.H_k        = H_k;
+    pc.scale      = 1.0f / sqrtf((float) S_v);
+    pc.rec_floats = (uint32_t) rec->ne[0];
+    pc.rec_set    = (uint32_t) (rec->nb[2] / sizeof(float));
+    if (mode == 1) {
+        pc.n_tokens = (uint32_t) src_v->ne[2];
+        pc.sq1 = (uint32_t) (src_q->nb[1] / sizeof(float));
+        pc.sq2 = (uint32_t) (src_q->nb[2] / sizeof(float));
+        pc.sq3 = (uint32_t) (src_q->nb[3] / sizeof(float));
+        pc.sk1 = (uint32_t) (src_k->nb[1] / sizeof(float));
+        pc.sk2 = (uint32_t) (src_k->nb[2] / sizeof(float));
+        pc.sk3 = (uint32_t) (src_k->nb[3] / sizeof(float));
+        pc.sv1 = (uint32_t) (src_v->nb[1] / sizeof(float));
+        pc.sv2 = (uint32_t) (src_v->nb[2] / sizeof(float));
+        pc.sv3 = (uint32_t) (src_v->nb[3] / sizeof(float));
+        pc.sb1 = (uint32_t) (src_beta->nb[1] / sizeof(float));
+        pc.sb2 = (uint32_t) (src_beta->nb[2] / sizeof(float));
+        pc.sb3 = (uint32_t) (src_beta->nb[3] / sizeof(float));
+        pc.rq3 = (uint32_t) (src_v->ne[3] / src_q->ne[3]);
+    } else {
+        pc.rq3 = 1;
+    }
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], state_buf, rec_buf, info_buf, dst_buf},
+        pc, { H, (uint32_t) info->ne[1], S_v });
+}

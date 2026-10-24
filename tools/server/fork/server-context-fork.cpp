@@ -310,10 +310,30 @@ bool server_ckpt_user_break_fork() {
     return brk;
 }
 
-bool server_evict_save_fork() {
-    static const bool save = [] {
-        const char * env = getenv("LLAMA_EVICT_SAVE");
+static int32_t server_env_int_fork(const char * name, int32_t def) {
+    const char * env = getenv(name);
+    return env ? (int32_t) atoi(env) : def;
+}
+
+int32_t server_prefill_budget_fork() {
+    static const int32_t value = server_env_int_fork("LLAMA_PREFILL_BUDGET", 2048);
+    return value;
+}
+
+bool server_slot_continue_fork() {
+    static const bool value = server_env_int_fork("LLAMA_SLOT_CONTINUE", 1) != 0;
+    return value;
+}
+
+int32_t server_answer_room_fork() {
+    static const int32_t value = std::max(0, server_env_int_fork("LLAMA_SLOT_ANSWER_ROOM", 8192));
+    return value;
+}
+
+bool server_slot_room_fork() {
+    static const bool room = [] {
+        const char * env = getenv("LLAMA_SLOT_ROOM");
         return env == nullptr || atoi(env) != 0;
     }();
-    return save;
+    return room;
 }

@@ -531,6 +531,16 @@ private:
     llama_context *              phase_owner = nullptr;
     std::vector<llama_context *> phase_followers;
 
+    // elastic KV (LLAMA_KV_ELASTIC, src/fork/llama-kv-elastic-fork.cpp): the cache maps memory to the cells in use and a
+    // step of them more (LLAMA_KV_ELASTIC_STEP), the rest is free for the moe-cache of the generation phase.
+    // kv_elastic_set_fork sets the capacity to about n_cells, giving up the moe-cache slots when the device has no
+    // memory left and release is set; false when the capacity stays below n_cells
+    void kv_elastic_init_fork();
+    bool kv_elastic_set_fork(uint32_t n_cells, bool release);
+
+    bool     kv_elastic      = false;
+    uint32_t kv_elastic_step = 8192;
+
     // env: LLAMA_GRAPH_CACHE, max graphs in gf_res_prev, 0 disables the scheduler snapshots
     uint32_t graph_cache_size = 8;
 

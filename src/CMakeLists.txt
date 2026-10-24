@@ -68,6 +68,7 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 set(LLAMA_FORK_SOURCES
     fork/llama-fork.cpp
     fork/llama-context-fork.cpp
+    fork/llama-kv-elastic-fork.cpp
     fork/llama-impl-fork.cpp
     fork/llama-load-watch-fork.cpp
     fork/llama-state-delta-fork.cpp

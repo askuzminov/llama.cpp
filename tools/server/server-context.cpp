@@ -266,6 +266,16 @@ struct server_slot {
 
     common_memory mem;
 
+    // fork: a slot paused for room in a unified KV cache (server_slot_room_fork): the state of its sequence in both
+    // contexts is here and its cells are free; the task, the sampler and the tokens stay with the slot
+    bool                 room_paused = false;
+    std::vector<uint8_t> room_tgt;
+    std::vector<uint8_t> room_dft;
+
+    // fork: the prompt tokens of the slot's last task, the part a continuation keeps (server_slot_continue_fork); the
+    // answer after it may come back rendered otherwise (a reasoning dropped from the history)
+    int32_t n_prompt_last = 0;
+
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
@@ -652,6 +662,14 @@ struct server_slot {
             GGML_ASSERT(task);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+
+            // fork: a slot paused for room holds no cells, so its tokens go with its saved state
+            if (room_paused) {
+                room_paused = false;
+                room_tgt = {};
+                room_dft = {};
+                prompt.clear();
+            }
 
             t_last_used = ggml_time_us();
 
@@ -1795,8 +1813,32 @@ private:
             }
         }
 
+        // fork: a slot takes a request for what it holds only when the request continues it: it keeps the prompt of the
+        // slot's last task, less 16 tokens a template may render otherwise once the answer is in the history. upstream's
+        // choice by similarity let a new agent session take the slot of another one that shares its system prompt and
+        // cut that history (Rulith Inference, apply_agent_slots_027); anything else goes to a free slot, else the least
+        // recently used one (server_slot_continue_fork)
+        const bool by_continue = server_slot_continue_fork() && task.id_slot == -1;
+        if (by_continue) {
+            size_t lcp_best = 0;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing() || slot.prompt.tokens.empty()) {
+                    continue;
+                }
+                const size_t lcp_len = slot.prompt.tokens.get_common_prefix(task.tokens);
+                const size_t n_keep  = std::min<size_t>(slot.prompt.tokens.size(), slot.n_prompt_last > 0 ? (size_t) slot.n_prompt_last : slot.prompt.tokens.size());
+                if (lcp_len + 16 >= n_keep && lcp_len > lcp_best) {
+                    lcp_best = lcp_len;
+                    ret      = &slot;
+                }
+            }
+            if (ret != nullptr) {
+                SLT_INF(*ret, "selected slot by continuation, %zu of %zu tokens kept\n", lcp_best, ret->prompt.tokens.size());
+            }
+        }
+
         // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        if (!by_continue && slot_prompt_similarity != 0.0f) { // fork: by_continue
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -1860,6 +1902,11 @@ private:
             }
         }
 
+        // fork: in a unified cache a task waits in the queue while its prompt has no room (server_slot_room_fork)
+        if (ret && !ret->is_processing() && !room_for_task_fork(*ret, task)) {
+            return nullptr;
+        }
+
         if (ret) {
             // the slot keeps most of its prompt, but a conversation that comes back can find more of itself in the cache
             update_cache = update_cache || (prompt_cache && prompt_cache->find_best(ret->prompt.tokens, task.tokens) != prompt_cache->states.end());
@@ -1892,7 +1939,7 @@ private:
     }
 
     // fork: clear the idle slot used least recently, other than `keep`, and keep its state in the prompt cache first
-    // (server_evict_save_fork). `update` lets the cache fit its limit after the save; the load path leaves that to
+    // (server_slot_room_fork). `update` lets the cache fit its limit after the save; the load path leaves that to
     // its own update, which runs after the load. false when no idle slot holds tokens
     bool evict_idle_lru_fork(const server_slot * keep, bool update) {
         server_slot * lru = nullptr;
@@ -1922,9 +1969,9 @@ private:
 
     // fork: a unified cache must have free cells for the state the prompt cache restores into `dst`: a load that does
     // not fit fails and erases its entry, and the conversation is computed again from the start. the idle slots used
-    // least recently give way until the cells of the other slots and the restored ones fit (server_evict_save_fork)
+    // least recently give way until the cells of the other slots and the restored ones fit (server_slot_room_fork)
     void evict_for_load_fork(const server_slot & dst, const server_tokens & tokens) {
-        if (!params_base.kv_unified || !server_evict_save_fork() || !prompt_cache) {
+        if (!params_base.kv_unified || !server_slot_room_fork() || !prompt_cache) {
             return;
         }
 
@@ -1949,6 +1996,215 @@ private:
         }
     }
 
+    // fork: the room of a unified KV cache (server_slot_room_fork). the cells are counted by the tokens of the slots: a
+    // margin covers what that misses (256 cells, at most 1/32 of the cache), the drafts of a generating slot are
+    // counted at up to 64 tokens (n-gram) when it speculates, and a decode that still finds no room falls back to the
+    // upstream path
+    bool room_on_fork() const {
+        return params_base.kv_unified && server_slot_room_fork();
+    }
+
+    int64_t room_margin_fork() const {
+        return std::min<int64_t>(256, llama_n_ctx(ctx_tgt)/32);
+    }
+
+    // the cells of the tokens a slot adds in the next step: a token and its draft when generating, its part of the
+    // prompt batch otherwise (the batch is shared, the caller caps the sum at n_batch)
+    static int64_t room_step_fork(const server_slot & slot, bool & prompt) {
+        prompt = false;
+        if (!slot.is_processing() || slot.room_paused || !slot.task) {
+            return 0;
+        }
+        if (slot.state == SLOT_STATE_GENERATING) {
+            return 1 + (slot.can_speculate() ? 64 : 0);
+        }
+        if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+            prompt = true;
+            return std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - slot.prompt.n_tokens());
+        }
+        return 0;
+    }
+
+    int64_t room_step_all_fork() const {
+        int64_t gen    = 0;
+        int64_t prompt = 0;
+        for (const auto & slot : slots) {
+            bool is_prompt = false;
+            const int64_t n = room_step_fork(slot, is_prompt);
+            (is_prompt ? prompt : gen) += n;
+        }
+        return gen + std::min<int64_t>(prompt, llama_n_batch(ctx_tgt));
+    }
+
+    // the cells the slots hold now: a paused slot holds none
+    int64_t room_held_fork() const {
+        int64_t held = 0;
+        for (const auto & slot : slots) {
+            held += slot.room_paused ? 0 : slot.prompt.n_tokens();
+        }
+        return held;
+    }
+
+    // whether the prompt of a new task fits next to the slots that run or wait paused, the idle ones giving way. the
+    // caller defers a task that does not, and the queue brings it back when a slot is released. a prompt longer than
+    // the cache goes on, to the error of the upstream path
+    bool room_for_task_fork(const server_slot & dst, const server_task & task) const {
+        if (!room_on_fork()) {
+            return true;
+        }
+        // a reserve for each answer: up to server_answer_room_fork tokens, less when the request allows less (Rulith
+        // Inference's pool guard holds 8192). with it a task that would make the running ones pause soon waits instead
+        auto answer_room = [](const server_task & t, int64_t n_done) {
+            const int64_t room = server_answer_room_fork();
+            const int64_t n_predict = t.params.n_predict > 0 ? (int64_t) t.params.n_predict : room;
+            return std::max<int64_t>(0, std::min(room, n_predict) - n_done);
+        };
+
+        const int64_t n_ctx = llama_n_ctx(ctx_tgt);
+        const int64_t need  = (int64_t) task.n_tokens() + answer_room(task, 0) + room_margin_fork();
+        if ((int64_t) task.n_tokens() + room_margin_fork() > n_ctx) {
+            return true;
+        }
+        int64_t held = 0;
+        for (const auto & slot : slots) {
+            if (&slot != &dst && slot.is_processing() && slot.task) {
+                held += std::max<int64_t>(slot.prompt.n_tokens(), slot.task->n_tokens()) + answer_room(*slot.task, slot.stats.n_gen);
+            }
+        }
+        if (held + need <= n_ctx) {
+            return true;
+        }
+        SRV_INF("task %d (%d tokens) waits for room: the running and paused slots hold %" PRId64 " of %" PRId64 " cells\n",
+                task.id, (int) task.n_tokens(), held, n_ctx);
+        return false;
+    }
+
+    // a running slot pauses for room: the state of its sequence in both contexts goes to RAM and its cells are freed.
+    // the task, the sampler, the tokens and the drafts stay with the slot
+    bool room_pause_fork(server_slot & slot) {
+        const size_t n_tgt = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        slot.room_tgt.resize(n_tgt);
+        if (llama_state_seq_get_data_ext(slot.ctx_tgt, slot.room_tgt.data(), n_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt) {
+            slot.room_tgt = {};
+            return false;
+        }
+        if (slot.ctx_dft) {
+            const size_t n_dft = llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            slot.room_dft.resize(n_dft);
+            if (llama_state_seq_get_data_ext(slot.ctx_dft, slot.room_dft.data(), n_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
+                slot.room_tgt = {};
+                slot.room_dft = {};
+                return false;
+            }
+        }
+
+        slot.mem.seq_rm(slot.id, -1, -1);
+
+        slot.room_paused = true;
+        slot.i_batch     = -1;
+
+        SLT_WRN(slot, "paused for room in the unified KV cache: %d tokens, %.1f MiB to RAM\n", slot.prompt.n_tokens(),
+                (slot.room_tgt.size() + slot.room_dft.size()) / (1024.0 * 1024.0));
+        return true;
+    }
+
+    // a paused slot takes its cells back
+    bool room_resume_fork(server_slot & slot) {
+        const size_t n_tgt = slot.room_tgt.size();
+        if (llama_state_seq_set_data_ext(slot.ctx_tgt, slot.room_tgt.data(), n_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt) {
+            return false;
+        }
+        if (slot.ctx_dft && !slot.room_dft.empty()) {
+            const size_t n_dft = slot.room_dft.size();
+            if (llama_state_seq_set_data_ext(slot.ctx_dft, slot.room_dft.data(), n_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
+                slot.mem.seq_rm(slot.id, -1, -1);
+                return false;
+            }
+        }
+
+        slot.room_paused = false;
+        slot.room_tgt    = {};
+        slot.room_dft    = {};
+
+        SLT_INF(slot, "resumed with room in the unified KV cache: %d tokens back from RAM\n", slot.prompt.n_tokens());
+        return true;
+    }
+
+    // the room of this step, before its batch is built. the paused slots come back first, the oldest task first, once
+    // their cells fit next to the running slots and what these add now, the idle slots giving way; with no slot
+    // running the oldest comes back anyway, as it fitted on its own before. then, while the running slots and their
+    // step do not fit, the idle slots give way, and after them the running slot whose task came last pauses; one
+    // running slot always goes on (its own context limit is the upstream one)
+    void room_fork() {
+        if (!room_on_fork()) {
+            return;
+        }
+
+        const int64_t n_ctx  = llama_n_ctx(ctx_tgt);
+        const int64_t margin = room_margin_fork();
+
+        auto fits = [&](int64_t extra) {
+            return room_held_fork() + room_step_all_fork() + extra + margin <= n_ctx;
+        };
+
+        auto n_running = [&]() {
+            int n = 0;
+            for (const auto & slot : slots) {
+                n += slot.is_processing() && !slot.room_paused && slot.task && slot.state != SLOT_STATE_WAIT_OTHER;
+            }
+            return n;
+        };
+
+        while (true) {
+            server_slot * oldest = nullptr;
+            for (auto & slot : slots) {
+                if (slot.room_paused && (oldest == nullptr || slot.task->id < oldest->task->id)) {
+                    oldest = &slot;
+                }
+            }
+            if (oldest == nullptr) {
+                break;
+            }
+
+            bool is_prompt = false;
+            oldest->room_paused = false;
+            int64_t need = room_step_fork(*oldest, is_prompt);
+            oldest->room_paused = true;
+            need = oldest->prompt.n_tokens() + (is_prompt ? std::min<int64_t>(need, llama_n_batch(ctx_tgt)) : need);
+
+            while (!fits(need) && evict_idle_lru_fork(nullptr, true)) {
+            }
+            if (!fits(need) && n_running() > 0) {
+                break;
+            }
+            if (!room_resume_fork(*oldest)) {
+                send_error(*oldest, "failed to restore the slot paused for room in the KV cache", ERROR_TYPE_SERVER);
+                oldest->release();
+            }
+        }
+
+        while (!fits(0)) {
+            if (evict_idle_lru_fork(nullptr, true)) {
+                continue;
+            }
+
+            server_slot * youngest = nullptr;
+            for (auto & slot : slots) {
+                if (!slot.is_processing() || slot.room_paused || !slot.task || slot.state == SLOT_STATE_WAIT_OTHER) {
+                    continue;
+                }
+                const bool pausable = slot.task->need_sampling() && !slot.task->is_parent() && !slot.task->is_child() &&
+                                      slot.task->type != SERVER_TASK_TYPE_TTS && !slot.audio_stream;
+                if (pausable && (youngest == nullptr || slot.task->id > youngest->task->id)) {
+                    youngest = &slot;
+                }
+            }
+            if (n_running() <= 1 || youngest == nullptr || !room_pause_fork(*youngest)) {
+                break;
+            }
+        }
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
@@ -1961,8 +2217,8 @@ private:
             return res;
         }
 
-        // fork: the idle slot used least recently, kept in the prompt cache first (server_evict_save_fork)
-        if (server_evict_save_fork()) {
+        // fork: the idle slot used least recently, kept in the prompt cache first (server_slot_room_fork)
+        if (server_slot_room_fork()) {
             return evict_idle_lru_fork(nullptr, true);
         }
 
@@ -2000,6 +2256,8 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.n_prompt_last = (int32_t) task.n_tokens(); // fork: server_slot_continue_fork
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3616,6 +3874,9 @@ private:
             }
         }
 
+        // fork: the room of a unified cache, before the batch is built (server_slot_room_fork)
+        room_fork();
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3780,6 +4041,9 @@ private:
                 // TTS slots drive their own decode loop in process_tts_slots(), never enter the shared batch
                 return;
             }
+            if (slot.room_paused) { // fork: paused for room, no cells (room_fork)
+                return;
+            }
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
@@ -3856,6 +4120,10 @@ private:
                 return;
             }
 
+            if (slot.room_paused) { // fork: paused for room (room_fork)
+                return;
+            }
+
             if (slot.audio_stream && !slot_audio_step(slot)) {
                 return; // waiting for audio, or the stream ended
             }
@@ -3921,6 +4189,42 @@ private:
                 }
             }
         });
+
+        // fork: the draft cap of this step by how many slots generate, and one length for all of them: a generating
+        // slot that does not draft now adds its earlier draft or none, so the others draft no longer than that, unless
+        // it replays accepted tokens (common_speculative_fork_draft_by_slots, common_speculative_fork_even_drafts)
+        if (spec && !drafting.empty() && generating.size() > 1) {
+            int32_t n_cap = common_speculative_fork_draft_by_slots((int) generating.size());
+
+            if (common_speculative_fork_even_drafts()) {
+                bool replay = false;
+                int32_t n_other = -1;
+                for (auto * other : generating) {
+                    if (std::find(drafting.begin(), drafting.end(), other) != drafting.end()) {
+                        continue;
+                    }
+                    replay |= other->spec_is_replay;
+                    n_other = n_other < 0 ? (int32_t) other->spec_draft.size() : std::min<int32_t>(n_other, (int32_t) other->spec_draft.size());
+                }
+                if (!replay && n_other >= 0) {
+                    n_cap = n_cap < 0 ? n_other : std::min(n_cap, n_other);
+                }
+            }
+
+            if (n_cap >= 0) {
+                for (auto * other : drafting) {
+                    auto & dp = common_speculative_get_draft_params(spec.get(), other->id);
+                    if (n_cap == 0) {
+                        dp.drafting = false;
+                    } else {
+                        dp.n_max = std::min(dp.n_max, n_cap);
+                    }
+                }
+                if (n_cap == 0) {
+                    drafting.clear();
+                }
+            }
+        }
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
@@ -3989,16 +4293,25 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // fork: while slots generate, a step takes at most this many prompt tokens, so that their next token does not
+        // wait for a whole batch of prompt (server_prefill_budget_fork)
+        const int32_t n_batch_prompt = generating.empty() || server_prefill_budget_fork() <= 0 ? n_batch :
+            std::min<int32_t>(n_batch, batch.size() + server_prefill_budget_fork());
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) { // fork: n_batch_prompt
                     return; // batch is full, skip remaining slots
                 }
 
                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS) {
+                    return;
+                }
+
+                if (slot.room_paused) { // fork: paused for room (room_fork)
                     return;
                 }
 
@@ -4473,7 +4786,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) { // fork: n_batch_prompt
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4742,7 +5055,7 @@ private:
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
                     for (auto & slot : slots) {
-                        if (slot.is_processing()) {
+                        if (slot.is_processing() && !slot.room_paused) { // fork: a slot paused for room is not in the batch
                             send_error(slot, err);
                             slot.release();
 

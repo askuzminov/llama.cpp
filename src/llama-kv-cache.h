@@ -5,8 +5,12 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
+#include <memory>
 #include <unordered_map>
 #include <vector>
+
+struct llama_kv_elastic_fork; // fork: src/fork/llama-kv-elastic-fork.cpp
 
 struct llama_cparams;
 struct llama_hparams;
@@ -175,6 +179,21 @@ public:
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
+    // fork: an elastic cache (src/fork/llama-kv-elastic-fork.cpp, LLAMA_KV_ELASTIC): only its first cells - the
+    // capacity - are used, and the device maps memory to them as the context grows; the rest of the cache costs no
+    // memory. elastic_init_fork moves the tensors to buffers the device maps on demand (emulate: ordinary buffers, for
+    // tests where the backend has none), elastic_commit_fork maps memory to n_cap cells (false if the device has none
+    // left), elastic_set_capacity_fork sets the capacity (not below the cells in use, mapping what it lacks, unmapping
+    // the rest) and returns it - the old one when the device cannot map the new
+    bool     elastic_init_fork(bool emulate);
+    bool     elastic_commit_fork(uint32_t n_cap);
+    uint32_t elastic_set_capacity_fork(uint32_t n_cap);
+    uint32_t elastic_capacity_fork() const { return n_cap_fork; }
+    size_t   elastic_cell_bytes_fork() const;
+
+    // fork: find_slot calls it with the cells the cache needs when the free cells within the capacity do not hold a ubatch
+    std::function<bool(uint32_t)> elastic_grow_fork;
+
     // n_kv of the full contexts, see set_n_kv_full()
     uint32_t get_n_kv_full() const;
 
@@ -319,6 +338,10 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // fork: the capacity of an elastic cache, 0: all cells (see elastic_init_fork)
+    uint32_t n_cap_fork = 0;
+    std::shared_ptr<llama_kv_elastic_fork> elastic_fork;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

@@ -78,6 +78,72 @@ int llama_context::phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, 
     return ggml_backend_sched_get_n_splits(sched.get());
 }
 
+void llama_context::kv_elastic_init_fork() {
+    // LLAMA_KV_ELASTIC: -1 (default) with --phase-mem and the moe-cache, where the device maps memory on demand (CUDA
+    // with VMM); 1 also elsewhere, emulated in ordinary buffers (tests, LLAMA_KV_ELASTIC_POISON); 0 off
+    static const int mode = [] {
+        const char * env = getenv("LLAMA_KV_ELASTIC");
+        return env ? atoi(env) : -1;
+    }();
+    if (!memory || mode == 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || (mode < 0 && !(cparams.phase_mem && moe_cache_fork))) {
+        return;
+    }
+    if (!memory->kv_elastic_init_fork(mode > 0)) {
+        if (mode > 0) {
+            LLAMA_LOG_WARN("%s: kv_elastic: the memory of this model or the device does not take it, off\n", __func__);
+        }
+        return;
+    }
+
+    // LLAMA_KV_ELASTIC_STEP: cells mapped beyond the ones in use (8192 cells = a 2 MiB granule of 256-byte indexer rows)
+    {
+        const char * env = getenv("LLAMA_KV_ELASTIC_STEP");
+        if (env) {
+            kv_elastic_step = std::max<uint32_t>(256, (uint32_t) std::max(0, atoi(env))/256*256);
+        }
+    }
+
+    kv_elastic = true;
+
+    // a cell search that runs out of capacity (a restored state, a batch past the plan) grows it, giving up the moe-cache
+    // slots if it has to
+    memory->kv_set_grow_fork([this](uint32_t n_cells) {
+        return kv_elastic_set_fork(n_cells + kv_elastic_step, true);
+    });
+
+    const uint32_t cap = memory->kv_set_capacity_fork(kv_elastic_step);
+
+    LLAMA_LOG_INFO("%s: kv_elastic: %u of %u cells mapped, step %u, %.1f MiB per 1024 cells%s\n", __func__, cap, cparams.n_ctx,
+            kv_elastic_step, memory->kv_cell_bytes_fork()*1024/1024.0/1024.0, mode > 0 ? " (on request)" : "");
+}
+
+bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release) {
+    if (!kv_elastic) {
+        return false;
+    }
+
+    const uint32_t old  = memory->kv_capacity_fork();
+    const uint32_t want = GGML_PAD(n_cells, kv_elastic_step);
+
+    uint32_t cap = memory->kv_set_capacity_fork(want);
+
+    // the moe-cache holds the memory: its slots go, the next generation phase sizes them from what is left
+    if (cap < std::min(want, cparams.n_ctx) && release && moe_cache_fork && moe_cache_fork->ready()) {
+        moe_cache_fork->release();
+        phase_cache = false;
+        gf_res_prev_reset();
+        gf_res_prev_active = nullptr;
+
+        cap = memory->kv_set_capacity_fork(want);
+    }
+
+    if (cap != old) {
+        LLAMA_LOG_INFO("%s: kv_elastic: %u -> %u cells (%u in use)\n", __func__, old, cap, memory->get_n_kv_used());
+    }
+
+    return cap >= std::min(n_cells, cparams.n_ctx);
+}
+
 void llama_context::phase_update(uint32_t n_tokens) {
     // a non-causal batch must be one ubatch, it uses the static layout
     if (!cparams.causal_attn) {
@@ -121,6 +187,27 @@ void llama_context::phase_update(uint32_t n_tokens) {
         phase_prompt(n_tokens);
     }
 
+    // elastic KV: the cells of this batch within the capacity before the slot search, and before a generation phase
+    // gives the free memory to the moe-cache
+    if (kv_elastic && memory->get_n_kv_used() + n_tokens > memory->kv_capacity_fork()) {
+        kv_elastic_set_fork(memory->get_n_kv_used() + n_tokens + kv_elastic_step, true);
+    }
+
+    // elastic KV: a capacity far over the cells in use within a generation phase (a cleared conversation, a short prompt
+    // after it) goes back to the device, and the moe-cache takes its slots again below
+    if (kv_elastic && gen) {
+        const uint32_t want = memory->get_n_kv_used() + n_tokens + kv_elastic_step;
+        if (memory->kv_capacity_fork() > GGML_PAD(want, kv_elastic_step) + std::max(2*kv_elastic_step, cparams.n_ctx/8)) {
+            if (moe_cache_fork && moe_cache_fork->ready()) {
+                moe_cache_fork->release();
+                gf_res_prev_reset();
+                gf_res_prev_active = nullptr;
+            }
+            phase_cache = false;
+            kv_elastic_set_fork(want, false);
+        }
+    }
+
     // as in the static layout: the warmup of common and the first batch of a prompt start at position 0, the draft contexts
     // are created after the warmup
     if (gen && moe_cache_fork && !phase_cache && !cparams.warmup && balloc->get_batch().pos[0] > 0) {
@@ -143,6 +230,15 @@ void llama_context::phase_update(uint32_t n_tokens) {
 
 void llama_context::phase_gen() {
     const int64_t t_start_us = ggml_time_us();
+
+    // elastic KV: the cells in use and a step; more than two steps over that go back to the device for the moe-cache
+    if (kv_elastic) {
+        const uint32_t want = memory->get_n_kv_used() + kv_elastic_step;
+        const uint32_t cap  = memory->kv_capacity_fork();
+        if (cap < want || cap > GGML_PAD(want, kv_elastic_step) + 2*kv_elastic_step) {
+            kv_elastic_set_fork(want, false);
+        }
+    }
 
     // the followers first, so that the moe-cache gets all the memory that is left
     for (auto * f : phase_followers) {
@@ -176,6 +272,11 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
         f->sched_free();
     }
     sched_free();
+
+    // elastic KV: the cells of the prompt and a step mapped before the free memory is measured for the plan
+    if (kv_elastic) {
+        kv_elastic_set_fork(memory->get_n_kv_used() + n_tokens + kv_elastic_step, false);
+    }
 
     const int64_t t_free_us = ggml_time_us();
 

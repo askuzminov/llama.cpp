@@ -125,10 +125,114 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // fork: the k largest logits in one pass instead of all n_vocab candidates and a partial sort (LLAMA_SAMPLER_FAST_TOP_K,
+    // 1 by default since 23.10, 0: upstream), after Rulith Inference's apply_prompt_sample_063 (0.26 -> ~0.05 ms a token
+    // there). taken when the samplers before top-k leave the logits as they are (penalties, DRY, top-n-sigma off), without
+    // grammar, reasoning budget, backend sampling or n_probs; the logit biases count in the choice and the chain still
+    // applies them. a tie among the k + 1 largest goes the full way, where the partial sort orders equal logits its own way
+    int8_t                                     fast_state = -1; // -1 not decided yet, 0 off, 1 on
+    int32_t                                    fast_k     = 0;
+    std::vector<float>                         fast_bias;       // n_vocab when there are logit biases, else empty
+    std::vector<std::pair<float, llama_token>> fast_heap;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+    }
+
+    bool set_logits_top_k(struct llama_context * ctx, int idx) {
+        if (fast_state < 0) {
+            fast_state = 0;
+            const char * env = getenv("LLAMA_SAMPLER_FAST_TOP_K");
+            if ((env == nullptr || atoi(env) != 0) && params.mirostat == 0 && params.n_probs == 0 && !params.backend_sampling) {
+                for (const auto & type : params.samplers) {
+                    if (type == COMMON_SAMPLER_TYPE_TOP_K) {
+                        if (params.top_k > 0 && params.top_k <= 256) {
+                            fast_k     = params.top_k;
+                            fast_state = 1;
+                        }
+                        break;
+                    }
+                    const bool neutral =
+                        (type == COMMON_SAMPLER_TYPE_PENALTIES && (params.penalty_last_n == 0 ||
+                            (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f))) ||
+                        (type == COMMON_SAMPLER_TYPE_DRY && (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0)) ||
+                        (type == COMMON_SAMPLER_TYPE_TOP_N_SIGMA && params.top_n_sigma <= 0.0f);
+                    if (!neutral) {
+                        break;
+                    }
+                }
+            }
+            if (fast_state == 1) {
+                // the biases of the chain's logit_bias sampler (common_sampler_init)
+                const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+                int32_t n_suppress = 0;
+                const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+                if (!params.logit_bias.empty() || n_suppress > 0) {
+                    fast_bias.assign(llama_vocab_n_tokens(vocab), 0.0f);
+                    for (const auto & lb : params.logit_bias) {
+                        if (lb.token >= 0 && lb.token < (llama_token) fast_bias.size()) {
+                            fast_bias[lb.token] += lb.bias;
+                        }
+                    }
+                    for (int32_t i = 0; i < n_suppress; ++i) {
+                        if (suppress[i] >= 0 && suppress[i] < (llama_token) fast_bias.size()) {
+                            fast_bias[suppress[i]] = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (fast_state == 0 || grmr || rbudget) {
+            return false;
+        }
+        if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL ||
+            llama_get_sampled_probs_ith(ctx, idx) || llama_get_sampled_logits_ith(ctx, idx)) {
+            return false;
+        }
+
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        const int     k       = fast_k;
+        if (logits == nullptr || n_vocab <= k + 1) {
+            return false;
+        }
+
+        // the k + 1 largest in a min-heap
+        auto & h = fast_heap;
+        h.clear();
+        const auto greater = [](const std::pair<float, llama_token> & a, const std::pair<float, llama_token> & b) {
+            return a.first > b.first;
+        };
+        const bool has_bias = !fast_bias.empty();
+        for (int i = 0; i < n_vocab; ++i) {
+            const float v = has_bias ? logits[i] + fast_bias[i] : logits[i];
+            if ((int) h.size() <= k) {
+                h.emplace_back(v, (llama_token) i);
+                std::push_heap(h.begin(), h.end(), greater);
+            } else if (v > h.front().first) {
+                std::pop_heap(h.begin(), h.end(), greater);
+                h.back() = { v, (llama_token) i };
+                std::push_heap(h.begin(), h.end(), greater);
+            }
+        }
+        std::sort(h.begin(), h.end(), greater);
+        for (int j = 0; j < k; ++j) {
+            if (!(h[j].first > h[j + 1].first)) {
+                return false;
+            }
+        }
+
+        cur.resize(k);
+        for (int j = 0; j < k; ++j) {
+            cur[j] = llama_token_data{ h[j].second, logits[h[j].second], 0.0f };
+        }
+
+        cur_p = { cur.data(), (size_t) k, -1, true };
+
+        return true;
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -441,6 +545,10 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .fast_state = */ -1,
+        /* .fast_k     = */ 0,
+        /* .fast_bias  = */ {},
+        /* .fast_heap  = */ {},
     };
 
     return result;
@@ -525,6 +633,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .fast_state = */ -1,
+        /* .fast_k     = */ 0,
+        /* .fast_bias  = */ {},
+        /* .fast_heap  = */ {},
     };
 }
 
@@ -616,7 +728,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    if (!gsmpl->set_logits_top_k(ctx, idx)) { // fork: LLAMA_SAMPLER_FAST_TOP_K
+        gsmpl->set_logits(ctx, idx);
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.

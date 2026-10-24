@@ -3899,6 +3899,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
+
+            // fork: the net with deferred rollback (mode 1) and the replay alone (mode 2), laid out as the net above
+            {
+                const size_t lazy_len = use_clustered_reduce ? gated_delta_net_lazy_f32_len :
+                                        use_subgroup_reduce  ? gated_delta_net_lazy_f32_nocluster_len : gated_delta_net_lazy_f32_shmem_len;
+                const void * lazy_data = use_clustered_reduce ? (const void *) gated_delta_net_lazy_f32_data :
+                                         use_subgroup_reduce  ? (const void *) gated_delta_net_lazy_f32_nocluster_data :
+                                                                (const void *) gated_delta_net_lazy_f32_shmem_data;
+                for (uint32_t mode = 1; mode <= 2; mode++) {
+                    const std::string name = "gated_delta_net_lazy_f32_d" + std::to_string(S_V) + (mode == 1 ? "" : "_replay");
+                    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_lazy[si][mode - 1],
+                        name.c_str(), lazy_len, lazy_data, "main", 9, sizeof(vk_op_gated_delta_net_lazy_push_constants),
+                        wg_denoms, {S_V, mode, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+                }
+            }
         }
     }
 
@@ -13296,6 +13311,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_GATED_DELTA_NET_LAZY: // fork: deferred rollback
+        ggml_vk_gated_delta_net_lazy(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_SSM_SCAN:
         ggml_vk_ssm_scan(ctx, compute_ctx, node);
 
@@ -16706,6 +16726,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return op->type == GGML_TYPE_F32;
             }
+        case GGML_OP_GATED_DELTA_NET_LAZY: // fork: deferred rollback
+            return ggml_vk_gated_delta_net_lazy_supported(op);
         case GGML_OP_SSM_SCAN:
             {
                 for (int i = 0; i < 6; i++) {

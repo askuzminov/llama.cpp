@@ -40,6 +40,20 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
 // 4564 MiB host compute buffer. LLAMA_DFLASH_UBATCH: tokens (default 512), 0 = the target's (or --spec-draft-n-ubatch)
 uint32_t common_speculative_fork_dflash_ubatch(uint32_t n_ubatch);
 
+// the drafts of several generating slots (23.10, after Rulith Inference's apply_spec_draft_by_slots and
+// apply_spec_even_drafts). the hybrid memory splits a verify batch into ubatches of equal tokens per sequence, so
+// drafts of different lengths verify in two or three passes of the whole model (Rulith, three conversations at 4K:
+// 34.3 -> 45.7 tok/s summed once even); and in this MoE a verified token reads ~10 more experts, which conversations
+// decoding together cannot share (Rulith, four: 37.9 -> 47.4 tok/s with the cap).
+// even: the MTP drafter keeps a sequence whose confident run ended drafting while another one is still confident and
+// cuts all of them to the longest confident run; common_speculative_draft cuts what is left uneven to the shortest.
+// LLAMA_SPEC_EVEN=0: per sequence, as upstream
+bool    common_speculative_fork_even_drafts();
+// the draft cap of a step with n_gen generating slots, -1 for none. LLAMA_SPEC_DRAFT_BY_SLOTS: the caps for 1, 2, ...
+// slots, the last one for more (default "3,3,2,2,2,1": what Rulith's measured adaptation picked on real tasks - two
+// conversations three drafts, four two, eight one), "0" or "" = no cap. one slot keeps --spec-auto as it is
+int32_t common_speculative_fork_draft_by_slots(int n_gen);
+
 // the catch-up of the MTP head over a decoded batch (process of the MTP implementation): in chunks of the draft
 // ubatch, so that the rows of the next chunk are rendered while the GPU computes the last one, and a batch longer than
 // a verify keeps only its last row of hidden state (drafting goes on from it; accept follows verify batches only).
@@ -198,6 +212,11 @@ struct common_speculative_auto {
     bool keep(llama_seq_id seq_id, const llama_token_data_array * cur_p, bool & more);
 
     void on_steps(int n_steps, int64_t t_us);
+
+    // MTP with even drafts: a token drafted after the sequence's confident run, to the length of another sequence's
+    // run (common_speculative_fork_even_drafts). its probability goes to the calibration with the verify result, the
+    // gate does not decide it
+    void pad(llama_seq_id seq_id, const llama_token_data_array * cur_p);
 
     void on_accept(llama_seq_id seq_id, uint16_t n_accepted);
 

@@ -100,6 +100,21 @@ struct vk_op_ssm_conv_concat_push_constants {
     uint32_t n_s;
 };
 
+// gated_delta_net_lazy.comp, strides in elements
+struct vk_op_gated_delta_net_lazy_push_constants {
+    uint32_t H;
+    uint32_t H_k;
+    uint32_t n_tokens;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sk1, sk2, sk3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t rq3;
+    float    scale;
+    uint32_t rec_floats;
+    uint32_t rec_set;
+};
+
 // flash_attn_union.comp, strides in elements
 struct vk_op_fa_union_push_constants {
     uint32_t N;
@@ -226,6 +241,10 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
                                      bool y_f32_kernel, uint64_t n_per_expert);
 // MUL_MAT: the matmuls that stay off the int8 path (GGML_VK_INT_COOPMAT=3, graph outputs, K under 512)
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
+// GATED_DELTA_NET_LAZY: the net with deferred rollback and the replay alone (ggml_gated_delta_net_lazy), they write into
+// the state rows and records they get as sources
+bool ggml_vk_gated_delta_net_lazy_supported(const ggml_tensor * op);
+void ggml_vk_gated_delta_net_lazy(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst);
 // set_tensor_2d_async: writes weights in place where the device memory is mapped, returns false for the staged copy
 bool ggml_vk_set_tensor_mapped(vk_context & cpy_ctx, const ggml_tensor * tensor, vk_buffer & buf, uint64_t dst_offset, const void * data,
                                size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);

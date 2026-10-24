@@ -25,3 +25,7 @@ bool llama_fork_before_compute(const llama_model & model, llama_memory_context_i
 // the inputs of tokens a coming decode will hold are read from storage now (the PLE rows of qwen4exp,
 // llama_prefetch_tokens): next holds the tokens from the first one not in the cache, only its last n_new are new
 void llama_fork_prefetch_tokens(const llama_model & model, llama_memory_i * mem, const llama_ubatch & next, int64_t n_new);
+
+// whether the graph of the model runs the deferred rollback of the gated delta net (llama_memory_recurrent::rec_l,
+// LLAMA_GDN_LAZY): the fork's qwen4exp does, the upstream copy does not
+bool llama_fork_gdn_lazy(const llama_model & model);

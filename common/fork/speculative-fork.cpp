@@ -259,6 +259,20 @@ bool common_speculative_auto::keep(llama_seq_id seq_id, const llama_token_data_a
     return true;
 }
 
+void common_speculative_auto::pad(llama_seq_id seq_id, const llama_token_data_array * cur_p) {
+    if (seq_id < 0 || seq_id >= (llama_seq_id) seqs.size()) {
+        return;
+    }
+
+    auto & s = seqs[seq_id];
+
+    s.hp.push_back(cur_p->data[0].p);
+
+    if (trace) {
+        s.q.emplace_back(cur_p->data, cur_p->data + std::min<size_t>(cur_p->size, 10));
+    }
+}
+
 void common_speculative_auto::on_steps(int n_steps, int64_t t_us) {
     if (n_steps <= 0) {
         return;
@@ -534,6 +548,42 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch) {
     const char * env = std::getenv("LLAMA_MTP_UBATCH");
     const long   cap = env ? std::strtol(env, nullptr, 10) : 1024;
     return cap > 0 ? std::min<uint32_t>(n_ubatch, (uint32_t) cap) : n_ubatch;
+}
+
+bool common_speculative_fork_even_drafts() {
+    static const bool even = [] {
+        const char * env = getenv("LLAMA_SPEC_EVEN");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return even;
+}
+
+int32_t common_speculative_fork_draft_by_slots(int n_gen) {
+    static const std::vector<int32_t> caps = [] {
+        const char * env = getenv("LLAMA_SPEC_DRAFT_BY_SLOTS");
+        std::vector<int32_t> res;
+        const std::string text = env ? env : "3,3,2,2,2,1";
+        size_t pos = 0;
+        while (pos < text.size()) {
+            const size_t end = text.find(',', pos);
+            const std::string item = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!item.empty()) {
+                res.push_back((int32_t) atoi(item.c_str()));
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            pos = end + 1;
+        }
+        if (res.size() == 1 && res[0] == 0) {
+            res.clear();
+        }
+        return res;
+    }();
+    if (caps.empty() || n_gen <= 1) {
+        return -1;
+    }
+    return caps[std::min<size_t>((size_t) n_gen - 1, caps.size() - 1)];
 }
 
 uint32_t common_speculative_fork_dflash_ubatch(uint32_t n_ubatch) {

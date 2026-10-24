@@ -403,8 +403,17 @@ rem cache). mtpkv: one slot with the window as the cache too (the exact window, 
 rem instead of 262144: -478 MiB), against auto. par4 and par4w0 with --no-cache-idle-slots: by default the server
 rem saves every idle slot to the RAM prompt cache and clears it from the unified KV whenever a task starts, so a
 rem conversation between its turns went RAM -> VRAM again (on the Mac 18 of 28 turns of 4 agents); when the 4
-rem conversations outgrow the 262K, the idle slot used least recently goes to the prompt cache (LLAMA_EVICT_SAVE)
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4w0 LLAMA_MTP_WINDOW_KV=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto"
+rem conversations outgrow the 262K, the idle slot used least recently goes to the prompt cache (LLAMA_SLOT_ROOM)
+rem 23.10 night: from Rulith Inference: the drafts of a step one length (LLAMA_SPEC_EVEN) and capped by the generating
+rem slots (LLAMA_SPEC_DRAFT_BY_SLOTS 3,3,2,2,2,1: par4 drafts 2), prompt pieces of 2048 while slots generate, a slot
+rem only for a continuation of its conversation, a reserve of 8192 for each answer at admission; par4nocap: the same
+rem without the cap (the drafts even), against par4
+rem 24.10: the delta net with deferred rollback (from Rulith Inference, FORK.md; LLAMA_GDN_LAZY, default on): a
+rem draft check no longer writes a state snapshot per token (3 MiB a layer each), it records what a replay needs and
+rem the next step replays the records its rollback kept; nolazy and par4nolazy: the snapshots as before, against
+rem auto and par4
+rem [replaced 24.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4w0 LLAMA_MTP_WINDOW_KV=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nocap LLAMA_SPEC_DRAFT_BY_SLOTS=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4w0 LLAMA_MTP_WINDOW_KV=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nocap LLAMA_SPEC_DRAFT_BY_SLOTS=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -764,9 +773,23 @@ rem against auto06 over the same turns: how much of the gap the context and the 
 rem 23.10: par4 as on the 395 (4 slots at once, MTP); dflashauto measured as even with MTP here, left out
 rem 23.10 evening: mtpkv: the head KV as a window of 16384 positions (LLAMA_MTP_WINDOW_KV=1, 512 -> ~34 MiB of
 rem VRAM, which goes to the expert slots), against auto; par4 with the changes of the 395 and --no-cache-idle-slots (see there)
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto"
+rem 24.10: nolazy, par4nolazy: the state snapshots of the draft checks as before the deferred rollback (see the 395),
+rem against auto and par4
+rem [replaced 24.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto"
+rem 24.10 (logs 23.10, src-81279893): par4 had 1.69 t/s a turn: --phase-mem turned itself off with -np 4, the static
+rem layout kept the compute buffer of -ub 8192 at the full depth (9.6 GB) and left the moe-cache no slot. now phase_mem
+rem runs with several slots of the unified cache. s128 had 78 slots against 50 and 18 percent more TG on the same 30 turns: the
+rem KV cache is elastic now (LLAMA_KV_ELASTIC, on with --phase-mem and the moe-cache): it maps memory to the cells in
+rem use and a step more, the rest goes to the moe-cache. kvfull, par4kvfull: the whole KV mapped as before, against
+rem auto and par4; nolazy, par4nolazy: the GDN snapshots as before the deferred rollback; s128 stays as the reference
+rem of a small KV; auto06 and mtpkv (measured 23.10) left out
+rem [replaced 24.10 morning] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;kvfull LLAMA_KV_ELASTIC=0 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4kvfull LLAMA_KV_ELASTIC=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
+rem 23.10: the prompt pieces while other slots generate (LLAMA_PREFILL_BUDGET, 2048 by default) would each
+rem upload the experts over PCIe here: n_batch as upstream
+if not defined LLAMA_PREFILL_BUDGET set "LLAMA_PREFILL_BUDGET=0"
 if not defined LLAMA_MOE_CACHE_REPORT set "LLAMA_MOE_CACHE_REPORT=1024"
 rem 15.10 night: a turn of ~500 tokens at 29K took 3.7 s: the prompt ubatch 2.45 (the uploads of the experts), the
 rem refill of the moe-cache 0.49, the part before the last user message on its own 0.18 (8 tokens; 60 tokens 0.51 at
@@ -867,7 +890,7 @@ if not defined DECNGEN     set "DECNGEN=1024"
 if not defined DECSAMP     set "DECSAMP=1.0 20 0.95"
 rem [no effect, an earlier line sets DECPREFIX] if not defined DECPREFIX   set "DECPREFIX=0"
 if not defined DECPORT     set "DECPORT=8097"
-if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache: prefetch|moe_cache: [0-9]+ layers|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch|prefetch_issue"
+if not defined DECGREP     set "DECGREP=moe_cache:.*slots|moe_cache: policy|moe_cache: prefetch|moe_cache: [0-9]+ layers|moe_cache_stats: +[0-9]+[*]|moe_cache_stats: .*fits|phase_mem:|sched_prof|buffer size|QSA KV in RAM|alloc peak|PLE rows of a ubatch|prefetch_issue|kv_elastic:"
 rem 1: the warmup run of llama-perplexity and llama-server at start. 0 (--no-warmup): it only adds load time and
 rem memory pressure, -lm dio reads the weights at load
 if not defined WARMUP      set "WARMUP=0"

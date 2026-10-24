@@ -48,12 +48,30 @@ struct server_ckpt_limits {
 // the chat 756.1 against 647.4, turns of ~550 tokens after 29K 3.62 s against 4.41, TG the same
 bool server_ckpt_user_break_fork();
 
-// LLAMA_EVICT_SAVE (1 by default since 23.10, 0: upstream): when a unified KV cache is full, the idle slot used least
-// recently is cleared, and the prompt cache keeps its state first; upstream clears the first idle slot and keeps
-// nothing. with every slot allowed the whole cache (agents, no --kv-unified-per-slot) and --no-cache-idle-slots, the
-// idle conversations stay in the cache while they fit, and the one that has to give way comes back from RAM on its
-// next turn instead of a new prefill. without --cache-ram it is cleared only
-bool server_evict_save_fork();
+// LLAMA_SLOT_ROOM (1 by default since 23.10, 0: upstream): the room of a unified KV cache (--kv-unified), where every
+// slot may grow to the whole cache (agents, no --kv-unified-per-slot) but all of them together cannot. upstream
+// clears the first idle slot when a decode finds no room and keeps nothing, and when the running slots alone do not
+// fit, every one of them fails ("Context size has been exceeded") and loses its cache. with this:
+// - the idle slot used least recently gives way, and the prompt cache keeps its state first (RAM, the disk with
+//   --cache-spill-dir); a load from the prompt cache makes its room the same way before it restores
+// - a new task whose prompt does not fit next to the running slots waits in the queue until one of them finishes
+// - when the running slots outgrow the cache, the one whose task came last pauses: its state goes to RAM, its cells
+//   are freed, and it continues once there is room again; nothing fails
+// with --no-cache-idle-slots the idle conversations stay in the cache while they fit
+bool server_slot_room_fork();
+
+// LLAMA_PREFILL_BUDGET (23.10, default 2048, 0: n_batch as upstream): while slots generate, a step takes at most this
+// many prompt tokens, so that the next token of the generating conversations does not wait for a whole batch of
+// prompt (Rulith Inference, apply_agent_slots_027). with experts in RAM (the 3090) every prompt piece uploads them
+int32_t server_prefill_budget_fork();
+
+// LLAMA_SLOT_CONTINUE (23.10, 1 by default, 0: upstream's similarity): a slot takes a request for what it holds only
+// when the request continues it, otherwise a free slot or the least recently used one
+bool server_slot_continue_fork();
+
+// LLAMA_SLOT_ANSWER_ROOM (23.10, default 8192, 0: none): the room a running answer is counted at when a new task asks
+// for room in a unified cache (server_slot_room_fork)
+int32_t server_answer_room_fork();
 
 // create the prompt cache for --cache-ram != 0, with the disk spill when it is configured
 void server_prompt_cache_init(

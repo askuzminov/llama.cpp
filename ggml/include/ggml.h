@@ -604,6 +604,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_FLASH_ATTN_LIST, // fork: attention over a list of KV cells per query row, ggml_flash_attn_list
+        GGML_OP_GATED_DELTA_NET_LAZY, // fork: ggml_gated_delta_net_lazy and ggml_gated_delta_net_replay
 
         GGML_OP_COUNT,
     };
@@ -2695,6 +2696,39 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // fork: the gated delta net with deferred rollback (23.10, after Rulith Inference's apply_gdn_deferred_rollback),
+    // for the short batches of a speculative verify. each sequence's state is read from a row of state_all (the
+    // recurrent cache [S_v*S_v*H_v, n_rows]) and first brought up to date by replaying the records the last batch
+    // left and its rollback kept; that state goes back to its row (the new base), and per token of this batch the
+    // record a later replay needs - delta [S_v, H_v], key [S_k, H_k], gate exp(g) [H_v] - instead of a state snapshot
+    // per token. a separate op, so that a backend without it is never handed the in-place writes into its sources
+    //   rec  : [H_v*S_v + H_k*S_k + H_v, R, n_sets] F32, sets of R records
+    //   info : [5, n_seqs] I32 per sequence: row read, row written, records replayed, set read, set written
+    // returns the attention scores [S_v*H_v, n_tokens*n_seqs]. q, k: [S_k, H_k, n_tokens, n_seqs] (not repeated to
+    // H_v), g: scalar gate [1, H_v, n_tokens, n_seqs]
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_lazy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state_all,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * info);
+
+    // fork: the replay alone, in place: the state of each info row (row read and its records) goes to the row
+    // written, as the plain net expects it before a longer batch. returns a view of state_all that orders what reads
+    // it after the replay; S_v, H_v and H_k give the record layout
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state_all,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * info,
+            int                   S_v,
+            int                   H_v,
+            int                   H_k);
 
     // DSA lightning indexer
     //

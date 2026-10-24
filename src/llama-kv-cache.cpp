@@ -1040,16 +1040,22 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        // fork: an elastic cache searches its capacity, grown first where its free cells do not hold the ubatch
+        if (n_cap_fork > 0 && n_cap_fork < cells.get_used() + n_tokens && elastic_grow_fork) {
+            elastic_grow_fork(cells.get_used() + n_tokens);
+        }
+        const uint32_t n_cells = n_cap_fork > 0 ? std::min(n_cap_fork, cells.size()) : cells.size();
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
+        if (head_cur > cells.get_used() + 2*n_tokens || head_cur >= n_cells) {
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        if (n_tokens > n_cells) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, n_cells);
             return { };
         }
 
@@ -1060,8 +1066,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+            if (head_cur + n_test > n_cells) {
+                n_tested += n_cells - head_cur;
                 head_cur = 0;
                 continue;
             }
@@ -1119,7 +1125,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= n_cells) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -1593,7 +1599,10 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // fork: an elastic cache shifts the cells of its capacity, see build_graph_shift
+        const uint32_t n = n_cap_fork > 0 ? std::min(n_cap_fork, cells.size()) : cells.size();
+
+        for (uint32_t i = 0; i < n; ++i) {
             data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
     }
@@ -2079,7 +2088,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    // fork: an elastic cache has memory only for the cells of its capacity (one stream)
+    const int64_t n_shift = n_cap_fork > 0 ? (int64_t) n_cap_fork : (int64_t) get_size()*n_stream;
+
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_shift);
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
@@ -2107,7 +2119,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_rot, n_head_kv, n_shift,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));

@@ -374,9 +374,12 @@ llama_context::llama_context(
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.phase_mem      = params.phase_mem;
 
-    // the phases time-share the memory of one sequence, the memory fit and non-causal batches use the static layout
-    if (cparams.phase_mem && cparams.n_seq_max > 1) {
-        LLAMA_LOG_WARN("%s: phase_mem needs n_seq_max = 1, it is off\n", __func__);
+    // the phases time-share the memory of the cache; several sequences only in one unified stream, whose used range the
+    // plan of a prompt takes as its depth (24.10: without phase_mem -np 4 on the 3090 kept the compute buffer of the
+    // largest ubatch at the full depth, 9.6 GB, and left the moe-cache no slot). the memory fit and non-causal batches
+    // use the static layout
+    if (cparams.phase_mem && cparams.n_seq_max > 1 && !cparams.kv_unified) {
+        LLAMA_LOG_WARN("%s: phase_mem needs n_seq_max = 1 or a unified KV cache, it is off\n", __func__);
         cparams.phase_mem = false;
     }
     if (cparams.phase_mem && (hparams.no_alloc || hparams.vocab_only || !cparams.causal_attn || llama_model_has_encoder(&model))) {
@@ -583,9 +586,11 @@ llama_context::llama_context(
 
             const int64_t n_gen = cparams.op_offload ? n_off - 1 : llama_moe_cache_fork::N_TOKENS_MAX;
 
-            // start in the generation layout, a large n_ubatch does not have to fit at the full KV depth
+            // start in the generation layout, a large n_ubatch does not have to fit at the full KV depth. the reserve
+            // rounds its tokens up to a multiple of the sequences, which must stay within the moe-cache step
+            const int64_t n_gen_max = llama_moe_cache_fork::N_TOKENS_MAX / cparams.n_seq_max * cparams.n_seq_max;
             phase          = LLAMA_PHASE_GEN;
-            phase_n_gen    = (uint32_t) std::min<int64_t>(std::clamp<int64_t>(n_gen, 1, llama_moe_cache_fork::N_TOKENS_MAX), cparams.n_ubatch);
+            phase_n_gen    = (uint32_t) std::min<int64_t>(std::clamp<int64_t>(n_gen, 1, std::max<int64_t>(1, n_gen_max)), cparams.n_ubatch);
             phase_n_reserve = phase_n_gen;
             const char * compact = getenv("LLAMA_PHASE_GEN_COMPACT");
             if (compact && atoi(compact) != 0) {
@@ -624,6 +629,9 @@ llama_context::llama_context(
     if (cparams.n_moe_cache != 0 && cparams.moe_cache_size == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.hparams.no_alloc) {
         moe_cache_fork = std::make_unique<llama_moe_cache_fork>(model, cparams.n_moe_cache);
     }
+
+    // fork: the KV cache maps memory to the cells in use only (LLAMA_KV_ELASTIC)
+    kv_elastic_init_fork();
 
     // Initialize the full vocabulary token ids for backend samplers.
     {
@@ -3136,6 +3144,10 @@ public:
 
     size_t n_bytes() override {
         return size_written;
+    }
+
+    bool has_data() const override {
+        return false;
     }
 
 private:

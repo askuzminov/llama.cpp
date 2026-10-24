@@ -17,6 +17,10 @@ public:
     // bytes written so far
     virtual size_t n_bytes() = 0;
 
+    // fork: false when only the size is counted (state_seq_get_size, no synchronize): a writer that would first
+    // rewrite what it saves (llama_memory_recurrent::rec_flatten) leaves the tensors alone then
+    virtual bool has_data() const { return true; }
+
     void write_string(const std::string & str);
 };
 

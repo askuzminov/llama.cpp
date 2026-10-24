@@ -61,6 +61,13 @@ public:
 
     void set_n_kv_full(uint32_t n_kv) override;
 
+    // the elastic KV cache: the attention cache searches its capacity, the indexer cache maps memory for the same cells
+    bool     kv_elastic_init_fork(bool emulate) override;
+    uint32_t kv_capacity_fork() const override;
+    uint32_t kv_set_capacity_fork(uint32_t n_cells) override;
+    size_t   kv_cell_bytes_fork() const override;
+    void     kv_set_grow_fork(std::function<bool(uint32_t)> grow) override;
+
     // the pool rows of a failed pass may be half written
     void ubatch_failed() override;
 
@@ -171,6 +178,9 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // the indexer cache is elastic too (kv_elastic_init_fork)
+    bool idx_elastic = false;
 
     //
     // qwen4exp QSA: block keys pooled from the indexer cells, kept across passes

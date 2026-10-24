@@ -78,6 +78,29 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // fork: deferred rollback of the gated delta net (ggml_gated_delta_net_lazy, 24.10, after Rulith Inference's
+    // apply_gdn_deferred_rollback; LLAMA_GDN_LAZY=0: off). a short batch leaves the state row of its cell as it found it
+    // and records per token what a replay needs, the next batch replays the records its rollback kept. per recurrent
+    // layer a record buffer [rec_floats, 1 + n_rs_seq, 2 * size] (two sets a cell: the next batch reads one and writes
+    // the other), per cell the records its last batch left - 0: its rows hold the state as the plain net leaves them,
+    // plane rs_idx of the cell - and the set that holds them
+    uint32_t rec_floats = 0;
+    int32_t  gdn_s  = 0; // S_v = S_k
+    int32_t  gdn_hv = 0; // value heads
+    int32_t  gdn_hk = 0; // key heads
+    std::vector<ggml_tensor *> rec_l;
+    std::vector<uint32_t>      rec_n;
+    std::vector<uint8_t>       rec_set;
+
+    bool lazy_on() const { return rec_floats > 0; }
+
+    // the records of a cell turned into the snapshot planes the plain net would have written for its last batch, the
+    // records dropped: what a state save reads (plane rs_idx) and what two sequences sharing the cell read from then on.
+    // The replay runs on the device of each layer (rec_backends, made on first use), so the planes have the bits the
+    // plain net leaves there
+    void rec_flatten(uint32_t cell);
+    std::map<ggml_backend_dev_t, ggml_backend_ptr> rec_backends;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -181,6 +204,23 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // fork: deferred rollback of the gated delta net (llama_memory_recurrent::rec_l)
+    ggml_tensor * get_rec_l(int32_t il) const;
+    bool     lazy_on() const;
+    uint32_t get_n_rs_seq() const;
+    int32_t  gdn_s() const;
+    int32_t  gdn_hv() const;
+    int32_t  gdn_hk() const;
+
+    // whether every i < n reads its state from its own cell (head + i)
+    bool s_copy_own_cell(int n) const;
+
+    // the per-cell input of the net with deferred rollback (lazy, n = n_seqs) or of the replay before the plain net
+    // (n = n_rs, the extras build_rs copies along included): row read, row written, records replayed, set read, set
+    // written. reads the rollback index without consuming it (s_copy does that) and moves the cells on: after the
+    // lazy net they hold n_seq_tokens records in the other set, after the plain one none
+    void lazy_info(int32_t * info, int n, bool lazy, uint32_t n_seq_tokens) const;
 
 private:
     const llama_memory_status status;

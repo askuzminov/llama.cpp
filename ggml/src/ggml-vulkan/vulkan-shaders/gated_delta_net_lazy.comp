@@ -1,0 +1,222 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#if USE_SUBGROUP_CLUSTERED
+#extension GL_KHR_shader_subgroup_clustered : enable
+#endif
+#if USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+// fork: the gated delta net with deferred rollback (ggml_gated_delta_net_lazy, MODE 1) and the replay alone
+// (ggml_gated_delta_net_replay, MODE 2). A workgroup row is one head of one cell: info row y holds the state row read,
+// the row written, the records replayed, the record set read and the set written. The state is read, brought up to
+// date with the records and written back; the net then runs the tokens as gated_delta_net.comp does and writes, per
+// token, its record (delta, key, gate) instead of a snapshot. The state steps are the expressions of
+// gated_delta_net.comp, so a replay gives the state the plain net leaves.
+
+// Caller guarantees valid spec constants: S_V % COLS_PER_WG == 0 and S_V % LANES_PER_COLUMN == 0.
+layout(constant_id = 0) const uint S_V = 128;
+layout(constant_id = 1) const uint MODE = 1;
+layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
+layout(constant_id = 3) const uint LANES_PER_COLUMN = 32;
+
+const uint COLS_PER_WG = SUBGROUP_SIZE / LANES_PER_COLUMN;
+const uint ROWS_PER_LANE = S_V / LANES_PER_COLUMN;
+
+layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint H;
+    uint H_k;
+    uint n_tokens;
+    uint sq1, sq2, sq3;
+    uint sk1, sk2, sk3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint rq3;
+    float scale;
+    // floats of one record, and of one record set (the records of 1 + n_rs_seq tokens)
+    uint rec_floats;
+    uint rec_set;
+};
+
+layout(binding = 0) readonly buffer QBuf     { float data_q[];     };
+layout(binding = 1) readonly buffer KBuf     { float data_k[];     };
+layout(binding = 2) readonly buffer VBuf     { float data_v[];     };
+layout(binding = 3) readonly buffer GBuf     { float data_g[];     };
+layout(binding = 4) readonly buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5)          buffer StateBuf { float data_state[]; };
+layout(binding = 6)          buffer RecBuf   { float data_rec[];   };
+layout(binding = 7) readonly buffer InfoBuf  { int   data_info[];  };
+layout(binding = 8)          buffer DstBuf   { float data_dst[];   };
+
+#if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+shared float temp[SUBGROUP_SIZE];
+
+// This does a reduction across groups of LANES_PER_COLUMN
+float reduce_add_shmem(float partial) {
+    const uint lane = gl_LocalInvocationID.x;
+    temp[lane] = partial;
+    barrier();
+    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0; s >>= 1u) {
+        float other = temp[lane ^ s];
+        barrier();
+        temp[lane] += other;
+        barrier();
+    }
+    const float result = temp[lane];
+    barrier();
+    return result;
+}
+#endif
+
+// clusterSize for subgroupClusteredAdd must be a compile-time constant; branch on spec constant
+float reduce_partial(float partial) {
+    switch (LANES_PER_COLUMN) {
+        case 1u:
+            return partial;
+#if USE_SUBGROUP_CLUSTERED
+        // Workaround for GLSL requiring a literal constant for the cluster size.
+        // The branches should all fold away.
+        case 2u:
+            return subgroupClusteredAdd(partial, 2u);
+        case 4u:
+            return subgroupClusteredAdd(partial, 4u);
+        case 8u:
+            return subgroupClusteredAdd(partial, 8u);
+        case 16u:
+            return subgroupClusteredAdd(partial, 16u);
+        case 32u:
+            return subgroupClusteredAdd(partial, 32u);
+        case 64u:
+            return subgroupClusteredAdd(partial, 64u);
+#endif
+        default:
+#if USE_SUBGROUP_ADD
+            return subgroupAdd(partial);
+#else
+            return reduce_add_shmem(partial);
+#endif
+    }
+}
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint seq_id  = gl_WorkGroupID.y;
+    // the workgroup is one subgroup; the local index keeps the rows and columns whole where a driver runs it narrower
+    const uint lane    = gl_LocalInvocationID.x % LANES_PER_COLUMN;
+    const uint col_wg  = gl_LocalInvocationID.x / LANES_PER_COLUMN;
+    const uint col     = gl_WorkGroupID.z * COLS_PER_WG + col_wg;
+
+    const uint row_in  = uint(data_info[5 * seq_id + 0]);
+    const uint row_out = uint(data_info[5 * seq_id + 1]);
+    const uint n_rep   = uint(data_info[5 * seq_id + 2]);
+    const uint set_rd  = uint(data_info[5 * seq_id + 3]);
+
+    // the replay alone leaves a state without records where it is
+    if (MODE == 2u && n_rep == 0u && row_in == row_out) {
+        return;
+    }
+
+    const uint state_size = S_V * S_V;
+    const uint head_off   = head_id * state_size + col * S_V;
+    const uint in_base    = row_in  * H * state_size + head_off;
+    const uint out_base   = row_out * H * state_size + head_off;
+
+    float s_shard[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        s_shard[r] = data_state[in_base + r * LANES_PER_COLUMN + lane];
+    }
+
+    // the records of the tokens the rollback kept: decay, then the key times the delta of the column
+    const uint kh = head_id % H_k;
+    for (uint j = 0; j < n_rep; j++) {
+        const uint  rj      = set_rd * rec_set + j * rec_floats;
+        const float g_val   = data_rec[rj + H * S_V + H_k * S_V + head_id];
+        const float delta_c = data_rec[rj + head_id * S_V + col];
+        const uint  kb      = rj + H * S_V + kh * S_V;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            s_shard[r] = g_val * s_shard[r] + data_rec[kb + r * LANES_PER_COLUMN + lane] * delta_c;
+        }
+    }
+
+    if (n_rep > 0u || row_in != row_out) {
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_state[out_base + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        }
+    }
+
+    if (MODE == 2u) {
+        return;
+    }
+
+    const uint set_wr = uint(data_info[5 * seq_id + 4]);
+    const uint iq3    = seq_id / rq3;
+
+    // the key and the gate of a head go to its record once, from the first column of the head
+    const bool first_col = gl_WorkGroupID.z == 0u && col_wg == 0u;
+
+    uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
+
+    for (uint t = 0; t < n_tokens; t++) {
+        const uint q_off  = iq3 * sq3 + t * sq2 + kh * sq1;
+        const uint k_off  = iq3 * sk3 + t * sk2 + kh * sk1;
+        const uint v_off  = seq_id * sv3 + t * sv2 + head_id * sv1;
+        const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
+        const float beta_val = data_beta[gb_off];
+
+        float k_reg[ROWS_PER_LANE];
+        float q_reg[ROWS_PER_LANE];
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            const uint i = r * LANES_PER_COLUMN + lane;
+            k_reg[r] = data_k[k_off + i];
+            q_reg[r] = data_q[q_off + i];
+        }
+
+        const float g_val = exp(data_g[gb_off]);
+        float g_exp[ROWS_PER_LANE];
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            g_exp[r] = g_val;
+        }
+
+        const float v_val = data_v[v_off + col];
+
+        float kv_shard = 0.0;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
+        }
+        float kv_col = reduce_partial(kv_shard);
+
+        float delta_col = (v_val - kv_col) * beta_val;
+
+        float attn_partial = 0.0;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+        float attn_col = reduce_partial(attn_partial);
+
+        if (lane == 0) {
+            data_dst[attn_off + col] = attn_col * scale;
+        }
+
+        attn_off += S_V * H;
+
+        const uint rt = set_wr * rec_set + t * rec_floats;
+        if (lane == 0) {
+            data_rec[rt + head_id * S_V + col] = delta_col;
+        }
+        if (first_col) {
+            if (head_id < H_k) {
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    data_rec[rt + H * S_V + head_id * S_V + r * LANES_PER_COLUMN + lane] = k_reg[r];
+                }
+            }
+            if (lane == 0) {
+                data_rec[rt + H * S_V + H_k * S_V + head_id] = g_val;
+            }
+        }
+    }
+}

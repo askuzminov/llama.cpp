@@ -291,6 +291,47 @@ void llama_memory_hybrid_idx_fork::set_n_kv_full(uint32_t n_kv) {
     }
 }
 
+bool llama_memory_hybrid_idx_fork::kv_elastic_init_fork(bool emulate) {
+    // the attention KV in RAM (LLAMA_QSA_KV_HOST) takes no device memory to begin with
+    if (kv_host || !get_mem_attn()->elastic_init_fork(emulate)) {
+        return false;
+    }
+    // the indexer keys sit in the cells of the attention cache: elastic where they can be, mapped in full otherwise
+    idx_elastic = mem_idx && mem_idx->elastic_init_fork(emulate);
+    if (mem_idx && !idx_elastic) {
+        LLAMA_LOG_WARN("%s: the indexer cache stays mapped in full\n", __func__);
+    }
+    return true;
+}
+
+uint32_t llama_memory_hybrid_idx_fork::kv_capacity_fork() const {
+    return get_mem_attn()->elastic_capacity_fork();
+}
+
+uint32_t llama_memory_hybrid_idx_fork::kv_set_capacity_fork(uint32_t n_cells) {
+    llama_kv_cache * attn = get_mem_attn();
+
+    // more cells: the indexer memory first, it must hold every cell the attention cache may place
+    if (idx_elastic && n_cells > attn->elastic_capacity_fork() && !mem_idx->elastic_commit_fork(n_cells)) {
+        return attn->elastic_capacity_fork();
+    }
+
+    const uint32_t res = attn->elastic_set_capacity_fork(n_cells);
+    if (idx_elastic) {
+        mem_idx->elastic_set_capacity_fork(res);
+    }
+
+    return res;
+}
+
+size_t llama_memory_hybrid_idx_fork::kv_cell_bytes_fork() const {
+    return get_mem_attn()->elastic_cell_bytes_fork() + (idx_elastic ? mem_idx->elastic_cell_bytes_fork() : 0);
+}
+
+void llama_memory_hybrid_idx_fork::kv_set_grow_fork(std::function<bool(uint32_t)> grow) {
+    get_mem_attn()->elastic_grow_fork = std::move(grow);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx_fork::init_update(llama_context * lctx, bool optimize) {
     // note: the pool is dropped when the context is applied, not here: llama_context::decode asks
     //       for an update on every call and most of them turn out to be no-ops
