@@ -781,7 +781,10 @@ struct server_prompt_cache {
 
     // evict oldest cached prompts until host RAM stays above the reserve, assuming `extra`
     // more bytes are about to be allocated. No-op when the reserve is disabled/unknown.
-    void evict_for_reserve(size_t extra);
+    // fork: may_write = false (a slot runs and its decode must not wait for the disk): what a write would relieve is
+    // dropped instead, host RAM below the reserve costs more than a cache miss. false when the cache could not cover
+    // the deficit
+    bool evict_for_reserve(size_t extra, bool may_write = true);
 
     // spill support (no-ops when spill_dir is empty)
     // paths are std::filesystem::path rather than std::string: spill_dir arrives as UTF-8, and the
@@ -816,9 +819,15 @@ struct server_prompt_cache {
 
     // fork: while set, a save keeps the RAM limit only as far as no disk write is needed - the cache can stay above it
     // until the next update(), and write_behind writes the new states out while the server is idle. set around the
-    // saves of slots evicted while others run (server_slot_room_fork), which must not wait for the disk. the host
-    // RAM reserve still writes when it has to
+    // saves made while other slots run, which must not wait for the disk; the host RAM reserve then drops what it
+    // would have written (evict_for_reserve). it defers only with --cache-spill-dir: without one free_ram never
+    // writes and drops the oldest states to the limit at once, and the idle write_behind and update(false) run only
+    // with a spill dir
     bool defer_writes = false;
+
+    // fork: host RAM the server holds outside the cache within the cache's RAM limit - the states of slots paused for
+    // room (room_pause_fork): the limit counts them, the cache gives way. empty = none
+    std::function<size_t()> ram_outside;
 };
 
 // used exclusively by router mode

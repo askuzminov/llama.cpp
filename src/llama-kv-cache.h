@@ -179,6 +179,17 @@ public:
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
+    // fork: the window the cache was made with, 0 for one of the whole context (the MTP head of qwen4exp,
+    // llama_mtp_window_kv)
+    uint32_t get_n_swa_fork() const { return swa_type == LLAMA_SWA_TYPE_NONE ? 0 : n_swa; }
+
+    // fork: find_slot also reuses a cell several sequences hold once the window masks it for each of them, and
+    // apply_ubatch drops it from all of them. upstream reuses a cell of one sequence only: after a seq_cp (the
+    // n_cmpl children of the server) the cells of the parent stay shared until every child has overwritten a cell of
+    // its own, and a cache of window x sequences + ubatch runs out of cells first. set for the window cache of the MTP
+    // head only (llama_model::create_memory); the other SWA caches keep the upstream rule
+    bool swa_reuse_shared_fork = false;
+
     // fork: an elastic cache (src/fork/llama-kv-elastic-fork.cpp, LLAMA_KV_ELASTIC): only its first cells - the
     // capacity - are used, and the device maps memory to them as the context grows; the rest of the cache costs no
     // memory. elastic_init_fork moves the tensors to buffers the device maps on demand (emulate: ordinary buffers, for
@@ -492,6 +503,9 @@ public:
 
     // fork: the cells of the current ubatch, nullptr for a context without a batch (src/fork, qwen4exp QSA)
     const llama_kv_cache::slot_info * get_sinfo() const { return sinfos.empty() ? nullptr : &sinfos[i_cur]; }
+
+    // fork: see llama_kv_cache::get_n_swa_fork
+    uint32_t get_n_swa_fork() const { return kv->get_n_swa_fork(); }
 
 private:
     llama_memory_status status;

@@ -133,15 +133,13 @@ void common_fork_spec_auto_apply(common_params & params, bool spec_types_given, 
         auto & spec = params.speculative;
 
         if (!spec.draft.n_max_set) {
-            spec.draft.n_max = std::max(spec.draft.n_max, COMMON_SPECULATIVE_AUTO_N_MAX);
-
-            // a DFlash draft: its own cap, see COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH
+            // the cap itself, not a max with the default n_max: a larger upstream default would have made it no cap. a
+            // DFlash draft has its own (COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH, equal to the MTP one since 22.10, kept
+            // apart so that either can be measured alone, as the 7 of DFlash was)
             const bool dflash = std::any_of(spec.types.begin(), spec.types.end(), [](auto t) {
                 return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
             });
-            if (dflash) {
-                spec.draft.n_max = std::max(spec.draft.n_max, COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH);
-            }
+            spec.draft.n_max = dflash ? COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH : COMMON_SPECULATIVE_AUTO_N_MAX;
         }
     }
 }

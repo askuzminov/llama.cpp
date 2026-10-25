@@ -1801,7 +1801,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    const size_t size_cur = size();
+    // fork: the limit counts the RAM the server holds outside the cache (ram_outside)
+    const size_t size_cur = size() + (ram_outside ? ram_outside() : 0);
 
     if (limit_size > 0 && size_cur + state_size_new > limit_size) {
         // make room before allocating the new vectors to avoid breaching the RAM limit; with a
@@ -1811,7 +1812,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     // make room so the new state keeps host RAM above the reserve
-    evict_for_reserve(state_size_new);
+    evict_for_reserve(state_size_new, !defer_writes);
 
     server_state_buf state_data_tgt;
     server_state_buf state_data_dft;
@@ -1968,16 +1969,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update(bool may_write) {
-    if (limit_size > 0 && size() > limit_size) {
+    // fork: the limit counts the RAM the server holds outside the cache (ram_outside)
+    const size_t size_ram = size() + (ram_outside ? ram_outside() : 0);
+    if (limit_size > 0 && size_ram > limit_size) {
         // spill cold states to disk (or drop them without a spill dir) to fit the RAM limit
-        free_ram(size() - limit_size, may_write);
+        free_ram(size_ram - limit_size, may_write);
     }
 
     // keep the on-disk spill within its budget
     enforce_disk_limit();
 
     // keep host RAM above the reserve (adapts to memory taken by other processes over time)
-    evict_for_reserve(0);
+    evict_for_reserve(0, may_write);
 
     // size() walks the whole list, so it is taken once and kept up to date
     size_t size_cur = size();

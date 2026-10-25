@@ -48,6 +48,11 @@ elseif (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-row-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
 
+# QSA with several sequences (registered below where the matrix models exist): built everywhere, as it needs only the
+# public API. a Windows DLL build has no generated models, so it runs there only by hand, on a qwen4exp-moe.gguf
+# generated elsewhere: test-qsa-multi-fork -m <model> --dense-out <file>, then the same with --dense-in <file>
+llama_build(test-qsa-multi-fork.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # the models of this matrix come from test-llama-archs (the generate-models fixture), which upstream builds under
     # the same condition: on a Windows DLL build there are none
@@ -69,8 +74,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # of drafts, checked by LLAMA_QSA_CHECK, the mask from positions per sequence, and the logits of every sequence
     # against the same sequence alone, on the qwen4exp model of the matrix. the mask from positions must give the logits
     # of the dense mask bit for bit, and LLAMA_QSA_MASK_POS is read once per process: a run with the dense mask writes
-    # its logits first
-    llama_build(test-qsa-multi-fork.cpp)
+    # its logits first. the binary is built on every platform (below), it needs only llama.h
     set(QSA_MULTI_DENSE "${CMAKE_CURRENT_BINARY_DIR}/test-qsa-multi-fork-dense.bin")
     llama_test(
         test-qsa-multi-fork

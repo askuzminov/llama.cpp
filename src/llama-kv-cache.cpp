@@ -1106,6 +1106,15 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                             can_use = true;
                         }
                     }
+                } else if (!can_use && swa_reuse_shared_fork) {
+                    // fork: a cell of several sequences, masked for each of them (swa_reuse_shared_fork)
+                    const llama_pos pos_cell = cells.pos_get(idx);
+                    const auto &    seqs     = cells.seq_get_all(idx);
+
+                    can_use = true;
+                    for (int s = 0; s < LLAMA_MAX_SEQ && can_use; ++s) {
+                        can_use = !seqs.test(s) || llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(s) + 1);
+                    }
                 }
 
                 if (can_use) {
@@ -1165,7 +1174,19 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             const auto idx = sinfo.idxs[s][ii];
 
-            if (!cells.is_empty(idx)) {
+            if (!cells.is_empty(idx) && swa_reuse_shared_fork) {
+                // fork: the cell may be shared, find_slot took it masked for each of its sequences
+                const llama_pos pos  = cells.pos_get(idx);
+                const auto      seqs = cells.seq_get_all(idx);
+
+                for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    if (seqs.test(s)) {
+                        seq_pos_max_rm[s] = std::max(seq_pos_max_rm[s], pos);
+                    }
+                }
+
+                cells.rm(idx);
+            } else if (!cells.is_empty(idx)) {
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);

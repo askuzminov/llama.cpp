@@ -293,6 +293,61 @@ static void test_min_tokens(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
+// fork: the RAM limit counts the RAM the server holds outside the cache (ram_outside: the states of slots paused for
+// room). the cache gives way: with no disk write while one may not happen (a decode would wait for it), the dirty
+// states then wait above the limit; with one when it may; and with none for the states write_behind put on disk
+static void test_ram_outside(const std::string & dir) {
+    server_prompt_cache cache(1, 0, 0, dir, 0, SIG);
+    cache.states.push_back(make_state(16, 100, 300*1024, 0));
+    cache.states.push_back(make_state(16, 200, 300*1024, 0));
+
+    size_t outside = 0;
+    cache.ram_outside = [&]() { return outside; };
+
+    cache.update(true);
+    assert(cache.states.size() == 2 && dir_empty(dir));
+
+    // 600 KiB of the cache and 600 KiB outside it: over the limit of 1 MiB
+    outside = 600*1024;
+    cache.update(false);
+    assert(cache.states.size() == 2 && dir_empty(dir));
+    for (const auto & st : cache.states) {
+        assert(!st.on_disk && st.data.size() > 0);
+    }
+
+    cache.update(true);
+    assert(cache.states.front().on_disk && cache.states.front().data.size() == 0);
+    assert(cache.size() + outside <= cache.limit_size);
+
+    // the rest written out while idle: update(false) frees its RAM, with no write
+    outside = 1024*1024;
+    assert(cache.write_behind(nullptr) == 1);
+    cache.update(false);
+    for (const auto & st : cache.states) {
+        assert(st.on_disk && st.data.size() == 0);
+    }
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
+// fork: host RAM below the reserve while a decode may not wait for the disk (may_write = false): the cache drops what
+// it would have written, and says whether that covered the deficit
+static void test_reserve_no_write(const std::string & dir) {
+    if (common_host_mem_available() == 0) {
+        return; // the reserve does nothing where the free host RAM is unknown
+    }
+
+    // a reserve no host has
+    server_prompt_cache cache(0, 0, SIZE_MAX / 4, dir, 0, SIG);
+    cache.states.push_back(make_state(16, 100, 4096, 0));
+    cache.states.push_back(make_state(16, 200, 4096, 0));
+
+    assert(!cache.evict_for_reserve(0, false));
+    assert(cache.states.empty());
+    assert(dir_empty(dir));
+}
+
 // shutdown -> restart: the files are adopted by a run with the same signature
 static void test_cold_start(const std::string & dir) {
     std::vector<server_prompt_data> ref;
@@ -458,6 +513,8 @@ int main() {
         { "write-behind",       test_write_behind       },
         { "write-behind-cancel", test_write_behind_cancel },
         { "min-tokens",         test_min_tokens         },
+        { "ram-outside",        test_ram_outside        },
+        { "reserve-no-write",   test_reserve_no_write   },
         { "rewrite-step",       test_rewrite_step       },
         { "cold-start",         test_cold_start         },
         { "signature-mismatch", test_signature_mismatch },

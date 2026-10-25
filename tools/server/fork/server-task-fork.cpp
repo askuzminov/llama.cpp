@@ -1331,19 +1331,19 @@ size_t server_prompt_cache::disk_size() const {
     return res;
 }
 
-void server_prompt_cache::evict_for_reserve(size_t extra) {
+bool server_prompt_cache::evict_for_reserve(size_t extra, bool may_write) {
     if (reserve_size == 0) {
-        return;
+        return true;
     }
 
     const size_t avail = common_host_mem_available();
     if (avail == 0) {
-        return; // could not determine available RAM -> don't act on it
+        return true; // could not determine available RAM -> don't act on it
     }
 
     const size_t want = reserve_size + extra;
     if (avail >= want) {
-        return;
+        return true;
     }
 
     // free the deficit only (freed heap may not return to the OS immediately, so re-querying
@@ -1352,5 +1352,20 @@ void server_prompt_cache::evict_for_reserve(size_t extra) {
     const size_t need = want - avail;
     SRV_WRN(" - host memory pressure, relieving %.3f MiB from the prompt cache (available %.3f MiB < reserve %.3f MiB)\n",
             need / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
-    free_ram(need);
+    size_t freed = free_ram(need, may_write);
+
+    // fork: a decode must not wait for the disk (may_write = false): free_ram took the states that need no write, and
+    // the ones it would have written are dropped, oldest first. those that live only on disk hold no RAM
+    for (auto it = states.begin(); it != states.end() && freed < need && !may_write; ) {
+        if (it->data.size() == 0) {
+            ++it;
+            continue;
+        }
+        SRV_WRN(" - dropping prompt-cache entry of %.3f MiB, no disk write while slots run\n", it->size() / (1024.0 * 1024.0));
+        freed += it->size();
+        erase_spill(*it);
+        it = states.erase(it);
+    }
+
+    return freed >= need;
 }

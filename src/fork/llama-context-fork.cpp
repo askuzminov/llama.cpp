@@ -546,16 +546,17 @@ void llama_set_qsa_reuse(llama_context * ctx, bool value) {
 }
 
 uint32_t llama_mtp_window_kv(const llama_context * ctx, uint32_t * n_window) {
-    // the cache llama_model::create_memory made for the dense MTP head: a plain KV cache, of fewer cells than the
-    // context when mtp_window_kv gave it the window only
+    // the cache llama_model::create_memory made for the dense MTP head: a plain KV cache, an SWA one of the window when
+    // mtp_window_kv gave it the window only. read from the cache, not from the rule again: the signature of the prompt
+    // cache has to describe the cache the states come from
     const auto & cparams = ctx->get_cparams();
     const auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory());
-    const bool window = kv != nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        dynamic_cast<const llama_model_qwen4exp_fork *>(&ctx->get_model()) != nullptr && kv->get_size() < cparams.n_ctx_seq;
+    const uint32_t n_swa = kv != nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+        dynamic_cast<const llama_model_qwen4exp_fork *>(&ctx->get_model()) != nullptr ? kv->get_n_swa_fork() : 0;
     if (n_window) {
-        *n_window = window ? (uint32_t) llama_model_qwen4exp_fork::mtp_window() : 0;
+        *n_window = n_swa;
     }
-    return window ? kv->get_size() : 0;
+    return n_swa > 0 ? kv->get_size() : 0;
 }
 
 // a ubatch of tokens of one sequence at consecutive positions, for the fork's reads ahead (the PLE rows need the tokens,

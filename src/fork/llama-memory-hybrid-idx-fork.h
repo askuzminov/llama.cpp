@@ -272,7 +272,7 @@ private:
 
     mutable uint64_t qsa_epoch = 1;
 
-    // qsa_pos_multi_ok of the ubatch of qsa_pos_ok_epoch
+    // the cell part of qsa_pos_multi_ok for the cache of qsa_pos_ok_epoch and n_kv (the token part is not kept)
     mutable uint64_t qsa_pos_ok_epoch = 0;
     mutable uint32_t qsa_pos_ok_n_kv  = 0;
     mutable bool     qsa_pos_ok       = false;

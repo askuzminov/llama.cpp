@@ -673,12 +673,18 @@ void common_speculative_fork_dflash_fit(const llama_model * model_dft, int32_t n
         return; // a causal draft may split its batch
     }
 
+    // the tokens of one sequence in the draft batch: the impl clamps n_max to the trained block (block_size - 1 drafts
+    // after id_last, block_size for an anchor-first DSpark), a LiliCorr lattice is always one block. the block size as
+    // the impl reads it
+    int32_t block_size = 16;
+    if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
+        block_size = std::atoi(buf);
+    }
     int32_t per_seq = std::max(1, n_max + 1);
+    if (block_size > 0) {
+        per_seq = std::min(per_seq, block_size);
+    }
     if (llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", buf, sizeof(buf)) >= 0 && std::atoi(buf) > 0) {
-        int32_t block_size = 16;
-        if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
-            block_size = std::atoi(buf);
-        }
         per_seq = std::max(per_seq, block_size);
     }
 

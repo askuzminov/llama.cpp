@@ -1501,39 +1501,41 @@ static int qsa_pos_stride_log2() {
 }
 
 bool llama_memory_hybrid_idx_fork::qsa_pos_multi_ok(const llama_ubatch * ubatch, uint32_t n_kv) const {
-    if (qsa_pos_ok_epoch == qsa_epoch && qsa_pos_ok_n_kv == n_kv) {
-        return qsa_pos_ok;
-    }
-
-    const auto & cells = get_mem_attn()->get_cells(ubatch->seq_id[0][0]);
-
     const int stride_log2 = qsa_pos_stride_log2();
 
-    // no cell held by two sequences: a used cell carries one sequence at least, so the cells of the sequences add up
-    // to the used ones exactly when none carries two. counted on the attention cache itself, in O(sequences)
-    size_t n_seq_cells = 0;
+    // the cells, once per state of the cache (qsa_epoch, n_kv): they do not depend on the ubatch
+    if (qsa_pos_ok_epoch != qsa_epoch || qsa_pos_ok_n_kv != n_kv) {
+        const auto & cells = get_mem_attn()->get_cells(ubatch->seq_id[0][0]);
 
-    int  n_present = 0;
-    bool ok        = true;
-    for (int q = 0; q < LLAMA_MAX_SEQ && ok; ++q) {
-        if (cells.seq_pos_min(q) >= 0) {
-            n_present++;
-            n_seq_cells += cells.seq_pos_get(q).size();
-            ok = cells.seq_pos_max(q) < (llama_pos(1) << stride_log2);
+        int  n_present = 0;
+        bool ok        = true;
+        for (int q = 0; q < LLAMA_MAX_SEQ && ok; ++q) {
+            if (cells.seq_pos_min(q) >= 0) {
+                n_present++;
+                ok = cells.seq_pos_max(q) < (llama_pos(1) << stride_log2);
+            }
         }
+        // every cell the input reads carries exactly one sequence (set_input_qsa_pos asserts it), checked on the
+        // attention cache itself, cell by cell. the count of the cells of each sequence against the used ones (24.10)
+        // missed a shared cell next to a used cell without a sequence, which llama_kv_cells allows (a state read sets
+        // the position before the sequences, and its format takes a cell of none). only with several sequences
+        for (uint32_t j = 0; j < n_kv && ok; ++j) {
+            ok = cells.is_empty(j) || cells.seq_count(j) == 1;
+        }
+        // every value must stay exact in f32, the half-integer mid of a token included: below 2^23, up to 32 sequences
+        ok = ok && ((int64_t) n_present << stride_log2) <= (int64_t(1) << 23);
+
+        qsa_pos_ok_epoch = qsa_epoch;
+        qsa_pos_ok_n_kv  = n_kv;
+        qsa_pos_ok       = ok;
     }
-    ok = ok && n_seq_cells == cells.get_used();
-    // the tokens too: the range [rank*stride, rank*stride + pos] of a token past the stride reaches into the next rank.
-    // the cells of an applied ubatch carry these positions, which this does not lean on
+
+    // the tokens, on every call: the range [rank*stride, rank*stride + pos] of a token past the stride reaches into
+    // the next rank. not in the memo, which a graph reserve with a ubatch of its own may fill under the same epoch
+    bool ok = qsa_pos_ok;
     for (uint32_t i = 0; i < ubatch->n_tokens && ok; ++i) {
         ok = ubatch->pos[i] < (llama_pos(1) << stride_log2);
     }
-    // every value must stay exact in f32, the half-integer mid of a token included: below 2^23, up to 32 sequences
-    ok = ok && ((int64_t) n_present << stride_log2) <= (int64_t(1) << 23);
-
-    qsa_pos_ok_epoch = qsa_epoch;
-    qsa_pos_ok_n_kv  = n_kv;
-    qsa_pos_ok       = ok;
 
     return ok;
 }

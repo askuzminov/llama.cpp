@@ -1,4 +1,5 @@
 #include "llama-row-cache-fork.h"
+#include "llama-env-parse-fork.h"
 
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -17,13 +18,20 @@
 
 namespace {
 
+// a whole number, as the fork's other knobs (llama_fork_env_parse; the standalone build of test-row-cache has no
+// llama_fork_env_int): atoll read "12abc" as 12 without a word. not above 0 is the default
 size_t row_cache_env(const char * name, size_t def) {
     const char * val = getenv(name);
-    if (val == nullptr) {
-        return def;
+    int64_t parsed = 0;
+    switch (llama_fork_env_parse(val, parsed)) {
+        case LLAMA_FORK_ENV_UNSET:
+            return def;
+        case LLAMA_FORK_ENV_BAD:
+            LLAMA_LOG_ERROR("%s: %s=\"%s\" is not a whole number, using %zu\n", __func__, name, val, def);
+            return def;
+        case LLAMA_FORK_ENV_OK:
+            break;
     }
-
-    const long long parsed = atoll(val);
 
     return parsed > 0 ? (size_t) parsed : def;
 }

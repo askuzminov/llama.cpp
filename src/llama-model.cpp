@@ -3493,11 +3493,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         uint32_t       kv_size  = cparams.n_ctx_seq;
                         uint32_t       n_swa    = hparams.n_swa;
                         llama_swa_type swa_type = hparams.swa_type;
-                        if (mtp_dense_fork && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        const bool mtp_window = mtp_dense_fork && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                             llama_model_qwen4exp_fork::mtp_window_kv(cparams, kv_size, n_swa, swa_type);
-                        }
 
-                        res = new llama_kv_cache(
+                        auto * kv = new llama_kv_cache(
                                 *this,
                                 hparams,
                                 params.type_k,
@@ -3514,6 +3513,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 nullptr,
                                 nullptr);
+                        // fork: the cells a seq_cp leaves shared come back once masked (swa_reuse_shared_fork)
+                        kv->swa_reuse_shared_fork = mtp_window;
+                        res = kv;
                     }
                 }
             }

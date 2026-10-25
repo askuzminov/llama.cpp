@@ -1612,6 +1612,10 @@ private:
 
         if (params_base.cache_ram_mib != 0) {
             server_prompt_cache_init(prompt_cache, params_base, n_ctx, ckpt_limits.reserve_bytes, model_tgt, ctx_tgt, ctx_dft, mctx != nullptr);
+            // fork: the states of the slots paused for room count against the RAM limit of the cache (room_ram_fork)
+            if (prompt_cache) {
+                prompt_cache->ram_outside = [this]() { return room_ram_held_fork(); };
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1926,9 +1930,7 @@ private:
 
                 // fork: while other slots run, the cache writes nothing to disk here, their next decode would wait for
                 // it: write_behind writes the states out once the server is idle (defer_writes)
-                const bool others_run = std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
-                    return &slot != ret && slot.is_processing();
-                });
+                const bool others_run = others_run_fork(ret);
                 prompt_cache->defer_writes = others_run;
 
                 ret->prompt_save(*prompt_cache);
@@ -1947,6 +1949,26 @@ private:
         }
 
         return ret;
+    }
+
+    // fork: whether a slot other than `self` runs: a disk write of the prompt cache now delays its next decode
+    bool others_run_fork(const server_slot * self) const {
+        return std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
+            return &slot != self && slot.is_processing();
+        });
+    }
+
+    // fork: save the state of `slot` to the prompt cache and keep the cache in its limits, with no disk write while
+    // other slots run (defer_writes)
+    bool prompt_save_fork(server_slot & slot) {
+        const bool others_run = others_run_fork(&slot);
+        prompt_cache->defer_writes = others_run;
+        const bool saved = slot.prompt_save(*prompt_cache);
+        prompt_cache->defer_writes = false;
+        if (saved) {
+            prompt_cache->update(!others_run);
+        }
+        return saved;
     }
 
     // fork: clear the idle slot used least recently, other than `keep`, and keep its state in the prompt cache first
@@ -2001,10 +2023,11 @@ private:
                 return true;
             }
 
+            // a slot paused for room keeps its tokens but holds no cells (room_held_fork)
             int64_t held = 0;
             for (const auto & slot : slots) {
                 if (&slot != &dst) {
-                    held += slot.prompt.n_tokens();
+                    held += slot.room_paused ? 0 : slot.prompt.n_tokens();
                 }
             }
             if (held + (int64_t) it->prompt.tokens.size() <= n_ctx) {
@@ -2101,17 +2124,63 @@ private:
         return false;
     }
 
+    // the host RAM the states of the paused slots hold
+    size_t room_ram_held_fork() const {
+        size_t held = 0;
+        for (const auto & slot : slots) {
+            held += slot.room_tgt.size() + slot.room_dft.size();
+        }
+        return held;
+    }
+
+    // whether `bytes` more of paused state fit in host RAM: the paused states stay within the RAM limit of the prompt
+    // cache (--cache-ram), which counts them and gives way to them (ram_outside), and the host RAM reserve holds with
+    // them, the cache dropping what it cannot free without a disk write: other slots run. no pause otherwise, else
+    // the pauses trade a full KV cache for a full host RAM
+    bool room_ram_fork(size_t bytes) {
+        const size_t held = room_ram_held_fork();
+        if (prompt_cache && prompt_cache->limit_size > 0) {
+            if (held + bytes > prompt_cache->limit_size) {
+                SRV_WRN("no pause for room: %.1f MiB of paused state over the prompt cache limit of %.1f MiB\n",
+                        (held + bytes) / (1024.0 * 1024.0), prompt_cache->limit_size / (1024.0 * 1024.0));
+                return false;
+            }
+            const size_t size_ram = prompt_cache->size() + held + bytes;
+            if (size_ram > prompt_cache->limit_size) {
+                prompt_cache->free_ram(size_ram - prompt_cache->limit_size, false);
+            }
+        }
+
+        bool fits = true;
+        if (prompt_cache) {
+            fits = prompt_cache->evict_for_reserve(bytes, false);
+        } else if (ckpt_limits.reserve_bytes > 0) {
+            const size_t avail = common_host_mem_available();
+            fits = avail == 0 || avail >= ckpt_limits.reserve_bytes + bytes;
+        }
+        if (!fits) {
+            SRV_WRN("no pause for room: %.1f MiB of state would take host RAM below the reserve of %.1f MiB\n",
+                    bytes / (1024.0 * 1024.0), ckpt_limits.reserve_bytes / (1024.0 * 1024.0));
+        }
+        return fits;
+    }
+
     // a running slot pauses for room: the state of its sequence in both contexts goes to RAM and its cells are freed.
-    // the task, the sampler, the tokens and the drafts stay with the slot
+    // the task, the sampler, the tokens and the drafts stay with the slot. no pause when the state does not fit in
+    // host RAM (room_ram_fork)
     bool room_pause_fork(server_slot & slot) {
         const size_t n_tgt = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        if (!room_ram_fork(n_tgt + n_dft)) {
+            return false;
+        }
+
         slot.room_tgt.resize(n_tgt);
         if (llama_state_seq_get_data_ext(slot.ctx_tgt, slot.room_tgt.data(), n_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt) {
             slot.room_tgt = {};
             return false;
         }
         if (slot.ctx_dft) {
-            const size_t n_dft = llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
             slot.room_dft.resize(n_dft);
             if (llama_state_seq_get_data_ext(slot.ctx_dft, slot.room_dft.data(), n_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
                 slot.room_tgt = {};
@@ -2999,8 +3068,9 @@ private:
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
             // keep the state that the child task is about to overwrite
-            if (prompt_cache && slot->prompt_save(*prompt_cache)) {
-                prompt_cache->update();
+            // fork: no disk write while other slots run (prompt_save_fork)
+            if (prompt_cache) {
+                prompt_save_fork(*slot);
             }
 
             int id_child = parent_task.child_tasks[idx].id;
@@ -3425,9 +3495,9 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                // fork: the task just launched runs, so no disk write here (prompt_save_fork)
+                                if (prompt_save_fork(slot)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
                                 }
 
                                 if (params_base.kv_unified) {

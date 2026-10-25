@@ -585,6 +585,23 @@ def decode_metrics(rs):
     return {"tg": rate(n, ms), "accept": da / dn if dn else None, "pp_short": pp[0], "pp_long": pp[1]}
 
 
+def server_slots(args):
+    """The slots llama-server gets from its arguments: the last -np / --parallel (the arm's own overrides the default 1),
+    and None with the reason where it cannot tell. The server takes the value only as the next argument: -np4 and
+    --parallel=4 are invalid arguments to it, and so is a value that is not a whole number."""
+    n, problem = 1, None
+    for i, a in enumerate(args):
+        if a in ("-np", "--parallel"):
+            value = args[i + 1] if i + 1 < len(args) else ""
+            try:
+                n = int(value)
+            except ValueError:
+                problem = f"{a} {value!r}: the slots are a whole number"
+        elif re.fullmatch(r"-np=?\d+|(-np|--parallel)=\S*", a):
+            problem = f"{a}: llama-server takes the slots as a separate argument, -np N"
+    return (None, problem) if problem else (n, None)
+
+
 def par_metrics(pi, chat_rows):
     """The conversations of a DECPAR arm at once: how many, the tokens generated together per second of the wall time,
     with the prompts read, and the median TG of a turn (the time a slot shared with the others)."""
@@ -631,7 +648,10 @@ def history_from_cache(path):
                 metrics = decode_metrics(res["rows"])
             elif kind == "decode-chat" and res.get("par") and stem.endswith("-chat"):
                 arm, point = stem[:-5], "par"
-                metrics = par_metrics(res["par"], res.get("chat", []))
+                # the conversations at once from the identity, which lists every one of them, copies included: a
+                # result kept before 25.10 has DECPAR (the copies, 4) in its "par", not the conversations (8)
+                pi = dict(res["par"], par=len(ident.get("chats") or []) or res["par"]["par"])
+                metrics = par_metrics(pi, res.get("chat", []))
             elif kind == "profile" and (m := re.fullmatch(r"(pp\d*|tg)-d(\d+)-(.+)", stem)):
                 arm, point = m[3], f"{m[1]}@{m[2]}"
                 host = res.get("host")
@@ -1430,12 +1450,11 @@ def cmd_decode():
             # empty without an error (the turns would ask about nothing, the rows look whole), and copies whose windows
             # overlap read the same text
             par = par_of[arm.name]
-            # the slots the server gets: the last -np of its arguments (the arm's own overrides the default 1)
-            n_slots = int([a for i, a in enumerate(args[1:]) if args[i] in ("-np", "--parallel")][-1])
+            n_slots, slots_problem = server_slots(args)
             reach = max(start + n_turns*add_chars for start, n_turns, add_chars in arm_chat_specs.get(arm.name, chat_specs))
             last = max(par - 1, 0)*par_shift + reach
-            problems = []
-            if par > 1 and len(chats) > n_slots:
+            problems = [slots_problem] if slots_problem else []
+            if par > 1 and n_slots is not None and len(chats) > n_slots:
                 problems.append(f"DECPAR={par} runs {len(chats)} conversations at once ({par} x {len(chats) // par} "
                                 f"DECCHAT specs) for {n_slots} slots: give the arm its own DECCHAT or -np {len(chats)}")
             if par > 1 and reach > par_shift:

@@ -1368,6 +1368,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                    // fork: the cap of this call (the probe of --spec-auto, the draft cap by slots) ends the walk, as
+                    // the MTP head stops at it: the picks past it would be cut after the draft, with their gate calls
+                    // and draws. the block itself keeps its length, its non-causal attention trained on the whole
+                    if (dp.n_max > 0 && (int32_t) result.size() >= dp.n_max) {
+                        break;
+                    }
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
@@ -2937,17 +2943,22 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // fork: a --spec-draft-n-ubatch of the user is the draft's ubatch as given, the caps below are for the default
+    const bool ubatch_given = params.speculative.draft.n_ubatch > 0;
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         // fork: a smaller ubatch, see common_speculative_fork_mtp_ubatch
-        cparams.n_ubatch = common_speculative_fork_mtp_ubatch(cparams.n_ubatch);
+        if (!ubatch_given) {
+            cparams.n_ubatch = common_speculative_fork_mtp_ubatch(cparams.n_ubatch);
+        }
     }
 
     // fork: the same for a DFlash / DSpark draft, see common_speculative_fork_dflash_ubatch
     const bool spec_dflash = std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto t) {
         return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
     });
-    if (spec_dflash) {
+    if (spec_dflash && !ubatch_given) {
         cparams.n_ubatch = common_speculative_fork_dflash_ubatch(cparams.n_ubatch);
     }
 

@@ -919,10 +919,8 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
         // padding could hold no cell in use at all (24.10). an exact window is LLAMA_MTP_WINDOW_KV=1
         static constexpr int64_t mtp_window_pad = 255;
         const int64_t mtp_window = llama_model_qwen4exp_fork::mtp_window();
-        uint32_t       wkv_size = 0;
-        uint32_t       wkv_swa  = 0;
-        llama_swa_type wkv_type = LLAMA_SWA_TYPE_NONE;
-        const bool window_kv = llama_model_qwen4exp_fork::mtp_window_kv(cparams, wkv_size, wkv_swa, wkv_type);
+        // the cache as it was made, not the rule again
+        const bool window_kv = inp_attn->mctx->get_n_swa_fork() > 0;
         ggml_tensor * k_all = inp_attn->mctx->get_k(ctx0, il);
         ggml_tensor * v_all = inp_attn->mctx->get_v(ctx0, il);
         const bool windowed = mtp_window > 0 && !window_kv && manual_ok && cparams.n_seq_max == 1 && kq_mask->ne[0] > mtp_window + mtp_window_pad &&

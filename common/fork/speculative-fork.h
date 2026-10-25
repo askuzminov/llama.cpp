@@ -30,19 +30,22 @@ common_speculative_type common_speculative_impl_type(const common_speculative_im
 // the ubatch of an MTP draft context. it holds as many cells as the target, and its dense KQ mask is n_ctx x n_ubatch
 // f16 both in the host compute buffer and on the device: 2 GiB each at 262144 x 4096 (the 395 11.10: compute buffers
 // of the MTP context 2800 MiB on the device and 2248 MiB pinned on the host). the catch-up over a prompt goes in
-// chunks of this size, llama_decode splits the target ubatch. LLAMA_MTP_UBATCH: tokens (default 1024), 0 = the target's
+// chunks of this size, llama_decode splits the target ubatch. LLAMA_MTP_UBATCH: tokens (default 1024), 0 = the target's.
+// a --spec-draft-n-ubatch of the user is taken as given, without the cap (25.10: it was cut to the cap without a word)
 uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch);
 
 // the ubatch of a DFlash / DSpark draft context. its decoder graph is reserved for n_ubatch tokens and computes the
 // logits of all of them, [n_vocab, n_ubatch] f32: 3.8 GiB at 248320 x 4096, while a draft decodes one block (8
 // positions per sequence) and the KV injection of the target features goes in chunks of this size anyway. on the 395
 // (22.10) the reserve put the LM head of the draft on the CPU, with a 644 MiB copy of the target's output.weight and a
-// 4564 MiB host compute buffer. LLAMA_DFLASH_UBATCH: tokens (default 512), 0 = the target's (or --spec-draft-n-ubatch)
+// 4564 MiB host compute buffer. LLAMA_DFLASH_UBATCH: tokens (default 512), 0 = the target's. a --spec-draft-n-ubatch of
+// the user is taken as given, without the cap (25.10: it was cut to 512 without a word); the fit below still raises it
 uint32_t common_speculative_fork_dflash_ubatch(uint32_t n_ubatch);
 
 // a non-causal draft (DFlash, unless its model says dflash.attention.causal) decodes the blocks of all drafting
-// sequences as one batch, which llama_decode takes only as one ubatch: n_seq_max blocks of n_max + 1 tokens (LiliCorr:
-// of its block size). its context then gets at least that many tokens per ubatch and per batch, over the cap above and
+// sequences as one batch, which llama_decode takes only as one ubatch: n_seq_max blocks of n_max + 1 tokens, at most of
+// the trained block size, to which the impl clamps n_max (LiliCorr: of its block size). its context then gets at least
+// that many tokens per ubatch and per batch, over the cap above and
 // over a smaller -ub; the assert of a larger batch was reached from 129 slots at n_max 3, from 33 at a block of 16
 void common_speculative_fork_dflash_fit(const llama_model * model_dft, int32_t n_max, llama_context_params & cparams);
 

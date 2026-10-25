@@ -1,4 +1,5 @@
 #include "llama-fork.h"
+#include "llama-env-parse-fork.h"
 
 #include "llama-impl.h"
 
@@ -12,23 +13,12 @@
 
 int64_t llama_fork_env_int(const char * name, int64_t def) {
     const char * env = getenv(name);
-    if (env == nullptr) {
+    int64_t v = def;
+    const llama_fork_env_parse_result res = llama_fork_env_parse(env, v);
+    if (res == LLAMA_FORK_ENV_UNSET) {
         return def;
     }
-    const char * p = env;
-    while (isspace((unsigned char) *p)) {
-        p++;
-    }
-    if (*p == '\0') {
-        return def;
-    }
-    errno = 0;
-    char * end = nullptr;
-    const long long v = strtoll(p, &end, 10);
-    while (end != nullptr && isspace((unsigned char) *end)) {
-        end++;
-    }
-    if (end == p || end == nullptr || *end != '\0' || errno == ERANGE) {
+    if (res == LLAMA_FORK_ENV_BAD) {
         static std::mutex            mutex;
         static std::set<std::string> warned;
         std::lock_guard<std::mutex> lock(mutex);

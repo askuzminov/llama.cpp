@@ -152,3 +152,22 @@ def test_running_slot_pauses_for_room(monkeypatch):
         alone = complete(prompt, n_predict)
         assert alone.status_code == 200
         assert alone.body["content"] == res.body["content"]
+
+
+def test_no_pause_below_ram_reserve(monkeypatch):
+    global server
+    # the case above, with a host RAM reserve no host has: a paused state would take host RAM below it, so no slot
+    # pauses (room_ram_fork), and the decode that finds no room takes the upstream path
+    monkeypatch.setenv("LLAMA_SLOT_ANSWER_ROOM", "0")
+    server.n_slots = 2
+    server.cache_ram_reserve = 1 << 30
+    server.start()
+    log = LogReader(server.log_path)
+
+    n_predict = 200
+    prompts = [STORY_A * 2, STORY_B * 2]
+    parallel_function_calls([(complete, (p, n_predict)) for p in prompts])
+    text = log.drain()
+
+    assert "no pause for room" in text
+    assert "paused for room in the unified KV cache" not in text

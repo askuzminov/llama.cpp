@@ -1,6 +1,8 @@
-// the fork's knobs of the environment (common_fork_env_int, common/fork/env-fork.h; llama_fork_env_int in libllama is
-// the same code): a value that is not a whole number gives the default and a warning, not the 0 of atoi, which for most
-// knobs means off or never
+// the fork's knobs of the environment: a value that is not a whole number gives the default and a warning, not the 0 of
+// atoi, which for most knobs means off or never. both readers parse with llama_fork_env_parse
+// (src/fork/llama-env-parse-fork.h): common_fork_env_int (common/fork/env-fork.h, common and the server) through the
+// environment, and the core itself for llama_fork_env_int (libllama: LLAMA_MTP_WINDOW*, the QSA knobs), which a
+// Windows DLL build does not export
 
 #include "fork/env-fork.h"
 
@@ -26,9 +28,17 @@ static void set_env(const char * name, const char * value) {
 #endif
 }
 
+// a value through common_fork_env_int, and the same value through the core libllama reads with: both give the same
 static int64_t with(const char * value, int64_t def) {
     set_env("LLAMA_TEST_ENV_FORK", value);
-    return common_fork_env_int("LLAMA_TEST_ENV_FORK", def);
+    const int64_t res = common_fork_env_int("LLAMA_TEST_ENV_FORK", def);
+
+    int64_t core = def;
+    if (llama_fork_env_parse(value, core) == LLAMA_FORK_ENV_BAD) {
+        core = def;
+    }
+    check(core == res, "llama_fork_env_parse agrees with common_fork_env_int", __LINE__);
+    return res;
 }
 
 int main() {
@@ -52,6 +62,13 @@ int main() {
     CHECK(with("12abc", 7) == 7);
     CHECK(with("0x10", 7) == 7);
     CHECK(with("99999999999999999999999", 7) == 7);
+
+    // the core: no value at all, and the kinds of result the readers act on
+    int64_t v = 5;
+    CHECK(llama_fork_env_parse(nullptr, v) == LLAMA_FORK_ENV_UNSET && v == 5);
+    CHECK(llama_fork_env_parse(" \t", v) == LLAMA_FORK_ENV_UNSET && v == 5);
+    CHECK(llama_fork_env_parse("-9223372036854775808", v) == LLAMA_FORK_ENV_OK && v == INT64_MIN);
+    CHECK(llama_fork_env_parse("16384x", v) == LLAMA_FORK_ENV_BAD);
 
     if (n_fail > 0) {
         fprintf(stderr, "%d checks failed\n", n_fail);
