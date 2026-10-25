@@ -588,15 +588,19 @@ def decode_metrics(rs):
 def server_slots(args):
     """The slots llama-server gets from its arguments: the last -np / --parallel (the arm's own overrides the default 1),
     and None with the reason where it cannot tell. The server takes the value only as the next argument: -np4 and
-    --parallel=4 are invalid arguments to it, and so is a value that is not a whole number."""
+    --parallel=4 are invalid arguments to it. It reads the value with std::stoi, which stops at the first character
+    that is not a digit (1_0 is 1 to it, 10 to int()), refuses 0 and takes a negative value for auto, so only ASCII
+    digits above 0 count here."""
     n, problem = 1, None
     for i, a in enumerate(args):
         if a in ("-np", "--parallel"):
             value = args[i + 1] if i + 1 < len(args) else ""
-            try:
+            if re.fullmatch(r"[0-9]+", value) and int(value) > 0:
                 n = int(value)
-            except ValueError:
-                problem = f"{a} {value!r}: the slots are a whole number"
+            elif re.fullmatch(r"-[0-9]+", value):
+                problem = f"{a} {value}: auto slots in llama-server, give their number"
+            else:
+                problem = f"{a} {value!r}: the slots are a whole number above 0"
         elif re.fullmatch(r"-np=?\d+|(-np|--parallel)=\S*", a):
             problem = f"{a}: llama-server takes the slots as a separate argument, -np N"
     return (None, problem) if problem else (n, None)

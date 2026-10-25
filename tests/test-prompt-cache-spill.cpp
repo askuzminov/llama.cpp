@@ -331,6 +331,33 @@ static void test_ram_outside(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
+// fork: alloc() makes room for the new state under the same limit, ram_outside counted: with no disk write while the
+// writes are deferred (the new state then comes above the limit), and with one when they are not
+static void test_ram_outside_alloc(const std::string & dir) {
+    server_prompt_cache cache(1, 0, 0, dir, 0, SIG);
+    cache.states.push_back(make_state(16, 100, 300*1024, 0));
+
+    const size_t outside = 600*1024;
+    cache.ram_outside = [&]() { return outside; };
+
+    server_prompt prompt;
+
+    // 300 KiB of the cache, 600 KiB outside it and 300 KiB new: over the limit of 1 MiB
+    cache.defer_writes = true;
+    prompt.tokens = server_tokens(make_tokens(16, 200), false);
+    assert(cache.alloc(prompt, 300*1024, 0) != nullptr);
+    assert(cache.states.size() == 2 && dir_empty(dir));
+
+    cache.defer_writes = false;
+    prompt.tokens = server_tokens(make_tokens(16, 300), false);
+    assert(cache.alloc(prompt, 300*1024, 0) != nullptr);
+    assert(cache.states.size() == 3);
+    assert(cache.size() + outside <= cache.limit_size);
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
 // fork: host RAM below the reserve while a decode may not wait for the disk (may_write = false): the cache drops what
 // it would have written, and says whether that covered the deficit
 static void test_reserve_no_write(const std::string & dir) {
@@ -514,6 +541,7 @@ int main() {
         { "write-behind-cancel", test_write_behind_cancel },
         { "min-tokens",         test_min_tokens         },
         { "ram-outside",        test_ram_outside        },
+        { "ram-outside-alloc",  test_ram_outside_alloc  },
         { "reserve-no-write",   test_reserve_no_write   },
         { "rewrite-step",       test_rewrite_step       },
         { "cold-start",         test_cold_start         },
