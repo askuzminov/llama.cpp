@@ -421,30 +421,40 @@ def gib(mib):
     return f"{mib / 1024:.1f}"
 
 
-def settle():
+def cool_down():
+    """COOL seconds (0): at least that long after the last model run or build, so that the arms of a run start from about
+    the same temperature (the 395 reached 95 C in an hour of chats to 213K on 14.10, the ops of the last profile depth
+    ran 2 percent slower than the night before; the first arm after the build of 14.10 ran 3 to 5 percent slower in
+    every phase than the second, also in the steps that read nothing from the drive). Returns the seconds it waited."""
+    cool = env_int("COOL", 0)
+    heat = None
+    for path in (LAST_HEAT, LAST_RUN):
+        try:
+            heat = time.time() - float(path.read_text())
+            break
+        except (OSError, ValueError):
+            continue
+    if cool > 0 and heat is not None and heat < cool:
+        print(f"cooling {cool - heat:.0f} s after the last model run or build (COOL)", flush=True)
+        time.sleep(cool - heat)
+        return cool - heat
+    return 0
+
+
+def settle(timed=True):
     """Before a model run: wait until the GPU memory of the last one is free again. The driver releases the memory of
     a finished process lazily: on the 395 a run right after another failed on memory or hung while loading
     (08.10-11.10). Done at once when the memory in use is within SETTLE_MARGIN MiB (2048) of the least seen on this
     machine (cache/idle-used.json), else the memory is read every SETTLE_STEP seconds (3) until it stops going down,
-    SETTLE_MAX seconds (180) at most. Without a reading the old rule: SETTLE seconds (30) after the last model run."""
+    SETTLE_MAX seconds (180) at most. Without a reading the old rule: SETTLE seconds (30) after the last model run.
+    timed=False: the run measures no speed (03, 08), so it does not wait for COOL either."""
     try:
         since = time.time() - float(LAST_RUN.read_text())
     except (OSError, ValueError):
         since = None
-    # COOL seconds (0): at least that long after the last model run or build, so that the arms of a run start from about
-    # the same temperature (the 395 reached 95 C in an hour of chats to 213K on 14.10, the ops of the last profile depth
-    # ran 2 percent slower than the night before; the first arm after the build of 14.10 ran 3 to 5 percent slower in
-    # every phase than the second, also in the steps that read nothing from the drive)
-    cool = env_int("COOL", 0)
-    try:
-        heat = time.time() - float(LAST_HEAT.read_text())
-    except (OSError, ValueError):
-        heat = since
-    if cool > 0 and heat is not None and heat < cool:
-        print(f"cooling {cool - heat:.0f} s after the last model run or build (COOL)", flush=True)
-        time.sleep(cool - heat)
-        if since is not None:
-            since += cool - heat
+    waited = cool_down() if timed else 0
+    if since is not None:
+        since += waited
     max_wait, step = env_int("SETTLE_MAX", 180), env_int("SETTLE_STEP", 3)
     if since is not None and since > max_wait:
         return
@@ -538,16 +548,17 @@ def retryable(code, text):
     return any(s in text for s in MEMORY_ERRORS) or (code & 0xffffffff >= 0xC0000000 and "error" not in text.lower())
 
 
-def execute(cmd, log, run_env, stdout=None, model=True, check=True, cwd=None):
+def execute(cmd, log, run_env, stdout=None, model=True, check=True, cwd=None, timed=True):
     """Run cmd with its output in log, its stdout in a separate file when given, in cwd when given. A model run that
-    fails on memory gets two more tries after longer waits: the driver frees the memory of the previous process lazily."""
+    fails on memory gets two more tries after longer waits: the driver frees the memory of the previous process lazily.
+    timed=False: a model run that measures no speed, see settle()."""
     cmd = [str(c) for c in cmd]
     if model:
         no_server_running()
     first = log
     for attempt in (1, 2, 3):
         if model:
-            settle()
+            settle(timed)
         with log.open("w", encoding="utf-8") as f:
             f.write(json.dumps({"command": cmd, "env": env_identity(run_env)}) + "\n")
             f.flush()
@@ -945,7 +956,7 @@ def cmd_quality():
         print(f"reference {ref.name}: running, {log.name}; about {ctx // 2 * chunks * 248324 * 2 / 2**30:.1f} GiB, "
               f"{shutil.disk_usage(folder).free / 2**30:.0f} GiB free", flush=True)
         try:
-            _, text = execute([exe, *params, *ref.args, "--kl-divergence-base", part], log, ref_env)
+            _, text = execute([exe, *params, *ref.args, "--kl-divergence-base", part], log, ref_env, timed=False)
             ppl = number(r"Final estimate: PPL = ([\d.]+) \+/- ([\d.]+)", text, "final PPL")
             logits_info(part, ctx, chunks)
             part.replace(data)
@@ -974,7 +985,7 @@ def cmd_quality():
                     "machine": machine()}
 
         def go(log):
-            _, text = execute(cmd, log, run_env)
+            _, text = execute(cmd, log, run_env, timed=False)
             return {"ratio": number(r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*([-\d.e+]+)[^\d]+([\d.e+-]+)", text, "PPL ratio"),
                     "kld": number(r"Mean\s+KLD:\s*([-\d.e+]+)", text, "mean KLD")[0],
                     "kld999": number(r"99\.9%\s+KLD:\s*([-\d.e+]+)", text, "99.9% KLD")[0],
@@ -1396,15 +1407,15 @@ def cmd_decode():
             except Fail as e:
                 run.failed = True
                 results[arm.name, prefix] = f"FAIL {e}"
-    def build_chats(specs, base=0, tag=""):
+    def build_chats(specs, base=0, tag="", gen=chat_gen):
         text = corpus[base:]
         chats = []
         for i, spec in enumerate(specs):
             start, n_turns, add_chars = spec
-            turns = [((text[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", chat_gen)]
+            turns = [((text[:start] + "\n\n" if start else "") + "Summarize the text above in two sentences.", gen)]
             for ti in range(n_turns):
                 add = text[start + ti*add_chars:start + (ti + 1)*add_chars]
-                turns.append((add + "\n\nAnd this part, in two sentences?", chat_gen))
+                turns.append((add + "\n\nAnd this part, in two sentences?", gen))
             # the name is the whole spec (two conversations from one start differ by their turns), and a spec given
             # twice runs twice under two names: the answer files of a turn are named after it
             repeat = specs[:i].count(spec)
@@ -1415,14 +1426,26 @@ def cmd_decode():
     # k*DECPARSHIFT chars on (the slots of -np, 23.10); the arm gives -np N itself. N copies of each DECCHAT spec run
     # at once (two specs and DECPAR=4: 8 clients), so the summary counts the conversations, and a run with more of
     # them than slots fails: the rest would wait for a slot inside the wall time and the rate would read low
-    par_of = {arm.name: int(arm.env.get("DECPAR", "1")) for arm in arms}
+    def arm_int(arm, name, default):
+        value = arm.env.get(name)
+        if value is None:
+            return default
+        if not re.fullmatch(r"[0-9]+", value):
+            raise Fail(f"{arm.name}: {name} must be a whole number, got {value!r}")
+        return int(value)
+
+    par_of = {arm.name: arm_int(arm, "DECPAR", 1) for arm in arms}
     par_shift = env_int("DECPARSHIFT", 250000)
+    # DECCHATGEN among the variables of an arm: its own tokens per answer (25.10: decode of a few streams at once with
+    # short prompts, as the multi-stream numbers of Rulith Inference)
+    gen_of = {arm.name: arm_int(arm, "DECCHATGEN", chat_gen) for arm in arms}
 
     def chats_for(arm):
         specs = arm_chat_specs.get(arm.name, chat_specs)
+        gen = gen_of[arm.name]
         if par_of[arm.name] <= 1:
-            return build_chats(specs)
-        return [c for k in range(par_of[arm.name]) for c in build_chats(specs, k*par_shift, f"p{k}-")]
+            return build_chats(specs, gen=gen)
+        return [c for k in range(par_of[arm.name]) for c in build_chats(specs, k*par_shift, f"p{k}-", gen)]
 
     chats_of = {arm.name: chats_for(arm) for arm in arms}
     if any(chats_of.values()):
@@ -1587,7 +1610,9 @@ def cmd_decode():
                              x["cache_n"] + x["prompt_n"], x["prompt_n"],
                              f"{rate(x['prompt_n'], x['prompt_ms']):.1f}", f"{rate(x['n'], x['ms']):.2f}",
                              f"{x['draft_acc']}/{x['draft_n']}" if x["draft_n"] else "-"] + (["k"] if kept else []))
-        own = "".join(f"; {name}: {' '.join(f'{a}:{b}:{c}' for a, b, c in specs)}" for name, specs in arm_chat_specs.items())
+        own = "".join(f"; {name}: {' '.join(f'{a}:{b}:{c}' for a, b, c in specs)}"
+                      + (f" ({gen_of[name]} tokens per answer)" if gen_of[name] != chat_gen else "")
+                      for name, specs in arm_chat_specs.items())
         run.add("", f"chat: conversations (start:turns:chars) {' '.join(f'{a}:{b}:{c}' for a, b, c in chat_specs)}{own} of "
                 f"{Path(env('PPLFILE')).name}, {chat_gen} tokens per answer, prompt cache on",
                 *table(["arm", "start-turns-chars", "turn", "depth", "new", "PP t/s", "TG t/s", "draft"], rows))
@@ -2360,7 +2385,7 @@ def cmd_starts():
             for i in range(n_starts):
                 wait_no_server()
                 no_server_running()
-                settle()
+                settle(timed=False)
                 one = log.with_name(f"{log.stem}-{i + 1}.log")
                 with one.open("w", encoding="utf-8") as f:
                     f.write(json.dumps({"command": [str(exe), *args], "env": env_identity(run_env)}) + "\n")
@@ -2434,6 +2459,9 @@ def cmd_kernels():
                         "env": env_identity(run_env), "machine": machine()}
 
             def go(log):
+                # a speed measurement too: COOL after the build (a perf run loads no model and does not count as heat,
+                # so only the first one after the build waits)
+                cool_down()
                 code, text = execute(cmd, log, run_env, model=False, check=False)
                 text = re.sub(r"\x1b\[[0-9;]*m", "", text)
                 rows = []

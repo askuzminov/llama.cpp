@@ -180,6 +180,10 @@ void ggml_vk_fork_log_int_coopmat(const vk_device & device, int mode, uint32_t m
 void ggml_vk_fork_f16acc(vk_device & device);
 // GGML_VK_SHMEM_LIMIT, GGML_VK_SHMEM_PROBE: the shared memory limit of the shaders, once the compute queue exists
 void ggml_vk_fork_shmem_limit(vk_device & device);
+
+// sparse buffers of the device (25.10), logged once: an elastic KV on Vulkan would reserve the range of the whole cache
+// and bind memory to the cells in use, as the CUDA one maps VMM granules (MoltenVK has none)
+void ggml_vk_fork_log_sparse(const vk_device & device);
 // GGML_VK_INT_LARGE_TILE: the large int8 coopmat tiles for matmul and matmul_id even where the large f16 tile is off
 void ggml_vk_fork_int_large_tile(const vk_device & device, bool & matmul, bool & matmul_id);
 // the <name>_Shared buffer type and GGML_VK_MM_CHUNK_MB

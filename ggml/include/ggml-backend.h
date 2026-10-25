@@ -391,6 +391,10 @@ extern "C" {
     // allocation of the input copies depends on it. A copy callback that maps the weights itself (the MoE cache of llama.cpp) needs 0
     GGML_API void                          ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, int depth);
 
+    // fork: the uploads that the prefetch issues ahead go through callback (graph NULL): it returns true when it issued the
+    // copy of src into dst on backend itself (a device cache of experts copies the experts it holds in device memory)
+    GGML_API void                          ggml_backend_sched_set_upload_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
     // fork: a timeline of host and device spans in the trace event format of Perfetto and chrome://tracing, written to the file
     // GGML_TIMELINE names while on (llama-server turns it on for LLAMA_TRACE_REQUESTS). Times are those of ggml_time_us()
     GGML_API bool                          ggml_timeline_on(void);

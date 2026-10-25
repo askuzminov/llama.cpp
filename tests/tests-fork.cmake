@@ -53,6 +53,10 @@ endif()
 # generated elsewhere: test-qsa-multi-fork -m <model> --dense-out <file>, then the same with --dense-in <file>
 llama_build(test-qsa-multi-fork.cpp)
 
+# the device cache of the host experts with --phase-mem (keep, fill, kv) against the release of all slots at every
+# phase switch: built everywhere (llama.h, gguf.h), registered where the matrix models exist, skips without a GPU
+llama_build(test-moe-cache-fork.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # the models of this matrix come from test-llama-archs (the generate-models fixture), which upstream builds under
     # the same condition: on a Windows DLL build there are none
@@ -94,6 +98,31 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-qsa-multi-fork PROPERTIES
         FIXTURES_REQUIRED "generate-models;qsa-multi-dense"
     )
+
+    # the moe-cache through the phase switches: the reference run writes the model it builds from the qwen4exp of the
+    # matrix (32 experts, no per-expert scales) and its logprobs, each mode compares with them in a run of its own
+    set(MOE_CACHE_REF "${CMAKE_CURRENT_BINARY_DIR}/test-moe-cache-fork-ref.bin")
+    llama_test(
+        test-moe-cache-fork
+        NAME test-moe-cache-fork-ref
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --out "${MOE_CACHE_REF}"
+    )
+    set_tests_properties(test-moe-cache-fork-ref PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        FIXTURES_SETUP moe-cache-ref
+    )
+    foreach(MOE_CACHE_MODE keep fill kv)
+        llama_test(
+            test-moe-cache-fork
+            NAME test-moe-cache-fork-${MOE_CACHE_MODE}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --ref "${MOE_CACHE_REF}" --mode ${MOE_CACHE_MODE}
+        )
+        set_tests_properties(test-moe-cache-fork-${MOE_CACHE_MODE} PROPERTIES
+            FIXTURES_REQUIRED "generate-models;moe-cache-ref"
+        )
+    endforeach()
 endif()
 
 # Test checkpoint delta encoding/decoding

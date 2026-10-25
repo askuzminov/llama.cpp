@@ -434,6 +434,12 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp_fork::build_arch_graph(c
 
 // DFlash drafters read the layer inputs as [n_embd, T] rows, so collapse the streams
 // (upstream 18a0777a5 on gg/qwen4exp-dflash-layer-inp, not in master yet)
+// a device of the Vulkan backend. the meta device of a tensor split (-sm tensor) has no registry: not Vulkan
+static bool qwen4exp_dev_is_vulkan(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0;
+}
+
 static ggml_tensor * hc_stream_mean(ggml_context * ctx, ggml_tensor * x) {
     const int64_t n_embd = x->ne[0];
     const int64_t hc     = x->ne[1];
@@ -475,7 +481,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
         return llama_fork_env_int("LLAMA_HC_F16", 1) != 0;
     }();
     if (hc_f16 && il >= 0 && nt >= 32 && cparams.fused_dsv4_hc_pre &&
-            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "Vulkan") == 0) {
+            qwen4exp_dev_is_vulkan(model.dev_layer(il))) {
         xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
 
         // the inputs of the combine before (block output, residual, injection) stay alive until the f16 copy is
@@ -1337,7 +1343,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
             // the lightning indexer takes the per-block bias as its f16 mask, see the scores below
             if (!keys_only) {
                 ggml_backend_dev_t dev_l = model.dev_layer(il);
-                const bool vk_l = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev_l)), "Vulkan") == 0;
+                const bool vk_l = qwen4exp_dev_is_vulkan(dev_l);
                 qsa->bias = ggml_new_tensor_3d(ctx0, blk_bias && qsa_use_lid(idx_dim, n_idx_h, n_tps, n_stream, vk_l) ? GGML_TYPE_F16 : GGML_TYPE_F32,
                         blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
@@ -1542,7 +1548,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
     }
 
     // Vulkan fuses split heads into one matmul with the sum at its store. Other backends batch the heads.
-    const bool is_vulkan = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0;
+    const bool is_vulkan = qwen4exp_dev_is_vulkan(dev);
     bool split_heads = llama_fork_env_int("LLAMA_QSA_SPLIT_HEADS", is_vulkan ? 1 : 0) != 0;
 
     // Use the full pool size so reserve and execution choose the same graph at every KV depth.
@@ -1796,7 +1802,7 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     bool use_list = false;
     if (list_mode == 1 && from_pos && cparams.flash_attn) {
         ggml_backend_dev_t dev_l = model.dev_layer(il);
-        const bool vk_l = std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev_l)), "Vulkan") == 0;
+        const bool vk_l = qwen4exp_dev_is_vulkan(dev_l);
         use_list = vk_l && n_kv_m >= (list_min >= 0 ? list_min : std::max<int64_t>(4096, 2*top_k->ne[0]));
     }
 

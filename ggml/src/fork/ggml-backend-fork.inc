@@ -454,6 +454,12 @@ void ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, int depth) {
     }
 }
 
+void ggml_backend_sched_set_upload_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->prefetch.upload_cb      = callback;
+    sched->prefetch.upload_cb_data = user_data;
+}
+
 // the uploads are done and their events can be reused (Vulkan takes back the events of a record only at a sync)
 static void ggml_backend_sched_prefetch_sync(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_prefetch * pf = &sched->prefetch;
@@ -578,7 +584,10 @@ static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched, int s)
             if (!ggml_backend_sched_prefetch_weight(input)) {
                 continue;
             }
-            ggml_backend_tensor_set_async(copy, tensor_copy(input, b, sched->cur_copy), input->data, 0, ggml_nbytes(input));
+            struct ggml_tensor * dst = tensor_copy(input, b, sched->cur_copy);
+            if (pf->upload_cb == nullptr || !pf->upload_cb(copy, input, dst, nullptr, pf->upload_cb_data)) {
+                ggml_backend_tensor_set_async(copy, dst, input->data, 0, ggml_nbytes(input));
+            }
         }
         ggml_backend_event_record(pf->done[b][t % (GGML_SCHED_PREFETCH_MAX + 1)], copy);
         if (pf->n_uploads++ == 0) {

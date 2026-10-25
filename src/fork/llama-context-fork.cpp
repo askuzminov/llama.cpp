@@ -31,6 +31,15 @@
 // phase_mem: device memory that the prompt compute buffers leave free
 static const size_t PHASE_MEM_MARGIN = 1024ull*1024*1024;
 
+// LLAMA_MOE_CACHE_KEEP (25.10): -1 (default) the moe-cache gives a prompt phase and the elastic KV only the layers of
+// slots they need, and the next generation phase uploads only those layers again; 0 releases all slots, as before;
+// N > 0 keeps at most N MiB through a prompt phase. on the 3090 (25.10) a ~3.8K-token turn released 13.5 GiB of slots
+// for the 6 GiB of prompt buffers and uploaded them all again after the prompt, ~1 s of its ~5 s
+static int64_t moe_cache_keep_mib() {
+    static const int64_t keep = llama_fork_env_int("LLAMA_MOE_CACHE_KEEP", -1);
+    return keep;
+}
+
 uint32_t llama_context::n_ubatch_split() const {
     return phase_n_tokens > 0 ? std::min(phase_n_tokens, cparams.n_ubatch) : cparams.n_ubatch;
 }
@@ -110,10 +119,25 @@ void llama_context::kv_elastic_init_fork() {
         return kv_elastic_set_fork(n_cells + kv_elastic_step, true);
     });
 
-    const uint32_t cap = memory->kv_set_capacity_fork(kv_elastic_step);
+    const uint32_t cap = kv_elastic_capacity_fork(kv_elastic_step);
 
     LLAMA_LOG_INFO("%s: kv_elastic: %u of %u cells mapped, step %u, %.1f MiB per 1024 cells%s\n", __func__, cap, cparams.n_ctx,
             kv_elastic_step, memory->kv_cell_bytes_fork()*1024/1024.0/1024.0, mode > 0 ? " (on request)" : "");
+}
+
+// LLAMA_KV_ELASTIC_TEST_MIB (tests): the device memory of the KV capacity and of the moe-cache slots together stops at this
+// many MiB, so that a growth past it makes the cache give up layers as on a full device. the emulation of
+// LLAMA_KV_ELASTIC=1 maps any capacity, and a host with free memory never gets there. 0 (default): no limit
+uint32_t llama_context::kv_elastic_capacity_fork(uint32_t n_cells) {
+    static const int64_t test_mib = llama_fork_env_int("LLAMA_KV_ELASTIC_TEST_MIB", 0);
+    const size_t cell = memory->kv_cell_bytes_fork();
+    if (test_mib > 0 && cell > 0) {
+        const size_t   held  = moe_cache_fork && moe_cache_fork->ready() ? moe_cache_fork->size_slots() : 0;
+        const size_t   limit = (size_t) test_mib*1024*1024;
+        const uint32_t fit   = limit > held ? (uint32_t) std::min<size_t>((limit - held)/cell/kv_elastic_step*kv_elastic_step, UINT32_MAX) : 0;
+        n_cells = std::min(n_cells, std::max(memory->kv_capacity_fork(), fit));
+    }
+    return memory->kv_set_capacity_fork(n_cells);
 }
 
 bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release) {
@@ -124,16 +148,23 @@ bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release) {
     const uint32_t old  = memory->kv_capacity_fork();
     const uint32_t want = GGML_PAD(n_cells, kv_elastic_step);
 
-    uint32_t cap = memory->kv_set_capacity_fork(want);
+    uint32_t cap = kv_elastic_capacity_fork(want);
 
-    // the moe-cache holds the memory: its slots go, the next generation phase sizes them from what is left
+    // the moe-cache holds the memory: it gives up layers of slots until the cells fit (all of them with
+    // LLAMA_MOE_CACHE_KEEP=0), the next generation phase gives those layers slots from what is left
     if (cap < std::min(want, cparams.n_ctx) && release && moe_cache_fork && moe_cache_fork->ready()) {
-        moe_cache_fork->release();
+        if (moe_cache_keep_mib() == 0) {
+            moe_cache_fork->release();
+            cap = kv_elastic_capacity_fork(want);
+        }
+        while (cap < std::min(want, cparams.n_ctx) && moe_cache_fork->ready()) {
+            // whole layers, at least one per try: the mapping rounds every tensor of the cache up to its granule
+            moe_cache_fork->release_bytes(std::max<size_t>(1, (size_t) (std::min(want, cparams.n_ctx) - cap)*memory->kv_cell_bytes_fork()));
+            cap = kv_elastic_capacity_fork(want);
+        }
         phase_cache = false;
         gf_res_prev_reset();
         gf_res_prev_active = nullptr;
-
-        cap = memory->kv_set_capacity_fork(want);
     }
 
     if (cap != old) {
@@ -141,6 +172,12 @@ bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release) {
     }
 
     return cap >= std::min(n_cells, cparams.n_ctx);
+}
+
+bool llama_context::sched_upload_experts_fork(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    GGML_UNUSED(graph);
+    auto * lctx = static_cast<llama_context *>(user_data);
+    return lctx->moe_cache_fork && lctx->moe_cache_fork->upload_weight(backend, src, dst);
 }
 
 void llama_context::phase_update(uint32_t n_tokens) {
@@ -174,7 +211,9 @@ void llama_context::phase_update(uint32_t n_tokens) {
         if (!small && n_tokens > phase_n_reserve) {
             phase_n_reserve = n_tokens;
         }
-        if (moe_cache_fork) {
+        // a larger generation reserve takes the memory of the slots; after a prompt phase the slots it left stay, its
+        // buffers go before the generation ones are reserved
+        if (moe_cache_fork && (phase == LLAMA_PHASE_GEN || moe_cache_keep_mib() == 0)) {
             moe_cache_fork->release();
         }
         phase_cache = false;
@@ -260,7 +299,9 @@ void llama_context::phase_gen() {
 void llama_context::phase_prompt(uint32_t n_tokens) {
     const int64_t t_start_us = ggml_time_us();
 
-    if (moe_cache_fork) {
+    // the moe-cache keeps the slots that the buffers of the plan leave room for, see moe_cache_keep_mib()
+    const bool keep = moe_cache_fork && moe_cache_keep_mib() != 0;
+    if (moe_cache_fork && !keep) {
         moe_cache_fork->release();
     }
     phase_cache = false;
@@ -271,12 +312,19 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
     }
     sched_free();
 
-    // elastic KV: the cells of the prompt and a step mapped before the free memory is measured for the plan
+    // elastic KV: the cells of the prompt and a step mapped before the free memory is measured for the plan (the
+    // moe-cache gives up layers for them if it has to)
     if (kv_elastic) {
-        kv_elastic_set_fork(memory->get_n_kv_used() + n_tokens + kv_elastic_step, false);
+        kv_elastic_set_fork(memory->get_n_kv_used() + n_tokens + kv_elastic_step, keep);
     }
 
     const int64_t t_free_us = ggml_time_us();
+
+    // the slots count as free memory of their device for the plan, the cache gives up what the buffers take below
+    ggml_backend_dev_t dev_cache  = keep && moe_cache_fork->ready() ? moe_cache_fork->get_dev() : nullptr;
+    const size_t       size_cache = dev_cache ? moe_cache_fork->size_slots() : 0;
+    size_t             size_kept  = 0;
+    size_t             free_cache = 0; // free memory of the device of the cache, without its slots
 
     // free memory of each device that runs the graphs
     std::map<ggml_backend_dev_t, size_t> budget;
@@ -292,6 +340,10 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
             size_t free  = 0;
             size_t total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
+            if (dev == dev_cache) {
+                free_cache = free;
+                free      += size_cache;
+            }
             if (total > 0) {
                 budget[dev] = free > PHASE_MEM_MARGIN ? free - PHASE_MEM_MARGIN : 0;
                 free_all += free;
@@ -319,6 +371,8 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
     int64_t e_last = 0; // bytes over the budget on the worst device
     int     s_last = 0; // graph splits
 
+    std::map<ggml_backend_dev_t, size_t> sizes_last; // of the last query
+
     const char * func = __func__;
 
     auto query = [&](uint32_t n_ub) {
@@ -331,6 +385,7 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
         for (const auto & [dev, b] : budget) {
             e_last = std::max(e_last, (int64_t) sizes[dev] - (int64_t) b);
         }
+        sizes_last = sizes;
         n_query++;
         LLAMA_LOG_DEBUG("%s: phase_mem: ubatch %u, %.0f MiB over the free memory, %d graph splits\n", func, n_ub, e_last/1024.0/1024.0, s_last);
     };
@@ -384,6 +439,17 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
                 __func__, n_lo, e_last/1024.0/1024.0, s_last, s_max);
     }
 
+    // the moe-cache gives up the layers of slots that the buffers of the plan take, and what LLAMA_MOE_CACHE_KEEP=N caps
+    if (dev_cache) {
+        query(n_lo);
+        int64_t need = (int64_t) sizes_last[dev_cache] + (int64_t) PHASE_MEM_MARGIN - (int64_t) free_cache;
+        if (moe_cache_keep_mib() > 0) {
+            need = std::max(need, (int64_t) size_cache - moe_cache_keep_mib()*1024*1024);
+        }
+        moe_cache_fork->release_bytes(need > 0 ? (size_t) need : 0);
+        size_kept = moe_cache_fork->ready() ? moe_cache_fork->size_slots() : 0;
+    }
+
     const int64_t t_query_us = ggml_time_us();
 
     // the allocation can fail although the sizes fit, e.g. when a driver refuses a large buffer
@@ -402,11 +468,18 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
             sched_reserve();
             break;
         } catch (const std::exception & err) {
-            if (n_lo <= n_step) {
-                throw;
+            // the slots that the cache kept go first, then the ubatch gets smaller
+            if (moe_cache_fork && moe_cache_fork->ready()) {
+                LLAMA_LOG_WARN("%s: phase_mem: %s at ubatch %u, the moe-cache gives up its slots\n", __func__, err.what(), n_lo);
+                moe_cache_fork->release();
+                size_kept = 0;
+            } else {
+                if (n_lo <= n_step) {
+                    throw;
+                }
+                LLAMA_LOG_WARN("%s: phase_mem: %s at ubatch %u, trying a smaller one\n", __func__, err.what(), n_lo);
+                n_lo = std::max(n_step, n_lo/2/n_step*n_step);
             }
-            LLAMA_LOG_WARN("%s: phase_mem: %s at ubatch %u, trying a smaller one\n", __func__, err.what(), n_lo);
-            n_lo = std::max(n_step, n_lo/2/n_step*n_step);
             for (auto * f : phase_followers) {
                 f->sched_free();
             }
@@ -432,9 +505,14 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
 
     const int64_t t_end_us = ggml_time_us();
 
-    LLAMA_LOG_INFO("%s: phase_mem: prompt, batch %u tokens, KV cells %u, ubatch %u of %u, compute %.0f + %.0f MiB (drafts), %.0f MiB were free, %d queries, %.2f s (free %.2f, queries %.2f, reserve %.2f)\n",
+    char kept[96] = "";
+    if (dev_cache) {
+        snprintf(kept, sizeof(kept), " (moe-cache kept %.0f of %.0f MiB)", size_kept/1024.0/1024.0, size_cache/1024.0/1024.0);
+    }
+
+    LLAMA_LOG_INFO("%s: phase_mem: prompt, batch %u tokens, KV cells %u, ubatch %u of %u, compute %.0f + %.0f MiB (drafts), %.0f MiB were free%s, %d queries, %.2f s (free %.2f, queries %.2f, reserve %.2f)\n",
             __func__, n_tokens, phase_n_kv, n_lo, n_max, dev_size(this)/1024.0/1024.0, size_f/1024.0/1024.0, free_all/1024.0/1024.0,
-            n_query, 1e-6*(t_end_us - t_start_us), 1e-6*(t_free_us - t_start_us), 1e-6*(t_query_us - t_free_us), 1e-6*(t_end_us - t_query_us));
+            kept, n_query, 1e-6*(t_end_us - t_start_us), 1e-6*(t_free_us - t_start_us), 1e-6*(t_query_us - t_free_us), 1e-6*(t_end_us - t_query_us));
 }
 
 llm_graph_result * llama_context::get_gf_res_reuse(const llm_graph_params & gparams) {

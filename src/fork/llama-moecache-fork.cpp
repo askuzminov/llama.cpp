@@ -962,6 +962,8 @@ llama_moe_cache_fork::llama_moe_cache_fork(const llama_model & model, int32_t n_
         LLAMA_LOG_ERROR("%s: LLAMA_MOE_CACHE_POLICY=\"%s\" is neither lru nor lfu, using lfu\n", __func__, policy);
     }
     async_table = llama_fork_env_int("LLAMA_MOE_CACHE_ASYNC", 0) != 0;
+    copy_dev    = llama_fork_env_int("LLAMA_MOE_CACHE_COPY", 1) != 0;
+    fill_bytes  = (size_t) std::max<int64_t>(0, llama_fork_env_int("LLAMA_MOE_CACHE_FILL", 0))*1024*1024;
 }
 
 llama_moe_cache_fork::~llama_moe_cache_fork() {
@@ -1099,6 +1101,20 @@ void llama_moe_cache_fork::init(ggml_backend_sched_t sched) {
     il2idx.assign(hparams.n_layer(), -1);
     for (int idx = 0; idx < (int) sel.size(); ++idx) {
         il2idx[sel[idx].il] = idx;
+        const ggml_tensor * ws[3] = { sel[idx].w_up, sel[idx].w_gate, sel[idx].w_down };
+        for (int which = 0; which < 3; ++which) {
+            if (ws[which] != nullptr) {
+                bound[ws[which]] = { idx, which };
+            }
+        }
+    }
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_views.reset(ggml_init(params));
     }
     hot.resize(sel.size());
     layers = std::move(sel);
@@ -1115,8 +1131,25 @@ void llama_moe_cache_fork::init(ggml_backend_sched_t sched) {
     }
 }
 
+size_t llama_moe_cache_fork::slot_bytes(int idx) const {
+    const layer & l = layers[idx];
+    size_t b = 0;
+    for (const ggml_tensor * w : { l.w_up, l.w_gate, l.w_down }) {
+        b += w ? w->nb[2] : 0;
+    }
+    return b;
+}
+
+size_t llama_moe_cache_fork::size_slots() const {
+    size_t res = 0;
+    for (const auto & b : buf_slots) {
+        res += b ? ggml_backend_buffer_get_size(b.get()) : 0;
+    }
+    return res;
+}
+
 void llama_moe_cache_fork::alloc() {
-    if (layers.empty() || backend_up == nullptr || ready()) {
+    if (layers.empty() || backend_up == nullptr || n_live == (int) layers.size()) {
         return;
     }
 
@@ -1130,11 +1163,29 @@ void llama_moe_cache_fork::alloc() {
     size_t total = 0;
     ggml_backend_dev_memory(dev, &free, &total);
 
+    // the layers without slots: all of them, or the ones that release_bytes() took
+    std::vector<int> todo;
+    size_t  b_todo = 0; // one slot on each of them
+    int32_t n_kept = 0; // the most slots of a layer that kept its slots
+    for (int idx = 0; idx < n_layers; ++idx) {
+        if (n_live > 0 && lrus[idx].n_slots > 0) {
+            n_kept = std::max(n_kept, lrus[idx].n_slots);
+            continue;
+        }
+        todo.push_back(idx);
+        b_todo += slot_bytes(idx);
+    }
+
     int64_t n = n_slots_req;
     if (n < 0) {
         // one more slot covers the zero slot and the padding
-        const size_t need = MOE_CACHE_MARGIN + b_slot;
-        n = free > need ? (int64_t) ((free - need) / b_slot) : 0;
+        const size_t need = MOE_CACHE_MARGIN + b_todo;
+        n = free > need ? (int64_t) ((free - need) / b_todo) : 0;
+        // a layer that gets slots again takes no more than the layers that kept theirs have, the counts even out when
+        // those give theirs up (release_bytes() takes the layers with the most slots first)
+        if (n_kept > 0) {
+            n = std::min<int64_t>(n, n_kept);
+        }
     }
     n = std::min<int64_t>(n, n_expert);
 
@@ -1144,128 +1195,193 @@ void llama_moe_cache_fork::alloc() {
 
     if (n <= 0) {
         llama_log_internal(log_level, "%s: %s has %.0f MiB free, one slot on %d layers takes %.2f MiB and %.0f MiB stay free, no slots\n",
-                MOE_CACHE_LOG, ggml_backend_dev_name(dev), free/mib, n_layers, b_slot/mib, MOE_CACHE_MARGIN/mib);
+                MOE_CACHE_LOG, ggml_backend_dev_name(dev), free/mib, (int) todo.size(), b_todo/mib, MOE_CACHE_MARGIN/mib);
         return;
     }
 
-    {
+    // the table and the host tensors of all layers stay while a layer has slots
+    if (n_live == 0) {
         ggml_init_params params = {
-            /*.mem_size   =*/ (4*n_layers + 1)*ggml_tensor_overhead(),
+            /*.mem_size   =*/ (n_layers + 1)*ggml_tensor_overhead(),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
         ctx_dev.reset(ggml_init(params));
         params.mem_size = (2*n_layers + (async_table ? 1 : 0))*ggml_tensor_overhead();
         ctx_host.reset(ggml_init(params));
+
+        table_all = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_expert, n_layers);
+        ggml_set_name(table_all, "moe_cache.table");
+        if (async_table) {
+            table_staging = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, n_expert, n_layers);
+            ggml_set_name(table_staging, "moe_cache.table_staging");
+        }
+
+        const int64_t n_used_max = model.hparams.n_expert_used_max();
+
+        for (int idx = 0; idx < n_layers; ++idx) {
+            layer & l = layers[idx];
+
+            l.table = ggml_view_2d(ctx_dev.get(), table_all, 1, n_expert, ggml_element_size(table_all), idx*table_all->nb[1]);
+            ggml_format_name(l.table, "moe_cache.%d.table", l.il);
+
+            l.skip = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, n_expert);
+            ggml_format_name(l.skip, "moe_cache.%d.skip", l.il);
+
+            l.ids = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, n_used_max*N_TOKENS_MAX);
+            ggml_format_name(l.ids, "moe_cache.%d.ids", l.il);
+        }
+
+        buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), ggml_backend_dev_buffer_type(dev)));
+        if (buf_dev) {
+            ggml_backend_buffer_type_t buft_host = async_table ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (!buft_host) {
+                buft_host = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+            }
+            buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
+        }
+        if (!buf_dev || !buf_host) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the table of %d layers on %s, no slots\n", MOE_CACHE_LOG, n_layers, ggml_backend_dev_name(dev));
+            free_all();
+            return;
+        }
+        ggml_backend_buffer_clear(buf_host.get(), 0);
+
+        table_host.assign(n_expert*n_layers, 0);
+        lrus.assign(n_layers, lru());
+        ctx_slots.resize(n_layers);
+        buf_slots.resize(n_layers);
     }
 
-    table_all = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_expert, n_layers);
-    ggml_set_name(table_all, "moe_cache.table");
-    if (async_table) {
-        table_staging = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, n_expert, n_layers);
-        ggml_set_name(table_staging, "moe_cache.table_staging");
-    }
+    // the worker of the last update() may still submit to backend_up
+    join_uploads();
 
-    const int64_t n_used_max = model.hparams.n_expert_used_max();
+    uint64_t n_up  = 0;
+    uint64_t b_up  = 0;
+    int      n_new = 0;
 
-    for (int idx = 0; idx < n_layers; ++idx) {
+    // the background fill takes the experts of the new layers by rank, the most recent of every layer first
+    std::vector<std::vector<fill_entry>> fill_new;
+
+    for (int idx : todo) {
         layer & l = layers[idx];
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ 3*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
 
         auto new_slots = [&](const ggml_tensor * w, const char * name) -> ggml_tensor * {
             if (w == nullptr) {
                 return nullptr;
             }
-            ggml_tensor * t = ggml_new_tensor_3d(ctx_dev.get(), w->type, w->ne[0], w->ne[1], n + 1);
+            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), w->type, w->ne[0], w->ne[1], n + 1);
             ggml_format_name(t, "moe_cache.%d.%s", l.il, name);
             return t;
         };
 
-        l.s_up   = new_slots(l.w_up, l.merged ? "gate_up" : "up");
-        l.s_gate = new_slots(l.w_gate, "gate");
-        l.s_down = new_slots(l.w_down, "down");
+        ggml_tensor * s_up   = new_slots(l.w_up, l.merged ? "gate_up" : "up");
+        ggml_tensor * s_gate = new_slots(l.w_gate, "gate");
+        ggml_tensor * s_down = new_slots(l.w_down, "down");
 
-        l.table = ggml_view_2d(ctx_dev.get(), table_all, 1, n_expert, ggml_element_size(table_all), idx*table_all->nb[1]);
-        ggml_format_name(l.table, "moe_cache.%d.table", l.il);
-
-        l.skip = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, n_expert);
-        ggml_format_name(l.skip, "moe_cache.%d.skip", l.il);
-
-        l.ids = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, n_used_max*N_TOKENS_MAX);
-        ggml_format_name(l.ids, "moe_cache.%d.ids", l.il);
-    }
-
-    buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), ggml_backend_dev_buffer_type(dev)));
-    if (buf_dev) {
-        ggml_backend_buffer_type_t buft_host = async_table ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
-        if (!buft_host) {
-            buft_host = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_dev_buffer_type(dev)));
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate %d slots of layer %d on %s, %d layers without slots\n",
+                    MOE_CACHE_LOG, (int) n, l.il, ggml_backend_dev_name(dev), n_layers - n_live);
+            break;
         }
-        buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
-    }
-    if (!buf_dev || !buf_host) {
-        LLAMA_LOG_ERROR("%s: failed to allocate %d slots on %s, no slots\n", MOE_CACHE_LOG, (int) n, ggml_backend_dev_name(dev));
-        buf_dev.reset();
-        for (auto & l : layers) {
-            l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = nullptr;
-        }
-        table_all = nullptr;
-        table_staging = nullptr;
-        ctx_dev.reset();
-        ctx_host.reset();
-        return;
-    }
 
-    // the zero slot must stay zero, the other slots start empty
-    ggml_backend_buffer_set_usage(buf_dev.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_backend_buffer_clear(buf_dev.get(), 0);
-    ggml_backend_buffer_clear(buf_host.get(), 0);
+        // the zero slot must stay zero, the other slots start empty
+        ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_clear(buf.get(), 0);
 
-    n_slots   = (int32_t) n;
-    n_slots_l = n_slots;
+        l.s_up   = s_up;
+        l.s_gate = s_gate;
+        l.s_down = s_down;
 
-    table_host.assign(n_expert*n_layers, n_slots);
+        ctx_slots[idx] = std::move(ctx);
+        buf_slots[idx] = std::move(buf);
 
-    lrus.assign(n_layers, lru());
-
-    uint64_t n_up = 0;
-    uint64_t b_up = 0;
-
-    for (int idx = 0; idx < n_layers; ++idx) {
         lru & c = lrus[idx];
+        c = lru();
+        c.n_slots = (int32_t) n;
         c.prev.assign(n_expert, -1);
         c.next.assign(n_expert, -1);
         c.slot.assign(n_expert, -1);
-        c.expert.assign(n_slots, -1);
-        c.live.assign(n_slots, 0);
+        c.expert.assign(c.n_slots, -1);
+        c.live.assign(c.n_slots, 0);
         c.seen.assign(n_expert, UINT64_MAX);
         if (frequency_admission) {
             c.freq.assign(n_expert, 0);
         }
 
-        int32_t * skip  = (int32_t *) layers[idx].skip->data;
+        int32_t * skip  = (int32_t *) l.skip->data;
         int32_t * table = table_host.data() + idx*n_expert;
+
+        std::fill_n(skip,  n_expert, 0);
+        std::fill_n(table, n_expert, c.n_slots);
 
         // upload the experts of the last release() again, the least recent first so that the LRU keeps its order
         const auto & h = hot[idx];
-        for (int32_t i = std::min<int32_t>(n_slots, (int32_t) h.size()) - 1; i >= 0; --i) {
+        for (int32_t i = std::min<int32_t>(c.n_slots, (int32_t) h.size()) - 1; i >= 0; --i) {
             const int32_t e = h[i];
             const int32_t s = c.n_fill++;
 
             c.expert[s] = e;
             c.slot[e]   = s;
-            c.live[s]   = 1;
             lru_push(c, e);
 
-            skip[e]  = 1;
-            table[e] = s;
-
-            b_up += upload(idx, e, s);
             n_up++;
+            b_up += slot_bytes(idx);
+
+            if (fill_bytes > 0) {
+                // the graphs read it once fill_issue() uploaded it and update() published it
+                if (fill_new.size() <= (size_t) i) {
+                    fill_new.resize(i + 1);
+                }
+                fill_new[i].push_back({ idx, e, s });
+                continue;
+            }
+
+            c.live[s] = 1;
+            skip[e]   = 1;
+            table[e]  = s;
+
+            upload(idx, e, s);
         }
+
+        n_live++;
+        n_new++;
     }
 
-    // the next graph reads the new slots at once
-    ggml_backend_synchronize(backend_up);
+    if (n_new == 0) {
+        if (n_live == 0) {
+            free_all();
+        }
+        return;
+    }
+
+    n_slots_l = (int32_t) n;
+
+    if (fill_bytes > 0) {
+        for (const auto & rank : fill_new) {
+            fill_q.insert(fill_q.end(), rank.begin(), rank.end());
+        }
+        // the first part runs during the next graph, and the next update() publishes it after its wait for ev_up
+        if (fill_issue() && ev_up != nullptr) {
+            ggml_backend_event_record(ev_up, backend_up);
+            ev_up_recorded = true;
+        }
+        for (auto & c : lrus) {
+            c.uploads_done.insert(c.uploads_done.end(), c.uploads_new.begin(), c.uploads_new.end());
+            c.uploads_new.clear();
+        }
+    } else {
+        // the next graph reads the new slots at once
+        ggml_backend_synchronize(backend_up);
+    }
     ggml_backend_tensor_set(table_all, table_host.data(), 0, ggml_nbytes(table_all));
 
     const int64_t t_us = ggml_time_us() - t_start_us;
@@ -1275,37 +1391,25 @@ void llama_moe_cache_fork::alloc() {
     b_refill   += b_up;
     t_alloc_us += t_us;
 
-    llama_log_internal(log_level, "%s: %s, %d of %d MoE layers, %d slots per layer, %.2f MiB per slot, %.2f MiB total, %.0f MiB were free, %d uploads per layer per step, "
-            "refilled %" PRIu64 " experts (%.1f MiB) in %.1f ms\n",
-            MOE_CACHE_LOG, ggml_backend_dev_name(dev), n_layers, n_moe, n_slots, b_slot/mib,
-            ggml_backend_buffer_get_size(buf_dev.get())/mib, free/mib, max_ins, n_up, b_up/mib, 1e-3*t_us);
+    char kept[64] = "";
+    if (n_live > n_new) {
+        snprintf(kept, sizeof(kept), " (%d kept their slots)", n_live - n_new);
+    }
+    llama_log_internal(log_level, "%s: %s, %d of %d MoE layers%s, %d slots per layer, %.2f MiB per slot, %.2f MiB total, %.0f MiB were free, %d uploads per layer per step, "
+            "refilled %" PRIu64 " experts (%.1f MiB) in %.1f ms%s\n",
+            MOE_CACHE_LOG, ggml_backend_dev_name(dev), n_new, n_moe, kept, n_slots_l, b_todo/mib,
+            size_slots()/mib, free/mib, max_ins, n_up, b_up/mib, 1e-3*t_us, fill_bytes > 0 ? " (queued, filled in the background)" : "");
 }
 
-void llama_moe_cache_fork::release() {
-    if (!ready()) {
-        return;
-    }
-
-    const int64_t t_start_us = ggml_time_us();
-    join_uploads();
-
-    // the last graph and the uploads can still use the slots
-    ggml_backend_synchronize(backend);
-    if (ev_up_recorded) {
-        ggml_backend_event_synchronize(ev_up);
-        ev_up_recorded = false;
-    }
-    ggml_backend_synchronize(backend_up);
-
-    hot = hot_now();
-    for (size_t idx = 0; idx < layers.size(); ++idx) {
-        layer & l = layers[idx];
+void llama_moe_cache_fork::free_all() {
+    for (auto & l : layers) {
         l.s_up = l.s_gate = l.s_down = l.table = l.skip = l.ids = nullptr;
     }
-    state_save();
 
     table_all = nullptr;
     table_staging = nullptr;
+    buf_slots.clear();
+    ctx_slots.clear();
     buf_dev.reset();
     buf_host.reset();
     ctx_dev.reset();
@@ -1314,9 +1418,244 @@ void llama_moe_cache_fork::release() {
     lrus.clear();
     table_host.clear();
 
-    n_slots = 0;
+    fill_q.clear();
+    fill_pos = 0;
+
+    n_live = 0;
+}
+
+bool llama_moe_cache_fork::fill_issue() {
+    size_t bytes  = 0;
+    bool   issued = false;
+    while (fill_pos < fill_q.size() && bytes < fill_bytes) {
+        const fill_entry f = fill_q[fill_pos++];
+        lru & c = lrus[f.idx];
+        // the layer gave its slots up (release_bytes), or the expert lost its slot since
+        if (c.n_slots == 0 || f.slot >= c.n_slots || c.expert[f.slot] != f.expert || c.slot[f.expert] != f.slot || c.live[f.slot]) {
+            continue;
+        }
+        bytes += upload(f.idx, f.expert, f.slot);
+        c.uploads_new.push_back(f.slot);
+        n_fill_up++;
+        issued = true;
+    }
+    if (fill_pos == fill_q.size()) {
+        fill_q.clear();
+        fill_pos = 0;
+    }
+    return issued;
+}
+
+// the last graph and the uploads can still use the slots
+void llama_moe_cache_fork::wait_idle() {
+    join_uploads();
+
+    ggml_backend_synchronize(backend);
+    if (ev_up_recorded) {
+        ggml_backend_event_synchronize(ev_up);
+        ev_up_recorded = false;
+    }
+    ggml_backend_synchronize(backend_up);
+}
+
+void llama_moe_cache_fork::release() {
+    if (!ready()) {
+        return;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+    wait_idle();
+
+    hot = hot_now();
+    state_save();
+    free_all();
 
     t_alloc_us += ggml_time_us() - t_start_us;
+}
+
+// the uploads are done (wait_idle): the graphs read them from now on, as they would after an alloc() that uploads the
+// experts again, instead of from the next step on
+void llama_moe_cache_fork::publish_done() {
+    bool dirty = false;
+
+    for (size_t idx = 0; idx < layers.size(); ++idx) {
+        lru & c = lrus[idx];
+
+        if (c.n_slots == 0) {
+            continue;
+        }
+
+        int32_t * skip  = (int32_t *) layers[idx].skip->data;
+        int32_t * table = table_host.data() + idx*n_expert;
+
+        for (int32_t v : c.evicted) {
+            skip[v]  = 0;
+            table[v] = c.n_slots;
+        }
+        for (auto * done : { &c.uploads_done, &c.uploads_new }) {
+            for (int32_t s : *done) {
+                const int32_t e = c.expert[s];
+                skip[e]   = 1;
+                table[e]  = s;
+                c.live[s] = 1;
+            }
+            dirty = dirty || !done->empty();
+            done->clear();
+        }
+        dirty = dirty || !c.evicted.empty();
+        c.evicted.clear();
+    }
+
+    if (dirty) {
+        ggml_backend_tensor_set(table_all, table_host.data(), 0, ggml_nbytes(table_all));
+    }
+}
+
+size_t llama_moe_cache_fork::release_bytes(size_t need) {
+    if (!ready()) {
+        return 0;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+    wait_idle();
+    publish_done();
+
+    // the layers with the most slots first, the last layers first among equals
+    std::vector<int> order;
+    for (int idx = 0; idx < (int) layers.size(); ++idx) {
+        if (lrus[idx].n_slots > 0) {
+            order.push_back(idx);
+        }
+    }
+    std::sort(order.begin(), order.end(), [this](int a, int b) {
+        return lrus[a].n_slots != lrus[b].n_slots ? lrus[a].n_slots > lrus[b].n_slots : a > b;
+    });
+
+    size_t freed = 0;
+
+    for (int idx : order) {
+        if (freed >= need) {
+            break;
+        }
+
+        lru   & c = lrus[idx];
+        layer & l = layers[idx];
+
+        // its experts, most recent first, for the next alloc()
+        hot[idx].clear();
+        for (int32_t e = c.head; e >= 0; e = c.next[e]) {
+            hot[idx].push_back(e);
+        }
+
+        // the graphs of this layer compute all of its experts on the host from now on
+        std::fill_n((int32_t *) l.skip->data, n_expert, 0);
+        l.s_up = l.s_gate = l.s_down = nullptr;
+
+        freed += ggml_backend_buffer_get_size(buf_slots[idx].get());
+        buf_slots[idx].reset();
+        ctx_slots[idx].reset();
+
+        c = lru();
+        n_live--;
+    }
+
+    // the waiting fill of the layers that went: their next alloc() queues them again
+    fill_q.erase(std::remove_if(fill_q.begin() + fill_pos, fill_q.end(), [this](const fill_entry & f) {
+        return lrus[f.idx].n_slots == 0;
+    }), fill_q.end());
+
+    if (n_live == 0) {
+        state_save();
+        free_all();
+    }
+
+    t_alloc_us += ggml_time_us() - t_start_us;
+
+    return freed;
+}
+
+bool llama_moe_cache_fork::bound_live(ggml_backend_t backend, const ggml_tensor * w, int & idx, int & which) const {
+    if (!copy_dev || !ready() || backend == nullptr || ggml_backend_get_device(backend) != dev) {
+        return false;
+    }
+    const auto it = bound.find(w);
+    if (it == bound.end() || lrus[it->second.first].n_slots == 0) {
+        return false;
+    }
+    idx   = it->second.first;
+    which = it->second.second;
+    return true;
+}
+
+// the run of experts from e on (up to last) that the slots hold where the graphs read them, in slots that follow each
+// other: copied into dst in device memory. an upload the cache started is not read before it is published
+int64_t llama_moe_cache_fork::copy_run(ggml_backend_t backend, int idx, int which, ggml_tensor * dst, int64_t e, int64_t last) {
+    const lru & c = lrus[idx];
+
+    const int32_t s = c.slot[e];
+    if (s < 0 || !c.live[s]) {
+        return 0;
+    }
+    int64_t n = 1;
+    while (e + n <= last && s + n < c.n_slots && c.slot[e + n] == s + n && c.live[s + n]) {
+        n++;
+    }
+
+    const layer & l = layers[idx];
+    ggml_tensor * bank = which == 0 ? l.s_up : which == 1 ? l.s_gate : l.s_down;
+
+    ggml_reset(ctx_views.get());
+    ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], s*bank->nb[2]);
+    ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
+    ggml_backend_view_init(src_view);
+    ggml_backend_view_init(dst_view);
+    ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+
+    n_copy_dev += n;
+    b_copy_dev += ggml_nbytes(src_view);
+
+    return n;
+}
+
+int64_t llama_moe_cache_fork::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+    int idx   = -1;
+    int which = 0;
+    if (!bound_live(backend, w, idx, which)) {
+        return 0;
+    }
+    return copy_run(backend, idx, which, dst, e, last);
+}
+
+bool llama_moe_cache_fork::upload_weight(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst) {
+    int idx   = -1;
+    int which = 0;
+    if (!bound_live(backend, w, idx, which)) {
+        return false;
+    }
+
+    const size_t nb2 = w->nb[2]; // the host weights of the cache are contiguous, see init()
+
+    auto up = [&](int64_t first, int64_t end) {
+        if (first < end) {
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) w->data + first*nb2, first*nb2, (end - first)*nb2);
+            b_copy_up += (end - first)*nb2;
+        }
+    };
+
+    int64_t next = 0; // the first expert not copied yet
+    for (int64_t e = 0; e < n_expert; ) {
+        const int64_t n = copy_run(backend, idx, which, dst, e, n_expert - 1);
+        if (n == 0) {
+            e++;
+            continue;
+        }
+        up(next, e);
+        e   += n;
+        next = e;
+    }
+    up(next, n_expert);
+
+    return true;
 }
 
 // the experts of each layer, most recent first: from the live LRU, or what the last release() kept
@@ -1327,6 +1666,10 @@ std::vector<std::vector<int32_t>> llama_moe_cache_fork::hot_now() const {
     std::vector<std::vector<int32_t>> h(layers.size());
     for (size_t idx = 0; idx < layers.size(); ++idx) {
         const lru & c = lrus[idx];
+        if (c.n_slots == 0) {
+            h[idx] = hot[idx]; // a layer without slots keeps what it had when it gave them up
+            continue;
+        }
         for (int32_t e = c.head; e >= 0; e = c.next[e]) {
             h[idx].push_back(e);
         }
@@ -1407,7 +1750,8 @@ const llama_moe_cache_fork::layer * llama_moe_cache_fork::get_layer(int il) cons
     if (!ready() || il < 0 || il >= (int) il2idx.size() || il2idx[il] < 0) {
         return nullptr;
     }
-    return &layers[il2idx[il]];
+    const layer & l = layers[il2idx[il]];
+    return l.s_up != nullptr ? &l : nullptr; // a layer that gave its slots up computes on the host
 }
 
 void llama_moe_cache_fork::lru_unlink(lru & c, int32_t e) {
@@ -1444,7 +1788,7 @@ void llama_moe_cache_fork::insert(size_t idx, int32_t e) {
 
     int32_t s = -1;
 
-    if (c.n_fill < n_slots) {
+    if (c.n_fill < c.n_slots) {
         s = c.n_fill++;
     } else {
         // take the slot of the least recently used expert, but not before its own upload is published
@@ -1532,6 +1876,10 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
         const layer & l = layers[idx];
         lru         & c = lrus[idx];
 
+        if (c.n_slots == 0) {
+            continue;
+        }
+
         const int32_t * ids  = (const int32_t *) l.ids->data;
         const int32_t * skip = (const int32_t *) l.skip->data;
 
@@ -1556,7 +1904,7 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
 
             if (frequency_admission) {
                 c.freq[e] += c.freq[e] < UINT16_MAX;
-                if (++c.n_seen >= MOE_STATS_LFU_WINDOW*n_slots) {
+                if (++c.n_seen >= MOE_STATS_LFU_WINDOW*c.n_slots) {
                     c.n_seen = 0;
                     for (auto & count : c.freq) {
                         count >>= 1;
@@ -1568,7 +1916,7 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
                 lru_unlink(c, e);
                 lru_push(c, e);
             } else if (n_new < max_ins) {
-                if (frequency_admission && c.n_fill == n_slots && c.freq[e] <= c.freq[c.tail]) {
+                if (frequency_admission && c.n_fill == c.n_slots && c.freq[e] <= c.freq[c.tail]) {
                     continue;
                 }
                 n_new++;
@@ -1577,11 +1925,20 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
         }
     }
 
+    // the background fill of the slots that alloc() gave out, published by the next update() as the inserts
+    if (fill_bytes > 0) {
+        fill_issue();
+    }
+
     bool dirty  = false;
     bool issued = false;
 
     for (size_t idx = 0; idx < layers.size(); ++idx) {
         lru & c = lrus[idx];
+
+        if (c.n_slots == 0) {
+            continue;
+        }
 
         int32_t * skip  = (int32_t *) layers[idx].skip->data;
         int32_t * table = table_host.data() + idx*n_expert;
@@ -1589,7 +1946,7 @@ void llama_moe_cache_fork::update(const llm_graph_result * res) {
         // the next graph must not read the slots that receive new uploads
         for (int32_t v : c.evicted) {
             skip[v]  = 0;
-            table[v] = n_slots;
+            table[v] = c.n_slots;
         }
         for (int32_t s : c.uploads_done) {
             const int32_t e = c.expert[s];
@@ -1667,5 +2024,12 @@ void llama_moe_cache_fork::report() const {
     if (n_alloc > 1) {
         LLAMA_LOG_WARN("%s: slots allocated %" PRIu64 " times, refilled %" PRIu64 " experts (%.1f MiB), alloc and release %.1f ms per call\n",
                 MOE_CACHE_LOG, n_alloc, n_refill, (double) b_refill/mib, 1e-3*(double) t_alloc_us/(double) n_alloc);
+    }
+    if (n_fill_up > 0) {
+        LLAMA_LOG_WARN("%s: the background fill uploaded %" PRIu64 " experts, %zu wait\n", MOE_CACHE_LOG, n_fill_up, fill_q.size() - fill_pos);
+    }
+    if (n_copy_dev > 0 || b_copy_up > 0) {
+        LLAMA_LOG_WARN("%s: prompt copies: %" PRIu64 " experts (%.1f MiB) from the slots, the uploads ahead %.1f MiB from the host\n",
+                MOE_CACHE_LOG, n_copy_dev, (double) b_copy_dev/mib, (double) b_copy_up/mib);
     }
 }

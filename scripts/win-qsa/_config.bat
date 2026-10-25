@@ -137,7 +137,8 @@ rem tokens per cycle both, the draft 7.5 against 11.8 ms, the cycle 69.9 against
 rem ~3.2); on the device 1.6 GiB less, but the reserve of the draft decoder for 4096 tokens put its LM head on the
 rem cpu (4564 MiB host compute buffer): LLAMA_DFLASH_UBATCH (512) since. the first start of dflash failed to
 rem allocate a 1.5 GiB model buffer right after 03 (the retry started)
-if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16"
+rem 25.10: GATED_DELTA_NET_LAZY (the deferred rollback of 24.10): the decode arms ran it, no case checked it
+if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;GATED_DELTA_NET_LAZY"
 rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=MUL_MAT type_a=q8_0,type_b=f16;MUL_MAT type_a=q4_K,type_b=f16;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;TOP_K;FLASH_ATTN_LIST"
 rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=FLASH_ATTN_LIST;FLASH_ATTN_EXT n_kv_max=[1-9]"
 rem 13.10 (19d20ba8): wide 53/53, but the attention at 122880 903.4 against 904.2 ms, PP 785.1 against 783.1: the
@@ -329,6 +330,7 @@ rem chat (nowarm as auto of the run before, 12.6 / 14.6 / 16.7 / 17.6), the gap 
 rem page cache of the first arm (PLE input of a prompt ubatch 60 against 45 ms per 1000 tokens). PP 685.1 against
 rem 715.0, TG 35.87 against 36.99. COOL now also counts from the end of a build. the next run: the same two arms
 rem in the other order (FORCE=1 with the same build)
+rem 25.10: COOL only before the runs that measure speed (04, 05, 07), 03 and 08 wait for the GPU memory only
 if not defined COOL       set "COOL=120"
 rem 14.10: 07-trace on the 395 through GGML_TIMELINE (Nsight Systems sees no AMD gpu): the gpu span of each command
 rem buffer next to the host phases of llama, where the gpu stands still in a prompt ubatch and in a decode step with MTP
@@ -413,7 +415,33 @@ rem draft check no longer writes a state snapshot per token (3 MiB a layer each)
 rem the next step replays the records its rollback kept; nolazy and par4nolazy: the snapshots as before, against
 rem auto and par4
 rem [replaced 24.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4w0 LLAMA_MTP_WINDOW_KV=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nocap LLAMA_SPEC_DRAFT_BY_SLOTS=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4w0 LLAMA_MTP_WINDOW_KV=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nocap LLAMA_SPEC_DRAFT_BY_SLOTS=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem [replaced 25.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;dflashauto @dflash --spec-type draft-dflash --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4w0 LLAMA_MTP_WINDOW_KV=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nocap LLAMA_SPEC_DRAFT_BY_SLOTS=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 25.10 (logs 25.10 17:39), doc chat TG at 0-40K / 40-80K / 80-120K / 120-160K / 160-213K: auto 40.2 / 39.8 /
+rem 41.3 / 40.3 / 37.9 (first after the build, PP 822 against 835-842 of the others), auto06 43.0 / 42.7 / 42.6 / 41.2 /
+rem 39.3, dflashauto 3-5 percent below auto, mtpkv within the noise, nolazy 38.8 / 38.7 / 39.7 / 38.3 / 36.8: the
+rem deferred rollback stays on. par4 did not start (mapMemory of a 1.66-1.9 GB weight buffer failed while loading, 3
+rem tries; its short-prompt server started at the 2nd); par4w0 / par4nocap / par4nolazy 25.6 / 26.2 / 24.9 t/s
+rem generated together, but that wall time holds the ~3.8K prompts of every turn (227K tokens) and a turn shares its
+rem steps with the 2048-token prompt pieces of the others (TG of a turn 7.8): no decode figure like the 62 t/s of two
+rem streams at Rulith Inference. one stream (short prompts, 1024 tokens): verify 31.3 ms + 5.3 ms a token, draft step
+rem 3.75 ms (2.88 of it the LM head over 248K tokens), 1.37 drafts and 1.86 tokens a cycle
+rem 25.10 evening, the next run: prob / prob06 (--spec-draft-sampling probabilistic, upstream since the merge of 3f03):
+rem the draft samples from the head and the target verifies by rejection sampling, acceptance 1 - TV(p, q) instead of
+rem p(argmax q), at temperature 1.0 / 0.6 against auto / auto06. par2s / par4s: 2 / 4 conversations at once of a
+rem question and one 200-char turn, 1024 tokens per answer (DECCHATGEN of the arm): the decode of several streams with
+rem short prompts, as the Rulith figures
+rem 25.10 night: the user takes the most throughput over the latency of the answers in progress. par4 against
+rem par4b0 (LLAMA_PREFILL_BUDGET=0, upstream: the whole prompt in a step): on 25.10 the 2048-token pieces read the
+rem prompts at ~716 t/s against ~790-820 of the 4096-token ubatches at those depths (~30 s of 566), the generating
+rem slots then stand fewer but longer times
+rem 25.10 night: pm / par4pm (--phase-mem -ub 8192; par4pm also with the whole prompt in a step): the prompt takes
+rem the largest ubatch that fits and the generation phase gives that memory back. on 28.09 it lost on the 395: every
+rem plan allocated its Vulkan buffers anew, 0.9-3.4 s a prompt chunk and 1.08 s to switch to the generation, more than
+rem the bigger ubatch gained; the phase_mem lines of these arms show what a plan and a switch cost now
+rem 25.10 night: shexp8 / par4sh: the experts of layers 40-47 (~12 GB) in the shared memory outside the 96 GiB carve-out
+rem (Vulkan0_Shared, the gpu reads them in place; 06.10: those of 44-47 cost nothing, the KV there 2.6 percent TG):
+rem the carve-out keeps ~12 GB free for the KV of more agents; par4 failed to load at the edge of the carve-out on 25.10
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;prob @draft --spec-auto --spec-draft-sampling probabilistic;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;prob06 DECSAMP=0.6:40:0.95 @draft --spec-auto --spec-draft-sampling probabilistic;par2s DECPAR=2 DECCHAT=0:1:200 DECCHATGEN=1024 @draft --spec-auto -np 2 --kv-unified --no-cache-idle-slots;par4s DECPAR=4 DECCHAT=0:1:200 DECCHATGEN=1024 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4b0 LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;pm @draft --spec-auto --phase-mem -ub 8192;par4pm LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots --phase-mem -ub 8192;shexp8 @draft --spec-auto -ot blk\.4[0-7]\.ffn_.*_exps=Vulkan0_Shared;par4sh DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots -ot blk\.4[0-7]\.ffn_.*_exps=Vulkan0_Shared"
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -559,7 +587,8 @@ rem ggml-cuda when its headers changed (README, 00-build)
 rem 22.10, after the merge of master (7170cad4d): CUDA got GGML_OP_TOP_K_MASK (d454a204e, used by the upstream copy
 rem only, LLAMA_UPSTREAM=qwen4exp) and ssm_conv of kernel 7 (39da130fc); the new op moved the numbers of the ops
 rem after it, the headers check removes the objects of ggml-cuda once. the Mac does not build CUDA. the same run again
-if not defined CHECKOPS   set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT"
+rem 25.10: GATED_DELTA_NET_LAZY (the deferred rollback of 24.10): the decode arms ran it, no case checked it
+if not defined CHECKOPS   set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;GATED_DELTA_NET_LAZY"
 if not defined RUN_CHECK  set "RUN_CHECK=1"
 if not defined RUN_QUALITY set "RUN_QUALITY=1"
 rem 21.10: qsachk, see the 395
@@ -784,7 +813,33 @@ rem use and a step more, the rest goes to the moe-cache. kvfull, par4kvfull: the
 rem auto and par4; nolazy, par4nolazy: the GDN snapshots as before the deferred rollback; s128 stays as the reference
 rem of a small KV; auto06 and mtpkv (measured 23.10) left out
 rem [replaced 24.10 morning] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;mtpkv LLAMA_MTP_WINDOW_KV=1 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;kvfull LLAMA_KV_ELASTIC=0 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4kvfull LLAMA_KV_ELASTIC=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 25.10 (logs 25.10, src-4854d4f3: the merge of master 3f03, elastic KV, GDN lazy): checks 30/30 (the CUDA part
+rem of the merge builds and passes), KLD 0.01776 (0.0180 on 23.10). kvfull repeats auto of 23.10 (doc chat PP 815 /
+rem 798 / 773 / 737 / 693 at 0-40K / 40-80K / 80-120K / 120-160K / 160-213K, TG 28.4 / 28.6 / 28.8 / 27.6 / 26.5), so
+rem the elastic KV is the whole change: auto TG 33.4 / 33.5 / 32.5 / 31.2 / 28.6 (+18 / +17 / +13 / +13 / +8 percent;
+rem 97 moe-cache slots at the start, 53 at 200K against 45-50), PP 736 / 727 / 721 / 696 / 663 (-10 to -4 percent):
+rem phase_prompt releases every slot and the prompt time counts the refill after it, 10.2 GiB in 789 ms a turn against
+rem 6.4 GiB in 501 ms. a turn (prompt and answer) 13.67 s against 13.96; short prompts 37.53 t/s against 31.37.
+rem par4: 18.12 t/s together (5.77 on 23.10), PP 695 / 676 / 621 at 0-20K / 20-40K / 40-70K (138 / 121 / 110), a
+rem turn's TG 5.15 (1.73); par4kvfull 16.69, par4nolazy 18.22. acceptance 0.65 in all par4 arms against 0.83-0.86 on
+rem 23.10: the even drafts (LLAMA_SPEC_EVEN, 23.10) carry the shorter confident runs on, draft lengths 2:4632 of
+rem 6341 cycles. nolazy as auto (a turn 13.51 against 13.67 s): the deferred rollback gives the 3090 nothing measurable
+rem [replaced 25.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;kvfull LLAMA_KV_ELASTIC=0 @draft --spec-auto;nolazy LLAMA_GDN_LAZY=0 @draft --spec-auto;s128 DECSAMP=0.6:40:0.95 DECCHAT=0:30:16000 @draft --spec-auto -c 131072;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4kvfull LLAMA_KV_ELASTIC=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4nolazy LLAMA_GDN_LAZY=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 25.10 evening, the next run. auto: the moe-cache keeps through a prompt phase the layers of slots that the prompt
+rem buffers leave room for and uploads only the others again (LLAMA_MOE_CACHE_KEEP, default -1): expected ~21 of 48
+rem layers a turn, the refill ~0.43 s instead of ~1 s. keep0 (LLAMA_MOE_CACHE_KEEP=0): all slots go, as on 25.10.
+rem chunk0 (GGML_CUDA_GRAPH_CHUNK_SIZE=0): the CUDA graphs whole, as before the merge of master 3f03 (chunks of 512
+rem nodes since). par4even0 (LLAMA_SPEC_EVEN=0): each of the 4 slots drafts its own length, against par4: a verified
+rem token costs 16-23 ms here, and the carried-on drafts (acceptance 0.65) may not pay for it. kvfull, nolazy, s128,
+rem par4kvfull, par4nolazy measured 25.10, left out
+rem 25.10 night, same run: copy0 (LLAMA_MOE_CACHE_COPY=0): the prompt copies upload every expert from the host,
+rem against auto, where the experts the kept slots hold are copied in device memory (~10 percent of the prompt
+rem uploads expected). fill256 (LLAMA_MOE_CACHE_FILL=256): the layers a prompt took are filled during the next steps,
+rem 256 MiB a step, instead of before the first one; the DDR4 is shared with the CPU experts (LLAMA_MOE_PREFETCH lost
+rem on that on 15.10), so it is off by default until this arm
+rem prob (--spec-draft-sampling probabilistic): the draft samples from the head, the target verifies by rejection
+rem sampling; a verified token costs 11-19 ms here, so the acceptance counts more than on the 395
+if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;prob @draft --spec-auto --spec-draft-sampling probabilistic;keep0 LLAMA_MOE_CACHE_KEEP=0 @draft --spec-auto;copy0 LLAMA_MOE_CACHE_COPY=0 @draft --spec-auto;fill256 LLAMA_MOE_CACHE_FILL=256 @draft --spec-auto;chunk0 GGML_CUDA_GRAPH_CHUNK_SIZE=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4even0 LLAMA_SPEC_EVEN=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 rem 23.10: the prompt pieces while other slots generate (LLAMA_PREFILL_BUDGET, 2048 by default) would each

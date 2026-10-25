@@ -808,6 +808,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_upload_callback(sched.get(), sched_upload_experts_fork, this); // fork
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     // fork: the upstream MoE cache maps the experts in its copy callback, the uploads ahead would bypass it
     if (moe_cache) {
@@ -3065,9 +3066,13 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
+        // fork: also the ones that --moe-cache (llama_moe_cache_fork) holds
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+        for (int64_t e = first; e <= last && (lctx->moe_cache || lctx->moe_cache_fork); ) {
+            int64_t n = lctx->moe_cache ? lctx->moe_cache->copy_experts(backend, src, dst, e, last) : 0;
+            if (n == 0 && lctx->moe_cache_fork) {
+                n = lctx->moe_cache_fork->copy_experts(backend, src, dst, e, last);
+            }
             if (n == 0) {
                 e++;
                 continue;

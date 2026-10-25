@@ -288,6 +288,17 @@ void ggml_vk_fork_shmem_limit(vk_device & device) {
     }
 }
 
+void ggml_vk_fork_log_sparse(const vk_device & device) {
+    const vk::PhysicalDeviceFeatures features = device->physical_device.getFeatures();
+    const std::vector<vk::QueueFamilyProperties> families = device->physical_device.getQueueFamilyProperties();
+    size_t n_sparse = 0;
+    for (const auto & f : families) {
+        n_sparse += (f.queueFlags & vk::QueueFlagBits::eSparseBinding) ? 1 : 0;
+    }
+    GGML_LOG_INFO("ggml_vulkan: sparse buffers: binding %d, residency %d, %zu of %zu queue families\n",
+        (int) features.sparseBinding, (int) features.sparseResidencyBuffer, n_sparse, families.size());
+}
+
 void ggml_vk_fork_log_limits(const vk_device & device) {
     // GGML_SCHED_LOG_REALLOC (ggml-backend.cpp): the limits behind the tensors supports_op sends to another backend
     if (getenv("GGML_SCHED_LOG_REALLOC")) {

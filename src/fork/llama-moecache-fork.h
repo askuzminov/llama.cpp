@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 class llm_graph_result;
@@ -193,16 +194,36 @@ public:
     // select the layers and create the upload backend, called once before alloc()
     void init(ggml_backend_sched_t sched);
 
-    // allocate the slots from the free device memory and upload the experts that the last release() kept
+    // allocate the slots from the free device memory and upload the experts that the last release() kept. the layers
+    // that kept their slots stay as they are, the others get as many as fit and at most as many as those have
     void alloc();
 
     // free the slots, keep the cached experts of each layer in LRU order for the next alloc()
     void release();
 
-    bool is_init() const { return initialized; }
-    bool ready()   const { return n_slots > 0; }
+    // free the slots of whole layers until at least need bytes are free, the layers with the most slots first (so that
+    // the counts even out), and return the bytes freed. the other layers keep their slots and experts, their finished
+    // uploads readable at once: a prompt phase takes the memory its buffers need and the next alloc() uploads only the
+    // layers it took (25.10). need 0 frees nothing
+    size_t release_bytes(size_t need);
 
-    int32_t get_n_slots() const { return n_slots; }
+    // device bytes of the slots of all layers
+    size_t size_slots() const;
+
+    // the experts from e on of the host weight w that the slots hold, while their slots follow each other (up to last),
+    // copied into dst in device memory on backend; returns how many, 0 when the slots do not hold expert e. the copy of
+    // the split inputs uploads the rest (llama_context::sched_copy_experts, as for the upstream cache)
+    int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+
+    // all of the host weight w into dst on backend: the experts the slots hold from device memory, the others uploaded
+    // (the uploads ahead of GGML_SCHED_PREFETCH); false when w is no weight of a layer with slots on this device, then
+    // the caller uploads it all. a prompt phase keeps the slots it leaves room for, so their experts need no PCIe
+    bool upload_weight(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst);
+
+    bool is_init() const { return initialized; }
+    bool ready()   const { return n_live > 0; }
+
+    int32_t get_n_slots() const { return n_slots_l; }
     int32_t get_max_ins() const { return max_ins; }
     bool uses_frequency_admission() const { return frequency_admission; }
 
@@ -231,10 +252,11 @@ private:
         std::vector<int32_t> uploads_done; // slots with an upload that finished, but is not published yet
         std::vector<int32_t> evicted;      // published experts that lost their slot
 
-        int32_t head   = -1;
-        int32_t tail   = -1;
-        int32_t n_fill = 0;
-        int32_t n_seen = 0;
+        int32_t head    = -1;
+        int32_t tail    = -1;
+        int32_t n_fill  = 0;
+        int32_t n_seen  = 0;
+        int32_t n_slots = 0; // slots of the layer, 0 while it has none
     };
 
     void   lru_unlink(lru & c, int32_t e);
@@ -270,8 +292,8 @@ private:
     int64_t t_submit_us = 0;
 
     int64_t n_expert  = 0;
-    int32_t n_slots   = 0;
-    int32_t n_slots_l = 0; // slots of the last alloc()
+    int32_t n_live    = 0; // layers with slots
+    int32_t n_slots_l = 0; // slots per layer of the last alloc()
     int32_t max_ins   = 1; // max expert uploads per layer per step, 1 measured best up to 192 slots
     size_t  b_slot    = 0; // bytes of one slot on every cached layer
     int     n_moe     = 0; // MoE layers of the model
@@ -285,10 +307,49 @@ private:
 
     bool ev_up_recorded = false;
 
-    ggml_context_ptr        ctx_dev;
+    ggml_context_ptr        ctx_dev; // the table
     ggml_context_ptr        ctx_host;
     ggml_backend_buffer_ptr buf_dev;
     ggml_backend_buffer_ptr buf_host;
+
+    // the slots of each layer in a buffer of their own, so that some layers can give them up and the rest keep them
+    std::vector<ggml_context_ptr>        ctx_slots;
+    std::vector<ggml_backend_buffer_ptr> buf_slots;
+
+    size_t slot_bytes(int idx) const; // one slot of the layer
+
+    // LLAMA_MOE_CACHE_COPY (25.10, 1; 0: the prompt copies upload every expert from the host, as before)
+    bool copy_dev = true;
+
+    std::unordered_map<const ggml_tensor *, std::pair<int, int>> bound; // host weight -> layer, 0 up 1 gate 2 down
+    ggml_context_ptr ctx_views; // of copy_run()
+
+    bool    bound_live(ggml_backend_t backend, const ggml_tensor * w, int & idx, int & which) const;
+    int64_t copy_run  (ggml_backend_t backend, int idx, int which, ggml_tensor * dst, int64_t e, int64_t last);
+
+    // LLAMA_MOE_CACHE_FILL=<MiB> (25.10, 0): alloc() gives the experts of the last release() their slots, and the steps
+    // upload them in the background, at most this much per step, the most recent of every layer first; until then
+    // the graphs compute them on the host. 0: alloc() uploads them all before the next graph
+    size_t fill_bytes = 0;
+
+    struct fill_entry {
+        int     idx;
+        int32_t expert;
+        int32_t slot;
+    };
+    std::vector<fill_entry> fill_q;   // waiting, from fill_pos on
+    size_t                  fill_pos = 0;
+
+    bool fill_issue(); // the next uploads of fill_q within fill_bytes, true when it started some
+
+    uint64_t n_fill_up = 0; // experts that the background fill uploaded
+
+    uint64_t n_copy_dev = 0; // experts that the prompt copies took from the slots
+    uint64_t b_copy_dev = 0;
+    uint64_t b_copy_up  = 0; // what the same copies uploaded
+    void   wait_idle();               // the graph and the uploads are done with the slots
+    void   publish_done();            // the finished uploads become readable
+    void   free_all();                // the slots and the table of all layers
 
     ggml_tensor * table_all = nullptr; // device I32 [n_expert, n_layers]
     ggml_tensor * table_staging = nullptr;

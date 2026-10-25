@@ -44,6 +44,9 @@ struct ggml_backend_sched_prefetch {
     ggml_backend_event_t done     [GGML_SCHED_MAX_BACKENDS][GGML_SCHED_PREFETCH_MAX + 1]; // on the copy, by split % (MAX + 1)
 
     int64_t n_uploads; // the first one is logged
+
+    ggml_backend_sched_copy_callback upload_cb; // ggml_backend_sched_set_upload_callback
+    void *                           upload_cb_data;
 };
 
 static void ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched);

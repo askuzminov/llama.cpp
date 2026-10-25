@@ -280,6 +280,8 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    // fork: the uploads of the prefetch take the experts that --moe-cache holds from its slots (llama-context-fork.cpp)
+    static bool sched_upload_experts_fork(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
@@ -537,6 +539,7 @@ private:
     // memory left and release is set; false when the capacity stays below n_cells
     void kv_elastic_init_fork();
     bool kv_elastic_set_fork(uint32_t n_cells, bool release);
+    uint32_t kv_elastic_capacity_fork(uint32_t n_cells); // memory->kv_set_capacity_fork within LLAMA_KV_ELASTIC_TEST_MIB
 
     bool     kv_elastic      = false;
     uint32_t kv_elastic_step = 8192;

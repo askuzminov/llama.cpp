@@ -4984,6 +4984,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
 
         ggml_vk_fork_shmem_limit(device);
+        ggml_vk_fork_log_sparse(device);
         ggml_vk_fork_mmid_f16reg_init(device);
         ggml_vk_fork_fa_union_init(device);
 
