@@ -328,7 +328,7 @@ int32_t server_prefill_budget_fork() {
 }
 
 bool server_prefill_exclusive_fork() {
-    static const bool value = server_env_int_fork("LLAMA_PREFILL_EXCLUSIVE", 0) != 0;
+    static const bool value = server_env_int_fork("LLAMA_PREFILL_EXCLUSIVE", 1) != 0;
     return value;
 }
 

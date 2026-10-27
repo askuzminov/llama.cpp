@@ -22,6 +22,7 @@ struct llama_model_qwen4exp_fork::ple_prefetch {
     std::mutex           mutex;
     std::thread          worker;
     bool                 active = false;
+    bool                 ok     = true;    // false: the gather threw, the rows are not there
     std::vector<int32_t> idx;
     std::vector<float>   rows;
 
@@ -2531,19 +2532,53 @@ void llama_model_qwen4exp_fork::ple_prefetch_start(const llama_ubatch & next, co
         return;
     }
 
+    ple_prefetch_launch(std::move(idx), false);
+}
+
+void llama_model_qwen4exp_fork::ple_prefetch_first(const llama_ubatch & first, const llama_kv_cache & kv) const {
+    static const bool enabled = [] {
+        return llama_fork_env_int("LLAMA_PLE_PREFETCH", 1) != 0 && llama_fork_env_int("LLAMA_PLE_PREFETCH_FIRST", 1) != 0;
+    }();
+    if (!enabled || !ple_cached || !ple_cache) {
+        return;
+    }
+
+    std::vector<int32_t> idx;
+    if (qwen4exp_ple_rows_ahead(hparams, first,
+            [&kv](const llama_ubatch & ub, uint32_t n, std::vector<llama_token> & res) { kv.get_prev_tokens(ub, n, res); }, idx) != 0) {
+        return;
+    }
+
+    ple_prefetch_launch(std::move(idx), true);
+}
+
+void llama_model_qwen4exp_fork::ple_prefetch_launch(std::vector<int32_t> && idx, bool keep) const {
     if (!ple_pf) {
         ple_pf = std::make_unique<ple_prefetch>();
     }
     ple_prefetch & pf = *ple_pf;
 
     std::lock_guard<std::mutex> lock(pf.mutex);
+    // the decode before read the first ubatch ahead already (llama_set_next_tokens), as large as the phase step had it
+    if (keep && pf.active) {
+        const size_t n = std::min(pf.idx.size(), idx.size());
+        if (std::equal(idx.begin(), idx.begin() + n, pf.idx.begin())) {
+            return;
+        }
+    }
     pf.finish();
     pf.idx = std::move(idx);
     pf.rows.resize(pf.idx.size()*hparams.ple_head_dim);
     pf.active = true;
+    pf.ok     = true;
     pf.n_started++;
+    // a read error would end the process from a thread; the input gathers the rows itself then, and reports it
     pf.worker = std::thread([this, &pf] {
-        ple_cache->get_rows(pf.idx.data(), (int64_t) pf.idx.size(), pf.rows.data());
+        try {
+            ple_cache->get_rows(pf.idx.data(), (int64_t) pf.idx.size(), pf.rows.data());
+        } catch (const std::exception &) {
+            pf.ok = false;
+        }
     });
 }
 
@@ -2604,7 +2639,9 @@ bool llama_model_qwen4exp_fork::ple_prefetch_take(const std::vector<int32_t> & i
     if (!pf.active) {
         return false;
     }
-    if (pf.idx != idx) {
+    // the rows read ahead for the first ubatch of a decode are those of the largest one it can have
+    // (ple_prefetch_first), the phase step may cut it shorter: a row list that starts with this one serves too
+    if (pf.idx.size() < idx.size() || !std::equal(idx.begin(), idx.end(), pf.idx.begin())) {
         static std::atomic<bool> logged { false };
         if (!logged.exchange(true)) {
             LLAMA_LOG_INFO("%s: the PLE rows gathered ahead are not the ones of this ubatch (%zu against %zu rows)\n",
@@ -2614,11 +2651,15 @@ bool llama_model_qwen4exp_fork::ple_prefetch_take(const std::vector<int32_t> & i
     }
     pf.finish();
     pf.active = false;
+    if (!pf.ok) {
+        return false;
+    }
     if (pf.n_used++ == 0) {
         // the server kills its process at the end, so the count at unload rarely makes it to the log
         LLAMA_LOG_INFO("%s: the PLE rows of a ubatch were gathered while the one before computed\n", __func__);
     }
     std::swap(dst, pf.rows);
+    dst.resize(idx.size()*hparams.ple_head_dim);
     return true;
 }
 
@@ -2648,6 +2689,15 @@ bool llama_fork_before_compute(const llama_model & model, llama_memory_context_i
 
 bool llama_fork_gdn_lazy(const llama_model & model) {
     return dynamic_cast<const llama_model_qwen4exp_fork *>(&model) != nullptr;
+}
+
+void llama_fork_prefetch_first(const llama_model & model, llama_memory_i * mem, const llama_ubatch & first) {
+    const auto * qm  = dynamic_cast<const llama_model_qwen4exp_fork *>(&model);
+    const auto * hyb = dynamic_cast<const llama_memory_hybrid_idx_fork *>(mem);
+    if (qm == nullptr || hyb == nullptr || hyb->get_mem_attn() == nullptr) {
+        return;
+    }
+    qm->ple_prefetch_first(first, *hyb->get_mem_attn());
 }
 
 void llama_fork_prefetch_tokens(const llama_model & model, llama_memory_i * mem, const llama_ubatch & next, int64_t n_new) {

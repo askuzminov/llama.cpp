@@ -2107,6 +2107,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // fork: the PLE rows of a prompt's first ubatch are gathered while the phase step, the reserve and the graph build run
+    fork_prefetch_first();
+
     // before the timing of the batch starts, a draft context follows the switches of its target
     if (cparams.phase_mem && phase_owner == nullptr && !opt_ctx) {
         phase_update(n_tokens_all);

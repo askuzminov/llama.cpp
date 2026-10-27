@@ -470,7 +470,38 @@ rem 393216 cells that takes memory only for the cells in use (static: ~10 GiB of
 rem the end), the GDN states of 6 slots ~2.7 GiB: do more agents fit. a full carve-out gives the granules shared
 rem memory (GGML_VK_ELASTIC_SPILL, the line "the device memory is full" in the log); the "elastic buffer" lines show
 rem the granule, the slab and the memory types the driver gave
-if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;greedy @draft --spec-auto --spec-draft-sampling greedy;kvel LLAMA_KV_ELASTIC=1 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4b0 LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x LLAMA_PREFILL_EXCLUSIVE=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4kvel LLAMA_KV_ELASTIC=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par6kvel LLAMA_KV_ELASTIC=1 DECPAR=6 DECPARSHIFT=200000 DECCHAT=0:12:16000 @draft --spec-auto -np 6 --kv-unified --no-cache-idle-slots -c 393216"
+rem 27.10: old0 (LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0): the PLE rows as before 27.10, against auto,
+rem where the row cache reads each distinct row of a gather once in slices and a decode's first ubatch has its rows
+rem gathered from the top of the decode (on 26.10 a prompt ubatch of the chats spent 130-240 ms on them before its
+rem graph; here no phase step hides them, the gather itself has to be faster)
+rem [replaced 27.10 evening, old0 added after the run] if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;greedy @draft --spec-auto --spec-draft-sampling greedy;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @draft --spec-auto;kvel LLAMA_KV_ELASTIC=1 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4b0 LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x LLAMA_PREFILL_EXCLUSIVE=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4kvel LLAMA_KV_ELASTIC=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par6kvel LLAMA_KV_ELASTIC=1 DECPAR=6 DECPARSHIFT=200000 DECCHAT=0:12:16000 @draft --spec-auto -np 6 --kv-unified --no-cache-idle-slots -c 393216"
+rem 27.10 (logs 27.10 10:25, f87a0d1a9, src-bf41aa47): checks 39/39; test-elastic-buffer-fork passed on the device
+rem (the driver allows 4294967295 allocations, a slab per granule; a commit of 256 MiB takes 256 MiB of the free
+rem memory and the decommit gives it back; the pass of the shared memory too). KLD 0.015321. doc chat to 212K, PP /
+rem TG over all turns: auto 776.0 / 40.63, greedy 782.5 / 40.07, kvel 781.1 / 40.54; short prompts TG 40.07 /
+rem 36.41 / 39.61; the 29K chat TG 42.80 / 38.50 / 41.83. warm worked: auto 125 ms of PLE input per prompt ubatch
+rem against 118-126 of the arms after it (26.10: 242 against ~134). 4 x 15 turns: par4 550.2 s (the 2048-token
+rem pieces), par4b0 529.0, par4x 525.5, par4kvel 552.2. par6kvel (6 x 12 turns, 393216 cells) 689.3 s, 25.49 t/s
+rem generated together against 27.19 of par4; at 6 slots the gate drafted almost never (0:14174 1:588). the KV of
+rem the elastic arms went to the shared memory at 188K cells in kvel (5.0 GB on the device, where the static cache
+rem held 6.9 GB), 155K in par4kvel, 90K in par6kvel (~196K of its cells there): the margin of 2048 MiB kept the
+rem rest free; 512 since, and the line "the device memory is full" gives the heap numbers. the speed did not drop
+rem (kvel the last third PP 735.9 / TG 39.18 against 724.5 / 39.03). two starts failed while loading, a 1.6 GB
+rem weight buffer with ErrorMemoryMapFailed (warm-p0, par4b0-chat; seen since 05.10), the retries ran
+rem 27.10 evening, the next run: the elastic KV is the default here (below), kv0 the static cache against auto.
+rem LLAMA_PREFILL_EXCLUSIVE is on by default since: par4 against par4x0 (=0, the 2048-token pieces as par4 before).
+rem old0: the PLE rows as before 27.10, see above. par6 / par8: 6 / 8 conversations of 12 turns at once (par8:
+rem copies 150000 chars apart, a cache of 458752 cells): how many agents fit with the shared memory
+rem [replaced 27.10 night] if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @draft --spec-auto;kv0 LLAMA_KV_ELASTIC=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x0 LLAMA_PREFILL_EXCLUSIVE=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par6 DECPAR=6 DECPARSHIFT=200000 DECCHAT=0:12:16000 @draft --spec-auto -np 6 --kv-unified --no-cache-idle-slots -c 393216;par8 DECPAR=8 DECPARSHIFT=150000 DECCHAT=0:12:16000 @draft --spec-auto -np 8 --kv-unified --no-cache-idle-slots -c 458752"
+rem 27.10 night: only what this run measures. auto: the defaults (the elastic KV, the exclusive prefill, the PLE
+rem rows of a decode's first ubatch gathered from its top and read in slices), kv0 the static KV, old0 the PLE rows
+rem as before 27.10, par4 four agents with the defaults. @p= with no prefix: the arm runs its chats only (its short
+rem prompts would repeat those of warm, which stand for auto: the same identity). left out, in the line above:
+rem par4x0 (exclusive off, the par4 of 27.10), par6 (as par6kvel of 27.10) and par8 (how many agents fit, not a
+rem check of these changes)
+if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;kv0 LLAMA_KV_ELASTIC=0 @p= @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @p= @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 27.10 evening: the KV takes device memory for the cells in use only by default here: LLAMA_KV_ELASTIC -1 now
+rem also covers a context with no expert cache on a device with sparse buffers (the daily server too)
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -886,7 +917,31 @@ rem 26.10 evening: --spec-auto drafts by probability since (see the 395): greedy
 rem (LLAMA_PREFILL_EXCLUSIVE=1): the generating slots wait while a prompt is read, against par4. warm: the PLE rows
 rem of the doc chat into the page cache first, see the 395 (26.10 here: the first chat arm 72 ms of inputs per prompt
 rem ubatch against ~59.5, about 3 of the 29 s that auto lost to copy0)
-if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;greedy @draft --spec-auto --spec-draft-sampling greedy;copy0 LLAMA_MOE_CACHE_COPY=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x LLAMA_PREFILL_EXCLUSIVE=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem [replaced 27.10] if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;greedy @draft --spec-auto --spec-draft-sampling greedy;copy0 LLAMA_MOE_CACHE_COPY=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x LLAMA_PREFILL_EXCLUSIVE=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 27.10 (logs 27.10 10:26, src-86d8eb82): checks 32/32 (test-elastic-buffer-fork on CUDA0: 256 MiB committed and
+rem given back exactly), KLD 0.017859. doc chat to 212K, PP / TG over all turns: auto 776.5 / 32.57, greedy 786.3 /
+rem 31.81, copy0 781.7 / 32.41; the 29K chat of short turns PP 165.5 / 172.0 / 162.3. the copies at the start of a
+rem split only (LLAMA_MOE_CACHE_COPY 1 since 26.10) close the gap to copy0 (a prompt ubatch 853 ms of submit against
+rem 849, on 26.10 977 against 847): they stay. probabilistic drafting: TG +2.4 percent in the doc chat (2.41 tokens
+rem a verify against 2.26), short prompts 39.47 against 39.23: the default stays. warm: the first chat arm 57.8 ms
+rem of inputs per prompt ubatch against 55-56 (26.10: 72.3 against ~59.5). par4x against par4: 755.1 against 768.7 s
+rem for the same 4 x 15 turns (-1.8 percent), a turn's PP 771 against 681 (+13 percent), its TG 5.45 against 5.63
+rem (median). a prompt turn of one ubatch spent 205 ms (5 percent of the ubatch) gathering its PLE rows before the
+rem graph; par4 4.7 ms (read while the generation ubatches before it ran), par4x 201 ms
+rem 27.10, the next run: the PLE rows of a decode's first ubatch are gathered from the top of the decode, during the
+rem phase step (LLAMA_PLE_PREFETCH_FIRST; the step took a median 0.21 s a prompt turn here), and the row cache reads
+rem each distinct row of a gather once, in slices of its readers (LLAMA_ROW_CACHE_SLICES; on a Mac 62768 rows 43-66
+rem ms against 113-120, the PLE bigrams and trigrams of a turn repeat). old0: both off, the 27.10 code; sl0: the
+rem read ahead with the old gather; rt8: 8 readers instead of 24 (the Mac gathered fastest with 4 from a warm page
+rem cache). par4 / par4x again: the exclusive prompts of par4x get the read ahead now
+rem 27.10 evening: LLAMA_PREFILL_EXCLUSIVE is on by default (the 395 runs of 27.10 and the one here): par4 is the
+rem exclusive prefill now, par4x0 (=0) the whole prompts mixed with the generation as par4 before
+rem [replaced 27.10 night] if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @draft --spec-auto;sl0 LLAMA_ROW_CACHE_SLICES=0 @draft --spec-auto;rt8 LLAMA_ROW_CACHE_THREADS=8 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x0 LLAMA_PREFILL_EXCLUSIVE=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 27.10 night: only what this run measures: auto against old0 (the PLE rows as before 27.10) and sl0 (the read
+rem ahead with the old gather), par4 (the exclusive prompts that lost the read ahead on 27.10). @p= with no prefix:
+rem the arm runs its chats only, see the 395. left out, in the line above: rt8 (the number of readers, after these)
+rem and par4x0 (exclusive off, the par4 of 27.10)
+if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;sl0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @p= @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 rem 23.10: the prompt pieces while other slots generate (LLAMA_PREFILL_BUDGET, 2048 by default) would each

@@ -8,9 +8,11 @@
 #include <string>
 
 // On-demand row reader for a tensor that is never loaded: the rows asked for are read from the
-// file in aligned blocks, buffered, so the page cache of the system is what holds them. Used for
-// tensors marked TENSOR_READ_LAZY when the lazy mode is LLAMA_LAZY_MODE_DIO, where the mmap path
-// would instead fault the table in page by page. See llama_model_loader::lazy_read.
+// file, buffered, so the page cache of the system is what holds them. Each distinct row of a
+// gather is read once by one of the readers (LLAMA_ROW_CACHE_SLICES=0: the older path through a
+// pool of aligned blocks). Used for tensors marked TENSOR_READ_LAZY when the lazy mode is
+// LLAMA_LAZY_MODE_DIO, where the mmap path would instead fault the table in page by page. See
+// llama_model_loader::lazy_read.
 struct llama_row_cache {
     // n_cols/n_rows are the tensor dimensions, offs the start of its data in the file
     // n_threads is the read queue depth, 0 lets the cache size it from the machine

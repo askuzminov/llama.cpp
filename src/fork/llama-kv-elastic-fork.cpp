@@ -6,8 +6,10 @@
 
 #include "llama-kv-cache.h"
 
+#include "llama-cparams.h"
 #include "llama-impl.h"
 #include "llama-fork.h"
+#include "llama-model.h"
 
 #include "ggml-backend.h"
 
@@ -52,6 +54,31 @@ struct llama_kv_elastic_fork {
 int llama_kv_elastic_mode_fork() {
     static const int mode = (int) llama_fork_env_int("LLAMA_KV_ELASTIC", -1);
     return mode;
+}
+
+// a device of the model whose backend gives elastic buffers (CUDA, Vulkan); whether the device itself takes them (VMM,
+// sparse buffers) shows only when the cache asks for one
+static bool llama_kv_elastic_device_fork(const llama_model & model) {
+    for (const auto & d : model.devices) {
+        if (d.is_meta || d.dev == nullptr) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev);
+        if (reg != nullptr && ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_alloc_elastic_fork") != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_kv_elastic_no_cache_fork(const llama_model & model, const llama_cparams & cparams) {
+    return llama_kv_elastic_mode_fork() < 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+           cparams.n_moe_cache == 0 && cparams.moe_cache_size == 0 && llama_kv_elastic_device_fork(model);
+}
+
+bool llama_kv_elastic_defer_fork(const llama_model & model, const llama_cparams & cparams) {
+    return cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+           (llama_kv_elastic_mode_fork() > 0 || llama_kv_elastic_no_cache_fork(model, cparams));
 }
 
 static thread_local bool llama_kv_defer_fork = false;

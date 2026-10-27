@@ -65,9 +65,11 @@ bool server_slot_room_fork();
 // prompt (Rulith Inference, apply_agent_slots_027). with experts in RAM (the 3090) every prompt piece uploads them
 int32_t server_prefill_budget_fork();
 
-// LLAMA_PREFILL_EXCLUSIVE (26.10, default 0: upstream): while a slot reads its prompt, the generating slots wait, so
-// that the prompt goes in whole batches with no tokens or drafts of theirs; they continue when no prompt is left.
-// a generating slot gets about a token per prompt batch otherwise (0.2-0.4 t/s at depth on the 395)
+// LLAMA_PREFILL_EXCLUSIVE (26.10, default 1 since 27.10, 0: upstream): while a slot reads its prompt, the generating
+// slots wait, so that the prompt goes in whole batches with no tokens or drafts of theirs; they continue when no prompt
+// is left. a generating slot gets about a token per prompt batch otherwise (0.2-0.4 t/s at depth on the 395). 27.10,
+// 4 conversations of 15 turns at once: 395 525.5 s against 529.0 with whole prompts mixed (LLAMA_PREFILL_BUDGET=0)
+// and 550.2 with the 2048-token pieces; 3090 755.1 against 768.7 (budget 0 there). the budget is moot while it is on
 bool server_prefill_exclusive_fork();
 
 // LLAMA_SLOT_CONTINUE (23.10, 1 by default, 0: upstream's similarity): a slot takes a request for what it holds only

@@ -37,6 +37,14 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
     void ple_prefetch_start(const llama_ubatch & next, const llama_kv_cache_context * mctx) const;
     bool ple_prefetch_take(const std::vector<int32_t> & idx, std::vector<float> & dst) const;
 
+    // the first ubatch of a decode that no call before it read ahead (llama_fork_prefetch_first, 27.10), from the top of
+    // the decode: its gather runs during the phase step and the reserve, a median 0.21 s a prompt turn on the 3090,
+    // instead of before the graph (205 ms of each 3923-token turn there). keeps a gather in flight that covers it.
+    // LLAMA_PLE_PREFETCH_FIRST=0: off
+    void ple_prefetch_first(const llama_ubatch & first, const llama_kv_cache & kv) const;
+    // the gather of idx in the background, in place of the one before it; keep: not when the one in flight covers idx
+    void ple_prefetch_launch(std::vector<int32_t> && idx, bool keep) const;
+
     // the PLE rows of tokens a coming decode will hold, read from the row cache by a worker now, so that the input
     // of that decode finds them in the page cache: the draft tokens of a speculative round while the next ones are
     // drafted (llama_prefetch_tokens). only the last n_new tokens of next are read. LLAMA_PLE_WARM=0: off

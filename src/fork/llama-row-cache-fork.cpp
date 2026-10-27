@@ -36,6 +36,23 @@ size_t row_cache_env(const char * name, size_t def) {
     return parsed > 0 ? (size_t) parsed : def;
 }
 
+// a switch: 0 is off, any other whole number on
+bool row_cache_env_flag(const char * name, bool def) {
+    const char * val = getenv(name);
+    int64_t parsed = 0;
+    switch (llama_fork_env_parse(val, parsed)) {
+        case LLAMA_FORK_ENV_UNSET:
+            return def;
+        case LLAMA_FORK_ENV_BAD:
+            LLAMA_LOG_ERROR("%s: %s=\"%s\" is not a whole number, using %d\n", __func__, name, val, (int) def);
+            return def;
+        case LLAMA_FORK_ENV_OK:
+            break;
+    }
+
+    return parsed != 0;
+}
+
 } // namespace
 
 struct llama_row_cache::impl {
@@ -94,6 +111,26 @@ struct llama_row_cache::impl {
     // blocks per point of the read path sweep, 0 = do not run it
     size_t bench_n = 0;
 
+    // the slice path (LLAMA_ROW_CACHE_SLICES, on by default): the distinct rows of a gather in file order, a job a slice
+    // of them, which its reader reads into a buffer of its own and dequantizes straight into dst, once per row however
+    // many entries of the list ask for it. the block path above has a job per request and a barrier per pool of
+    // 2*run_max*3 blocks, every job takes job_mutex twice, and a repeat is found only within a pool: on 27.10 a prompt
+    // ubatch of 3923 tokens (62768 rows) took 205 ms of inputs on the 3090 and 130-240 ms on the 395. the PLE n-grams
+    // of qwen4exp repeat: in 3923 words of English text 53% of the bigrams and 39% of the trigrams came before, and a
+    // repeat is 8 rows. a run of r.n distinct rows from r.block, r.i_first unused
+    bool                              slices        = true;
+    size_t                            slice_run_max = 1;    // most rows one request of a slice covers
+    const int32_t *                   job_rows      = nullptr;   // the distinct rows, ascending
+    const uint32_t *                  job_first     = nullptr;   // distinct row j goes to the entries job_ent[job_first[j] ..
+    const uint32_t *                  job_ent       = nullptr;   // job_first[j + 1]) of the list
+    float *                           job_dst       = nullptr;
+    std::vector<std::vector<uint8_t>> slice_bufs;           // one per reader
+    std::atomic<int64_t>              slice_req{0};
+    std::vector<uint64_t>             plan_keys;            // the scratch of a gather: row << 32 | entry, sorted
+    std::vector<int32_t>              plan_rows;
+    std::vector<uint32_t>             plan_first;
+    std::vector<uint32_t>             plan_ent;
+
     impl(const std::string & path, size_t offs, ggml_type type, int64_t n_cols, int64_t n_rows,
          int n_threads);
     ~impl();
@@ -101,10 +138,12 @@ struct llama_row_cache::impl {
     void stop_workers();
 
     void read_run(size_t i_worker, const run & r);
-    void run_jobs(const std::vector<run> & runs, size_t n_blocks);
+    void read_slice(size_t i_worker, const run & r);
+    void run_jobs(const std::vector<run> & runs);
     void bench(size_t n_bench);
 
     void gather(const int32_t * rows, int64_t n, float * dst);
+    void gather_slices(const int32_t * rows, int64_t n, float * dst);
 };
 
 llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type type,
@@ -159,6 +198,13 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
         files.emplace_back(new llama_file(path.c_str(), "rb", false));
     }
 
+    // a request of the slice path stays under 256 KiB, a reader's buffer holds one
+    slices = row_cache_env_flag("LLAMA_ROW_CACHE_SLICES", true);
+    if (slices) {
+        slice_run_max = std::max<size_t>(1, std::min<size_t>(run_max, 256*1024/row_size));
+        slice_bufs.assign((size_t) n_threads, std::vector<uint8_t>(slice_run_max*row_size));
+    }
+
     // ~impl does not run for a constructor that throws, and destroying a joinable thread calls
     // std::terminate. The guard joins the pool on the way out until the constructor disarms it
     struct pool_guard {
@@ -170,6 +216,7 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
         workers.emplace_back([this, i] {
             while (true) {
                 size_t i_job = 0;
+                bool   slice = false;
                 {
                     std::unique_lock<std::mutex> lock(job_mutex);
                     job_cv.wait(lock, [this] {
@@ -179,6 +226,7 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
                         return;
                     }
                     i_job = job_next++;
+                    slice = job_rows != nullptr;
                 }
 
                 const size_t n_jobs = job_runs->size();
@@ -191,7 +239,11 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
                 const int64_t t_io_start = ggml_time_us();
 
                 try {
-                    read_run(i, r);
+                    if (slice) {
+                        read_slice(i, r);
+                    } else {
+                        read_run(i, r);
+                    }
                 } catch (const std::exception & err) {
                     std::lock_guard<std::mutex> lock(job_mutex);
                     if (job_error.empty()) {
@@ -217,10 +269,11 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
     const size_t i_name = path.find_last_of("/\\");
 
     LLAMA_LOG_INFO("%s: %.2f GiB table stays on disk in %s, blocks of %zu B, %d readers, "
-            "up to %zu blocks per request\n",
+            "up to %zu blocks per request, %s\n",
             __func__, ggml_row_size(type, n_cols)*n_rows/1024.0/1024.0/1024.0,
             path.c_str() + (i_name == std::string::npos ? 0 : i_name + 1),
-            blk_size, n_threads, run_max);
+            blk_size, n_threads, slices ? slice_run_max : run_max,
+            slices ? "slices of the row list" : "chunks of the block pool (LLAMA_ROW_CACHE_SLICES=0)");
 
     if (bench_n > 0) {
         bench(bench_n);
@@ -272,7 +325,7 @@ void llama_row_cache::impl::bench(size_t n_bench) {
                     runs[k] = { (seed >> 16) % n_starts, (uint32_t) n_blk, (uint32_t) (k*n_blk) };
                 }
 
-                run_jobs(runs, batch*n_blk);
+                run_jobs(runs);
             }
 
             const int64_t n_reqs  = (int64_t) n_batches*batch;
@@ -333,7 +386,56 @@ void llama_row_cache::impl::read_run(size_t i_worker, const run & r) {
     }
 }
 
-void llama_row_cache::impl::run_jobs(const std::vector<run> & runs, size_t n_blocks) {
+// distinct rows r.block .. r.block + r.n of the gather: a row, with the rows right after it in the file when the gather
+// asks for them too, in one request; dequantized into the first entry that asks for it and copied to the others
+void llama_row_cache::impl::read_slice(size_t i_worker, const run & r) {
+    llama_file * file = files[i_worker].get();
+    uint8_t *    buf  = slice_bufs[i_worker].data();
+
+    const int64_t k_end = (int64_t) r.block + r.n;
+
+    for (int64_t k = (int64_t) r.block; k < k_end; ) {
+        const int64_t row = job_rows[k];
+
+        int64_t len = 1;
+        while (k + len < k_end && (size_t) len < slice_run_max && job_rows[k + len] == row + len) {
+            len++;
+        }
+
+        const size_t off  = offs + (size_t) row*row_size;
+        const size_t size = (size_t) len*row_size;
+
+        // a table cut short by the end of the file reads zeros there, as the block path does
+        const size_t want = off < file_size ? std::min(size, file_size - off) : 0;
+        if (want > 0) {
+            file->seek(off, SEEK_SET);
+            file->read_raw_unsafe(buf, want);
+        }
+        if (want < size) {
+            memset(buf + want, 0, size - want);
+        }
+
+        for (int64_t j = 0; j < len; j++) {
+            const uint8_t * src = buf + (size_t) j*row_size;
+            const uint32_t  e0  = job_first[k + j];
+            const uint32_t  e1  = job_first[k + j + 1];
+            float *         out = job_dst + (size_t) job_ent[e0]*n_cols;
+            if (type == GGML_TYPE_F32) {
+                memcpy(out, src, row_size);
+            } else {
+                to_float(src, out, n_cols);
+            }
+            for (uint32_t e = e0 + 1; e < e1; e++) {
+                memcpy(job_dst + (size_t) job_ent[e]*n_cols, out, n_cols*sizeof(float));
+            }
+        }
+
+        slice_req.fetch_add(1, std::memory_order_relaxed);
+        k += len;
+    }
+}
+
+void llama_row_cache::impl::run_jobs(const std::vector<run> & runs) {
     if (runs.empty()) {
         return;
     }
@@ -357,8 +459,6 @@ void llama_row_cache::impl::run_jobs(const std::vector<run> & runs, size_t n_blo
         err       = job_error;
     }
 
-    n_read    += n_blocks;
-    n_req     += runs.size();
     t_wait_us += ggml_time_us() - t_start;
 
     if (!err.empty()) {
@@ -425,7 +525,10 @@ void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst)
             }
         }
 
-        run_jobs(runs, want.size());
+        run_jobs(runs);
+
+        n_read += want.size();
+        n_req  += runs.size();
 
         for (int64_t k = i; k < i_end; k++) {
             const size_t   off = offs + (size_t) rows[k]*row_size;
@@ -461,6 +564,71 @@ void llama_row_cache::impl::gather(const int32_t * rows, int64_t n, float * dst)
     }
 }
 
+void llama_row_cache::impl::gather_slices(const int32_t * rows, int64_t n, float * dst) {
+    if (n <= 0) {
+        return;
+    }
+    if (n > (int64_t) UINT32_MAX) {
+        throw std::runtime_error(format("row cache: a gather of %" PRId64 " rows", n));
+    }
+
+    // the distinct rows in file order, and for each the entries of the list that ask for it
+    plan_keys.resize((size_t) n);
+    for (int64_t k = 0; k < n; k++) {
+        if (rows[k] < 0 || rows[k] >= n_rows) {
+            throw std::runtime_error(format("row cache: row %" PRId64 " out of range", (int64_t) rows[k]));
+        }
+        plan_keys[k] = (uint64_t) rows[k] << 32 | (uint64_t) k;
+    }
+    std::sort(plan_keys.begin(), plan_keys.end());
+
+    plan_rows.clear();
+    plan_first.clear();
+    plan_ent.resize((size_t) n);
+    for (int64_t k = 0; k < n; k++) {
+        const int32_t row = (int32_t) (plan_keys[k] >> 32);
+        if (plan_rows.empty() || plan_rows.back() != row) {
+            plan_rows.push_back(row);
+            plan_first.push_back((uint32_t) k);
+        }
+        plan_ent[k] = (uint32_t) plan_keys[k];
+    }
+    plan_first.push_back((uint32_t) n);
+
+    const int64_t n_uniq = (int64_t) plan_rows.size();
+
+    // up to 4 slices per reader, taken as the readers come free: a row the page cache does not hold is a read of the
+    // drive, and the reader that meets a few of them must not hold up the gather. a gather of up to that many rows,
+    // as at a decode step, has a slice per row: the requests of the block path, without its pool and map
+    const int64_t n_slices = std::min<int64_t>(n_uniq, 4*(int64_t) files.size());
+    const int64_t per      = (n_uniq + n_slices - 1)/n_slices;
+
+    std::vector<run> runs;
+    runs.reserve((size_t) n_slices);
+    for (int64_t k = 0; k < n_uniq; k += per) {
+        runs.push_back({ (uint64_t) k, (uint32_t) std::min<int64_t>(per, n_uniq - k), 0 });
+    }
+
+    // published to the readers by the lock run_jobs takes, and theirs until the last job is done
+    job_rows  = plan_rows.data();
+    job_first = plan_first.data();
+    job_ent   = plan_ent.data();
+    job_dst   = dst;
+    slice_req.store(0);
+
+    struct reset {
+        impl * self;
+        ~reset() { self->job_rows = nullptr; self->job_first = nullptr; self->job_ent = nullptr; self->job_dst = nullptr; }
+    } on_exit { this };
+
+    run_jobs(runs);
+
+    n_hit  += n - n_uniq;
+    n_miss += n_uniq;
+    n_read += n_uniq;
+    n_req  += slice_req.load();
+}
+
 llama_row_cache::llama_row_cache(const std::string & path, size_t offs, ggml_type type,
                                  int64_t n_cols, int64_t n_rows, int n_threads) :
     pimpl(new impl(path, offs, type, n_cols, n_rows, n_threads)) {}
@@ -472,7 +640,11 @@ void llama_row_cache::get_rows(const int32_t * rows, int64_t n, float * dst) {
 
     const int64_t t_start = ggml_time_us();
 
-    pimpl->gather(rows, n, dst);
+    if (pimpl->slices) {
+        pimpl->gather_slices(rows, n, dst);
+    } else {
+        pimpl->gather(rows, n, dst);
+    }
 
     pimpl->n_gather++;
     pimpl->n_row_ask   += n;
@@ -486,11 +658,19 @@ void llama_row_cache::print_stats(const char * tag) const {
         return;
     }
 
-    LLAMA_LOG_INFO("%s: %s: %.1f%% of %" PRId64 " block lookups hit, %" PRId64 " blocks read "
-            "in %" PRId64 " requests (%.2f GiB, %.0f B each)\n",
-            __func__, tag, 100.0*p->n_hit/n_ask, n_ask, p->n_read, p->n_req,
-            p->n_read*p->blk_size/1024.0/1024.0/1024.0,
-            p->n_req > 0 ? (double) p->n_read*p->blk_size/p->n_req : 0.0);
+    if (p->slices) {
+        LLAMA_LOG_INFO("%s: %s: %.1f%% of %" PRId64 " rows asked repeat a row of the same gather, %" PRId64 " rows read in %"
+                PRId64 " requests (%.2f GiB, %.0f B each)\n",
+                __func__, tag, 100.0*p->n_hit/n_ask, n_ask, p->n_read, p->n_req,
+                p->n_read*p->row_size/1024.0/1024.0/1024.0,
+                p->n_req > 0 ? (double) p->n_read*p->row_size/p->n_req : 0.0);
+    } else {
+        LLAMA_LOG_INFO("%s: %s: %.1f%% of %" PRId64 " block lookups hit, %" PRId64 " blocks read "
+                "in %" PRId64 " requests (%.2f GiB, %.0f B each)\n",
+                __func__, tag, 100.0*p->n_hit/n_ask, n_ask, p->n_read, p->n_req,
+                p->n_read*p->blk_size/1024.0/1024.0/1024.0,
+                p->n_req > 0 ? (double) p->n_read*p->blk_size/p->n_req : 0.0);
+    }
 
     const int64_t t_io = p->t_io_us.load();
 

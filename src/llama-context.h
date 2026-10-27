@@ -485,6 +485,10 @@ private:
     // before the graph of a ubatch runs: the fork's work that overlaps it (llama_fork_before_compute)
     void fork_before_compute(llama_memory_context_i * mctx);
 
+    // the top of a decode, the batch in balloc: the inputs of a prompt's first ubatch read in the background
+    // (llama_fork_prefetch_first)
+    void fork_prefetch_first();
+
     // set_next_tokens: the tokens, the position of the first and its sequence; decode calls that saw them
     std::vector<llama_token> next_tokens;
     llama_pos                next_pos0  = 0;

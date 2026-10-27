@@ -100,11 +100,13 @@ void llama_context::kv_elastic_init_fork() {
 }
 
 void llama_context::kv_elastic_try_fork() {
-    // LLAMA_KV_ELASTIC: -1 (default) with --phase-mem and the moe-cache, where the device maps memory on demand (CUDA
-    // with VMM, Vulkan with sparse buffers); 1 also elsewhere, emulated in ordinary buffers where the device has none
-    // (tests, LLAMA_KV_ELASTIC_POISON); 0 off
-    const int mode = llama_kv_elastic_mode_fork();
-    if (!memory || mode == 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || (mode < 0 && !(cparams.phase_mem && moe_cache_fork))) {
+    // LLAMA_KV_ELASTIC: -1 (default) where the device maps memory on demand (CUDA with VMM, Vulkan with sparse buffers),
+    // with --phase-mem and the moe-cache (the 3090) or with no expert cache at all (the 395, since 27.10); 1 also
+    // elsewhere, emulated in ordinary buffers where the device has none (tests, LLAMA_KV_ELASTIC_POISON); 0 off
+    const int  mode     = llama_kv_elastic_mode_fork();
+    const bool no_cache = llama_kv_elastic_no_cache_fork(model, cparams);
+    if (!memory || mode == 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+            (mode < 0 && !(cparams.phase_mem && moe_cache_fork) && !no_cache)) {
         return;
     }
     if (!memory->kv_elastic_init_fork(mode > 0)) {
@@ -137,7 +139,8 @@ void llama_context::kv_elastic_try_fork() {
     }
 
     LLAMA_LOG_INFO("%s: kv_elastic: %u of %u cells mapped, step %u, %.1f MiB per 1024 cells%s\n", __func__, cap, cparams.n_ctx,
-            kv_elastic_step, memory->kv_cell_bytes_fork()*1024/1024.0/1024.0, mode > 0 ? " (on request)" : "");
+            kv_elastic_step, memory->kv_cell_bytes_fork()*1024/1024.0/1024.0,
+            mode > 0 ? " (on request)" : no_cache ? " (by default: no expert cache, LLAMA_KV_ELASTIC=0 for a static one)" : "");
 }
 
 // LLAMA_KV_ELASTIC_TEST_MIB (tests): the device memory of the KV capacity and of the moe-cache slots together stops at this
@@ -718,6 +721,27 @@ void llama_context::fork_before_compute(llama_memory_context_i * mctx) {
     const llama_ubatch hint = llama_fork_tokens_ubatch(next_tokens.data(), n, next_pos0, next_seq);
     llama_fork_before_compute(model, mctx, &hint);
     next_tokens.clear();
+}
+
+void llama_context::fork_prefetch_first() {
+    if (!memory) {
+        return;
+    }
+    // a prompt, tokens of one sequence at consecutive positions; the rows of a decode step of a few tokens come in well
+    // under a millisecond, less than the thread of a read ahead costs
+    const llama_batch & batch = balloc->get_batch();
+    if (batch.token == nullptr || batch.embd != nullptr || batch.n_tokens < 32 || batch.n_seq_id[0] != 1) {
+        return;
+    }
+    const llama_seq_id seq = batch.seq_id[0][0];
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq || batch.pos[i] != batch.pos[0] + i) {
+            return;
+        }
+    }
+    // the phase step after this picks the ubatch: the tokens of the largest one, the first takes its share of the rows
+    const uint32_t n = std::min<uint32_t>((uint32_t) batch.n_tokens, cparams.n_ubatch);
+    llama_fork_prefetch_first(model, memory.get(), llama_fork_tokens_ubatch(batch.token, n, batch.pos[0], seq));
 }
 
 void llama_set_next_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id) {
