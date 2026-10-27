@@ -499,7 +499,20 @@ rem as before 27.10, par4 four agents with the defaults. @p= with no prefix: the
 rem prompts would repeat those of warm, which stand for auto: the same identity). left out, in the line above:
 rem par4x0 (exclusive off, the par4 of 27.10), par6 (as par6kvel of 27.10) and par8 (how many agents fit, not a
 rem check of these changes)
-if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;kv0 LLAMA_KV_ELASTIC=0 @p= @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @p= @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem [replaced 27.10 night, measured] if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;kv0 LLAMA_KV_ELASTIC=0 @p= @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @p= @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 27.10 night (logs 27.10 18:37, src-b474764d): checks 39/39, KLD 0.015368. doc chat to 213K, PP / TG over all
+rem turns: auto 795.7 / 41.46, old0 776.3 / 41.06, kv0 797.3 / 41.51. a prompt ubatch waited for its PLE rows
+rem 8.5 ms (median 2.3) before its graph against 133.6 (156.1) in old0, a turn about 100 ms shorter; the graph
+rem build of that ubatch took 108 ms against 90 (the 32 readers on the 32 threads). the elastic KV by default
+rem (the line "by default: no expert cache" in the log) grew from 8192 to 221184 cells, all on the device: no
+rem spill with the margin of 512 (on 27.10 kvel spilled at 188K); kv0, the static cache, the same speed. par4
+rem (exclusive, elastic, PLE ahead) 527.0 s, 28.18 t/s together (par4x of 27.10: 525.5 s, 27.43), a turn's PP
+rem 757 against 731, par4 reached 237568 cells, no spill. no start failed
+rem 27.10 night, the next run: rt16 / rt8 (LLAMA_ROW_CACHE_THREADS 16 / 8, 32 by default here) against auto:
+rem fewer readers leave threads to the graph build, but here the gather of a turn has only that build (~90 ms)
+rem to hide in. the chats read rows warm (warm before them): fewer readers also mean fewer reads of the drive at
+rem once for the rows of a new text
+if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;rt16 LLAMA_ROW_CACHE_THREADS=16 @p= @draft --spec-auto;rt8 LLAMA_ROW_CACHE_THREADS=8 @p= @draft --spec-auto"
 rem 27.10 evening: the KV takes device memory for the cells in use only by default here: LLAMA_KV_ELASTIC -1 now
 rem also covers a context with no expert cache on a device with sparse buffers (the daily server too)
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
@@ -941,7 +954,20 @@ rem 27.10 night: only what this run measures: auto against old0 (the PLE rows as
 rem ahead with the old gather), par4 (the exclusive prompts that lost the read ahead on 27.10). @p= with no prefix:
 rem the arm runs its chats only, see the 395. left out, in the line above: rt8 (the number of readers, after these)
 rem and par4x0 (exclusive off, the par4 of 27.10)
-if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;sl0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @p= @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem [replaced 27.10 night, measured] if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;old0 LLAMA_PLE_PREFETCH_FIRST=0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;sl0 LLAMA_ROW_CACHE_SLICES=0 @p= @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @p= @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 27.10 night (logs 27.10 18:36, src-54f7c352): checks 32/32, KLD 0.017549. doc chat to 213K, PP / TG over all
+rem turns: auto 795.0 / 31.89, old0 778.1 / 32.14, sl0 792.3 / 32.01; the 29K chat of short turns 165.5 / 162.7 /
+rem 170.7 (their gathers are small). a prompt ubatch waited for its PLE rows 3.1 ms before its graph in auto and
+rem sl0 against 219.4 in old0, a turn about 100 ms shorter (median 99): the rest went into the phase step, 0.268 s
+rem against 0.213 (0.290 in sl0), its free and queries parts (calls of the driver), while the 24 readers take all
+rem 24 threads. the verify steps the same in all three (2 tokens 49.5-50.0 ms). par4 (exclusive, PLE ahead) 761.9
+rem s against 755.1 of par4x on 27.10, a turn's PP 757 against 771: its PLE wait went (201 -> 3 ms), its phase
+rem step grew 0.214 -> 0.251 s. no start failed
+rem 27.10 night, the next run: rt16 / rt8 (LLAMA_ROW_CACHE_THREADS 16 / 8, 24 by default here) against auto:
+rem fewer readers leave the phase step its threads; the gather of a turn has the 0.21-0.27 s of that step to hide
+rem in. the chats read rows warm (warm before them): fewer readers also mean fewer reads of the drive at once for
+rem the rows of a new text
+if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;rt16 LLAMA_ROW_CACHE_THREADS=16 @p= @draft --spec-auto;rt8 LLAMA_ROW_CACHE_THREADS=8 @p= @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 rem 23.10: the prompt pieces while other slots generate (LLAMA_PREFILL_BUDGET, 2048 by default) would each
