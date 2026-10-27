@@ -4230,6 +4230,13 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // fork: the generating slots wait while a slot reads its prompt (server_prefill_exclusive_fork)
+        const bool prompt_only = server_prefill_exclusive_fork() && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.is_processing() && !slot.room_paused && slot.task &&
+                   slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_TRANSCRIBE_RT &&
+                   (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
+        });
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS) {
@@ -4237,6 +4244,10 @@ private:
             }
 
             if (slot.room_paused) { // fork: paused for room (room_fork)
+                return;
+            }
+
+            if (prompt_only) { // fork: waits for the prompts (server_prefill_exclusive_fork)
                 return;
             }
 
@@ -4428,6 +4439,12 @@ private:
                 }
 
                 if (slot.room_paused) { // fork: paused for room (room_fork)
+                    return;
+                }
+
+                // fork: the generating slots wait (server_prefill_exclusive_fork). they take no part in the batch either: one
+                // set as slot_batched here would keep out a prompt it cannot batch with, and the steps would stay empty
+                if (prompt_only && slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_PROCESSING_PROMPT) {
                     return;
                 }
 

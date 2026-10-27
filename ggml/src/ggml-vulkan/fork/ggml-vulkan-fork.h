@@ -184,6 +184,10 @@ void ggml_vk_fork_shmem_limit(vk_device & device);
 // sparse buffers of the device (25.10), logged once: an elastic KV on Vulkan would reserve the range of the whole cache
 // and bind memory to the cells in use, as the CUDA one maps VMM granules (MoltenVK has none)
 void ggml_vk_fork_log_sparse(const vk_device & device);
+
+// elastic buffers (26.10): the clear of a buffer with memory bound to some granules only clears those; false for an
+// ordinary buffer
+bool ggml_vk_fork_elastic_clear(ggml_backend_vk_buffer_context * ctx, uint8_t value);
 // GGML_VK_INT_LARGE_TILE: the large int8 coopmat tiles for matmul and matmul_id even where the large f16 tile is off
 void ggml_vk_fork_int_large_tile(const vk_device & device, bool & matmul, bool & matmul_id);
 // the <name>_Shared buffer type and GGML_VK_MM_CHUNK_MB

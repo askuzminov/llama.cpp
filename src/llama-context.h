@@ -538,6 +538,7 @@ private:
     // kv_elastic_set_fork sets the capacity to about n_cells, giving up the moe-cache slots when the device has no
     // memory left and release is set; false when the capacity stays below n_cells
     void kv_elastic_init_fork();
+    void kv_elastic_try_fork(); // kv_elastic_init_fork without the full allocation of the caches it did not place
     bool kv_elastic_set_fork(uint32_t n_cells, bool release);
     uint32_t kv_elastic_capacity_fork(uint32_t n_cells); // memory->kv_set_capacity_fork within LLAMA_KV_ELASTIC_TEST_MIB
 

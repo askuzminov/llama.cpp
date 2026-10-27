@@ -13674,6 +13674,10 @@ bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_
 void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
+    if (ggml_vk_fork_elastic_clear(ctx, value)) { // fork: only the granules with memory
+        return;
+    }
+
     ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
 }
 

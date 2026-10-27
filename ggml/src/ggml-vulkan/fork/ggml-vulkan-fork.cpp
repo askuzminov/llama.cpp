@@ -295,8 +295,9 @@ void ggml_vk_fork_log_sparse(const vk_device & device) {
     for (const auto & f : families) {
         n_sparse += (f.queueFlags & vk::QueueFlagBits::eSparseBinding) ? 1 : 0;
     }
-    GGML_LOG_INFO("ggml_vulkan: sparse buffers: binding %d, residency %d, %zu of %zu queue families\n",
-        (int) features.sparseBinding, (int) features.sparseResidencyBuffer, n_sparse, families.size());
+    GGML_LOG_INFO("ggml_vulkan: sparse buffers: binding %d, residency %d, %zu of %zu queue families, max allocations %u\n",
+        (int) features.sparseBinding, (int) features.sparseResidencyBuffer, n_sparse, families.size(),
+        device->properties.limits.maxMemoryAllocationCount);
 }
 
 void ggml_vk_fork_log_limits(const vk_device & device) {
@@ -682,6 +683,442 @@ static void ggml_vk_fork_profiler(bool start) {
     }
 }
 
+// elastic buffers (26.10): the elastic KV cache of llama (LLAMA_KV_ELASTIC, src/fork/llama-kv-elastic-fork.cpp) places its
+// tensors in a buffer that reserves the range of the whole cache and binds device memory to the cells in use, per
+// granule, as the CUDA one maps VMM granules (ggml-cuda/fork/elastic-buffer-fork.inc). Here a sparse buffer: the device
+// needs sparseBinding and sparseResidencyBuffer and a queue family that binds sparse memory (the AMD driver of the 395
+// has them, MoltenVK has not). The memory the cache does not bind stays free. The granules take their memory from slabs
+// of the buffer: one granule a slab where the driver allows many allocations, several where it allows few
+// (maxMemoryAllocationCount, 4096 on some Windows drivers); a slab is freed with its last granule. When the device
+// memory is full, the slabs come from the shared memory (host visible, not device local) where the buffer takes it:
+// on the 395 the same DRAM outside the carve-out, which the gpu reads at about the same speed (the experts of 40-47
+// there cost ~1 percent TG, 26.10); GGML_VK_ELASTIC_SPILL=0 turns this off, 2 takes every slab from there (tests).
+// Full is read from VK_EXT_memory_budget before a slab is allocated, a heap keeping GGML_VK_ELASTIC_MARGIN_MIB (2048)
+// free for the compute buffers: the AMD driver of the 395 gives device memory past the carve-out without an error and
+// stalls on its first use (the MTP head at 98.8 GB of buffers, 11.10), so a failed allocation comes too late. The
+// buffer is not host visible: the tensor writes and reads go through the staging buffers
+struct ggml_vk_elastic_fork {
+    struct slab {
+        vk::DeviceMemory     mem;   // null once freed, the place is taken again
+        std::vector<uint8_t> used;  // per granule of the slab
+        size_t               n_used = 0;
+        bool                 spill  = false; // of the shared memory
+    };
+
+    vk_device               device;
+    size_t                  granularity   = 0; // a multiple of the sparse page size
+    size_t                  slab_granules = 1;
+    uint32_t                memory_type   = 0;
+    int                     spill_type    = -1; // the shared memory type, -1 for none
+    bool                    spill_only    = false; // GGML_VK_ELASTIC_SPILL=2
+    bool                    budget        = false; // VK_EXT_memory_budget: the room of a heap is read before a slab
+    uint64_t                margin        = 0;     // bytes each heap keeps free
+    bool                    device_full   = false; // the device memory had no room for a slab in this commit
+    bool                    spilled       = false; // logged
+    vk::MemoryAllocateFlags alloc_flags;       // the device address flag where the buffers have addresses
+    std::vector<int32_t>    granule_slab;      // per granule of the buffer: its slab, -1 while unbound
+    std::vector<uint32_t>   granule_piece;     // and its place in the slab
+    std::vector<slab>       slabs;
+
+    ~ggml_vk_elastic_fork() {
+        for (const slab & s : slabs) {
+            if (s.mem) {
+                device->device.freeMemory(s.mem);
+            }
+        }
+    }
+
+    // a slab with room, of the device memory or the shared memory, slabs.size() for none
+    size_t open_slab(bool spill) const {
+        for (size_t k = 0; k < slabs.size(); ++k) {
+            if (slabs[k].mem && slabs[k].spill == spill && slabs[k].n_used < slab_granules) {
+                return k;
+            }
+        }
+        return slabs.size();
+    }
+
+    // whether a slab fits the heap of the memory type within its budget, less the margin; true without the budget
+    bool heap_room(uint32_t type) const {
+        if (!budget) {
+            return true;
+        }
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget_props;
+        vk::PhysicalDeviceMemoryProperties2 props2;
+        props2.pNext = &budget_props;
+        device->physical_device.getMemoryProperties2(&props2);
+        const uint32_t heap  = props2.memoryProperties.memoryTypes[type].heapIndex;
+        const uint64_t limit = std::min<uint64_t>(budget_props.heapBudget[heap], props2.memoryProperties.memoryHeaps[heap].size);
+        return budget_props.heapUsage[heap] + slab_granules*granularity + margin <= limit;
+    }
+
+    bool alloc_slab(uint32_t type, vk::DeviceMemory & mem) const {
+        vk::MemoryAllocateFlagsInfo flags_info(alloc_flags);
+        try {
+            mem = device->device.allocateMemory(vk::MemoryAllocateInfo(slab_granules*granularity, type, &flags_info));
+        } catch (const vk::SystemError &) {
+            return false;
+        }
+        return true;
+    }
+
+    // a place for granule i: a device slab with room, a new device slab, then the same of the shared memory; false
+    // when there is no memory for one
+    bool take(size_t i) {
+        size_t k = open_slab(false);
+        if (k == slabs.size()) {
+            vk::DeviceMemory mem;
+            bool spill = false;
+            if (spill_only || device_full || !heap_room(memory_type) || !alloc_slab(memory_type, mem)) {
+                device_full = true;
+                k = spill_type >= 0 ? open_slab(true) : slabs.size();
+                if (k == slabs.size()) {
+                    if (spill_type < 0 || !heap_room((uint32_t) spill_type) || !alloc_slab((uint32_t) spill_type, mem)) {
+                        return false;
+                    }
+                    spill = true;
+                    if (!spilled) {
+                        GGML_LOG_INFO("ggml_vulkan: elastic buffer: the device memory is full, granules from the shared memory (type %d)\n", spill_type);
+                        spilled = true;
+                    }
+                }
+            }
+            if (mem) {
+                k = 0;
+                while (k < slabs.size() && slabs[k].mem) {
+                    ++k;
+                }
+                if (k == slabs.size()) {
+                    slabs.emplace_back();
+                }
+                slabs[k].mem    = mem;
+                slabs[k].used.assign(slab_granules, 0);
+                slabs[k].n_used = 0;
+                slabs[k].spill  = spill;
+            }
+        }
+        slab & s = slabs[k];
+        const size_t p = std::find(s.used.begin(), s.used.end(), 0) - s.used.begin();
+        s.used[p] = 1;
+        s.n_used++;
+        granule_slab[i]  = (int32_t) k;
+        granule_piece[i] = (uint32_t) p;
+        return true;
+    }
+
+    // granule i leaves its place, after it is unbound; free_empty() then frees the slabs with no granule left
+    void give(size_t i) {
+        slab & s = slabs[granule_slab[i]];
+        s.used[granule_piece[i]] = 0;
+        s.n_used--;
+        granule_slab[i] = -1;
+    }
+
+    void free_empty() {
+        for (slab & s : slabs) {
+            if (s.mem && s.n_used == 0) {
+                device->device.freeMemory(s.mem);
+                s.mem = vk::DeviceMemory();
+            }
+        }
+    }
+};
+
+// the queue of the binds: one whose family binds sparse memory, nullptr where the device has no sparse buffers
+static vk_queue * ggml_vk_fork_sparse_queue(const vk_device & device) {
+    const vk::PhysicalDeviceFeatures features = device->physical_device.getFeatures();
+    if (!features.sparseBinding || !features.sparseResidencyBuffer) {
+        return nullptr;
+    }
+    const std::vector<vk::QueueFamilyProperties> families = device->physical_device.getQueueFamilyProperties();
+    for (vk_queue * q : { device->compute_queue.get(), device->transfer_queue.get() }) {
+        if (q != nullptr && q->queue_family_index < families.size() &&
+                (families[q->queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding)) {
+            return q;
+        }
+    }
+    return nullptr;
+}
+
+// binds the memory of each entry (null: unbinds) to the buffer, and waits for it
+static void ggml_vk_fork_sparse_bind(const vk_device & device, vk::Buffer buffer, const std::vector<vk::SparseMemoryBind> & binds) {
+    if (binds.empty()) {
+        return;
+    }
+    vk_queue * q = ggml_vk_fork_sparse_queue(device);
+    GGML_ASSERT(q != nullptr);
+
+    vk::SparseBufferMemoryBindInfo buffer_bind(buffer, (uint32_t) binds.size(), binds.data());
+    vk::BindSparseInfo info;
+    info.setBufferBindCount(1);
+    info.setPBufferBinds(&buffer_bind);
+
+    struct fence_guard {
+        vk::Device dev;
+        vk::Fence  fence;
+        ~fence_guard() { dev.destroyFence(fence); }
+    } guard { device->device, device->device.createFence({}) };
+    {
+        std::unique_lock<std::mutex> device_guard;
+        if (q->handle->device_submit_mutex) {
+            device_guard = std::unique_lock<std::mutex>(*q->handle->device_submit_mutex);
+        }
+        q->handle->lock();
+        try {
+            q->handle->queue.bindSparse(info, guard.fence);
+        } catch (...) {
+            q->handle->unlock();
+            throw;
+        }
+        q->handle->unlock();
+    }
+    VK_CHECK(device->device.waitForFences({ guard.fence }, true, UINT64_MAX), "elastic bindSparse waitForFences", device);
+}
+
+// the work of the queues done, so that no command reads a granule that goes
+static void ggml_vk_fork_queues_idle(const vk_device & device) {
+    for (vk_queue * q : { device->compute_queue.get(), device->transfer_queue.get() }) {
+        if (q == nullptr) {
+            continue;
+        }
+        q->handle->lock();
+        q->handle->queue.waitIdle();
+        q->handle->unlock();
+    }
+}
+
+// a buffer of `size` bytes with no memory bound yet, nullptr where the device has no sparse buffers
+static ggml_backend_buffer_t ggml_backend_vk_buft_alloc_elastic_fork(ggml_backend_buffer_type_t buft, size_t size) {
+    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
+        return nullptr;
+    }
+    ggml_backend_vk_buffer_type_context * bctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    vk_device device = bctx->device;
+    if (bctx->shared || size == 0 || ggml_vk_fork_sparse_queue(device) == nullptr) {
+        return nullptr;
+    }
+
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+                                 vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    const vk::BufferCreateFlags flags = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+
+    // the granule: the 2 MiB that llama aligns the tensors of the cache to, in whole sparse pages
+    size_t granule = 2u*1024*1024;
+    size_t total   = GGML_PAD(size, granule);
+
+    vk::Buffer buffer;
+    vk::MemoryRequirements req;
+    try {
+        buffer = device->device.createBuffer({ flags, total, usage, vk::SharingMode::eExclusive });
+        req    = device->device.getBufferMemoryRequirements(buffer);
+        if (req.alignment > 0 && granule % req.alignment != 0) {
+            device->device.destroyBuffer(buffer);
+            buffer  = VK_NULL_HANDLE;
+            granule = GGML_PAD(granule, (size_t) req.alignment);
+            total   = GGML_PAD(size, granule);
+            buffer  = device->device.createBuffer({ flags, total, usage, vk::SharingMode::eExclusive });
+            req     = device->device.getBufferMemoryRequirements(buffer);
+        }
+    } catch (const vk::SystemError & e) {
+        if (buffer) {
+            device->device.destroyBuffer(buffer);
+        }
+        GGML_LOG_WARN("ggml_vulkan: no sparse buffer of %zu bytes: %s\n", size, e.what());
+        return nullptr;
+    }
+
+    // no protected or lazily allocated memory (a sparse bind takes neither), no AMD device coherent or uncached memory
+    // (the deviceCoherentMemory feature is not enabled)
+    const vk::MemoryPropertyFlags no = vk::MemoryPropertyFlagBits::eProtected | vk::MemoryPropertyFlagBits::eLazilyAllocated |
+                                       vk::MemoryPropertyFlagBits::eDeviceCoherentAMD | vk::MemoryPropertyFlagBits::eDeviceUncachedAMD;
+    const vk::PhysicalDeviceMemoryProperties props = device->physical_device.getMemoryProperties();
+    int memory_type = -1;
+    for (uint32_t i = 0; i < props.memoryTypeCount && memory_type < 0; ++i) {
+        const vk::MemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
+        if ((req.memoryTypeBits & (1u << i)) && (f & vk::MemoryPropertyFlagBits::eDeviceLocal) && !(f & no)) {
+            memory_type = (int) i;
+        }
+    }
+    if (memory_type < 0) {
+        device->device.destroyBuffer(buffer);
+        return nullptr;
+    }
+    // the shared memory for the slabs that the device memory has no room for (GGML_VK_ELASTIC_SPILL=0: none, 2: all)
+    const int spill_mode = getenv("GGML_VK_ELASTIC_SPILL") != nullptr ? atoi(getenv("GGML_VK_ELASTIC_SPILL")) : 1;
+    int spill_type = -1;
+    if (spill_mode != 0) {
+        const vk::MemoryPropertyFlags want = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+        for (uint32_t i = 0; i < props.memoryTypeCount && spill_type < 0; ++i) {
+            const vk::MemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
+            if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && !(f & vk::MemoryPropertyFlagBits::eDeviceLocal) && !(f & no)) {
+                spill_type = (int) i;
+            }
+        }
+    }
+
+    auto el = std::make_shared<ggml_vk_elastic_fork>();
+    el->device      = device;
+    el->granularity = granule;
+    el->memory_type = (uint32_t) memory_type;
+    el->spill_type  = spill_type;
+    el->spill_only  = spill_mode == 2 && spill_type >= 0;
+    el->budget      = device->idx < vk_instance.device_supports_membudget.size() && vk_instance.device_supports_membudget[device->idx];
+    el->margin      = (uint64_t) std::max<int64_t>(0, getenv("GGML_VK_ELASTIC_MARGIN_MIB") != nullptr ?
+                          atoll(getenv("GGML_VK_ELASTIC_MARGIN_MIB")) : 2048)*1024*1024;
+    if (device->buffer_device_address) {
+        el->alloc_flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+    }
+    el->granule_slab.assign(total/granule, -1);
+    el->granule_piece.assign(total/granule, 0);
+
+    // granules per slab: elastic buffers that fill the whole heap of their memory take at most three quarters of the
+    // allocations the device allows (32 MiB slabs for a 96 GiB heap and 4096 allocations)
+    {
+        const uint64_t heap   = props.memoryHeaps[props.memoryTypes[memory_type].heapIndex].size;
+        const uint64_t budget = std::max<uint64_t>(1, device->properties.limits.maxMemoryAllocationCount/4*3);
+        el->slab_granules = (size_t) std::max<uint64_t>(1, (heap/granule + budget - 1)/budget);
+    }
+    GGML_LOG_INFO("ggml_vulkan: elastic buffer of %.1f MiB: granule %zu KiB, %zu per slab, memory type %d, shared type %d%s, budget %d\n",
+        total/1024.0/1024.0, granule/1024, el->slab_granules, memory_type, spill_type, el->spill_only ? " (all slabs)" : "", (int) el->budget);
+
+    vk_buffer vkb = std::make_shared<vk_buffer_struct>();
+    vkb->buffer                = buffer;
+    vkb->device_memory         = VK_NULL_HANDLE;
+    vkb->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal; // not mapped: no direct host access
+    vkb->ptr                   = nullptr;
+    vkb->size                  = total;
+    vkb->device                = device;
+    if (device->buffer_device_address) {
+        vkb->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(buffer));
+    }
+
+    std::string name = bctx->name;
+    ggml_backend_vk_buffer_context * ctx = new ggml_backend_vk_buffer_context(device, std::move(vkb), name);
+    ctx->elastic = el;
+
+    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, ctx, total);
+}
+
+// binds device memory, zeroed, to the granules of [offset, offset + size) that have none; false when the device has no
+// memory left for them (the granules bound before stay bound)
+static bool ggml_backend_vk_buffer_commit_fork(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    if (!ggml_backend_buffer_is_vk(buffer)) {
+        return false;
+    }
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    ggml_vk_elastic_fork * el = ctx->elastic.get();
+    if (el == nullptr || size == 0) {
+        return true;
+    }
+
+    const size_t g  = el->granularity;
+    const size_t i0 = offset/g;
+    const size_t i1 = std::min(el->granule_slab.size(), (offset + size + g - 1)/g);
+
+    // the device memory freed elsewhere since the last call is tried again, once per call
+    el->device_full = false;
+
+    std::vector<vk::SparseMemoryBind> binds;
+    bool ok = true;
+    for (size_t i = i0; i < i1; ++i) {
+        if (el->granule_slab[i] >= 0) {
+            continue;
+        }
+        if (!el->take(i)) {
+            ok = false;
+            break;
+        }
+        binds.push_back(vk::SparseMemoryBind(i*g, g, el->slabs[el->granule_slab[i]].mem, el->granule_piece[i]*g));
+    }
+
+    try {
+        ggml_vk_fork_sparse_bind(el->device, ctx->dev_buffer->buffer, binds);
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: binding %zu granules of an elastic buffer failed: %s\n", binds.size(), e.what());
+        for (const auto & b : binds) {
+            el->give(b.resourceOffset/g);
+        }
+        el->free_empty();
+        return false;
+    }
+
+    // padding cells are read by the attention: no NaN in them, as the clear of an ordinary buffer
+    for (size_t k = 0; k < binds.size(); ) {
+        size_t j = k + 1;
+        while (j < binds.size() && binds[j].resourceOffset == binds[j - 1].resourceOffset + g) {
+            ++j;
+        }
+        ggml_vk_buffer_memset(ctx->dev_buffer, binds[k].resourceOffset, 0, (j - k)*g);
+        k = j;
+    }
+
+    return ok;
+}
+
+// unbinds and frees the granules that lie whole inside [offset, offset + size)
+static void ggml_backend_vk_buffer_decommit_fork(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    if (!ggml_backend_buffer_is_vk(buffer)) {
+        return;
+    }
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    ggml_vk_elastic_fork * el = ctx->elastic.get();
+    if (el == nullptr || size == 0) {
+        return;
+    }
+
+    const size_t g  = el->granularity;
+    const size_t i0 = (offset + g - 1)/g;
+    const size_t i1 = std::min(el->granule_slab.size(), (offset + size)/g);
+
+    std::vector<vk::SparseMemoryBind> binds;
+    for (size_t i = i0; i < i1; ++i) {
+        if (el->granule_slab[i] >= 0) {
+            binds.push_back(vk::SparseMemoryBind(i*g, g, vk::DeviceMemory(), 0));
+        }
+    }
+    if (binds.empty()) {
+        return;
+    }
+
+    // the granules stay bound when the unbind fails: their memory is not freed under a binding
+    try {
+        ggml_vk_fork_queues_idle(el->device);
+        ggml_vk_fork_sparse_bind(el->device, ctx->dev_buffer->buffer, binds);
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: unbinding %zu granules of an elastic buffer failed: %s\n", binds.size(), e.what());
+        return;
+    }
+    for (const auto & b : binds) {
+        el->give(b.resourceOffset/g);
+    }
+    el->free_empty();
+}
+
+bool ggml_vk_fork_elastic_clear(ggml_backend_vk_buffer_context * ctx, uint8_t value) {
+    ggml_vk_elastic_fork * el = ctx->elastic.get();
+    if (el == nullptr) {
+        return false;
+    }
+    const uint32_t val32 = (uint32_t) value * 0x01010101;
+    const size_t   g     = el->granularity;
+    for (size_t i = 0; i < el->granule_slab.size(); ) {
+        if (el->granule_slab[i] < 0) {
+            ++i;
+            continue;
+        }
+        size_t j = i + 1;
+        while (j < el->granule_slab.size() && el->granule_slab[j] >= 0) {
+            ++j;
+        }
+        ggml_vk_buffer_memset(ctx->dev_buffer, i*g, val32, (j - i)*g);
+        i = j;
+    }
+    return true;
+}
+
 void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
@@ -689,6 +1126,15 @@ void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char *
     }
     if (strcmp(name, "ggml_backend_profiler_fork") == 0) {
         return (void *) ggml_vk_fork_profiler;
+    }
+    if (strcmp(name, "ggml_backend_buft_alloc_elastic_fork") == 0) {
+        return (void *) ggml_backend_vk_buft_alloc_elastic_fork;
+    }
+    if (strcmp(name, "ggml_backend_buffer_commit_fork") == 0) {
+        return (void *) ggml_backend_vk_buffer_commit_fork;
+    }
+    if (strcmp(name, "ggml_backend_buffer_decommit_fork") == 0) {
+        return (void *) ggml_backend_vk_buffer_decommit_fork;
     }
     return nullptr;
 }

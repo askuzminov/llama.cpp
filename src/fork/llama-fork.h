@@ -34,3 +34,19 @@ void llama_fork_prefetch_tokens(const llama_model & model, llama_memory_i * mem,
 // whether the graph of the model runs the deferred rollback of the gated delta net (llama_memory_recurrent::rec_l,
 // LLAMA_GDN_LAZY): the fork's qwen4exp does, the upstream copy does not
 bool llama_fork_gdn_lazy(const llama_model & model);
+
+// LLAMA_KV_ELASTIC (llama_context::kv_elastic_init_fork): -1 (default) elastic with --phase-mem and the moe-cache, 1
+// also elsewhere (emulated where the device has no elastic buffers), 0 off
+int llama_kv_elastic_mode_fork();
+
+// the KV caches built while one of these lives leave their tensors without memory, a buffer of size 0 marking them for
+// the scheduler as with no_alloc. the context then places them in elastic buffers (llama_kv_cache::elastic_init_fork)
+// or, where that does not take, allocates them in full (alloc_deferred_fork), so that the start does not hold the
+// whole static cache next to the compute buffers before the elastic one replaces it (26.10). set with
+// LLAMA_KV_ELASTIC=1 around the memory of the fork's qwen4exp, the one memory whose context does either
+struct llama_kv_defer_scope_fork {
+    explicit llama_kv_defer_scope_fork(bool on);
+    ~llama_kv_defer_scope_fork();
+    bool prev;
+};
+bool llama_kv_defer_alloc_fork();

@@ -13,6 +13,10 @@ llama_build_and_test(test-spec-auto-fork.cpp)
 # the fork's knobs of the environment: a value that is not a whole number gives the default, not the 0 of atoi
 llama_build_and_test(test-env-fork.cpp)
 
+# the elastic buffers of the backends (CUDA VMM, Vulkan sparse buffers) on every GPU device that has them, skipped
+# elsewhere; 01-check runs it on the machines (CHECKUNITS)
+llama_build_and_test(test-elastic-buffer-fork.cpp)
+
 # prompt-cache disk spill: block-aligned unbuffered file layout, cold-start adoption, rejection of
 # foreign or truncated files. server-context is a static library, so this links on Windows too.
 llama_build_and_test(test-prompt-cache-spill.cpp)
@@ -112,7 +116,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
         FIXTURES_SETUP moe-cache-ref
     )
-    foreach(MOE_CACHE_MODE keep fill kv)
+    foreach(MOE_CACHE_MODE keep fill kv upload)
         llama_test(
             test-moe-cache-fork
             NAME test-moe-cache-fork-${MOE_CACHE_MODE}

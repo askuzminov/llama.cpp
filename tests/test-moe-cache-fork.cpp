@@ -7,12 +7,14 @@
 //   the host until then: the logits within the difference of the host and the device computing an expert
 // - kv: a growth of the elastic KV takes layers of slots one by one where the device is full (LLAMA_KV_ELASTIC_TEST_MIB
 //   makes it full), the next step gives them back
+// - upload: as keep, and the uploads ahead of whole weights (GGML_SCHED_PREFETCH, every prompt here with
+//   GGML_SCHED_PREFETCH_LOAD=0) take the experts the slots hold from device memory too (LLAMA_MOE_CACHE_COPY=2)
 // the reference run (--out) releases all slots at every phase switch and uploads every expert of a prompt copy from the
 // host. the knobs are read once per process, so each mode is a run of its own (ctest runs them after the reference).
 // the model is the qwen4exp of test-llama-archs with 32 experts instead of 2 and without the per-expert scales, which
 // the cache does not take; its memory takes the elastic KV. each run checks in the log that its path ran
 //
-// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf (--out <file> | --ref <file> --mode keep|fill|kv)
+// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf (--out <file> | --ref <file> --mode keep|fill|kv|upload)
 
 #include "llama.h"
 
@@ -278,8 +280,9 @@ int main(int argc, char ** argv) {
             mode = argv[++i];
         }
     }
-    if (model_in == nullptr || (out == nullptr) == (ref == nullptr) || (ref != nullptr && mode != "keep" && mode != "fill" && mode != "kv")) {
-        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> (--out <file> | --ref <file> --mode keep|fill|kv)\n", argv[0]);
+    if (model_in == nullptr || (out == nullptr) == (ref == nullptr) ||
+            (ref != nullptr && mode != "keep" && mode != "fill" && mode != "kv" && mode != "upload")) {
+        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> (--out <file> | --ref <file> --mode keep|fill|kv|upload)\n", argv[0]);
         return 1;
     }
 
@@ -292,11 +295,15 @@ int main(int argc, char ** argv) {
     if (out != nullptr) {
         set_env("LLAMA_MOE_CACHE_KEEP", "0");
         set_env("LLAMA_MOE_CACHE_COPY", "0");
-    } else if (mode == "keep" || mode == "fill") {
+    } else if (mode == "keep" || mode == "fill" || mode == "upload") {
         // one of the two layers of 37.1 MiB stays (the last one goes first: the counts are even), so the 1-token MoE of
         // the last layer in a prompt graph (its output row) has no slots, as in the reference
         set_env("LLAMA_MOE_CACHE_KEEP", "40");
         set_env("LLAMA_MOE_CACHE_FILL", mode == "fill" ? "1" : "0");
+        if (mode == "upload") {
+            set_env("LLAMA_MOE_CACHE_COPY", "2");
+            set_env("GGML_SCHED_PREFETCH_LOAD", "0");
+        }
     } else {
         // the slots take 74.25 MiB, so the KV gets 512 cells next to them and every growth past that takes a layer
         set_env("LLAMA_KV_ELASTIC_TEST_MIB", "75");
@@ -375,7 +382,7 @@ int main(int argc, char ** argv) {
 
     // keep is bit for bit; fill computes the experts that wait on the host (3.5e-5 apart on the Mac Vulkan0); kv keeps
     // all slots through the prompts, so the 1-token MoE of the last layer reads them there (4.8e-7)
-    const double tol = mode == "keep" ? 0.0 : mode == "fill" ? 1e-4 : 1e-5;
+    const double tol = mode == "keep" || mode == "upload" ? 0.0 : mode == "fill" ? 1e-4 : 1e-5;
 
     CHECK(recs.size() == want.size());
     double max_diff = 0.0;
@@ -400,9 +407,12 @@ int main(int argc, char ** argv) {
 
     // the path of the mode ran
     CHECK(log_has("kept their slots")); // an alloc() that uploaded only the layers it had taken
-    if (mode == "keep" || mode == "fill") {
+    if (mode == "keep" || mode == "fill" || mode == "upload") {
         CHECK(log_has("(moe-cache kept 37 of 74 MiB)"));
         CHECK(log_has("prompt copies: "));
+    }
+    if (mode == "upload") {
+        CHECK(!log_has("the uploads ahead 0.0 MiB")); // upload_weight() took whole weights
     }
     if (mode == "fill") {
         CHECK(log_has("filled in the background"));

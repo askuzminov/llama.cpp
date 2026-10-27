@@ -1357,10 +1357,16 @@ struct ggml_backend_vk_context {
     double gt_period_ms {};
 };
 
+struct ggml_vk_elastic_fork;
+
 struct ggml_backend_vk_buffer_context {
     vk_device_ref device;
     vk_buffer dev_buffer;
     std::string name;
+
+    // fork: a sparse buffer with device memory bound to the granules in use (ggml_backend_vk_buft_alloc_elastic_fork); its
+    // memory goes after the buffer, which the destructor destroys first
+    std::shared_ptr<ggml_vk_elastic_fork> elastic;
 
     ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, std::string& name) :
         device(device),

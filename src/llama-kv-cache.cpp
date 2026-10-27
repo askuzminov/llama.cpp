@@ -300,6 +300,13 @@ llama_kv_cache::llama_kv_cache(
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
+        } else if (llama_kv_defer_alloc_fork()) {
+            // fork: no memory yet, the context places the tensors in elastic buffers or allocates them in full
+            // (llama_kv_defer_scope_fork); the buffer of size 0 keeps the type and marks them for the scheduler
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf;
+            }
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
         }
@@ -2577,6 +2584,18 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
+        }
+
+        // fork: an elastic cache maps memory to the cells of the state first. the attention cache grows itself and the
+        // indexer with it (llama_memory_hybrid_idx_fork), the indexer restores after it into the cells it shares
+        if (elastic_fork && cell_count > n_cap_fork) {
+            if (elastic_grow_fork) {
+                elastic_grow_fork(cell_count);
+            }
+            if (cell_count > n_cap_fork) {
+                LLAMA_LOG_ERROR("%s: the elastic cache maps %u cells, the state holds %u\n", __func__, n_cap_fork, cell_count);
+                return false;
+            }
         }
 
         // the cells go in from 0, so a mirrored cache lands on the same ones as long as it restores the same count. the layout itself carries no more information here

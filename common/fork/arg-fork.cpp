@@ -141,6 +141,15 @@ void common_fork_spec_auto_apply(common_params & params, bool spec_types_given, 
             });
             spec.draft.n_max = dflash ? COMMON_SPECULATIVE_AUTO_N_MAX_DFLASH : COMMON_SPECULATIVE_AUTO_N_MAX;
         }
+
+        // the draft sampled from the head and verified by rejection (26.10) unless --spec-draft-sampling says otherwise:
+        // a sampled target accepts 1 - TV(p, q) of such drafts against p(argmax q) of the greedy ones. the 395, chat to
+        // 213K at temperature 1.0: 156 draft tokens accepted a turn against 145-148 of three greedy arms, TG +3.2
+        // percent; at 0.6 155 against 152, TG the same; the 3090: the chat the same. --spec-draft-sampling greedy:
+        // upstream
+        if (!spec.draft.probabilistic_set) {
+            spec.draft.probabilistic = true;
+        }
     }
 }
 

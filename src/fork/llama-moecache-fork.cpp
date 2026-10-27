@@ -962,7 +962,7 @@ llama_moe_cache_fork::llama_moe_cache_fork(const llama_model & model, int32_t n_
         LLAMA_LOG_ERROR("%s: LLAMA_MOE_CACHE_POLICY=\"%s\" is neither lru nor lfu, using lfu\n", __func__, policy);
     }
     async_table = llama_fork_env_int("LLAMA_MOE_CACHE_ASYNC", 0) != 0;
-    copy_dev    = llama_fork_env_int("LLAMA_MOE_CACHE_COPY", 1) != 0;
+    copy_dev    = (int) std::clamp<int64_t>(llama_fork_env_int("LLAMA_MOE_CACHE_COPY", 1), 0, 2);
     fill_bytes  = (size_t) std::max<int64_t>(0, llama_fork_env_int("LLAMA_MOE_CACHE_FILL", 0))*1024*1024;
 }
 
@@ -1629,7 +1629,7 @@ int64_t llama_moe_cache_fork::copy_experts(ggml_backend_t backend, const ggml_te
 bool llama_moe_cache_fork::upload_weight(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst) {
     int idx   = -1;
     int which = 0;
-    if (!bound_live(backend, w, idx, which)) {
+    if (copy_dev < 2 || !bound_live(backend, w, idx, which)) {
         return false;
     }
 

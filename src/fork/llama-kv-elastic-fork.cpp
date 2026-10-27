@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <stdexcept>
 
 typedef ggml_backend_buffer_t (*llama_buft_alloc_elastic_t)(ggml_backend_buffer_type_t buft, size_t size);
 typedef bool (*llama_buffer_commit_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
@@ -20,6 +21,11 @@ typedef void (*llama_buffer_decommit_t)(ggml_backend_buffer_t buffer, size_t off
 
 // the VMM granule of CUDA; a coarser one only maps a little more than asked
 static constexpr size_t LLAMA_KV_ELASTIC_ALIGN = 2u*1024*1024;
+
+extern "C" {
+// ggml-backend-impl.h (exported from ggml-base, not in the public headers): one buffer over several, which frees them
+GGML_API ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers);
+}
 
 struct llama_kv_elastic_fork {
     struct range {
@@ -43,6 +49,49 @@ struct llama_kv_elastic_fork {
     bool poison = false;
 };
 
+int llama_kv_elastic_mode_fork() {
+    static const int mode = (int) llama_fork_env_int("LLAMA_KV_ELASTIC", -1);
+    return mode;
+}
+
+static thread_local bool llama_kv_defer_fork = false;
+
+llama_kv_defer_scope_fork::llama_kv_defer_scope_fork(bool on) : prev(llama_kv_defer_fork) {
+    llama_kv_defer_fork = on;
+}
+
+llama_kv_defer_scope_fork::~llama_kv_defer_scope_fork() {
+    llama_kv_defer_fork = prev;
+}
+
+bool llama_kv_defer_alloc_fork() {
+    return llama_kv_defer_fork;
+}
+
+void llama_kv_cache::alloc_deferred_fork() {
+    if (hparams.no_alloc) {
+        return;
+    }
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        // the buffer of size 0 of the constructor (an elastic cache has replaced it)
+        if (ggml_backend_buffer_get_size(buf.get()) != 0) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            t->buffer = nullptr;
+            t->data   = nullptr;
+        }
+        ggml_backend_buffer_t res = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!res) {
+            throw std::runtime_error("failed to allocate buffer for kv cache");
+        }
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(res), ggml_backend_buffer_get_size(res)/1024.0/1024.0);
+        ggml_backend_buffer_clear(res, 0);
+        buf.reset(res);
+    }
+}
+
 bool llama_kv_cache::elastic_init_fork(bool emulate) {
     // one stream, rows per cell (no transposed V), the own tensors of the cache. quantized types pad their tensors in
     // init_tensor, which would write into memory not mapped yet
@@ -55,16 +104,32 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
         }
     }
 
+    // the tensors of a buffer type in chunks of at most its largest buffer (Vulkan: one allocation, 2 GiB on the 395),
+    // a chunk per elastic buffer and one buffer over the chunks for the cache
+    struct chunk {
+        std::vector<std::pair<ggml_tensor *, size_t>> placed;
+        size_t                total = 0;
+        ggml_backend_buffer_t buf   = nullptr;
+    };
     struct plan {
         ggml_backend_buffer_type_t buft;
         llama_buft_alloc_elastic_t alloc;
         llama_buffer_commit_t      commit;
         llama_buffer_decommit_t    decommit;
-        std::vector<std::pair<ggml_tensor *, size_t>> placed;
-        size_t                     total = 0;
-        ggml_backend_buffer_t      buf   = nullptr;
+        std::vector<chunk>         chunks;
     };
     std::vector<plan> plans;
+
+    auto free_all = [&plans]() {
+        for (auto & q : plans) {
+            for (auto & c : q.chunks) {
+                if (c.buf) {
+                    ggml_backend_buffer_free(c.buf);
+                    c.buf = nullptr;
+                }
+            }
+        }
+    };
 
     // all buffers or none: a cache half elastic would map memory for some tensors only
     for (auto & [ctx, buf] : ctxs_bufs) {
@@ -87,29 +152,73 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
             p.decommit = nullptr;
         }
 
+        // whole granules: a chunk padded to its granule stays within the largest buffer
+        const size_t max_size = ggml_backend_buft_get_max_size(p.buft)/LLAMA_KV_ELASTIC_ALIGN*LLAMA_KV_ELASTIC_ALIGN;
+
+        p.chunks.emplace_back();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
             if (t->view_src != nullptr) {
                 continue;
             }
-            p.total = GGML_PAD(p.total, LLAMA_KV_ELASTIC_ALIGN);
-            p.placed.push_back({ t, p.total });
-            p.total += ggml_backend_buft_get_alloc_size(p.buft, t);
+            const size_t bytes = ggml_backend_buft_get_alloc_size(p.buft, t);
+            if (bytes > max_size) {
+                return false;
+            }
+            size_t offs = GGML_PAD(p.chunks.back().total, LLAMA_KV_ELASTIC_ALIGN);
+            if (offs + bytes > max_size && !p.chunks.back().placed.empty()) {
+                p.chunks.emplace_back();
+                offs = 0;
+            }
+            p.chunks.back().placed.push_back({ t, offs });
+            p.chunks.back().total = offs + bytes;
         }
-        p.total = GGML_PAD(p.total, LLAMA_KV_ELASTIC_ALIGN);
+        for (auto & c : p.chunks) {
+            c.total = std::max<size_t>(GGML_PAD(c.total, LLAMA_KV_ELASTIC_ALIGN), LLAMA_KV_ELASTIC_ALIGN);
+        }
 
         plans.push_back(std::move(p));
     }
 
-    for (auto & p : plans) {
-        p.buf = p.alloc ? p.alloc(p.buft, p.total) : ggml_backend_buft_alloc_buffer(p.buft, p.total);
-        if (p.buf == nullptr) {
-            for (auto & q : plans) {
-                if (q.buf) {
-                    ggml_backend_buffer_free(q.buf);
+    // the first range decides how the capacity counts as mapped, so the cache is all elastic or all emulated: a
+    // backend without elastic buffers (the CPU part of a partial offload) makes the others emulated too
+    if (emulate && std::any_of(plans.begin(), plans.end(), [](const plan & p) { return p.alloc == nullptr; })) {
+        for (auto & p : plans) {
+            p.alloc    = nullptr;
+            p.commit   = nullptr;
+            p.decommit = nullptr;
+        }
+    }
+
+    auto alloc_all = [&plans]() {
+        for (auto & p : plans) {
+            for (auto & c : p.chunks) {
+                c.buf = p.alloc ? p.alloc(p.buft, c.total) : ggml_backend_buft_alloc_buffer(p.buft, c.total);
+                if (c.buf == nullptr) {
+                    return false;
                 }
             }
+        }
+        return true;
+    };
+
+    // a backend with elastic buffers whose device gives none (Vulkan without sparse buffers: MoltenVK) emulates the
+    // whole cache, as a backend without them
+    if (!alloc_all()) {
+        free_all();
+        const bool elastic = std::any_of(plans.begin(), plans.end(), [](const plan & p) { return p.alloc != nullptr; });
+        if (!emulate || !elastic) {
             return false;
         }
+        for (auto & p : plans) {
+            p.alloc    = nullptr;
+            p.commit   = nullptr;
+            p.decommit = nullptr;
+        }
+        if (!alloc_all()) {
+            free_all();
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: kv_elastic: the device gives no elastic buffer, emulated in ordinary buffers\n", __func__);
     }
 
     auto el = std::make_shared<llama_kv_elastic_fork>();
@@ -119,18 +228,20 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
         auto & p   = plans[i];
         auto & ctx = ctxs_bufs[i].first;
 
-        char * base = (char *) ggml_backend_buffer_get_base(p.buf);
+        for (auto & c : p.chunks) {
+            char * base = (char *) ggml_backend_buffer_get_base(c.buf);
 
-        for (size_t j = 0; j < p.placed.size(); ++j) {
-            ggml_tensor * t    = p.placed[j].first;
-            const size_t  offs = p.placed[j].second;
-            const size_t  end  = j + 1 < p.placed.size() ? p.placed[j + 1].second : p.total;
+            for (size_t j = 0; j < c.placed.size(); ++j) {
+                ggml_tensor * t    = c.placed[j].first;
+                const size_t  offs = c.placed[j].second;
+                const size_t  end  = j + 1 < c.placed.size() ? c.placed[j + 1].second : c.total;
 
-            t->buffer = nullptr;
-            t->data   = nullptr;
-            GGML_ASSERT(ggml_backend_tensor_alloc(p.buf, t, base + offs) == GGML_STATUS_SUCCESS);
+                t->buffer = nullptr;
+                t->data   = nullptr;
+                GGML_ASSERT(ggml_backend_tensor_alloc(c.buf, t, base + offs) == GGML_STATUS_SUCCESS);
 
-            el->ranges.push_back({ t, p.buf, offs, t->nb[1], ggml_nbytes(t), end - offs, p.commit, p.decommit });
+                el->ranges.push_back({ t, c.buf, offs, t->nb[1], ggml_nbytes(t), end - offs, p.commit, p.decommit });
+            }
         }
 
         // the views of the streams follow their tensors
@@ -141,11 +252,17 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
             }
         }
 
-        // the old buffer goes, an emulated one is cleared as the cache cleared its own
-        ctxs_bufs[i].second.reset(p.buf);
-        if (!p.alloc) {
-            ggml_backend_buffer_clear(p.buf, 0);
+        // an emulated chunk is cleared as the cache cleared its own buffer
+        std::vector<ggml_backend_buffer_t> bufs;
+        for (auto & c : p.chunks) {
+            if (!p.alloc) {
+                ggml_backend_buffer_clear(c.buf, 0);
+            }
+            bufs.push_back(c.buf);
         }
+
+        // the old buffer goes, the new one owns its chunks
+        ctxs_bufs[i].second.reset(bufs.size() == 1 ? bufs[0] : ggml_backend_multi_buffer_alloc_buffer(bufs.data(), bufs.size()));
     }
 
     // an emulated cache has its memory, all of it counts as mapped until the first capacity is set
@@ -174,6 +291,19 @@ bool llama_kv_cache::elastic_commit_fork(uint32_t n_cap) {
     n_cap = std::min(n_cap, get_size());
 
     auto & el = *elastic_fork;
+
+    // the poison test: a cell in use that the capacity takes only now held data a device would not have kept (the
+    // writes past the mapped memory go nowhere there), and the zeroing below loses it here as well
+    if (el.poison && n_cap > el.n_mapped) {
+        const auto & cells = v_cells[0];
+        for (uint32_t i = el.n_mapped; i < std::min(n_cap, cells.size()); ++i) {
+            if (!cells.is_empty(i)) {
+                LLAMA_LOG_ERROR("%s: kv_elastic: cell %u is in use past the %u mapped cells, its data is lost\n", __func__, i, el.n_mapped);
+                break;
+            }
+        }
+    }
+
     for (const auto & r : el.ranges) {
         const size_t need = std::min(r.bytes, (size_t) n_cap*r.row);
         if (r.commit) {

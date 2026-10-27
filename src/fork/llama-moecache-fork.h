@@ -216,8 +216,8 @@ public:
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
     // all of the host weight w into dst on backend: the experts the slots hold from device memory, the others uploaded
-    // (the uploads ahead of GGML_SCHED_PREFETCH); false when w is no weight of a layer with slots on this device, then
-    // the caller uploads it all. a prompt phase keeps the slots it leaves room for, so their experts need no PCIe
+    // (the uploads ahead of GGML_SCHED_PREFETCH, LLAMA_MOE_CACHE_COPY=2 only); false when w is no weight of a layer with
+    // slots on this device, then the caller uploads it all
     bool upload_weight(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst);
 
     bool is_init() const { return initialized; }
@@ -318,8 +318,12 @@ private:
 
     size_t slot_bytes(int idx) const; // one slot of the layer
 
-    // LLAMA_MOE_CACHE_COPY (25.10, 1; 0: the prompt copies upload every expert from the host, as before)
-    bool copy_dev = true;
+    // LLAMA_MOE_CACHE_COPY (25.10): 1 (default) the copy of the experts that a split names at its start takes the ones
+    // the slots hold from device memory (copy_experts); 2 also the uploads ahead of whole weights (upload_weight); 0
+    // every expert from the host, as before. 3090 26.10: the uploads ahead lost with it, PP 706 against 782 at ~3.8K
+    // turns: one transfer a weight that the kernels hide became some 190 calls of each prompt ubatch (+400 ms of host
+    // and stream per ubatch); the turns of ~550 tokens, copied at the start of their splits, gained (3.24 s against 3.63)
+    int copy_dev = 1;
 
     std::unordered_map<const ggml_tensor *, std::pair<int, int>> bound; // host weight -> layer, 0 up 1 gate 2 down
     ggml_context_ptr ctx_views; // of copy_run()

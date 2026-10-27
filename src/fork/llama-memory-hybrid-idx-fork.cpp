@@ -331,6 +331,13 @@ void llama_memory_hybrid_idx_fork::kv_set_grow_fork(std::function<bool(uint32_t)
     get_mem_attn()->elastic_grow_fork = std::move(grow);
 }
 
+void llama_memory_hybrid_idx_fork::kv_alloc_deferred_fork() {
+    get_mem_attn()->alloc_deferred_fork();
+    if (mem_idx) {
+        mem_idx->alloc_deferred_fork();
+    }
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx_fork::init_update(llama_context * lctx, bool optimize) {
     // note: the pool is dropped when the context is applied, not here: llama_context::decode asks
     //       for an update on every call and most of them turn out to be no-ops

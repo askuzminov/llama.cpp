@@ -90,11 +90,20 @@ int llama_context::phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, 
 }
 
 void llama_context::kv_elastic_init_fork() {
+    kv_elastic_try_fork();
+
+    // the caches the memory built without memory for this (LLAMA_KV_ELASTIC=1, llama_kv_defer_scope_fork) and that did
+    // not become elastic get their full buffers now
+    if (memory) {
+        memory->kv_alloc_deferred_fork();
+    }
+}
+
+void llama_context::kv_elastic_try_fork() {
     // LLAMA_KV_ELASTIC: -1 (default) with --phase-mem and the moe-cache, where the device maps memory on demand (CUDA
-    // with VMM); 1 also elsewhere, emulated in ordinary buffers (tests, LLAMA_KV_ELASTIC_POISON); 0 off
-    static const int mode = [] {
-        return (int) llama_fork_env_int("LLAMA_KV_ELASTIC", -1);
-    }();
+    // with VMM, Vulkan with sparse buffers); 1 also elsewhere, emulated in ordinary buffers where the device has none
+    // (tests, LLAMA_KV_ELASTIC_POISON); 0 off
+    const int mode = llama_kv_elastic_mode_fork();
     if (!memory || mode == 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || (mode < 0 && !(cparams.phase_mem && moe_cache_fork))) {
         return;
     }
@@ -120,6 +129,12 @@ void llama_context::kv_elastic_init_fork() {
     });
 
     const uint32_t cap = kv_elastic_capacity_fork(kv_elastic_step);
+
+    // the device has no memory for the first cells: a capacity of 0 reads as the whole cache to the code that does not
+    // know the elastic one, which would write into memory never mapped. the context fails as a full allocation did
+    if (cap == 0) {
+        throw std::runtime_error("kv_elastic: the device has no memory for the first cells of the KV cache");
+    }
 
     LLAMA_LOG_INFO("%s: kv_elastic: %u of %u cells mapped, step %u, %.1f MiB per 1024 cells%s\n", __func__, cap, cparams.n_ctx,
             kv_elastic_step, memory->kv_cell_bytes_fork()*1024/1024.0/1024.0, mode > 0 ? " (on request)" : "");

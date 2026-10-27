@@ -327,6 +327,11 @@ int32_t server_prefill_budget_fork() {
     return value;
 }
 
+bool server_prefill_exclusive_fork() {
+    static const bool value = server_env_int_fork("LLAMA_PREFILL_EXCLUSIVE", 0) != 0;
+    return value;
+}
+
 bool server_slot_continue_fork() {
     static const bool value = server_env_int_fork("LLAMA_SLOT_CONTINUE", 1) != 0;
     return value;

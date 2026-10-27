@@ -4296,6 +4296,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
             }
+            params.speculative.draft.probabilistic_set = true; // fork: --spec-auto keeps a given one
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(

@@ -65,6 +65,11 @@ bool server_slot_room_fork();
 // prompt (Rulith Inference, apply_agent_slots_027). with experts in RAM (the 3090) every prompt piece uploads them
 int32_t server_prefill_budget_fork();
 
+// LLAMA_PREFILL_EXCLUSIVE (26.10, default 0: upstream): while a slot reads its prompt, the generating slots wait, so
+// that the prompt goes in whole batches with no tokens or drafts of theirs; they continue when no prompt is left.
+// a generating slot gets about a token per prompt batch otherwise (0.2-0.4 t/s at depth on the 395)
+bool server_prefill_exclusive_fork();
+
 // LLAMA_SLOT_CONTINUE (23.10, 1 by default, 0: upstream's similarity): a slot takes a request for what it holds only
 // when the request continues it, otherwise a free slot or the least recently used one
 bool server_slot_continue_fork();

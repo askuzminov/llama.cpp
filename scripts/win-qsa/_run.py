@@ -753,9 +753,10 @@ class Run:
         self.lines.extend(lines)
         (self.dir / "summary.txt").write_text("\n".join(self.lines) + "\n", encoding="utf-8")
 
-    def measure(self, label, identity, run):
-        """The kept result of this identity, or a new one from run(log). Returns (result, kept)."""
-        record = cache_get(identity, label)
+    def measure(self, label, identity, run, keep=True):
+        """The kept result of this identity, or a new one from run(log); keep=False always runs it. Returns (result,
+        kept)."""
+        record = cache_get(identity, label) if keep else None
         if record:
             self.kept += 1
             print(f"{label}: kept result of {record['time']}", flush=True)
@@ -852,7 +853,7 @@ def cmd_check():
             fails.extend(f"  {op[0]} {arm.name}: {s}" for s in r["fails"])
     # the fork's unit tests (tests/tests-fork.cmake) that build on this machine: an exit code of 0 passes. each runs in
     # its own folder of the run, test-row-cache writes its table file next to it. CHECKUNITS=none: none
-    units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill test-mtp-window-fork test-spec-auto-fork test-env-fork"))
+    units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill test-mtp-window-fork test-spec-auto-fork test-env-fork test-elastic-buffer-fork"))
     for name in units:
         try:
             exe = Arm("default").binary(name)
@@ -863,8 +864,10 @@ def cmd_check():
         # the source id leaves tests/ out (a test change keeps the measurements), so the test's own source is part
         # of its identity: a fixed test runs again on the same build id (test-prompt-cache-spill, 22.10)
         src = ROOT / "tests" / f"{name}.cpp"
+        # the TEST_* knobs too (TEST_ELASTIC_REQUIRE: a skip kept as a pass would hide the device path)
         identity = {"v": VERSION, "kind": "unit", "build": build_id(exe.parent), "test": name, "machine": machine(),
-                    "src": digest(src) if src.is_file() else None}
+                    "src": digest(src) if src.is_file() else None,
+                    "env": {k: v for k, v in sorted(os.environ.items()) if k.upper().startswith("TEST_")}}
 
         def go_unit(log, exe=exe, work=work):
             work.mkdir(parents=True, exist_ok=True)
@@ -1435,7 +1438,9 @@ def cmd_decode():
         return int(value)
 
     par_of = {arm.name: arm_int(arm, "DECPAR", 1) for arm in arms}
-    par_shift = env_int("DECPARSHIFT", 250000)
+    # DECPARSHIFT among the variables of an arm: its own offset of the copies (26.10: 6 copies fit PPLFILE closer)
+    par_shift_default = env_int("DECPARSHIFT", 250000)
+    shift_of = {arm.name: arm_int(arm, "DECPARSHIFT", par_shift_default) for arm in arms}
     # DECCHATGEN among the variables of an arm: its own tokens per answer (25.10: decode of a few streams at once with
     # short prompts, as the multi-stream numbers of Rulith Inference)
     gen_of = {arm.name: arm_int(arm, "DECCHATGEN", chat_gen) for arm in arms}
@@ -1445,7 +1450,7 @@ def cmd_decode():
         gen = gen_of[arm.name]
         if par_of[arm.name] <= 1:
             return build_chats(specs, gen=gen)
-        return [c for k in range(par_of[arm.name]) for c in build_chats(specs, k*par_shift, f"p{k}-", gen)]
+        return [c for k in range(par_of[arm.name]) for c in build_chats(specs, k*shift_of[arm.name], f"p{k}-", gen)]
 
     chats_of = {arm.name: chats_for(arm) for arm in arms}
     if any(chats_of.values()):
@@ -1477,6 +1482,7 @@ def cmd_decode():
             # empty without an error (the turns would ask about nothing, the rows look whole), and copies whose windows
             # overlap read the same text
             par = par_of[arm.name]
+            par_shift = shift_of[arm.name]
             n_slots, slots_problem = server_slots(args)
             reach = max(start + n_turns*add_chars for start, n_turns, add_chars in arm_chat_specs.get(arm.name, chat_specs))
             last = max(par - 1, 0)*par_shift + reach
@@ -1496,9 +1502,12 @@ def cmd_decode():
                 results[arm.name, "chat"] = "FAIL " + "; ".join(problems)
                 continue
             try:
+                # DECWARM=1 among the variables of an arm: it only warms the page cache for the chats after it (the PLE
+                # rows of their text), so it runs every time, never kept
                 results[arm.name, "chat"] = run.measure(label, identity,
                                                         lambda log: serve(exe, args, run_env, log, [], arm_samp[arm.name],
-                                                                          port, "", chats, par_of[arm.name]))
+                                                                          port, "", chats, par_of[arm.name]),
+                                                        keep=arm_int(arm, "DECWARM", 0) == 0)
             except Fail as e:
                 run.failed = True
                 results[arm.name, "chat"] = f"FAIL {e}"

@@ -3344,7 +3344,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx && dynamic_cast<const llama_model_qwen4exp_fork *>(this) != nullptr) {
-                        // the fork's qwen4exp keeps its pooled block keys in its own copy of the memory type
+                        // the fork's qwen4exp keeps its pooled block keys in its own copy of the memory type. with
+                        // LLAMA_KV_ELASTIC=1 its KV caches get no memory here, the context places them (llama_kv_defer_scope_fork)
+                        llama_kv_defer_scope_fork defer_kv(llama_kv_elastic_mode_fork() > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
                         res = new llama_memory_hybrid_idx_fork(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,

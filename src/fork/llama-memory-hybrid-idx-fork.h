@@ -67,6 +67,7 @@ public:
     uint32_t kv_set_capacity_fork(uint32_t n_cells) override;
     size_t   kv_cell_bytes_fork() const override;
     void     kv_set_grow_fork(std::function<bool(uint32_t)> grow) override;
+    void     kv_alloc_deferred_fork() override;
 
     // the pool rows of a failed pass may be half written
     void ubatch_failed() override;

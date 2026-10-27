@@ -441,7 +441,36 @@ rem the bigger ubatch gained; the phase_mem lines of these arms show what a plan
 rem 25.10 night: shexp8 / par4sh: the experts of layers 40-47 (~12 GB) in the shared memory outside the 96 GiB carve-out
 rem (Vulkan0_Shared, the gpu reads them in place; 06.10: those of 44-47 cost nothing, the KV there 2.6 percent TG):
 rem the carve-out keeps ~12 GB free for the KV of more agents; par4 failed to load at the edge of the carve-out on 25.10
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;prob @draft --spec-auto --spec-draft-sampling probabilistic;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;prob06 DECSAMP=0.6:40:0.95 @draft --spec-auto --spec-draft-sampling probabilistic;par2s DECPAR=2 DECCHAT=0:1:200 DECCHATGEN=1024 @draft --spec-auto -np 2 --kv-unified --no-cache-idle-slots;par4s DECPAR=4 DECCHAT=0:1:200 DECCHATGEN=1024 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4b0 LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;pm @draft --spec-auto --phase-mem -ub 8192;par4pm LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots --phase-mem -ub 8192;shexp8 @draft --spec-auto -ot blk\.4[0-7]\.ffn_.*_exps=Vulkan0_Shared;par4sh DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots -ot blk\.4[0-7]\.ffn_.*_exps=Vulkan0_Shared"
+rem 26.10 (logs 26.10 18:58, src-bc5914fe): checks all passed, the driver takes sparse buffers (binding 1, residency 1,
+rem 3 of 5 queue families): an elastic KV on Vulkan can bind memory to the cells in use. KLD 0.015296. doc chat to 213K,
+rem PP / TG over all turns: auto 747 / 39.36 (the first chat arm, its PLE rows cold), prob 767 / 40.61 (+3.2 percent TG
+rem at temperature 1.0), auto06 766 / 41.03, prob06 767 / 41.12; short prompts prob06 40.67 against 37.77. pm
+rem (--phase-mem -ub 8192)
+rem 608 / 40.22: a plan 0.31-0.88 s a turn (the reserve of the Vulkan buffers) and 0.39 s to switch to the generation,
+rem while a ~3.8K turn takes no ubatch above 4096. shexp8 (experts of 40-47 in the shared memory) 759 / 38.96: ~1
+rem percent TG for ~12 GB of the carve-out. decode alone, all streams generating: par2s 2 streams 57.6 t/s, par4s 4
+rem streams 67.7 (short contexts), par4 / par4b0 / par4pm / par4sh 58.2 / 58.4 / 59.4 / 59.3 to ~60K each; their
+rem prompts held 313-362 s of ~580, together 23.7 / 25.5 / 22.0 / 26.1 t/s; the budget 0 read the prompts in the same
+rem 334 s. prob-p0 died in the first sched_reserve, before a token (the prob chat with the same arguments ran all 57
+rem turns): the allocation failures near the carve-out again, as par4 on 25.10
+rem [replaced 26.10 evening] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;prob @draft --spec-auto --spec-draft-sampling probabilistic;auto06 DECSAMP=0.6:40:0.95 @draft --spec-auto;prob06 DECSAMP=0.6:40:0.95 @draft --spec-auto --spec-draft-sampling probabilistic;par2s DECPAR=2 DECCHAT=0:1:200 DECCHATGEN=1024 @draft --spec-auto -np 2 --kv-unified --no-cache-idle-slots;par4s DECPAR=4 DECCHAT=0:1:200 DECCHATGEN=1024 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4b0 LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;pm @draft --spec-auto --phase-mem -ub 8192;par4pm LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots --phase-mem -ub 8192;shexp8 @draft --spec-auto -ot blk\.4[0-7]\.ffn_.*_exps=Vulkan0_Shared;par4sh DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots -ot blk\.4[0-7]\.ffn_.*_exps=Vulkan0_Shared"
+rem 26.10 evening: --spec-auto drafts by probability since (the draft sampled from the head and verified by
+rem rejection; --spec-draft-sampling greedy keeps the old way): greedy against auto. on 26.10 prob accepted 156 draft
+rem tokens a turn against 145-148 of the three greedy arms at 1.0 (auto, pm, shexp8), TG +3.2 percent; 152 / 155 at
+rem 0.6, TG the same. warm (DECWARM=1: never kept; one turn of the 900000 chars the doc chat reads, 16 tokens): the
+rem PLE rows of that text into the page cache first. the chats have no rows request as the short prompts have, so
+rem the first chat arm read them from the drive: on 26.10 auto had 61 ms of inputs per prompt ubatch against ~35 of the arms after it, its PP
+rem 2.5 percent low (the TG not). kvel (LLAMA_KV_ELASTIC=1): the KV takes device memory for the cells in use only,
+rem bound to a sparse buffer in 2 MiB granules (slabs of several where the driver allows few allocations: its maximum
+rem is in the sparse line of the log), and no static KV is allocated at the start any more; against auto: what the
+rem sparse binding costs the prompts and the decode. par4x (LLAMA_PREFILL_EXCLUSIVE=1): the generating slots wait
+rem while a prompt is read, the prompt goes in whole batches, against par4 and par4b0. par4kvel: par4 with the
+rem elastic KV. par6kvel: 6 conversations of 12 turns at once (copies 200000 chars apart) in a unified cache of
+rem 393216 cells that takes memory only for the cells in use (static: ~10 GiB of KV at the start; here ~8 GiB at
+rem the end), the GDN states of 6 slots ~2.7 GiB: do more agents fit. a full carve-out gives the granules shared
+rem memory (GGML_VK_ELASTIC_SPILL, the line "the device memory is full" in the log); the "elastic buffer" lines show
+rem the granule, the slab and the memory types the driver gave
+if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;greedy @draft --spec-auto --spec-draft-sampling greedy;kvel LLAMA_KV_ELASTIC=1 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4b0 LLAMA_PREFILL_BUDGET=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x LLAMA_PREFILL_EXCLUSIVE=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4kvel LLAMA_KV_ELASTIC=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par6kvel LLAMA_KV_ELASTIC=1 DECPAR=6 DECPARSHIFT=200000 DECCHAT=0:12:16000 @draft --spec-auto -np 6 --kv-unified --no-cache-idle-slots -c 393216"
 rem [no effect, an earlier line sets DECARMS] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_STARTS set "RUN_STARTS=0"
@@ -839,7 +868,25 @@ rem 256 MiB a step, instead of before the first one; the DDR4 is shared with the
 rem on that on 15.10), so it is off by default until this arm
 rem prob (--spec-draft-sampling probabilistic): the draft samples from the head, the target verifies by rejection
 rem sampling; a verified token costs 11-19 ms here, so the acceptance counts more than on the 395
-if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;prob @draft --spec-auto --spec-draft-sampling probabilistic;keep0 LLAMA_MOE_CACHE_KEEP=0 @draft --spec-auto;copy0 LLAMA_MOE_CACHE_COPY=0 @draft --spec-auto;fill256 LLAMA_MOE_CACHE_FILL=256 @draft --spec-auto;chunk0 GGML_CUDA_GRAPH_CHUNK_SIZE=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4even0 LLAMA_SPEC_EVEN=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem [replaced 26.10] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;prob @draft --spec-auto --spec-draft-sampling probabilistic;keep0 LLAMA_MOE_CACHE_KEEP=0 @draft --spec-auto;copy0 LLAMA_MOE_CACHE_COPY=0 @draft --spec-auto;fill256 LLAMA_MOE_CACHE_FILL=256 @draft --spec-auto;chunk0 GGML_CUDA_GRAPH_CHUNK_SIZE=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4even0 LLAMA_SPEC_EVEN=0 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 26.10 (logs 26.10 19:02, src-f85fbe5a): checks 31/31, GATED_DELTA_NET_LAZY 88/88 on CUDA the first time, KLD
+rem 0.01778. doc chat to 213K, PP / TG over all turns: copy0 782 / 31.29, keep0 751 / 31.16, auto 706 / 31.37. the
+rem partial release works (25 of 48 layers keep their slots, the refill 6.4 GiB in 305 ms a turn against 13.2 GiB in
+rem 613 ms), but the copies from the slots in the uploads ahead lost: a prompt ubatch of ~3770 tokens 4063 ms of host
+rem against 3662, one transfer a weight that the kernels hide became some 190 calls; at the turns of ~550 tokens, which
+rem copy at the start of their splits, the copies gained (3.24 s a turn against 3.63). since then LLAMA_MOE_CACHE_COPY
+rem 1 takes the slots only at the start of a split, 2 also in the uploads ahead. fill256 TG 29.52 against 31.37 (the
+rem fill and the CPU experts share the DDR4): off. chunk0 as auto (720 / 31.36): the CUDA graph chunks of 3f03 stay.
+rem prob as auto in the chat (31.37), short prompts 40.13 against 38.17. par4 18.11 t/s together, par4even0 15.11: the
+rem even drafts stay
+rem 26.10, the next run: auto (the partial release, the copies at the start of a split only) against copy0 on the big
+rem and the short turns
+rem [replaced 26.10 evening] if not defined DECARMS    set "DECARMS=auto @draft --spec-auto;copy0 LLAMA_MOE_CACHE_COPY=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
+rem 26.10 evening: --spec-auto drafts by probability since (see the 395): greedy against auto. par4x
+rem (LLAMA_PREFILL_EXCLUSIVE=1): the generating slots wait while a prompt is read, against par4. warm: the PLE rows
+rem of the doc chat into the page cache first, see the 395 (26.10 here: the first chat arm 72 ms of inputs per prompt
+rem ubatch against ~59.5, about 3 of the 29 s that auto lost to copy0)
+if not defined DECARMS    set "DECARMS=warm DECWARM=1 DECCHAT=900000:0:0 DECCHATGEN=16 @draft --spec-auto;auto @draft --spec-auto;greedy @draft --spec-auto --spec-draft-sampling greedy;copy0 LLAMA_MOE_CACHE_COPY=0 @draft --spec-auto;par4 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots;par4x LLAMA_PREFILL_EXCLUSIVE=1 DECPAR=4 DECCHAT=0:15:16000 @draft --spec-auto -np 4 --kv-unified --no-cache-idle-slots"
 rem [no effect, an earlier line sets RUN_DECODE] if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 rem 23.10: the prompt pieces while other slots generate (LLAMA_PREFILL_BUDGET, 2048 by default) would each
@@ -928,6 +975,9 @@ rem from one process to the next on 05.10, the same within a process
 :defaults_done
 rem ---- the same on both ----
 rem 01-check: test-backend-ops ops, "OP [regex of the case parameters]", separated by ;
+rem 26.10: test-elastic-buffer-fork (CHECKUNITS) fails when no device gave an elastic buffer: the 3090 has CUDA VMM,
+rem the 395 sparse buffers, so its pass shows that the path of the device ran
+if not defined TEST_ELASTIC_REQUIRE set "TEST_ELASTIC_REQUIRE=1"
 rem [no effect, an earlier line sets CHECKOPS] if not defined CHECKOPS    set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;SCALE_SILU;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV"
 rem 02-bench (llama-bench) is gone since 13.10: the speed comes from the server (04, DECCHAT), the BENCH* settings
 rem above are history

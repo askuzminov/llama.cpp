@@ -358,6 +358,7 @@ struct common_params_speculative_draft {
 
     // fork:
     bool n_max_set = false; // n_max was given explicitly, --spec-auto then keeps it as the cap
+    bool probabilistic_set = false; // --spec-draft-sampling was given, --spec-auto then keeps it
 };
 
 struct common_params_speculative_ngram_mod {

@@ -202,6 +202,10 @@ public:
     uint32_t elastic_capacity_fork() const { return n_cap_fork; }
     size_t   elastic_cell_bytes_fork() const;
 
+    // fork: the buffers of a cache built without memory (llama_kv_defer_scope_fork) that elastic_init_fork did not
+    // replace, allocated and cleared as the constructor does; nothing for the others
+    void     alloc_deferred_fork();
+
     // fork: find_slot calls it with the cells the cache needs when the free cells within the capacity do not hold a ubatch
     std::function<bool(uint32_t)> elastic_grow_fork;
 
