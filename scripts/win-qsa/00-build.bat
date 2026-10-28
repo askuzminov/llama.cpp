@@ -131,7 +131,7 @@ if not exist "%BIN%" set "BIN=%BUILD%\bin"
 
 echo.
 echo binaries in %BIN%
-for %%f in (llama-perplexity.exe llama-server.exe test-backend-ops.exe) do (
+for %%f in (llama-perplexity.exe llama-quality-fork.exe llama-server.exe test-backend-ops.exe) do (
     if exist "%BIN%\%%f" (echo   ok      %%f) else (echo   MISSING %%f)
 )
 if defined PY if exist "%~dp0_run.py" %PY% "%~dp0_run.py" build-end

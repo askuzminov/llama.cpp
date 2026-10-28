@@ -61,11 +61,11 @@ def n_tokens(text: str) -> int:
 NO_ROOM = "failed to find free space in the KV cache"
 
 
-def complete(prompt: str | list[int], n_predict: int, id_slot: int | None = None):
+def complete(prompt: str | list[int], n_predict: int, id_slot: int | None = None, timeout=DEFAULT_REQUEST_TIMEOUT):
     data = {"prompt": prompt, "n_predict": n_predict, "cache_prompt": True, "ignore_eos": True}
     if id_slot is not None:
         data["id_slot"] = id_slot
-    return server.make_request("POST", "/completion", data=data)
+    return server.make_request("POST", "/completion", data=data, timeout=timeout)
 
 
 def test_idle_slot_gives_way_and_comes_back():
@@ -121,6 +121,29 @@ def test_task_waits_for_room():
     text = log.drain()
     assert "waits for room" in text
     assert NO_ROOM not in text
+
+
+@pytest.mark.parametrize("n_clients", [1, 4])
+def test_full_context_task_does_not_wait_in_an_empty_cache(n_clients):
+    global server
+    server.n_slots = 4
+    server.start()
+    log = LogReader(server.log_path)
+
+    # The prompt and answer fit; the extra admission margin does not.
+    n_predict = 32
+    prompt = [100] * (server.n_ctx - n_predict - 1)
+    results = parallel_function_calls([(complete, (prompt, n_predict, None, 30)) for _ in range(n_clients)])
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["tokens_predicted"] == n_predict
+        assert not res.body["truncated"]
+    text = log.drain()
+    assert NO_ROOM not in text
+    if n_clients == 1:
+        assert "waits for room" not in text
+    else:
+        assert "waits for room" in text
 
 
 def test_running_slot_pauses_for_room(monkeypatch):

@@ -24,6 +24,8 @@
 | `serve.bat` | да | повседневный запуск llama-server (router, `models.ini`), не замер |
 | `get-wikitext.bat` | нет | текст для 03 и для `DECPREFIX` |
 
+Полный контекст, качество, MTP, параллельность, префилл и восстановление кеша: [09-full-context.bat](09-full-context.bat), инструкция [FULL-CONTEXT.md](FULL-CONTEXT.md). Этот набор запускается отдельно от `run-all.bat` и не ограничивается `QCTX` из старого теста.
+
 ## Настройка машины
 
 1. Скопировать `_local.example.bat` в `_local.bat`. Вписать `MODEL` (первый файл модели),

@@ -2677,7 +2677,12 @@ def config_dead_lines(path=None):
     return [(i + 1, pattern.match(lines[i]).group(1)) for i in sorted(dead) if all(dead[i])]
 
 
-COMMANDS = {"starts": cmd_starts, "check": cmd_check, "quality": cmd_quality, "decode": cmd_decode,
+def cmd_full():
+    from _full import run
+    return run(sys.modules[__name__])
+
+
+COMMANDS = {"full": cmd_full, "starts": cmd_starts, "check": cmd_check, "quality": cmd_quality, "decode": cmd_decode,
             "profile": cmd_profile, "kernels": cmd_kernels, "trace": cmd_trace, "build-begin": cmd_build_begin,
             "build-end": cmd_build_end, "build-stable": cmd_build_stable}
 

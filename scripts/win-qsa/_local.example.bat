@@ -60,3 +60,17 @@ rem set "RUN_QUALITY=0"
 
 rem ---- source of the wikitext text, if huggingface is unreachable ----
 rem set "PPLURL=http://.../wikitext-2-raw-v1.zip"
+
+rem ---- 09: native full-context suite, see FULL-CONTEXT.md ----
+rem Every corpus needs at least native_context + 1 tokens; texts are never repeated.
+rem set "FULL_CORPORA=wiki=C:\data\wiki.txt;ru=C:\data\russian.txt;code=C:\data\code.txt"
+rem set "FULL_STAGES=quality server mixed cache profile"
+rem set "FULL_DRY_RUN=1"
+rem set "FULL_REPEATS=1"
+rem set "FULL_SEEDS=1 2 3"
+rem set "FULL_PAR=1 4"
+rem set "FULL_NGEN=512"
+rem set "FULL_TIMEOUT=7200"
+rem set "FULL_ARMS=none --spec-type none;auto @draft --spec-auto"
+rem set "FULL_F16ACC=1"
+rem FULL_CTX is only for smoke tests; omit it for full native context.

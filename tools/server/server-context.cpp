@@ -2116,7 +2116,8 @@ private:
                 held += std::max<int64_t>(slot.prompt.n_tokens(), slot.task->n_tokens()) + answer_room(*slot.task, slot.stats.n_gen);
             }
         }
-        if (held + need <= n_ctx) {
+        // The margin must not block the only task. Its context limit is checked by the decode path.
+        if (held == 0 || held + need <= n_ctx) {
             return true;
         }
         SRV_INF("task %d (%d tokens) waits for room: the running and paused slots hold %" PRId64 " of %" PRId64 " cells\n",
