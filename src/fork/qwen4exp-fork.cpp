@@ -1801,7 +1801,8 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         return llama_fork_env_int("LLAMA_QSA_FA_LIST_MIN", -1);
     }();
     bool use_list = false;
-    if (list_mode == 1 && from_pos && cparams.flash_attn) {
+    // A partial final block can need repeated live cells when every cache cell is occupied.
+    if (list_mode == 1 && from_pos && cparams.flash_attn && n_kv_m % hparams.dsv4_compress_ratios[il] == 0) {
         ggml_backend_dev_t dev_l = model.dev_layer(il);
         const bool vk_l = qwen4exp_dev_is_vulkan(dev_l);
         use_list = vk_l && n_kv_m >= (list_min >= 0 ? list_min : std::max<int64_t>(4096, 2*top_k->ne[0]));

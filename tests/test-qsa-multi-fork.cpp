@@ -17,6 +17,7 @@
 //   with a position at or past it in a cell or a token takes the dense mask, every other one the mask from positions,
 //   both with the logits of the dense run. QSA keeps its positions below n_kv, so the 2^18 of the default takes a
 //   cache of more than 262144 cells to cross: the test lowers the stride to 2^7 (LLAMA_QSA_POS_STRIDE_LOG2)
+// - no repeated cells in a selection: Vulkan FLASH_ATTN_LIST counts every entry, including block padding
 // - a prompt copied to other sequences: shared cells, so the dense mask and nothing carried, the logits as alone
 //
 // usage: test-qsa-multi-fork -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>]
@@ -24,6 +25,7 @@
 #include "llama.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -89,11 +91,27 @@ static long long qsa_checked_since(size_t from) {
 
 // the nodes |cell - mid| of the graphs a context computed, see the top
 static int g_n_abs = 0;
+static int g_n_selections = 0;
+static int g_n_duplicate_rows = 0;
 
 static bool eval_cb(ggml_tensor * t, bool ask, void * /*user_data*/) {
     if (ask && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_ABS && t->src[0] != nullptr &&
             t->src[0]->op == GGML_OP_SUB) {
         g_n_abs++;
+    }
+    if (strncmp(t->name, "indexer_top_k-", 14) == 0 && strchr(t->name, ' ') == nullptr) {
+        if (ask) {
+            return true;
+        }
+        std::vector<int32_t> ids(t->ne[0]);
+        for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+            const size_t offset = (row % t->ne[1])*t->nb[1] + (row/t->ne[1] % t->ne[2])*t->nb[2] + (row/(t->ne[1]*t->ne[2]))*t->nb[3];
+            ggml_backend_tensor_get(t, ids.data(), offset, ids.size()*sizeof(int32_t));
+            std::sort(ids.begin(), ids.end());
+            g_n_duplicate_rows += std::adjacent_find(ids.begin(), ids.end()) != ids.end();
+            g_n_selections++;
+        }
+        return true;
     }
     return false;
 }
@@ -420,7 +438,12 @@ static bool run_multi(llama_model * model, const scenario & sc, multi_run & res)
     if (ctx == nullptr) {
         return false;
     }
+    const int n_selections = g_n_selections;
+    const int n_duplicates = g_n_duplicate_rows;
     const bool ok = run(ctx, sc, -1, res.logits, &res.abs_steps);
+    printf("%s: %d QSA selections, %d rows with repeated cells\n", sc.name, g_n_selections - n_selections, g_n_duplicate_rows - n_duplicates);
+    CHECK(g_n_selections > n_selections);
+    CHECK(g_n_duplicate_rows == n_duplicates);
 
     // the cache reports what LLAMA_QSA_CHECK compared as it goes
     const size_t from = log_size();

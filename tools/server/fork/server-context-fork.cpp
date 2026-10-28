@@ -169,6 +169,11 @@ uint64_t server_prompt_cache_signature(
     s += "|" + std::to_string((int) params.kv_unified);
     s += "|" + std::to_string(ctx_dft != nullptr);
     s += "|" + std::to_string(LLAMA_STATE_SEQ_VERSION);
+    char arch[32] = {};
+    if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) >= 0 && std::string(arch) == "qwen4exp") {
+        // The old QSA padding could repeat live cells and corrupt cached recurrent states.
+        s += "|qsa-padding 1";
+    }
     // the KV cache of the dense MTP head keeping only its window (LLAMA_MTP_WINDOW_KV): a state saved with the whole
     // cache does not fit it ("not enough cells", the entry is dropped), one of another window holds other positions.
     // Added only then, so that the files of every other configuration keep their signature

@@ -1678,7 +1678,16 @@ void llama_memory_hybrid_idx_fork::set_input_qsa(
         const qsa_group & g = st.grp[s];
 
         if (dst_blk_cells) {
-            std::copy(g.blk_cells.begin(), g.blk_cells.end(), dst_blk_cells + s*(r*n_blocks));
+            int32_t * dst = dst_blk_cells + s*(r*n_blocks);
+            std::copy(g.blk_cells.begin(), g.blk_cells.end(), dst);
+
+            // Attention lists count repeated cells more than once. Pad with empty cells, masked for every sequence.
+            int64_t j = g.n_bid*r + g.n_spare;
+            for (int64_t c = 0; c < n_kv && j < r*n_blocks; ++c) {
+                if (cells.is_empty(c)) {
+                    dst[j++] = (int32_t) c;
+                }
+            }
         }
 
         // unpooled cells all point at one spare block. a spare block exists only when some
