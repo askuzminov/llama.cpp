@@ -898,7 +898,9 @@ void server_prompt_cache::persist() {
     }
 
     for (auto & st : states) {
-        spill_state(st);
+        if (spill_exists(st) || !st.disk_evicted) {
+            spill_state(st);
+        }
     }
 
     enforce_disk_limit();
@@ -1052,6 +1054,7 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     st.disk_bytes   = spill_layout_of(h).size;
     st.ckpt_on_disk = h.n_ckpt;
     st.on_disk      = true;
+    st.disk_evicted = false;
     return spill_exists(st);
 }
 
@@ -1062,6 +1065,7 @@ bool server_prompt_cache::spill_exists(server_prompt_cache_state & st) {
             st.on_disk = false;
             st.disk_bytes = 0;
             st.ckpt_on_disk = 0;
+            st.disk_evicted = true;
         }
     }
     return st.on_disk;
@@ -1095,6 +1099,9 @@ bool server_prompt_cache::spill_state(server_prompt_cache_state & st, size_t dis
 
 bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
     if (!spill_exists(st)) {
+        if (st.data.size() > 0) {
+            st.disk_evicted = false; // a real cache hit makes the state worth persisting again
+        }
         return st.data.size() > 0;
     }
     std::error_code touch_ec;
@@ -1254,11 +1261,7 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
     size_t freed = 0;
 
     if (!spill_dir.empty()) {
-        // spill oldest resident states to disk: this frees their RAM but keeps them restorable, so
-        // we never drop a state just to satisfy a RAM deficit. Spilling the whole (bounded) cache
-        // is the most we can do for host-RAM pressure; the disk budget alone decides what is
-        // dropped for good (enforce_disk_limit)
-        size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit;
+        const size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit;
 
         // a clean state already has its copy on disk (write_behind put it there while idle), so
         // releasing its RAM costs no I/O at all. Take those first
@@ -1306,6 +1309,9 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
 
         if (may_write) {
             enforce_disk_limit();
+            if (freed < need) {
+                freed += drop_resident(need - freed);
+            }
         }
         return freed;
     }
@@ -1318,6 +1324,30 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
         states.pop_front();
     }
 
+    return freed;
+}
+
+size_t server_prompt_cache::drop_resident(size_t need) {
+    size_t freed = 0;
+    for (auto it = states.begin(); it != states.end() && freed < need;) {
+        const size_t before = it->size();
+        if (before == 0) {
+            ++it;
+            continue;
+        }
+        SRV_WRN(" - releasing %.3f MiB of prompt-cache RAM after spill could not cover the deficit\n", before / (1024.0 * 1024.0));
+        if (spill_exists(*it)) {
+            evict_state(*it);
+        }
+        if (it->on_disk) {
+            it->prompt.checkpoints.clear();
+            freed += before - it->size();
+            ++it;
+        } else {
+            freed += before;
+            it = states.erase(it);
+        }
+    }
     return freed;
 }
 
@@ -1359,7 +1389,7 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
     for (auto it = states.begin(); it != states.end(); ++it) {
         auto & st = *it;
 
-        if (st.on_disk || st.data.size() == 0) {
+        if (spill_exists(st) || st.disk_evicted || st.data.size() == 0) {
             continue;
         }
 
@@ -1402,6 +1432,20 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
 
             erase_spill(*it2);
             it2 = states.erase(it2);
+        }
+    }
+
+    // Writes that failed or were skipped must not leave the idle cache above its RAM budget.
+    if (limit_size > 0) {
+        const size_t resident = size();
+        const size_t outside = ram_outside ? ram_outside() : 0;
+        const size_t budget = limit_size - std::min(limit_size, outside);
+        if (resident > budget) {
+            const size_t need = resident - budget;
+            const size_t freed = free_ram(need, false);
+            if (freed < need) {
+                drop_resident(need - freed);
+            }
         }
     }
 
@@ -1448,17 +1492,8 @@ bool server_prompt_cache::evict_for_reserve(size_t extra, bool may_write) {
             need / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
     size_t freed = free_ram(need, may_write);
 
-    // fork: a decode must not wait for the disk (may_write = false): free_ram took the states that need no write, and
-    // the ones it would have written are dropped, oldest first. those that live only on disk hold no RAM
-    for (auto it = states.begin(); it != states.end() && freed < need && !may_write; ) {
-        if (it->data.size() == 0) {
-            ++it;
-            continue;
-        }
-        SRV_WRN(" - dropping prompt-cache entry of %.3f MiB, no disk write while slots run\n", it->size() / (1024.0 * 1024.0));
-        freed += it->size();
-        erase_spill(*it);
-        it = states.erase(it);
+    if (freed < need) {
+        freed += drop_resident(need - freed);
     }
 
     return freed >= need;

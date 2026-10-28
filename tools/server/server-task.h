@@ -710,6 +710,7 @@ struct server_prompt_cache_state {
     uint64_t uid        = 0;
     bool     on_disk    = false;
     size_t   disk_bytes = 0;
+    bool     disk_evicted = false; // do not rewrite unchanged states evicted by the shared budget
 
     // context checkpoints the file holds. The RAM copy is complete only when the list matches it,
     // and only then is dropping the list free
@@ -799,7 +800,7 @@ struct server_prompt_cache {
     bool spill_state(server_prompt_cache_state & st, size_t disk_free = SIZE_MAX); // write_state + evict_state, keeps st in the list
     bool unspill_state(server_prompt_cache_state & st); // disk -> RAM (reads st.data back, keeps the file)
 
-    // write-behind: copy dirty states to disk while nothing else runs, without freeing their RAM.
+    // write-behind: copy dirty states to disk while nothing else runs, then enforce the RAM budget without more writes.
     // `interrupted` is polled between states so a request that arrives does not wait for the rest.
     // Returns the number of states written.
     size_t write_behind(const std::function<bool()> & interrupted);
@@ -813,10 +814,11 @@ struct server_prompt_cache {
 
     // shutdown: push everything still resident to disk and keep the files for the next run
     void persist();
-    // spill oldest resident states (and, if there is no spill dir, drop them) until at least `need`
-    // RAM bytes are relieved; then enforce the disk budget. Returns RAM bytes relieved.
+    // spill oldest resident states, discarding RAM that cannot be saved, until at least `need` bytes are relieved.
+    // Returns RAM bytes relieved. Also enforces the disk budget.
     // may_write = false: only what needs no write (states write_behind already put on disk)
     size_t free_ram(size_t need, bool may_write = true);
+    size_t drop_resident(size_t need); // discard RAM copies, keeping valid spill files
 
     // fork: while set, a save keeps the RAM limit only as far as no disk write is needed - the cache can stay above it
     // until the next update(), and write_behind writes the new states out while the server is idle. set around the

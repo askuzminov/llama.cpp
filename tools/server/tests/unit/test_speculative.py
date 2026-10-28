@@ -265,3 +265,44 @@ def test_draft_token_probs():
         assert abs(tok_draft["logprob"] - tok_no_draft["logprob"]) < 0.25
     # real logprobs are not all exactly 0.0 (prob 1.0)
     assert any(tok["logprob"] < -1e-4 for tok in probs_draft)
+
+
+def test_stop_discards_unused_draft():
+    global server
+    server.server_slots = True
+    server.no_cache_idle_slots = True
+    # Identical models make the whole greedy draft acceptable.
+    assert server.model_draft is not None
+    server.model_file = server.model_draft
+    server.model_hf_repo = server.model_hf_file = None
+    server.spec_draft_n_min = 1
+    server.spec_draft_n_max = 8
+    server.start()
+    prompt = [1, 100, 101, 102, 103, 104]
+    request = {
+        "prompt": prompt, "temperature": 0.0, "n_predict": 32,
+        "return_tokens": True, "ignore_eos": True, "id_slot": 0, "cache_prompt": False,
+        "speculative.p_min": 0.0,
+    }
+    baseline = server.make_request("POST", "/completion", data=request)
+    assert baseline.status_code == 200, baseline.body
+    tokens = baseline.body["tokens"]
+    word = server.make_request("POST", "/detokenize", data={"tokens": tokens[2:3]})
+    assert word.status_code == 200 and word.body["content"]
+    stopped = server.make_request("POST", "/completion", data={**request, "stop": [word.body["content"]]})
+    assert stopped.status_code == 200, stopped.body
+    assert stopped.body["stop_type"] == "word"
+    assert stopped.body["timings"]["draft_n"] > 0
+    assert stopped.body["tokens_predicted"] < 8
+    slots = server.make_request("GET", "/slots")
+    assert slots.status_code == 200
+    kept = len(prompt) + stopped.body["tokens_predicted"] - 1
+    assert slots.body[0]["n_prompt_tokens"] == kept
+    # Continue exactly what the client saw. Cached and fresh continuations must agree.
+    continuation = prompt + stopped.body["tokens"]
+    next_request = {**request, "prompt": continuation, "n_predict": 8, "cache_prompt": True}
+    warm = server.make_request("POST", "/completion", data=next_request)
+    fresh = server.make_request("POST", "/completion", data={**next_request, "cache_prompt": False})
+    assert warm.status_code == fresh.status_code == 200
+    assert warm.body["tokens"] == fresh.body["tokens"]
+    assert warm.body["timings"]["cache_n"] == kept

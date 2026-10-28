@@ -382,6 +382,9 @@ static void test_reserve_no_write(const std::string & dir) {
     assert(!cache.evict_for_reserve(0, false));
     assert(cache.states.empty());
     assert(dir_empty(dir));
+    server_prompt prompt;
+    prompt.tokens = server_tokens(make_tokens(16, 300), false);
+    assert(cache.alloc(prompt, 4096, 0) == nullptr);
 }
 
 // shutdown -> restart: the files are adopted by a run with the same signature
@@ -617,6 +620,91 @@ static void test_shared_lru(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
+static void test_no_rewrite_after_eviction(const std::string & dir) {
+    server_prompt_cache a(0, 0, 0, dir, 60000, SIG, 1);
+    server_prompt_cache b(0, 0, 0, dir, 60000, SIG ^ 1, 2);
+    a.states.push_back(make_state(100, 1, 40960, 0));
+    b.states.push_back(make_state(100, 2, 40960, 0));
+    assert(a.write_behind(nullptr) == 1);
+    const auto old = a.spill_path(a.states.front().uid);
+    std::filesystem::last_write_time(old, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+    assert(b.write_behind(nullptr) == 1);
+    const auto keep = b.spill_path(b.states.front().uid);
+    for (int i = 0; i < 4; ++i) {
+        assert(a.write_behind(nullptr) == 0);
+        assert(b.write_behind(nullptr) == 0);
+        assert(std::filesystem::exists(keep));
+    }
+    a.persist();
+    assert(std::filesystem::exists(keep));
+    assert(!a.states.front().data.main.empty());
+    // Reusing the RAM copy makes it eligible for persistence again.
+    assert(a.unspill_state(a.states.front()));
+    assert(a.write_behind(nullptr) == 1);
+    clear_cache(a);
+    clear_cache(b);
+    assert(dir_empty(dir));
+}
+
+static void test_ram_limit_spill_failure(const std::string & dir) {
+    server_prompt_cache cache(1, 262144, 0, dir, 65536, SIG);
+    cache.defer_writes = true;
+    for (int base : {100, 200}) {
+        server_prompt prompt;
+        prompt.tokens = server_tokens(make_tokens(100, base), false);
+        assert(cache.alloc(prompt, 700*1024, 0));
+    }
+    assert(cache.size() > cache.limit_size);
+    cache.defer_writes = false;
+    cache.update(true);
+    assert(cache.size() <= cache.limit_size);
+    assert(cache.states.size() == 1);
+    assert(cache.states.front().prompt.tokens[0] == 200);
+    clear_cache(cache);
+
+    // A busy directory is also a spill failure, even when the file fits its budget.
+    cache.spill_limit = 0;
+    cache.defer_writes = true;
+    for (int base : {300, 400}) {
+        server_prompt prompt;
+        prompt.tokens = server_tokens(make_tokens(100, base), false);
+        assert(cache.alloc(prompt, 700*1024, 0));
+    }
+    cache.defer_writes = false;
+    {
+        common_file_lock lock(fs_path(dir) / ".prompt-cache.lock");
+        assert(lock.acquire());
+        cache.update(true);
+        assert(cache.size() <= cache.limit_size);
+    }
+    assert(cache.states.size() == 1);
+    assert(cache.states.front().prompt.tokens[0] == 400);
+    clear_cache(cache);
+    cache.spill_limit = 65536;
+    for (int base : {500, 600}) {
+        server_prompt prompt;
+        prompt.tokens = server_tokens(make_tokens(100, base), false);
+        assert(cache.alloc(prompt, 700*1024, 0));
+        assert(cache.size() <= cache.limit_size);
+    }
+    assert(cache.states.size() == 1);
+    assert(cache.states.front().prompt.tokens[0] == 600);
+    clear_cache(cache);
+    cache.defer_writes = true;
+    for (int base : {700, 800}) {
+        server_prompt prompt;
+        prompt.tokens = server_tokens(make_tokens(100, base), false);
+        assert(cache.alloc(prompt, 700*1024, 0));
+    }
+    cache.defer_writes = false;
+    assert(cache.write_behind(nullptr) == 0);
+    assert(cache.size() <= cache.limit_size);
+    assert(cache.states.size() == 1);
+    assert(cache.states.front().prompt.tokens[0] == 800);
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
 static void test_cache_compatibility(const char * model_path) {
     llama_backend_init();
     auto mp = llama_model_default_params();
@@ -698,6 +786,8 @@ int main(int argc, char ** argv) {
         { "shared-budget",      test_shared_budget      },
         { "shared-writers",     test_shared_writers     },
         { "shared-lru",         test_shared_lru         },
+        { "no-rewrite-evicted", test_no_rewrite_after_eviction },
+        { "ram-spill-failure",  test_ram_limit_spill_failure },
     };
 
     for (const auto & t : tests) {

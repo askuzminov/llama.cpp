@@ -1812,7 +1812,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     // make room so the new state keeps host RAM above the reserve
-    evict_for_reserve(state_size_new, !defer_writes);
+    if (!evict_for_reserve(state_size_new, !defer_writes)) {
+        return nullptr;
+    }
 
     server_state_buf state_data_tgt;
     server_state_buf state_data_dft;

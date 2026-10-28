@@ -5483,43 +5483,47 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
-
                 slot.spec_draft = std::move(accepted);
             }
 
             const auto ids = std::move(slot.spec_draft);
 
-            size_t n_accepted = ids.size() - 1;
-            if (slot.spec_is_replay && n_accepted > 0) {
-                n_accepted--;
-            }
+            const bool is_replay = slot.spec_is_replay;
             slot.spec_is_replay = false;
 
             slot.stats.update_gen_last();
 
-            // update how many tokens out of those tested were accepted
-            slot.stats.n_draft_accepted += n_accepted;
-            slot.stats.n_draft_verif_steps += 1;
-
-            auto & n_accepted_per_pos = slot.n_accepted_per_pos;
-            if (n_accepted_per_pos.empty()) {
-                n_accepted_per_pos.resize(common_speculative_n_max(spec.get()), 0);
-            }
-            for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
-                n_accepted_per_pos[i]++;
-            }
-
-            // add accepted tokens to the prompt
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
-            slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+            const auto finish = [&](size_t n_keep) {
+                common_speculative_accept(spec.get(), slot.id, n_keep);
 
-            slot.sampled = ids.back(); // last accepted token
-            SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+                const size_t n_accepted = n_keep - (is_replay && n_keep > 0 ? 1 : 0);
+                slot.stats.n_draft_accepted += n_accepted;
+                slot.stats.n_draft_verif_steps += 1;
+                auto & per_pos = slot.n_accepted_per_pos;
+                if (per_pos.empty()) {
+                    per_pos.resize(common_speculative_n_max(spec.get()), 0);
+                }
+                for (size_t i = 0; i < n_accepted && i < per_pos.size(); ++i) {
+                    per_pos[i]++;
+                }
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+                const llama_pos end = slot.prompt.tokens.pos_next();
+                bool ok = llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, end, -1);
+                if (slot.ctx_dft) {
+                    ok = llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, end, -1) && ok;
+                }
+                // Recurrent models may not support this rollback. A cache miss keeps the next request correct.
+                if (!ok) {
+                    slot.prompt_clear();
+                }
+                return n_accepted;
+            };
 
             for (size_t i = 0; i < ids.size(); ++i) {
+                if (i > 0) {
+                    slot.prompt.tokens.push_back(ids[i - 1]);
+                }
                 completion_token_output result;
 
                 result.tok          = ids[i];
@@ -5534,6 +5538,7 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
+                    finish(i);
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
@@ -5542,6 +5547,7 @@ private:
                 }
             }
 
+            const size_t n_accepted = finish(ids.size() - 1);
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
