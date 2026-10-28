@@ -24,6 +24,8 @@ target_include_directories(test-prompt-cache-spill PRIVATE
     ${PROJECT_SOURCE_DIR}/tools/server
     ${PROJECT_SOURCE_DIR}/tools/mtmd)
 target_link_libraries(test-prompt-cache-spill PRIVATE server-context)
+llama_test(test-prompt-cache-spill NAME test-prompt-cache-compat LABEL "model behavior" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-prompt-cache-compat PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # the row cache test calls internal functions of libllama. a Windows DLL exports LLAMA_API only, so there the test is
 # built from the sources of the row cache and llama_file, with the two helpers of llama-impl.cpp that they use
@@ -56,6 +58,7 @@ endif()
 # public API. a Windows DLL build has no generated models, so it runs there only by hand, on a qwen4exp-moe.gguf
 # generated elsewhere: test-qsa-multi-fork -m <model> --dense-out <file>, then the same with --dense-in <file>
 llama_build(test-qsa-multi-fork.cpp)
+target_include_directories(test-qsa-multi-fork PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 # the device cache of the host experts with --phase-mem (keep, fill, kv) against the release of all slots at every
 # phase switch: built everywhere (llama.h, gguf.h), registered where the matrix models exist, skips without a GPU
@@ -84,6 +87,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # of the dense mask bit for bit, and LLAMA_QSA_MASK_POS is read once per process: a run with the dense mask writes
     # its logits first. the binary is built on every platform (below), it needs only llama.h
     set(QSA_MULTI_DENSE "${CMAKE_CURRENT_BINARY_DIR}/test-qsa-multi-fork-dense.bin")
+    llama_test(test-qsa-multi-fork NAME test-ple-read-error-fork LABEL "model behavior" ARGS --ple-read-error -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-ple-read-error-fork PROPERTIES FIXTURES_REQUIRED generate-models)
     llama_test(
         test-qsa-multi-fork
         NAME test-qsa-multi-fork-dense

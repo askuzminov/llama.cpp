@@ -35,7 +35,7 @@ static void common_params_add_args_cache_ram(const common_params & params, const
         "cache. The files are kept on shutdown and picked up again on the next start (cold-start reuse) as long as "
         "the model and KV configuration match. The context checkpoints go out with the state, so a prompt that "
         "matches only a prefix can still roll back after a restart. Several models may share one directory: a file "
-        "is named after the configuration it belongs to, so a model only ever reads and drops its own. "
+        "is read only by its matching configuration; the disk budget is shared by all models in PATH. "
         "Best on fast NVMe. (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.cache_spill_dir = value;
@@ -44,9 +44,8 @@ static void common_params_add_args_cache_ram(const common_params & params, const
     add_opt(common_arg(
         {"--cache-disk"}, "N",
         string_format("[experimental] disk budget in MiB for spilled prompt-cache states (see --cache-spill-dir). "
-            "This budget is the only thing that deletes them: once it is exceeded the least valuable states go "
-            "first, ranked by how often each was reused times how much work it saves. The budget counts one model, "
-            "so a directory shared by several of them holds up to N MiB for each (default: %d, 0 = unlimited)", params.cache_disk_mib),
+            "The limit covers all models in the directory. Oldest unused files are evicted first across models. "
+            "Use the same budget in servers sharing PATH (default: %d, 0 = unlimited)", params.cache_disk_mib),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("cache-disk must be >= 0");

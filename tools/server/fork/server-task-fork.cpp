@@ -3,11 +3,15 @@
 #include "server-task.h"
 
 #include "common.h"
+#include "file-lock.h"
 #include "llama.h"
 #include "server-common.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <chrono>
 #include <filesystem>
+#include <fstream>
 
 #if defined(_WIN32)
 #   ifndef NOMINMAX
@@ -236,6 +240,87 @@ spill_layout spill_layout_of(const spill_header & h) {
     return l;
 }
 
+struct spill_entry {
+    std::filesystem::path path;
+    std::filesystem::file_time_type modified;
+    size_t bytes;
+};
+
+// Only completed cache files participate. Ignore temporary files, symlinks and unrelated files.
+static std::vector<spill_entry> spill_entries(const std::filesystem::path & dir, bool remove_tmp = false) {
+    std::vector<spill_entry> entries;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto & entry = *it;
+        if (entry.symlink_status(ec).type() != std::filesystem::file_type::regular || ec) {
+            ec.clear();
+            continue;
+        }
+        std::string name = spill_fs_utf8(entry.path().filename());
+        const bool temporary = name.size() > 4 && name.compare(name.size() - 4, 4, SPILL_TMP_EXT) == 0;
+        if (temporary) {
+            name.resize(name.size() - 4);
+        }
+        if (name.compare(0, 6, "state-") != 0 || !spill_is_hex16(name, 6) || !spill_is_hex16(name, 23)) {
+            continue;
+        }
+        const uint64_t owner = std::strtoull(name.substr(6, 16).c_str(), nullptr, 16);
+        const uint64_t signature = std::strtoull(name.substr(23, 16).c_str(), nullptr, 16);
+        if (spill_name_classify(name, owner, signature) != SPILL_NAME_MINE) {
+            continue;
+        }
+        if (temporary) {
+            // All writers hold the directory lock, so any remaining temporary file is abandoned.
+            if (remove_tmp) {
+                std::filesystem::remove(entry.path(), ec);
+                ec.clear();
+            }
+            continue;
+        }
+        spill_header h = {};
+        std::ifstream f(entry.path(), std::ios::binary);
+        if (!f.read((char *) &h, sizeof(h)) || memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) != 0 ||
+                h.version != SPILL_VERSION || !spill_header_sane(h) || h.signature != signature ||
+                spill_name_of(owner, signature, h.uid) != name) {
+            continue;
+        }
+        const auto bytes = entry.file_size(ec);
+        if (ec || bytes != spill_layout_of(h).size || bytes > SIZE_MAX) {
+            ec.clear();
+            continue;
+        }
+        const auto modified = entry.last_write_time(ec);
+        if (!ec) {
+            entries.push_back({entry.path(), modified, (size_t) bytes});
+        }
+        ec.clear();
+    }
+    return entries;
+}
+
+// Caller holds the directory lock. A cache hit updates mtime, so eviction is global LRU.
+static bool spill_prune(const std::filesystem::path & dir, size_t limit) {
+    auto entries = spill_entries(dir, true);
+    uint64_t used = 0;
+    for (const auto & entry : entries) {
+        used += entry.bytes;
+    }
+    std::sort(entries.begin(), entries.end(), [](const spill_entry & a, const spill_entry & b) {
+        return a.modified == b.modified ? a.path < b.path : a.modified < b.modified;
+    });
+    for (const auto & entry : entries) {
+        if (used <= limit) {
+            break;
+        }
+        std::error_code ec;
+        if (std::filesystem::remove(entry.path, ec)) {
+            used -= entry.bytes;
+            SRV_TRC(" - prompt-cache directory budget: removed '%s' (%.3f MiB)\n", spill_fs_utf8(entry.path).c_str(), entry.bytes / (1024.0 * 1024.0));
+        }
+    }
+    return used <= limit;
+}
+
 // One spill file, read or written with the cache bypassed. An aligned buffer goes to the device as
 // is; anything else passes through an aligned bounce buffer, so callers may hand over ordinary
 // unaligned pointers and sizes. Falls back to cached I/O when the platform or filesystem refuses
@@ -431,7 +516,7 @@ private:
         const std::wstring name = path.wstring();
 
         const DWORD access = write ? GENERIC_WRITE : GENERIC_READ;
-        const DWORD share  = write ? 0 : FILE_SHARE_READ;
+        const DWORD share  = write ? 0 : (FILE_SHARE_READ | FILE_SHARE_DELETE);
         const DWORD disp   = write ? CREATE_ALWAYS : OPEN_EXISTING;
 
         fh = CreateFileW(name.c_str(), access, share, nullptr, disp,
@@ -628,6 +713,7 @@ server_prompt_cache::server_prompt_cache(size_t limit_size_mib, size_t limit_tok
     this->signature    = signature;
     this->owner        = owner;
     this->has_mtmd     = has_mtmd;
+    next_uid = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
     if (!this->spill_dir.empty()) {
         std::error_code ec;
@@ -666,6 +752,10 @@ std::filesystem::path server_prompt_cache::spill_path(uint64_t uid) const {
 }
 
 size_t server_prompt_cache::restore_spilled() {
+    common_file_lock lock(spill_dir_path() / ".prompt-cache.lock");
+    if (!lock.acquire([] { return false; })) {
+        return 0;
+    }
     std::error_code ec;
     std::filesystem::directory_iterator it(spill_dir_path(), ec);
     if (ec) {
@@ -795,6 +885,7 @@ size_t server_prompt_cache::restore_spilled() {
                 n_stale, n_stale_bytes / (1024.0 * 1024.0));
     }
 
+    lock.close();
     enforce_disk_limit();
 
     return found.size();
@@ -822,11 +913,19 @@ void server_prompt_cache::persist() {
 }
 
 bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel, size_t disk_free) {
-    if (spill_dir.empty() || st.on_disk) {
+    if (spill_dir.empty() || spill_exists(st)) {
         return false;
     }
     if (st.data.main.empty() && st.data.drft.empty()) {
         return false; // nothing big to write out
+    }
+    common_file_lock lock(spill_dir_path() / ".prompt-cache.lock");
+    // Skip a busy directory instead of delaying a request behind another model's write.
+    if (!lock.acquire([] { return false; }) || (cancel && *cancel && (*cancel)())) {
+        return false;
+    }
+    if (spill_limit > 0) {
+        disk_free = std::min(disk_free, spill_limit);
     }
 
     // the prompt is stored alongside the state so the file can be picked up after a restart. Media
@@ -881,10 +980,16 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     if (spill_layout_of(h).size > disk_free) {
         return false;
     }
-
-    if (st.uid == 0) {
-        st.uid = next_uid++;
+    // Reserve room for the temporary file too; the directory lock excludes other writers.
+    if (spill_limit > 0 && !spill_prune(spill_dir_path(), spill_limit - spill_layout_of(h).size)) {
+        return false;
     }
+
+    // Another server using the same model may have assigned the next UID already.
+    std::error_code exists_ec;
+    do {
+        st.uid = next_uid++;
+    } while (std::filesystem::exists(spill_path(st.uid), exists_ec) && !exists_ec);
     h.uid = st.uid;
 
     const std::filesystem::path path = spill_path(st.uid);
@@ -947,11 +1052,23 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     st.disk_bytes   = spill_layout_of(h).size;
     st.ckpt_on_disk = h.n_ckpt;
     st.on_disk      = true;
-    return true;
+    return spill_exists(st);
+}
+
+bool server_prompt_cache::spill_exists(server_prompt_cache_state & st) {
+    if (st.on_disk) {
+        std::error_code ec;
+        if (!std::filesystem::exists(spill_path(st.uid), ec) && !ec) {
+            st.on_disk = false;
+            st.disk_bytes = 0;
+            st.ckpt_on_disk = 0;
+        }
+    }
+    return st.on_disk;
 }
 
 void server_prompt_cache::evict_state(server_prompt_cache_state & st) {
-    if (!st.on_disk) {
+    if (!spill_exists(st)) {
         return; // without a disk copy the blobs are the only copy
     }
 
@@ -965,7 +1082,7 @@ void server_prompt_cache::evict_state(server_prompt_cache_state & st) {
 }
 
 bool server_prompt_cache::spill_state(server_prompt_cache_state & st, size_t disk_free) {
-    if (!st.on_disk) {
+    if (!spill_exists(st)) {
         if (!write_state(st, nullptr, disk_free)) {
             return false;
         }
@@ -977,9 +1094,11 @@ bool server_prompt_cache::spill_state(server_prompt_cache_state & st, size_t dis
 }
 
 bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
-    if (!st.on_disk) {
-        return true;
+    if (!spill_exists(st)) {
+        return st.data.size() > 0;
     }
+    std::error_code touch_ec;
+    std::filesystem::last_write_time(spill_path(st.uid), std::filesystem::file_time_type::clock::now(), touch_ec);
 
     // the file stays. It holds exactly the bytes the state is handing back, so taking it away only
     // buys a full rewrite at the next idle. enforce_disk_limit decides when a file goes
@@ -991,23 +1110,19 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
 
     spill_file f;
 
-    // a file that cannot be read back is of no use to anyone: drop it and clear the on-disk flag,
-    // so the state is not retried on every load and stops counting against the disk budget.
-    // the entry is left with no data at all, which is what the caller must react to.
+    // A read failure discards the file, but an intact resident state remains usable.
     const auto drop = [&]() {
         f.close();
 
         std::error_code ec;
         std::filesystem::remove(path, ec);
 
-        st.data.main.clear(); st.data.main.shrink_to_fit();
-        st.data.drft.clear(); st.data.drft.shrink_to_fit();
         st.prompt.checkpoints.clear();
         st.on_disk      = false;
         st.disk_bytes   = 0;
         st.ckpt_on_disk = 0;
 
-        return false;
+        return st.data.size() > 0;
     };
 
     if (!f.open_read(path)) {
@@ -1018,7 +1133,7 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
     spill_header h = {};
     if (!f.read_at(0, &h, sizeof(h)) ||
             memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) != 0 ||
-            h.version != SPILL_VERSION ||
+            h.version != SPILL_VERSION || h.uid != st.uid ||
             h.signature != signature ||
             !spill_header_sane(h) ||
             spill_layout_of(h).size != f.size()) {
@@ -1028,11 +1143,20 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
 
     const spill_layout lay = spill_layout_of(h);
 
+    const auto packed = st.prompt.tokens.serialize();
+    std::vector<char> stored(packed.size());
+    if (h.n_prompt != packed.size()/sizeof(llama_token) ||
+            (!stored.empty() && !f.read_at(lay.off_prompt, stored.data(), stored.size())) || stored != packed) {
+        return drop();
+    }
+
     const auto rd = [&](server_state_buf & v, uint64_t off, uint64_t n) -> bool {
         v.resize(n);
         return n == 0 || f.read_at(off, v.data(), n);
     };
-    if (!rd(st.data.main, lay.off_main, h.n_main) || !rd(st.data.drft, lay.off_drft, h.n_drft)) {
+    server_prompt_data loaded;
+    const bool resident = st.data.size() > 0;
+    if (!resident && (!rd(loaded.main, lay.off_main, h.n_main) || !rd(loaded.drft, lay.off_drft, h.n_drft))) {
         SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
         return drop();
     }
@@ -1095,6 +1219,9 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
 
     f.close();
 
+    if (!resident) {
+        st.data = std::move(loaded);
+    }
     return true; // the state is clean now: same bytes in RAM and on disk
 }
 
@@ -1106,47 +1233,19 @@ void server_prompt_cache::erase_spill(const server_prompt_cache_state & st) {
 }
 
 void server_prompt_cache::enforce_disk_limit() {
-    if (spill_dir.empty() || spill_limit == 0) {
+    if (spill_dir.empty()) {
         return;
     }
-    size_t used = disk_size();
-
-    // drop the least valuable on-disk state (oldest first on a tie) until within budget. Value is
-    // how often the state was reused times how much work it saves, so a rarely used or a short and
-    // cheap to redo prompt goes first and a cold start keeps the long ones that pay off
-    while (used > spill_limit) {
-        auto   sel     = states.end();
-        size_t sel_val = 0;
-
-        for (auto it = states.begin(); it != states.end(); ++it) {
-            if (!it->on_disk) {
-                continue;
-            }
-            const size_t val = (size_t) (it->prompt.n_used + 1) * it->prompt.tokens.size();
-
-            if (sel == states.end() || val < sel_val) {
-                sel     = it;
-                sel_val = val;
-            }
-        }
-        if (sel == states.end()) {
-            break; // nothing on disk left to drop
-        }
-        const bool resident = sel->data.size() > 0;
-
-        SRV_WRN(" - prompt-cache disk budget exceeded, dropping %s state (%.3f MiB, %d tokens, used %u time(s))\n",
-                resident ? "the disk copy of a resident" : "spilled", sel->disk_bytes / (1024.0 * 1024.0),
-                sel->prompt.n_tokens(), sel->prompt.n_used);
-
-        used -= std::min(used, sel->disk_bytes);
-        erase_spill(*sel);
-
-        if (resident) {
-            // the blobs are still in RAM, so only the copy goes - the entry stays usable
-            sel->on_disk    = false;
-            sel->disk_bytes = 0;
+    common_file_lock lock(spill_dir_path() / ".prompt-cache.lock");
+    if (spill_limit > 0 && lock.acquire([] { return false; })) {
+        spill_prune(spill_dir_path(), spill_limit);
+    }
+    for (auto it = states.begin(); it != states.end();) {
+        spill_exists(*it);
+        if (!it->on_disk && it->data.size() == 0) {
+            it = states.erase(it);
         } else {
-            states.erase(sel);
+            ++it;
         }
     }
 }
@@ -1159,7 +1258,7 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
         // we never drop a state just to satisfy a RAM deficit. Spilling the whole (bounded) cache
         // is the most we can do for host-RAM pressure; the disk budget alone decides what is
         // dropped for good (enforce_disk_limit)
-        size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit - std::min(spill_limit, disk_size());
+        size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit;
 
         // a clean state already has its copy on disk (write_behind put it there while idle), so
         // releasing its RAM costs no I/O at all. Take those first
@@ -1185,7 +1284,6 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
             const size_t big = st.size();
             if (spill_state(st, disk_free)) {
                 freed     += big - st.size();
-                disk_free -= std::min(disk_free, st.disk_bytes);
             }
         }
 
@@ -1206,7 +1304,9 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
             freed += big;
         }
 
-        enforce_disk_limit();
+        if (may_write) {
+            enforce_disk_limit();
+        }
         return freed;
     }
 
@@ -1242,11 +1342,12 @@ static size_t spill_prefix_on_disk(const std::list<server_prompt_cache_state> & 
 }
 
 size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupted) {
-    if (spill_dir.empty()) {
+    if (spill_dir.empty() || (interrupted && interrupted())) {
         return 0;
     }
 
-    size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit - std::min(spill_limit, disk_size());
+    enforce_disk_limit();
+    const size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit;
 
     size_t n_written = 0;
     size_t n_bytes   = 0;
@@ -1284,7 +1385,6 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
             continue;
         }
 
-        disk_free -= std::min(disk_free, st.disk_bytes);
         n_bytes   += st.disk_bytes;
         n_written += 1;
 
@@ -1299,10 +1399,6 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
 
             SRV_TRC(" - dropping the disk copy of a %d token prefix, the %d token state covers it\n",
                     it2->prompt.n_tokens(), st.prompt.n_tokens());
-
-            if (disk_free != SIZE_MAX) {
-                disk_free += it2->disk_bytes;
-            }
 
             erase_spill(*it2);
             it2 = states.erase(it2);
@@ -1321,13 +1417,11 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
 
 size_t server_prompt_cache::disk_size() const {
     size_t res = 0;
-
-    for (const auto & state : states) {
-        if (state.on_disk) {
-            res += state.disk_bytes;
+    if (!spill_dir.empty()) {
+        for (const auto & entry : spill_entries(spill_dir_path())) {
+            res += entry.bytes;
         }
     }
-
     return res;
 }
 

@@ -1976,8 +1976,10 @@ void server_prompt_cache::update(bool may_write) {
         free_ram(size_ram - limit_size, may_write);
     }
 
-    // keep the on-disk spill within its budget
-    enforce_disk_limit();
+    // Directory scans stay off the inference path; writes already enforce the shared budget.
+    if (may_write) {
+        enforce_disk_limit();
+    }
 
     // keep host RAM above the reserve (adapts to memory taken by other processes over time)
     evict_for_reserve(0, may_write);

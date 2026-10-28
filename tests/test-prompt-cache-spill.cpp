@@ -7,7 +7,11 @@
 // plus the cold-start adoption, signature mismatch, legacy names and truncation paths.
 
 #include "server-task.h"
+#include "fork/server-context-fork.h"
+#include "common.h"
+#include "file-lock.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -115,7 +119,12 @@ static void fill(server_prompt_cache & cache) {
 }
 
 static bool dir_empty(const std::string & dir) {
-    return std::filesystem::directory_iterator(fs_path(dir)) == std::filesystem::directory_iterator();
+    for (const auto & entry : std::filesystem::directory_iterator(fs_path(dir))) {
+        if (entry.path().filename() != ".prompt-cache.lock") {
+            return false;
+        }
+    }
+    return true;
 }
 
 // the cache never drops a state without erasing its file first, so a test must not either
@@ -452,7 +461,9 @@ static void test_legacy_names(const std::string & dir) {
 
     std::vector<std::filesystem::path> files;
     for (const auto & entry : std::filesystem::directory_iterator(root)) {
-        files.push_back(entry.path());
+        if (entry.path().filename() != ".prompt-cache.lock") {
+            files.push_back(entry.path());
+        }
     }
     assert(files.size() == sizeof(CASES)/sizeof(CASES[0]));
     for (const auto & path : files) {
@@ -510,6 +521,9 @@ static void test_truncated(const std::string & dir) {
     }
 
     for (const auto & entry : std::filesystem::directory_iterator(fs_path(dir))) {
+        if (entry.path().filename() == ".prompt-cache.lock") {
+            continue;
+        }
         const uintmax_t n_file = std::filesystem::file_size(entry.path());
         assert(n_file > 4096);
         std::filesystem::resize_file(entry.path(), n_file - 4096);
@@ -522,7 +536,140 @@ static void test_truncated(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
-int main() {
+static void test_shared_budget(const std::string & dir) {
+    server_prompt_cache a(0, 0, 0, dir, 60000, SIG, 1);
+    server_prompt_cache b(0, 0, 0, dir, 60000, SIG ^ 1, 2);
+    a.states.push_back(make_state(100, 1, 40960, 0));
+    const auto ref = a.states.front().data;
+    assert(a.write_behind(nullptr) == 1);
+    const auto old = a.spill_path(a.states.front().uid);
+    auto orphan = old;
+    orphan += ".tmp";
+    std::filesystem::copy_file(old, orphan);
+    std::filesystem::last_write_time(old, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+    const auto unrelated = fs_path(dir) / "notes.bin";
+    { std::ofstream f(unrelated); f << "keep"; }
+    b.states.push_back(make_state(100, 2, 40960, 0));
+    assert(b.write_behind(nullptr) == 1);
+    assert(a.disk_size() <= 60000 && b.disk_size() == a.disk_size());
+    assert(!std::filesystem::exists(old));
+    assert(!std::filesystem::exists(orphan));
+    assert(std::filesystem::exists(unrelated));
+    // Eviction by another model must not discard the remaining RAM copy.
+    a.evict_state(a.states.front());
+    assert(!a.states.front().on_disk && a.states.front().data.main == ref.main);
+    assert(a.unspill_state(a.states.front()));
+    b.evict_state(b.states.front());
+    const auto b_path = b.spill_path(b.states.front().uid);
+    std::filesystem::last_write_time(b_path, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+    assert(a.write_behind(nullptr) == 1);
+    assert(!std::filesystem::exists(b_path));
+    assert(!b.unspill_state(b.states.front()));
+    b.enforce_disk_limit();
+    assert(b.states.empty());
+    clear_cache(a);
+    std::filesystem::remove(unrelated);
+    assert(dir_empty(dir));
+}
+
+static void test_shared_writers(const std::string & dir) {
+    server_prompt_cache a(0, 0, 0, dir, 0, SIG, 1);
+    server_prompt_cache b(0, 0, 0, dir, 0, SIG, 1);
+    a.states.push_back(make_state(100, 1, 40960, 0));
+    b.states.push_back(make_state(100, 2, 40960, 0));
+    {
+        common_file_lock lock(fs_path(dir) / ".prompt-cache.lock");
+        assert(lock.acquire());
+        assert(a.write_behind(nullptr) == 0);
+        assert(!a.states.front().on_disk);
+    }
+    assert(a.write_behind(nullptr) == 1);
+    assert(b.write_behind(nullptr) == 1);
+    assert(a.states.front().uid != b.states.front().uid);
+    a.evict_state(a.states.front());
+    assert(a.unspill_state(a.states.front()));
+    assert(a.states.front().data.main == make_blob(40960, 2));
+    clear_cache(a);
+    clear_cache(b);
+    assert(dir_empty(dir));
+}
+
+static void test_shared_lru(const std::string & dir) {
+    server_prompt_cache a(0, 0, 0, dir, 100000, SIG, 1);
+    server_prompt_cache b(0, 0, 0, dir, 100000, SIG ^ 1, 2);
+    a.states.push_back(make_state(100, 1, 40960, 0));
+    b.states.push_back(make_state(100, 2, 40960, 0));
+    assert(a.write_behind(nullptr) == 1);
+    assert(b.write_behind(nullptr) == 1);
+    const auto old_a = a.spill_path(a.states.front().uid);
+    const auto old_b = b.spill_path(b.states.front().uid);
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(old_a, now - std::chrono::hours(2));
+    std::filesystem::last_write_time(old_b, now - std::chrono::hours(1));
+    assert(a.unspill_state(a.states.front()));
+    b.states.push_back(make_state(100, 3, 40960, 0));
+    assert(b.write_behind(nullptr) == 1);
+    assert(std::filesystem::exists(old_a));
+    assert(!std::filesystem::exists(old_b));
+    assert(a.disk_size() <= 100000);
+    clear_cache(a);
+    clear_cache(b);
+    assert(dir_empty(dir));
+}
+
+static void test_cache_compatibility(const char * model_path) {
+    llama_backend_init();
+    auto mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model_ptr model(llama_model_load_from_file(model_path, mp));
+    assert(model);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128;
+    cp.n_batch = cp.n_ubatch = 32;
+    cp.n_threads = cp.n_threads_batch = 2;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    assert(ctx);
+    common_params params;
+    params.model.path = model_path;
+    const auto signature = [&](const common_params & p) { return server_prompt_cache_signature(p, model.get(), ctx.get(), nullptr); };
+    const uint64_t base = signature(params);
+    auto changed = params;
+    changed.rope_freq_scale = 0.5f;
+    assert(signature(changed) != base);
+    changed = params;
+    changed.yarn_attn_factor = 1.0f;
+    const auto yarn = signature(changed);
+    changed.yarn_attn_factor = 1.0000001f;
+    assert(signature(changed) != yarn);
+    const auto file = std::filesystem::temp_directory_path() / "llama-cache-identity-test.bin";
+    { std::ofstream f(file); f << "weights"; }
+    changed.model.path = fs_utf8(file);
+    const auto original_time = std::filesystem::last_write_time(file);
+    const auto first = signature(changed);
+    std::filesystem::last_write_time(file, original_time - std::chrono::seconds(10));
+    assert(signature(changed) != first);
+    auto draft_signature = [&](const common_params & p) { return server_prompt_cache_signature(p, model.get(), ctx.get(), ctx.get()); };
+    changed.speculative.draft.mparams.path = changed.model.path;
+    const auto draft = draft_signature(changed);
+    changed.speculative.draft.cache_type_k = GGML_TYPE_Q8_0;
+    assert(draft_signature(changed) != draft);
+    changed = params;
+    changed.mmproj.path = fs_utf8(file);
+    assert(signature(changed) != base);
+    const auto media = signature(changed);
+    changed.image_max_tokens = 4096;
+    assert(signature(changed) != media);
+    std::filesystem::remove(file);
+    ctx.reset();
+    model.reset();
+    llama_backend_free();
+}
+
+int main(int argc, char ** argv) {
+    if (argc == 3 && std::string(argv[1]) == "-m") {
+        test_cache_compatibility(argv[2]);
+        return 0;
+    }
     // write_behind times itself: on Windows ggml_time_us divides by the counter frequency that ggml_time_init
     // sets, and no model load does it here (0xc0000094 on the 395, 22.10)
     ggml_time_init();
@@ -548,6 +695,9 @@ int main() {
         { "signature-mismatch", test_signature_mismatch },
         { "legacy-names",       test_legacy_names       },
         { "truncated",          test_truncated          },
+        { "shared-budget",      test_shared_budget      },
+        { "shared-writers",     test_shared_writers     },
+        { "shared-lru",         test_shared_lru         },
     };
 
     for (const auto & t : tests) {

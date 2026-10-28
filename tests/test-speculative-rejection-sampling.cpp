@@ -14,6 +14,75 @@
 // Tests that common_sampler_sample_and_accept_n_rejection preserves the target
 // distribution regardless of what the draft distribution Q looks like.
 
+static bool test_terminal_and_bias(llama_model * model, llama_context * ctx) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    float * logits = llama_get_logits_ith(ctx, -1);
+    const std::vector<float> saved(logits, logits + n_vocab);
+    bool ok = true;
+    common_params_sampling sampling;
+    sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    sampling.temp = 1.0f;
+    const llama_token eos = llama_vocab_eos(vocab);
+    if (eos >= 0) {
+        const llama_token other = eos == 5 ? 6 : 5;
+        std::fill(logits, logits + n_vocab, -INFINITY);
+        logits[eos] = 0.0f;
+        for (bool rejection : { false, true }) {
+            for (const llama_tokens & draft : { llama_tokens{eos, other}, llama_tokens{eos}, llama_tokens{other} }) {
+                common_sampler_ptr smpl(common_sampler_init(model, sampling));
+                std::vector<std::vector<llama_token_data>> q;
+                for (llama_token t : draft) {
+                    q.push_back({{t, 0.0f, 1.0f}});
+                }
+                const std::vector<int> idxs(draft.size() + 1, -1);
+                const auto result = rejection
+                    ? common_sampler_sample_and_accept_n_rejection(smpl.get(), ctx, idxs, draft, q, false)
+                    : common_sampler_sample_and_accept_n(smpl.get(), ctx, idxs, draft, false);
+                ok = ok && result == llama_tokens{eos};
+            }
+        }
+        // A rejected EOG draft must still return the target's non-terminal replacement.
+        logits[eos] = -INFINITY;
+        logits[other] = 0.0f;
+        common_sampler_ptr smpl(common_sampler_init(model, sampling));
+        ok = ok && common_sampler_sample_and_accept_n_rejection(smpl.get(), ctx, {-1, -1}, {eos}, {{{eos, 0.0f, 1.0f}}}, false) == llama_tokens{other};
+        common_sampler_ptr bonus(common_sampler_init(model, sampling));
+        ok = ok && common_sampler_sample_and_accept_n(bonus.get(), ctx, {-1, -1}, {other}, false) == llama_tokens({other, other});
+    } else {
+        LOG("Skipping EOG cases: this vocabulary has no EOS\n");
+    }
+
+    const char * old_env = std::getenv("LLAMA_SAMPLER_FAST_TOP_K");
+    const std::string old_value = old_env ? old_env : "1";
+    auto set_fast = [](const char * value) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_SAMPLER_FAST_TOP_K", value);
+#else
+        setenv("LLAMA_SAMPLER_FAST_TOP_K", value, 1);
+#endif
+    };
+    std::fill(logits, logits + n_vocab, -50.0f);
+    logits[5] = -25.0f;
+    logits[6] = 10.0f;
+    logits[7] = 9.0f;
+    sampling.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    sampling.temp = 0.0f;
+    sampling.top_k = 2;
+    sampling.logit_bias = {{5, 20.0f}, {5, 20.0f}};
+    for (const char * fast : { "0", "1" }) {
+        set_fast(fast);
+        common_sampler_ptr smpl(common_sampler_init(model, sampling));
+        ok = ok && common_sampler_sample(smpl.get(), ctx, -1) == 5;
+    }
+    set_fast(old_value.c_str());
+    std::copy(saved.begin(), saved.end(), logits);
+    if (!ok) {
+        LOG_ERR("terminal token or repeated logit bias regression\n");
+    }
+    return ok;
+}
+
 static int test_speculative_rejection_sampling(common_params & params, int n_trials) {
     params.sampling.backend_sampling = false;
     auto llama_init = common_init_from_params(params);
@@ -33,6 +102,10 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
     if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
         LOG_ERR("failed to decode the test prompt\n");
         return 1;
+    }
+
+    if (n_trials == 0) {
+        return test_terminal_and_bias(model_tgt, ctx_tgt) ? 0 : 1;
     }
 
     common_params_sampling sampling;
@@ -156,6 +229,9 @@ static int test_speculative_rejection_sampling(common_params & params, int n_tri
         ok = false;
     }
 
+    if (!test_terminal_and_bias(model_tgt, ctx_tgt)) {
+        ok = false;
+    }
     if (!ok) {
         return 1;
     }
@@ -180,8 +256,8 @@ static std::optional<parsed_args> parse_n_trials_arg(int argc, char ** argv, int
                 return std::nullopt;
             }
             int value = std::atoi(argv[i + 1]);
-            if (value <= 0) {
-                LOG_ERR("%s: --n-trials requires a positive number argument\n", __func__);
+            if (value < 0) {
+                LOG_ERR("%s: --n-trials requires a non-negative number argument\n", __func__);
                 return std::nullopt;
             }
             result.n_trials = value;

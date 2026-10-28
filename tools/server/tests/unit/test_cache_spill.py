@@ -31,6 +31,10 @@ LONG_PROMPT = (
 IMG_URL = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png"
 
 
+def spill_files(directory):
+    return [name for name in os.listdir(directory) if name != ".prompt-cache.lock"]
+
+
 def test_prompt_cache_spill_enabled_reuse():
     spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-test-")
 
@@ -120,7 +124,7 @@ def test_prompt_cache_spill_written_on_shutdown():
         # nothing else is sent: the prompt lives only in the slot
         server.stop()
 
-        files = os.listdir(spill_dir)
+        files = spill_files(spill_dir)
         assert len(files) == 1, f"expected one spill file after a clean stop, got {files}"
         assert os.path.getsize(os.path.join(spill_dir, files[0])) > 0
 
@@ -169,7 +173,7 @@ def test_prompt_cache_write_behind_while_idle():
         # the write runs on the idle path right after the response is sent
         files = []
         for _ in range(50):
-            files = [f for f in os.listdir(spill_dir) if f.endswith(".bin")]
+            files = [f for f in spill_files(spill_dir) if f.endswith(".bin")]
             if files:
                 break
             time.sleep(0.1)
@@ -180,7 +184,7 @@ def test_prompt_cache_write_behind_while_idle():
         res = server.make_request("GET", "/health")
         assert res.status_code == 200, res.body
         time.sleep(0.5)
-        assert os.listdir(spill_dir) == files, "a clean state was written a second time"
+        assert spill_files(spill_dir) == files, "a clean state was written a second time"
 
         # the state is still usable: extending the prompt must reuse it
         res = server.make_request("POST", "/completion", data={
@@ -232,13 +236,13 @@ def test_prompt_cache_spill_kill_mid_write():
         tmp = []
         deadline = time.time() + 10
         while not tmp and time.time() < deadline:
-            tmp = [f for f in os.listdir(spill_dir) if f.endswith(".tmp")]
+            tmp = [f for f in spill_files(spill_dir) if f.endswith(".tmp")]
         assert tmp, "the state was not written under a temporary name"
 
         server.process.kill()
         server.process.wait()
 
-        assert os.listdir(spill_dir) == tmp, "the killed write left a file under a state name"
+        assert spill_files(spill_dir) == tmp, "the killed write left a file under a state name"
 
         m = re.fullmatch(r"state-([0-9a-f]{16})-([0-9a-f]{16})-\d+\.bin\.tmp", tmp[0])
         owner, sig = m.group(1), m.group(2)
@@ -261,7 +265,7 @@ def test_prompt_cache_spill_kill_mid_write():
         server = make_server()
         server.start()
 
-        assert sorted(os.listdir(spill_dir)) == sorted(keep), "the start must remove the unfinished files of this model only"
+        assert sorted(spill_files(spill_dir)) == sorted(keep), "the start must remove the unfinished files of this model only"
     finally:
         server.stop()
         try:
@@ -296,7 +300,7 @@ def test_prompt_cache_spill_with_mmproj():
 
         files = []
         for _ in range(50):
-            files = [f for f in os.listdir(spill_dir) if f.endswith(".bin")]
+            files = [f for f in spill_files(spill_dir) if f.endswith(".bin")]
             if files:
                 break
             time.sleep(0.1)
@@ -367,7 +371,7 @@ def test_prompt_cache_spill_with_image():
 
         files = []
         for _ in range(50):
-            files = [f for f in os.listdir(spill_dir) if f.endswith(".bin")]
+            files = [f for f in spill_files(spill_dir) if f.endswith(".bin")]
             if files:
                 break
             time.sleep(0.1)
@@ -438,7 +442,7 @@ def test_prompt_cache_hit_keeps_the_file():
         # write-behind puts it on disk while the server is idle
         before = []
         for _ in range(50):
-            before = sorted(f for f in os.listdir(spill_dir) if f.endswith(".bin"))
+            before = sorted(f for f in spill_files(spill_dir) if f.endswith(".bin"))
             if before:
                 break
             time.sleep(0.1)
@@ -453,7 +457,7 @@ def test_prompt_cache_hit_keeps_the_file():
         assert res.body["timings"]["cache_n"] > 0, "expected reuse from the prompt cache"
 
         time.sleep(0.5)
-        assert sorted(os.listdir(spill_dir)) == before, "a cache hit must not rewrite the spill dir"
+        assert sorted(spill_files(spill_dir)) == before, "a cache hit must not rewrite the spill dir"
 
         # and the state is still coherent after all that
         res = server.make_request("POST", "/completion", data={
@@ -503,7 +507,7 @@ def test_prompt_cache_min_tokens_skips_short_prompts():
         assert res.status_code == 200, res.body
 
         time.sleep(0.5)
-        assert os.listdir(spill_dir) == [], "short prompts must not enter the cache"
+        assert spill_files(spill_dir) == [], "short prompts must not enter the cache"
     finally:
         server.stop()
         try:
@@ -516,8 +520,7 @@ def test_prompt_cache_min_tokens_skips_short_prompts():
 
 def test_prompt_cache_spill_dir_shared_by_two_models():
     # Two models may point at one spill dir. The file name carries the signature of the
-    # configuration, so a model only ever reads and drops its own files, and it still finds them
-    # after the other model has run there.
+    # configuration, so a model only reads compatible files. Both survive while the shared budget fits.
     spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-share-")
 
     def setup(server):
@@ -545,14 +548,14 @@ def test_prompt_cache_spill_dir_shared_by_two_models():
         cold = run(server)
         assert cold["prompt_n"] > 1
 
-        mine = os.listdir(spill_dir)
+        mine = spill_files(spill_dir)
         assert len(mine) == 1, f"expected one spill file after a clean stop, got {mine}"
 
         # the other model spills into the same directory
         server = setup(ServerPreset.stories15m_moe())
         run(server)
 
-        both = sorted(os.listdir(spill_dir))
+        both = sorted(spill_files(spill_dir))
         assert len(both) == 2, f"each model must keep its own file, got {both}"
         assert mine[0] in both, "the second model dropped the first one's file"
 
@@ -663,7 +666,7 @@ def test_prompt_cache_spill_carries_checkpoints():
 
         server.stop()
 
-        files = os.listdir(spill_dir)
+        files = spill_files(spill_dir)
         assert len(files) == 1, f"expected one spill file after a clean stop, got {files}"
 
         with open(os.path.join(spill_dir, files[0]), "rb") as f:

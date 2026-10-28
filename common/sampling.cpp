@@ -167,6 +167,18 @@ struct common_sampler {
             if (fast_state == 1) {
                 // the biases of the chain's logit_bias sampler (common_sampler_init)
                 const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+                std::vector<llama_token> biased;
+                for (const auto & lb : params.logit_bias) {
+                    if (lb.token >= 0 && lb.token < llama_vocab_n_tokens(vocab)) {
+                        biased.push_back(lb.token);
+                    }
+                }
+                std::sort(biased.begin(), biased.end());
+                // The bias sampler handles repeated IDs differently in a reduced candidate array.
+                if (std::adjacent_find(biased.begin(), biased.end()) != biased.end()) {
+                    fast_state = 0;
+                    return false;
+                }
                 int32_t n_suppress = 0;
                 const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
                 if (!params.logit_bias.empty() || n_suppress > 0) {
@@ -821,9 +833,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        // do not accept draft tokens after an EOG - they are not output but would stay in the context
-        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
-        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+        // Tokens after EOG must not enter the context, including the bonus token.
+        if (draft[i] != id || llama_vocab_is_eog(vocab, id)) {
             break;
         }
     }
@@ -854,6 +865,8 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -913,6 +926,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            if (llama_vocab_is_eog(vocab, draft[i])) {
+                break;
+            }
             continue;
         }
 

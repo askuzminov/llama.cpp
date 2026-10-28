@@ -313,6 +313,11 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
+if (TARGET test-speculative-rejection-sampling)
+    llama_test(test-speculative-rejection-sampling NAME test-speculative-eog LABEL "model behavior" ARGS -m "${MODEL_DEST}" --n-trials 0 -t 2)
+    set_tests_properties(test-speculative-eog PROPERTIES FIXTURES_REQUIRED test-download-model)
+endif()
+
 # the context state cases against a real model, the sweep above uses the generated dummy ones
 llama_test(test-llama-context  NAME test-llama-context-model  LABEL "model behavior backend"  ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-llama-context-model PROPERTIES FIXTURES_REQUIRED test-download-model)

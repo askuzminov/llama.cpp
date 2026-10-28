@@ -758,7 +758,7 @@ struct server_prompt_cache {
     size_t reserve_size = 0;
 
     // [experimental] disk spill: when spill_dir is set, cold states are written to disk instead of
-    // being dropped under memory pressure; spill_limit caps total on-disk bytes (0 = unlimited).
+    // being dropped under memory pressure; spill_limit caps the shared directory across models (0 = unlimited).
     std::string spill_dir;
     size_t      spill_limit = 0;
     uint64_t    next_uid    = 1;
@@ -774,7 +774,7 @@ struct server_prompt_cache {
     // an mmproj is loaded, so a spilled prompt may hold media chunks and can be restored with them
     bool has_mtmd = false;
 
-    size_t disk_size() const; // bytes currently spilled to disk
+    size_t disk_size() const; // completed cache bytes in the shared directory
 
     // the cached state that load() restores for tokens_new: it keeps more of itself and of tokens_new than tokens_cur does. states.end() when there is none
     std::list<server_prompt_cache_state>::iterator find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new);
@@ -804,7 +804,8 @@ struct server_prompt_cache {
     // Returns the number of states written.
     size_t write_behind(const std::function<bool()> & interrupted);
     void erase_spill(const server_prompt_cache_state & st); // delete the backing file, if any
-    void enforce_disk_limit(); // drop the least-used on-disk states over spill_limit
+    bool spill_exists(server_prompt_cache_state & st); // refresh after another process evicts a file
+    void enforce_disk_limit(); // global LRU over spill_limit
 
     // cold start: adopt the spill files left by a previous run whose signature matches. Returns
     // the number of states adopted.

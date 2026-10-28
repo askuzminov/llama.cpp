@@ -23,15 +23,19 @@
 // usage: test-qsa-multi-fork -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>]
 
 #include "llama.h"
+#include "llama-ext.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <random>
 #include <string>
@@ -58,11 +62,13 @@ static void set_env(const char * name, const char * value) {
 
 // the log, for the count of LLAMA_QSA_CHECK; errors go on to stderr
 static std::mutex  g_log_mutex;
+static std::condition_variable g_log_cv;
 static std::string g_log;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
     g_log += text;
+    g_log_cv.notify_all();
     if (level == GGML_LOG_LEVEL_ERROR) {
         fputs(text, stderr);
     }
@@ -532,6 +538,42 @@ static void test_scenario(llama_model * model, const scenario & sc, const logits
     }
 }
 
+static void test_ple_read_error(const char * source) {
+    const auto path = std::filesystem::temp_directory_path() / "llama-ple-read-error.gguf";
+    std::filesystem::copy_file(std::filesystem::u8path(source), path, std::filesystem::copy_options::overwrite_existing);
+    auto mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    mp.lazy_mode = LLAMA_LAZY_MODE_DIO;
+    llama_model * model = llama_model_load_from_file(path.u8string().c_str(), mp);
+    CHECK(model != nullptr);
+    if (model) {
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 128;
+        cp.n_batch = cp.n_ubatch = 8;
+        cp.n_threads = cp.n_threads_batch = 2;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        CHECK(ctx != nullptr);
+        if (ctx) {
+            const size_t from = log_size();
+            std::filesystem::resize_file(path, 0);
+            llama_token tokens[] = {1, 2, 3};
+            llama_prefetch_tokens(ctx, tokens, 3, 3, 0, 0);
+            {
+                std::unique_lock<std::mutex> lock(g_log_mutex);
+                CHECK(g_log_cv.wait_for(lock, std::chrono::seconds(30), [from] {
+                    return g_log.find("PLE read-ahead disabled:", from) != std::string::npos;
+                }));
+            }
+            // A disabled warmer must also tolerate another request and a normal shutdown.
+            llama_prefetch_tokens(ctx, tokens, 3, 3, 0, 0);
+            llama_free(ctx);
+        }
+        llama_model_free(model);
+    }
+    std::filesystem::remove(path);
+}
+
 int main(int argc, char ** argv) {
     const char * path      = nullptr;
     const char * dense_out = nullptr;
@@ -557,6 +599,11 @@ int main(int argc, char ** argv) {
 
     llama_log_set(log_cb, nullptr);
     llama_backend_init();
+    if (argc > 1 && strcmp(argv[1], "--ple-read-error") == 0) {
+        test_ple_read_error(path);
+        llama_backend_free();
+        return n_fail == 0 ? 0 : 1;
+    }
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;

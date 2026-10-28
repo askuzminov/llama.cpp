@@ -11,7 +11,12 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
+#include <filesystem>
+#include <iomanip>
+#include <locale>
+#include <sstream>
 #include <string>
 
 // count cap used when the host cannot be probed, so no byte budget can be measured
@@ -148,6 +153,40 @@ void server_prompt_cache_init(
     }
 }
 
+static std::string server_cache_file_identity(const std::string & name, const llama_model * model = nullptr) {
+    if (name.empty()) {
+        return "|no-file";
+    }
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    auto add = [&](const std::string & file) {
+        const auto path = std::filesystem::u8path(file);
+        std::error_code ec;
+        const auto canonical = std::filesystem::weakly_canonical(path, ec);
+        out << '|' << std::quoted(ec ? file : canonical.u8string());
+        const auto size = std::filesystem::file_size(path, ec);
+        out << '|' << (ec ? 0 : size);
+        const auto modified = std::filesystem::last_write_time(path, ec);
+        out << '|' << (ec ? 0 : (int64_t) modified.time_since_epoch().count());
+    };
+    add(name);
+    char count[32] = {};
+    if (model && llama_model_meta_val_str(model, "split.count", count, sizeof(count)) > 0) {
+        const int n_split = std::atoi(count);
+        if (n_split > 1 && n_split <= UINT16_MAX) {
+            std::vector<char> prefix(name.size() + 1);
+            if (llama_split_prefix(prefix.data(), prefix.size(), name.c_str(), 0, n_split) > 0) {
+                std::vector<char> split(name.size() + 32);
+                for (int i = 1; i < n_split; ++i) {
+                    llama_split_path(split.data(), split.size(), prefix.data(), i, n_split);
+                    add(split.data());
+                }
+            }
+        }
+    }
+    return out.str();
+}
+
 uint64_t server_prompt_cache_signature(
         const common_params & params,
         const llama_model * model_tgt,
@@ -162,6 +201,7 @@ uint64_t server_prompt_cache_signature(
     s += "|" + std::to_string(llama_model_size(model_tgt));
     s += "|" + std::to_string(llama_n_ctx(ctx_tgt));
     s += "|" + std::to_string(llama_n_ctx_seq(ctx_tgt));
+    s += "|" + std::to_string(llama_n_rs_seq(ctx_tgt));
     s += "|" + std::to_string((int) params.cache_type_k);
     s += "|" + std::to_string((int) params.cache_type_v);
     s += "|" + std::to_string(params.n_parallel);
@@ -169,6 +209,44 @@ uint64_t server_prompt_cache_signature(
     s += "|" + std::to_string((int) params.kv_unified);
     s += "|" + std::to_string(ctx_dft != nullptr);
     s += "|" + std::to_string(LLAMA_STATE_SEQ_VERSION);
+    // File timestamps avoid reading all weights at startup. Exact float text preserves close overrides.
+    s += "|compat 2" + server_cache_file_identity(params.model.path, model_tgt);
+    std::ostringstream config;
+    config.imbue(std::locale::classic());
+    config << std::hexfloat << '|' << params.rope_scaling_type << '|' << params.rope_freq_base << '|' << params.rope_freq_scale
+           << '|' << params.yarn_ext_factor << '|' << params.yarn_attn_factor << '|' << params.yarn_beta_fast
+           << '|' << params.yarn_beta_slow << '|' << params.yarn_orig_ctx;
+    config << "|attention " << params.attention_type << '|' << params.embedding;
+    for (const auto & kv : params.kv_overrides) {
+        if (kv.key[0] == 0) {
+            break;
+        }
+        config << "|kv " << std::quoted(kv.key) << '|' << kv.tag;
+        switch (kv.tag) {
+            case LLAMA_KV_OVERRIDE_TYPE_INT:   config << '|' << kv.val_i64; break;
+            case LLAMA_KV_OVERRIDE_TYPE_FLOAT: config << '|' << kv.val_f64; break;
+            case LLAMA_KV_OVERRIDE_TYPE_BOOL:  config << '|' << kv.val_bool; break;
+            case LLAMA_KV_OVERRIDE_TYPE_STR:   config << '|' << std::quoted(kv.val_str); break;
+        }
+    }
+    config << "|lora " << params.lora_init_without_apply;
+    for (const auto & adapter : params.lora_adapters) {
+        config << server_cache_file_identity(adapter.path) << '|' << adapter.scale;
+    }
+    config << "|control " << params.control_vector_layer_start << '|' << params.control_vector_layer_end;
+    for (const auto & cv : params.control_vectors) {
+        config << server_cache_file_identity(cv.fname) << '|' << cv.strength;
+    }
+    config << "|mmproj" << server_cache_file_identity(params.mmproj.path);
+    config << '|' << params.image_min_tokens << '|' << params.image_max_tokens << '|' << params.video_fps;
+    if (ctx_dft) {
+        const auto & draft = params.speculative.draft;
+        config << "|draft" << server_cache_file_identity(draft.mparams.path, llama_get_model(ctx_dft))
+               << '|' << llama_n_ctx(ctx_dft) << '|' << llama_n_ctx_seq(ctx_dft)
+               << '|' << llama_n_rs_seq(ctx_dft)
+               << '|' << draft.cache_type_k << '|' << draft.cache_type_v;
+    }
+    s += config.str();
     char arch[32] = {};
     if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) >= 0 && std::string(arch) == "qwen4exp") {
         // The old QSA padding could repeat live cells and corrupt cached recurrent states.
@@ -333,7 +411,7 @@ int32_t server_prefill_budget_fork() {
 }
 
 bool server_prefill_exclusive_fork() {
-    static const bool value = server_env_int_fork("LLAMA_PREFILL_EXCLUSIVE", 1) != 0;
+    static const bool value = server_env_int_fork("LLAMA_PREFILL_EXCLUSIVE", 0) != 0;
     return value;
 }
 

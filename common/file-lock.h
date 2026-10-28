@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <functional>
 #include <string>
 
@@ -7,7 +8,7 @@
 // Lazy: acquire() opens the lock file, so a read-only cache works if the lock is never acquired.
 class common_file_lock {
 public:
-    common_file_lock(const std::string & lock_path);
+    common_file_lock(const std::filesystem::path & lock_path);
     ~common_file_lock();
 
     // take the lock, waiting while another process holds it;
@@ -29,7 +30,7 @@ private:
 
     status try_lock();
 
-    std::string lock_path;
+    std::filesystem::path lock_path;
 
     int  fd     = -1;
     bool locked = false;

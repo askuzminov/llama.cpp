@@ -9,6 +9,7 @@
 
 import os
 import tempfile
+import threading
 
 import pytest
 from utils import *
@@ -60,7 +61,7 @@ def n_tokens(text: str) -> int:
 NO_ROOM = "failed to find free space in the KV cache"
 
 
-def complete(prompt: str, n_predict: int, id_slot: int | None = None):
+def complete(prompt: str | list[int], n_predict: int, id_slot: int | None = None):
     data = {"prompt": prompt, "n_predict": n_predict, "cache_prompt": True, "ignore_eos": True}
     if id_slot is not None:
         data["id_slot"] = id_slot
@@ -171,3 +172,48 @@ def test_no_pause_below_ram_reserve(monkeypatch):
 
     assert "no pause for room" in text
     assert "paused for room in the unified KV cache" not in text
+
+
+def test_generation_progress_during_another_prompt(monkeypatch):
+    global server
+    monkeypatch.delenv("LLAMA_PREFILL_EXCLUSIVE", raising=False)
+    monkeypatch.setenv("LLAMA_PREFILL_BUDGET", "64")
+    monkeypatch.setenv("LLAMA_SLOT_ANSWER_ROOM", "0")
+    server.n_ctx = 8192
+    server.n_slots = 2
+    server.n_batch = server.n_ubatch = 64
+    server.server_continuous_batching = True
+    server.debug = True
+    server.cache_ram = 0
+    server.cache_ram_reserve = 0
+    server.n_ctx_checkpoints = 0
+    server.start()
+    log = LogReader(server.log_path)
+    started = threading.Event()
+
+    def generate():
+        chunks = []
+        for chunk in server.make_stream_request("POST", "/completion", data={
+            "prompt": [100] * 16, "n_predict": 2048, "id_slot": 0,
+            "stream": True, "ignore_eos": True, "temperature": 0,
+        }):
+            chunks.append(chunk)
+            if chunk.get("content"):
+                started.set()
+        return chunks
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        answer = pool.submit(generate)
+        assert started.wait(timeout=60)
+        other = complete([200] * 1024, 2, 1)
+        assert other.status_code == 200
+        assert answer.result(timeout=120)[-1]["stop"]
+
+    text = log.drain()
+    begin = re.search(r"slot .*id\s+1 \|.*new prompt", text)
+    end = re.search(r"slot .*id\s+1 \|.*slot decode token", text)
+    assert begin and end and begin.start() < end.start()
+    during = text[begin.end():end.start()]
+    # One token may be batched after the other prompt finishes; more proves interleaving.
+    n_decode = len(re.findall(r"slot .*id\s+0 \|.*slot decode token", during))
+    assert n_decode > 1, f"only {n_decode} decode steps during the other prompt"

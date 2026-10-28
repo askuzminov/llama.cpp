@@ -47,7 +47,7 @@ struct llama_model_qwen4exp_fork::ple_warmer {
 
     int64_t n_rows = 0;
 
-    ~ple_warmer() {
+    void finish() {
         {
             std::lock_guard<std::mutex> lock(mutex);
             stop = true;
@@ -57,6 +57,8 @@ struct llama_model_qwen4exp_fork::ple_warmer {
             worker.join();
         }
     }
+
+    ~ple_warmer() { finish(); }
 };
 
 llama_model_qwen4exp_fork::llama_model_qwen4exp_fork(const struct llama_model_params & params) : llama_model_base(params) {}
@@ -84,6 +86,12 @@ bool llama_model_qwen4exp_fork::mtp_window_kv(const llama_cparams & cparams, uin
 }
 
 llama_model_qwen4exp_fork::~llama_model_qwen4exp_fork() {
+    if (ple_pf) {
+        ple_pf->finish();
+    }
+    if (ple_wm) {
+        ple_wm->finish();
+    }
     if (ple_pf && ple_pf->n_started > 0) {
         LLAMA_LOG_INFO("%s: PLE rows of %" PRId64 " ubatches gathered ahead, %" PRId64 " of them used\n", __func__,
                 ple_pf->n_started, ple_pf->n_used);
@@ -2616,8 +2624,16 @@ void llama_model_qwen4exp_fork::ple_warm(const llama_ubatch & next, const llama_
                 std::vector<int32_t> rows = std::move(wm->queue.front());
                 wm->queue.erase(wm->queue.begin());
                 lock.unlock();
-                scratch.resize(rows.size()*hparams.ple_head_dim);
-                ple_cache->get_rows(rows.data(), (int64_t) rows.size(), scratch.data());
+                try {
+                    scratch.resize(rows.size()*hparams.ple_head_dim);
+                    ple_cache->get_rows(rows.data(), (int64_t) rows.size(), scratch.data());
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_WARN("%s: PLE read-ahead disabled: %s\n", __func__, e.what());
+                    lock.lock();
+                    wm->stop = true;
+                    wm->queue.clear();
+                    return;
+                }
                 lock.lock();
                 wm->n_rows += (int64_t) rows.size();
             }
@@ -2625,7 +2641,9 @@ void llama_model_qwen4exp_fork::ple_warm(const llama_ubatch & next, const llama_
     }
     {
         std::lock_guard<std::mutex> lock(ple_wm->mutex);
-        ple_wm->queue.push_back(std::move(idx));
+        if (!ple_wm->stop) {
+            ple_wm->queue.push_back(std::move(idx));
+        }
     }
     ple_wm->cv.notify_one();
 }

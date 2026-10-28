@@ -23,21 +23,15 @@
 #include <cstring>
 #endif
 
-common_file_lock::common_file_lock(const std::string & lock_path) {
+common_file_lock::common_file_lock(const std::filesystem::path & lock_path) {
     this->lock_path = lock_path;
 }
 
 #if defined(_WIN32)
 // the \\?\ prefix (for paths longer than 255 chars) is only accepted on absolute paths
 // with backslash separators: normalize first, then check the length of the absolute form
-static std::wstring as_extended_path(const std::string & path) {
-    // convert from the narrow encoding std::filesystem uses on this system
-    int wlen = MultiByteToWideChar(CP_ACP, 0, path.c_str(), (int) path.size(), nullptr, 0);
-    if (wlen <= 0) {
-        return std::wstring(path.begin(), path.end()); // best effort for exotic encodings
-    }
-    std::wstring wide(wlen, L'\0');
-    MultiByteToWideChar(CP_ACP, 0, path.c_str(), (int) path.size(), wide.data(), wlen);
+static std::wstring as_extended_path(const std::filesystem::path & path) {
+    const std::wstring wide = path.wstring();
 
     if (wide.rfind(L"\\\\?\\", 0) == 0) {
         return wide;
@@ -75,7 +69,7 @@ common_file_lock::status common_file_lock::try_lock() {
         std::wstring lock_path_w = as_extended_path(lock_path);
         fd = _wopen(lock_path_w.c_str(), _O_RDWR | _O_CREAT | _O_BINARY | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
         if (fd < 0) {
-            LOG_ERR("%s: cannot open lock file: %s\n", __func__, lock_path.c_str());
+            LOG_ERR("%s: cannot open lock file: %s\n", __func__, lock_path.u8string().c_str());
             return status::error;
         }
     }
@@ -100,7 +94,7 @@ common_file_lock::status common_file_lock::try_lock() {
         // group-writable, so users sharing a cache can wait on the lock
         fd = open(lock_path.c_str(), open_flags, 0664);
         if (fd < 0) {
-            LOG_ERR("%s: cannot open lock file: %s\n", __func__, lock_path.c_str());
+            LOG_ERR("%s: cannot open lock file: %s\n", __func__, lock_path.u8string().c_str());
             return status::error;
         }
         // open() filters the mode through the umask
@@ -125,11 +119,11 @@ bool common_file_lock::acquire(const std::function<bool()> & keep_waiting) {
     // the lock file is opened by try_lock, its parent must exist by then
     if (!lock_path.empty()) {
         std::error_code ec;
-        auto lock_dir = std::filesystem::path(lock_path).parent_path();
+        auto lock_dir = lock_path.parent_path();
         if (!lock_dir.empty()) {
             std::filesystem::create_directories(lock_dir, ec);
             if (ec) {
-                LOG_ERR("%s: unable to create lock directory '%s': %s\n", __func__, lock_dir.string().c_str(), ec.message().c_str());
+                LOG_ERR("%s: unable to create lock directory '%s': %s\n", __func__, lock_dir.u8string().c_str(), ec.message().c_str());
                 return false;
             }
         }
