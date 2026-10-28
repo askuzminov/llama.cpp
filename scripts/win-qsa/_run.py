@@ -367,13 +367,17 @@ def cache_get(identity, label):
         return None
 
 
-def cache_put(identity, result, log):
+def cache_put(identity, result, log, durable=False):
     folder = CACHE / "results"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / (identity_key(identity) + ".json")
     part = path.with_suffix(".part")
     record = {"identity": identity, "result": result, "log": str(log), "time": now()}
-    part.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
+    with part.open("w", encoding="utf-8") as file:
+        file.write(json.dumps(record, indent=1) + "\n")
+        if durable:
+            file.flush()
+            os.fsync(file.fileno())
     part.replace(path)
 
 

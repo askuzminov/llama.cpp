@@ -10,19 +10,29 @@ from pathlib import Path
 import random
 import re
 import socket
+import shutil
 import statistics
 import threading
 import time
 import urllib.request
+import uuid
 
 
 REFERENCE = {"LLAMA_HC_F16": "0", "LLAMA_QSA_POOL_F32": "1", "GGML_VK_F16ACC": "0"}
 DEFAULT = {"LLAMA_HC_F16": "1", "LLAMA_QSA_POOL_F32": "0", "GGML_VK_F16ACC": "0"}
 STAGES = {"quality", "server", "mixed", "cache", "profile"}
+SELECTION_KNOBS = {"FULL_STAGES", "FULL_DRY_RUN", "FULL_ARMS", "FULL_QARMS", "FULL_PAR", "FULL_TASKS",
+                   "FULL_REPEATS", "FULL_SEEDS", "FULL_BUDGETS", "FULL_CACHE_STEPS", "FULL_PORT", "FULL_TIMEOUT"}
 
 
 def write_json(path, value):
-    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    path = Path(path)
+    part = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
+    with part.open("w", encoding="utf-8") as file:
+        file.write(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+        file.flush()
+        os.fsync(file.fileno())
+    part.replace(path)
 
 
 def probe_positions(context, window=128, dense=False):
@@ -199,6 +209,43 @@ def parse_arms(b, variable, defaults):
     return arms
 
 
+class CheckpointError(Exception):
+    pass
+
+
+class Checkpoints:
+    def __init__(self, suite, name, identity):
+        self.suite = suite
+        self.name = name
+        self.identity = dict(identity, kind="full-progress")
+        self.folder = suite.b.CACHE / "full-progress" / suite.b.identity_key(self.identity)
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        record = self.suite.b.cache_get(dict(self.identity, checkpoint=key), self.name + "-" + key)
+        if record and isinstance(record.get("result"), dict):
+            return record["result"]
+        return None
+
+    def put(self, key, result):
+        try:
+            self.suite.b.cache_put(dict(self.identity, checkpoint=key), result,
+                                   self.suite.run.dir / "console.txt", durable=True)
+        except OSError as error:
+            raise CheckpointError(f"cannot save {self.name}/{key}: {error}") from error
+        with self.lock:
+            print(f"{self.name}/{key}: saved", flush=True)
+
+    def measure(self, key, function):
+        result = self.get(key)
+        if result is not None:
+            print(f"{self.name}/{key}: restored", flush=True)
+            return result
+        result = function()
+        self.put(key, result)
+        return result
+
+
 class Suite:
     def __init__(self, b):
         self.b = b
@@ -209,6 +256,7 @@ class Suite:
         self.exe = self.base.binary("llama-quality-fork")
         self.qargs = b.split_args(b.env("FULL_QARGS", "-b 16384 -ub " + ("8192" if b.env("BACKEND") == "cuda" else "4096")))
         self.results = []
+        self.proc = None
         self.timeout = b.env_int("FULL_TIMEOUT", 7200)
         self.port = b.env_int("FULL_PORT", 8098)
         self.identity = {"driver": b.digest(Path(__file__)), "model": b.model_identity(self.model),
@@ -302,6 +350,8 @@ class Suite:
             else:
                 result = function()
             self.record(stage, name, result)
+        except CheckpointError as error:
+            raise self.b.Fail(f"progress could not be saved; stopped: {error}") from error
         except self.b.Skip as error:
             self.record(stage, name, {"status": "NOT_TESTED", "error": str(error)})
         except (self.b.Fail, OSError, ValueError, RuntimeError) as error:
@@ -411,7 +461,7 @@ class Suite:
                     "stop_type": answer["choices"][0]["finish_reason"],
                     "n": usage["completion_tokens"], "prompt_n": usage["prompt_tokens"],
                     "cached_n": usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
-                    "wall_s": time.perf_counter() - started, "ttft_s": None,
+                    "wall_s": time.perf_counter() - started, "finished_at": time.perf_counter(), "ttft_s": None,
                     "event_gaps_s": [], "token_gaps_s": [], "timings": answer.get("timings", {})}
         body = {"prompt": prompt, "n_predict": n or self.ngen, "seed": seed,
                 "temperature": 0 if greedy else temp, "top_k": int(top_k), "top_p": top_p,
@@ -508,7 +558,8 @@ class Suite:
                 "server_runtime": {p.name: b.digest(p) for p in sorted(exe.parent.iterdir())
                                    if p.is_file() and p.suffix.lower() in {".dll", ".so", ".dylib"}},
                 "decargs": b.env("DECARGS"), "env": b.env_identity(b.arm_env(arm, DEFAULT)),
-                "knobs": {k: v for k, v in os.environ.items() if k.startswith("FULL_")},
+                "knobs": {k: v for k, v in os.environ.items() if k.startswith("FULL_") and k not in SELECTION_KNOBS},
+                "ngen": self.ngen, "sampling": b.env("FULL_SAMP", "1.0 20 0.95"),
                 "context": self.context, "draft": b.model_identity(draft) if draft else None,
                 "corpus": b.digest(self.corpora[0][1])}
 
@@ -539,20 +590,53 @@ class Suite:
             if check.connect_ex(("127.0.0.1", self.port)) == 0:
                 raise b.Fail(f"port {self.port} is already in use; choose FULL_PORT")
         proc, log = b.start_server(exe, args, run_env, self.run.dir / (name + "-server.log"))
+        self.proc = proc
         try:
             yield f"http://127.0.0.1:{self.port}", log
         finally:
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
+            self.proc = None
             b.mark_end()
 
-    def batch(self, url, prompts, seed, cache=False, functional=False):
-        before = time.perf_counter()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
-            futures = [pool.submit(self.request, url, prompt, seed + i, cache, fixed=not functional) for i, (prompt, _) in enumerate(prompts)]
-            rows = [f.result() for f in futures]
-        wall = time.perf_counter() - before
+    def stop_requests(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+
+    def batch(self, url, prompts, seed, cache=False, functional=False, progress=None, key=None):
+        saved = progress.get(key) if progress else None
+        if saved is not None:
+            return saved
+        records = [progress.get(f"{key}-request-{i}") if progress else None for i in range(len(prompts))]
+        coherent = all(records) and len({r["attempt"] for r in records}) == 1
+        if not functional and not coherent:
+            records = [None] * len(prompts)
+        before, attempt = time.perf_counter(), uuid.uuid4().hex
+
+        def request(i):
+            row = self.request(url, prompts[i][0], seed + i, cache, fixed=not functional)
+            record = {"response": row, "attempt": attempt, "started": before}
+            if progress:
+                progress.put(f"{key}-request-{i}", record)
+            return record
+
+        pending = [i for i, record in enumerate(records) if record is None]
+        if pending:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(pending))
+            try:
+                futures = {pool.submit(request, i): i for i in pending}
+                for future in concurrent.futures.as_completed(futures):
+                    records[futures[future]] = future.result()
+            except BaseException:
+                self.stop_requests()
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
+            else:
+                pool.shutdown(wait=True)
+        rows = [r["response"] for r in records]
+        coherent = len({r["attempt"] for r in records}) == 1
+        wall = max(r["finished_at"] for r in rows) - records[0]["started"] if coherent else None
         events = sorted([(r["first_at"], 1) for r in rows if r.get("first_at") is not None]
                         + [(r["finished_at"], -1) for r in rows if r.get("first_at") is not None])
         active, max_active = 0, 0
@@ -565,12 +649,18 @@ class Suite:
             row["loop_period_tokens"] = repeated_tail(row.get("tokens", []))
             row["answer_complete"] = row.get("stop_type") not in {"limit", "length"}
             row["task_ok"] = row["answer"] == expected and row["answer_complete"] and not row["loop_period_tokens"]
-        return {"wall_s": wall, "aggregate_tps": sum(r["n"] for r in rows) / wall,
-                "max_overlapping_generation_streams": max_active,
+        result = {"wall_s": wall, "aggregate_tps": sum(r["n"] for r in rows) / wall if coherent else None,
+                "resumed_partial": not coherent, "max_overlapping_generation_streams": max_active if coherent else None,
                 "ttft_p95_s": percentile([r["ttft_s"] for r in rows if r["ttft_s"] is not None], .95),
                 "itl_event_p95_s": percentile([gap for r in rows for gap in r["event_gaps_s"]], .95),
                 "itl_p95_s": percentile([gap for r in rows for gap in r["token_gaps_s"]], .95),
                 "task_success": statistics.mean(r["task_ok"] for r in rows), "requests": rows}
+        if not coherent:
+            for metric in ("ttft_p95_s", "itl_event_p95_s", "itl_p95_s"):
+                result[metric] = None
+        if progress:
+            progress.put(key, result)
+        return result
 
     def server_tests(self, filler):
         b = self.b
@@ -581,25 +671,56 @@ class Suite:
             for par in self.pars:
                 name = f"{arm.name}-p{par}"
                 def go(arm=arm, par=par, name=name):
-                    rows = []
-                    with self.server(name, arm, par) as (url, log):
+                    progress = Checkpoints(self, "full-server-" + name, dict(self.server_identity(arm), par=par))
+                    rows, performance = [], []
+                    with contextlib.ExitStack() as stack:
+                        url = None
+                        def server_url():
+                            nonlocal url
+                            if url is None:
+                                url, _ = stack.enter_context(self.server(name, arm, par))
+                            return url
+
                         for rep in range(self.repeats):
                             for ti, kind in enumerate(tasks):
-                                prompts = [self.task(url, filler, kind, 1000 * rep + 100 * ti + i,
-                                                    self.context - self.ngen - 1) for i in range(par)]
-                                for seed in self.seeds:
+                                prompts = None
+                                for si, seed in enumerate(self.seeds):
+                                    cold_live = False
                                     for warm in (False, True):
-                                        result = self.batch(url, prompts, seed, cache=warm, functional=True)
+                                        key = f"r{rep}-t{ti}-{kind}-s{si}-{seed}-{'warm' if warm else 'cold'}"
+                                        result = progress.get(key)
+                                        if result is None:
+                                            if prompts is None:
+                                                prompts = [self.task(server_url(), filler, kind, 1000 * rep + 100 * ti + i,
+                                                                    self.context - self.ngen - 1) for i in range(par)]
+                                            saved = [progress.get(f"{key}-request-{i}") for i in range(par)]
+                                            if warm and not cold_live and not all(saved):
+                                                print(f"{name}/{key}: rebuilding warm cache after resume (not measured)", flush=True)
+                                                self.batch(server_url(), prompts, seed, functional=True)
+                                            result = self.batch(server_url(), prompts, seed, cache=warm, functional=True,
+                                                                progress=progress, key=key)
+                                            if not warm:
+                                                cold_live = not any(saved)
                                         rows.append({"repeat": rep, "task": kind, "seed": seed, "warm_requested": warm, **result})
                                         write_json(self.run.dir / (name + "-requests.json"), rows)
+                                        speed = f"{result['aggregate_tps']:.2f} t/s" if result["aggregate_tps"] is not None else "partial resume, timing excluded"
                                         print(f"{name} {kind} rep={rep + 1} seed={seed} warm={warm}: "
-                                              f"{result['aggregate_tps']:.2f} t/s, tasks {result['task_success']:.0%}", flush=True)
-                        prompts = [self.task(url, filler, "retrieve", 90000 + i, self.context - self.ngen - 1) for i in range(par)]
-                        performance = [self.batch(url, prompts, seed, cache=False) for seed in self.seeds]
+                                              f"{speed}, tasks {result['task_success']:.0%}", flush=True)
+                        prompts = None
+                        for si, seed in enumerate(self.seeds):
+                            key = f"performance-s{si}-{seed}"
+                            result = progress.get(key)
+                            if result is None:
+                                if prompts is None:
+                                    prompts = [self.task(server_url(), filler, "retrieve", 90000 + i,
+                                                        self.context - self.ngen - 1) for i in range(par)]
+                                result = self.batch(server_url(), prompts, seed, progress=progress, key=key)
+                            performance.append(result)
                     return {"status": "MEASURED", "arm": arm.text, "par": par, "runs": rows,
                             "performance": performance,
                             "task_success": statistics.mean(r["task_success"] for r in rows)}
-                self.attempt("server", name, go, lambda arm=arm, par=par: dict(self.server_identity(arm), par=par))
+                self.attempt("server", name, go, lambda arm=arm, par=par: dict(self.server_identity(arm), par=par,
+                             plan={"tasks": tasks, "repeats": self.repeats, "seeds": self.seeds}))
 
     def mixed(self, filler):
         b = self.b
@@ -608,34 +729,53 @@ class Suite:
             arm = b.Arm(f"{name} LLAMA_PREFILL_BUDGET={budget} LLAMA_PREFILL_EXCLUSIVE=0 "
                         + ("@draft --spec-auto" if b.env("SPECDRAFT") else "--spec-type none"))
             def go(arm=arm, name=name):
+                n = min(b.env_int("FULL_MIX_NGEN", 1024), self.context // 32)
+                if n < 1:
+                    raise b.Fail("context too short for mixed prefill test")
+                progress = Checkpoints(self, "full-mixed-" + name, dict(self.server_identity(arm), generation=n))
                 runs = []
-                with self.server(name, arm, 4) as (url, log):
+                with contextlib.ExitStack() as stack:
+                    url = None
                     for rep in range(self.repeats):
-                        n = min(b.env_int("FULL_MIX_NGEN", 1024), self.context // 32)
-                        if n < 1:
-                            raise b.Fail("context too short for mixed prefill test")
-                        events = [threading.Event() for _ in range(3)]
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                            fs = [pool.submit(self.request, url, filler[:self.context // 8 - i], rep + i,
-                                              False, events[i], n) for i in range(3)]
-                            deadline = time.monotonic() + self.timeout
-                            for event, future in zip(events, fs):
-                                while not event.wait(1):
-                                    if future.done():
-                                        future.result()
-                                        raise b.Fail("mixed test: a generation ended before its first token")
-                                    if time.monotonic() >= deadline:
-                                        raise b.Fail("mixed test: a generation never started")
-                            fourth_start = time.perf_counter()
-                            fourth = pool.submit(self.request, url, filler[:self.context // 2], rep + 4, False, None, n)
-                            rows = [f.result() for f in fs] + [fourth.result()]
-                        overlap = all(r["finished_at"] > fourth_start for r in rows[:3])
-                        runs.append({"overlap_observed": overlap, "fourth_ttft_s": rows[3]["ttft_s"],
-                                     "generating_itl_event_p95_s": percentile([g for r in rows[:3] for g in r["event_gaps_s"]], .95),
-                                     "requests": rows})
+                        key = f"repeat-{rep}"
+                        result = progress.get(key)
+                        if result is None:
+                            if url is None:
+                                url, _ = stack.enter_context(self.server(name, arm, 4))
+                            events = [threading.Event() for _ in range(3)]
+                            def ask(i, prompt, seed, first=None):
+                                row = self.request(url, prompt, seed, False, first, n)
+                                progress.put(f"{key}-request-{i}", {"response": row})
+                                return row
+                            pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+                            try:
+                                fs = [pool.submit(ask, i, filler[:self.context // 8 - i], rep + i, events[i]) for i in range(3)]
+                                deadline = time.monotonic() + self.timeout
+                                for event, future in zip(events, fs):
+                                    while not event.wait(1):
+                                        if future.done():
+                                            future.result()
+                                            raise b.Fail("mixed test: a generation ended before its first token")
+                                        if time.monotonic() >= deadline:
+                                            raise b.Fail("mixed test: a generation never started")
+                                fourth_start = time.perf_counter()
+                                fourth = pool.submit(ask, 3, filler[:self.context // 2], rep + 4)
+                                rows = [f.result() for f in fs] + [fourth.result()]
+                            except BaseException:
+                                self.stop_requests()
+                                pool.shutdown(wait=True, cancel_futures=True)
+                                raise
+                            else:
+                                pool.shutdown(wait=True)
+                            overlap = all(r["finished_at"] > fourth_start for r in rows[:3])
+                            result = {"overlap_observed": overlap, "fourth_ttft_s": rows[3]["ttft_s"],
+                                      "generating_itl_event_p95_s": percentile([g for r in rows[:3] for g in r["event_gaps_s"]], .95),
+                                      "requests": rows}
+                            progress.put(key, result)
+                        runs.append(result)
                         write_json(self.run.dir / (name + "-requests.json"), runs)
                 return {"status": "MEASURED" if all(r["overlap_observed"] for r in runs) else "NO_OVERLAP", "runs": runs}
-            self.attempt("mixed", name, go, lambda arm=arm: self.server_identity(arm))
+            self.attempt("mixed", name, go, lambda arm=arm: dict(self.server_identity(arm), repeats=self.repeats))
 
     def cache(self, filler):
         b = self.b
@@ -657,23 +797,48 @@ class Suite:
 
         for stride in b.env_ints("FULL_CACHE_STEPS", "0 8192 32768"):
             name = f"cache-{stride}"
-            folder = self.run.dir / (name + "-data")
-            folder.mkdir()
             arm = b.Arm("cache --spec-type none")
-            def go(stride=stride, name=name, folder=folder):
+            def go(stride=stride, name=name):
                 if stride > self.context - self.ngen - 1:
                     return {"status": "NOT_EXERCISED", "reason": "minimum exceeds prompt length"}
                 prompt = filler[:self.context - self.ngen - 1]
-                with self.server(name + "-cold", arm, 1) as (url, log):
-                    cold = self.request(url, prompt, cache=False, greedy=True)
                 turns = b.env_int("FULL_CACHE_TURNS", 4)
                 step = b.env_int("FULL_CACHE_GROW", min(2048, self.context // 16))
                 if turns < 1 or step < 1 or len(prompt) - turns * step <= max(16, stride):
                     raise b.Fail("cache growth needs positive turns/step and an initial prompt above the minimum")
+                progress = Checkpoints(self, "full-" + name, dict(self.server_identity(arm), stride=stride, turns=turns, step=step))
+                folder = progress.folder / "states"
+                folder.mkdir(parents=True, exist_ok=True)
+
+                def cold_request():
+                    with self.server(name + "-cold", arm, 1) as (url, log):
+                        return self.request(url, prompt, cache=False, greedy=True)
+                cold = progress.measure("cold", cold_request)
+
+                saved = [progress.get(f"growth-{turn}") for turn in range(turns + 1)]
+                if not any(saved):
+                    for path in folder.glob("*.bin"):
+                        path.unlink()
+                for path in folder.glob("*.tmp"):
+                    path.unlink()
+                if any(saved) and not list(folder.glob("*.bin")) and progress.get("restore") is None:
+                    raise b.Fail(f"saved disk states are missing from {folder}; rerun this cache case with FORCE={name}")
                 growth = []
-                with self.server(name + "-grow", arm, 1, folder, stride) as (url, log):
+                with contextlib.ExitStack() as stack:
+                    url, last_live = None, None
                     for turn in range(turns + 1):
+                        result = saved[turn]
+                        if result is not None:
+                            growth.append(result)
+                            continue
+                        if url is None:
+                            url, log = stack.enter_context(self.server(name + "-grow", arm, 1, folder, stride))
                         length = len(prompt) - (turns - turn) * step
+                        primed = turn > 0 and last_live != turn - 1
+                        if primed:
+                            print(f"{name}/growth-{turn}: restoring previous history (not measured)", flush=True)
+                            self.request(url, prompt[:length - step], cache=True, greedy=True)
+                            wait_disk(folder)
                         offset = log.stat().st_size
                         began = time.perf_counter()
                         response = self.request(url, prompt[:length], cache=True, greedy=True)
@@ -682,13 +847,18 @@ class Suite:
                             file.seek(offset)
                             text = file.read().decode("utf-8", errors="replace")
                         writes = re.findall(r"wrote (\d+) state\(s\) to disk while idle, ([\d.]+) MiB in ([\d.]+) ms", text)
-                        growth.append({"prompt_n": length, "request": response, "disk_bytes": size,
-                                       "wall_including_idle_s": time.perf_counter() - began,
-                                       "written_mib": sum(float(w[1]) for w in writes),
-                                       "write_ms": sum(float(w[2]) for w in writes)})
+                        result = {"prompt_n": length, "request": response, "disk_bytes": size,
+                                  "resumed_after_restart": primed, "wall_including_idle_s": time.perf_counter() - began,
+                                  "written_mib": sum(float(w[1]) for w in writes), "write_ms": sum(float(w[2]) for w in writes)}
+                        progress.put(f"growth-{turn}", result)
+                        growth.append(result)
+                        last_live = turn
                         write_json(self.run.dir / (name + "-growth.json"), growth)
-                with self.server(name + "-restore", arm, 1, folder, stride) as (url, log):
-                    restored = self.request(url, prompt, cache=True, greedy=True)
+                size = growth[-1]["disk_bytes"]
+                def restore_request():
+                    with self.server(name + "-restore", arm, 1, folder, stride) as (url, log):
+                        return self.request(url, prompt, cache=True, greedy=True)
+                restored = progress.measure("restore", restore_request)
                 restore_same = restored["tokens"] == growth[-1]["request"]["tokens"] and bool(restored["tokens"])
                 cold_same = cold["tokens"] == restored["tokens"] and bool(cold["tokens"])
                 hit = restored["timings"].get("cache_n", 0) > 0
@@ -698,14 +868,18 @@ class Suite:
                 return {"status": status, "disk_bytes": size,
                         "disk_limit_ok": limit_ok,
                         "restore_same_tokens": restore_same, "cold_same_tokens": cold_same, "restore_hit": hit,
-                        "cold": cold, "restored": restored, "growth": growth,
+                        "cold": cold, "restored": restored, "growth": growth, "state_directory": str(folder),
                         "written_mib": sum(r["written_mib"] for r in growth)}
-            self.attempt("cache", name, go)
+            self.attempt("cache", name, go, lambda stride=stride: dict(self.server_identity(arm), case="cache", stride=stride))
 
     def profile(self, filler):
         b = self.b
         arm = b.Arm("profile @draft --spec-auto" if b.env("SPECDRAFT") else "profile --spec-type none")
         def go():
+            progress = Checkpoints(self, "full-profile", self.server_identity(arm))
+            saved = progress.get("complete")
+            if saved is not None and Path(saved["timeline"]).is_file() and b.digest(saved["timeline"]) == saved.get("timeline_sha256"):
+                return saved
             with self.server("profile", arm, 1, profile=True) as (url, log):
                 prompt = self.tool_task(url, filler[1:], {"beta": "profile"}, 0, self.context - self.ngen - 1, with_tools=False)
                 result = self.request(url, prompt, n=self.ngen)
@@ -715,9 +889,16 @@ class Suite:
                 timeline = self.run.dir / "profile-timeline.json"
                 if not timeline.is_file() or timeline.stat().st_size < 100:
                     raise b.Fail("profile wrote no timeline; the traced non-streaming chat was not captured")
-            return {"status": "PROFILE_ONLY", "request": result, "top_vulkan_ops": ops[:40],
-                    "log": str(log), "timeline": str(timeline),
-                    "note": "Timing instrumentation changes speed; use server runs for performance comparisons."}
+            progress.folder.mkdir(parents=True, exist_ok=True)
+            kept_timeline = progress.folder / "timeline.json"
+            kept_log = progress.folder / "server.log"
+            shutil.copyfile(timeline, kept_timeline)
+            shutil.copyfile(log, kept_log)
+            result = {"status": "PROFILE_ONLY", "request": result, "top_vulkan_ops": ops[:40],
+                      "log": str(kept_log), "timeline": str(kept_timeline), "timeline_sha256": b.digest(kept_timeline),
+                      "note": "Timing instrumentation changes speed; use server runs for performance comparisons."}
+            progress.put("complete", result)
+            return result
         self.attempt("profile", arm.name, go)
 
     def finish(self):
