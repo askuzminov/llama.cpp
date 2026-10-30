@@ -13,22 +13,20 @@ static bool ggml_vk_graph_node_is_empty(const ggml_tensor * node) {
     return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
 }
 
-// nodes: scale, sigmoid, scale, dsv4_hc_post, rms_norm, mul (hc_post_norm_pattern), then cpy to f16 when
-// fused_hc_post_norm_f16 (hc_post_norm_f16_pattern): the normalized streams go to the cpy in f16
+// nodes: scale, sigmoid, scale, dsv4_hc_post, rms_norm, mul (hc_post_norm_pattern)
 void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * scale_in = cgraph->nodes[node_idx];
     const ggml_tensor * hc_post  = cgraph->nodes[node_idx + 3];
     const ggml_tensor * norm     = cgraph->nodes[node_idx + 4];
-    const ggml_tensor * mul      = ctx->fused_hc_post_norm_f16 ? cgraph->nodes[node_idx + 6] : cgraph->nodes[node_idx + 5];
+    const ggml_tensor * mul      = cgraph->nodes[node_idx + 5];
 
     const ggml_tensor * x        = hc_post->src[0];
     const ggml_tensor * residual = hc_post->src[1];
     const ggml_tensor * p_src    = scale_in->src[0];
 
-    // the gamma is the second source of the mul, whether the cpy follows it or not
-    const ggml_tensor * w        = cgraph->nodes[node_idx + 5]->src[1];
+    const ggml_tensor * w        = mul->src[1];
 
-    vk_pipeline pipeline = ctx->fused_hc_post_norm_f16 ? ctx->device->pipeline_dsv4_hc_post_norm_f16n : ctx->device->pipeline_dsv4_hc_post_norm_f32;
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_post_norm_f32;
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -322,85 +320,6 @@ void ggml_vk_mul_mat_headsum(ggml_backend_vk_context * ctx, vk_context& subctx, 
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, a), b_buf, d_buf, bias ? ggml_vk_tensor_subbuffer(ctx, bias) : d_buf }, pc, { m, n, 1 });
-}
-
-// LIGHTNING_INDEXER of a prompt on the MUL_MAT_HEADSUM matmul: sum_h relu(q_h . k) + mask is what the fused heads compute,
-// with the f16 mask as the bias. the graph then holds one score and an f16 mask, where the matmul path held the head
-// scores (two of 1 GiB at n_kv 262144 and a 4096-token ubatch on the 395, reserved even when the heads fuse) and an f32
-// bias. lightning_indexer.comp stays for a few tokens, where it beat the fused matmul (0.77 ms per decode step at
-// 122880, 08.10), and for every case below: 4 heads, unit weights (a FILL of 1, as the qwen4exp graph builds them), one
-// stream, an f32 or f16 key pool. GGML_VK_LID_HEADSUM=0: lightning_indexer.comp always; GGML_VK_LID_HEADSUM_MIN_TOKENS
-// (65): the tokens from which the matmul takes it
-bool ggml_vk_fork_lid_headsum(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * dst) {
-    static const bool disabled = [] { const char * env = getenv("GGML_VK_LID_HEADSUM"); return env && atoi(env) == 0; }();
-    static const int64_t min_tokens = [] {
-        const char * env = getenv("GGML_VK_LID_HEADSUM_MIN_TOKENS");
-        return env ? (int64_t) atoi(env) : (int64_t) 65;
-    }();
-    const ggml_tensor * q = dst->src[0];
-    const ggml_tensor * k = dst->src[1];
-    const ggml_tensor * w = dst->src[2];
-    const ggml_tensor * m = dst->src[3];
-
-    if (disabled || ctx->device->coopmat2 || ctx->device->disable_fusion || q->ne[2] < min_tokens) {
-        return false;
-    }
-    if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) || m == nullptr ||
-        m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 || !ggml_vk_headsum_pipelines(ctx, k->type)) {
-        return false;
-    }
-    if (q->ne[1] != HEADSUM_HEADS || q->ne[3] != 1 || k->ne[1] != 1 || k->ne[3] != 1 || m->ne[3] != 1 ||
-        !ggml_is_contiguous(q) || !ggml_is_contiguous(dst) || k->nb[0] != ggml_type_size(k->type) ||
-        k->nb[2] % ggml_type_size(k->type) != 0) {
-        return false;
-    }
-    if (w->op != GGML_OP_FILL || ggml_get_op_params_f32(w, 0) != 1.0f) {
-        return false;
-    }
-    // the mask is read at the index of dst
-    if (m->ne[0] != dst->ne[0] || m->ne[1] != dst->ne[1] || m->nb[0] != sizeof(ggml_fp16_t) ||
-        m->nb[1] / sizeof(ggml_fp16_t) != dst->nb[1] / sizeof(float) || m->nb[1] % sizeof(ggml_fp16_t) != 0) {
-        return false;
-    }
-    const uint64_t max_range = ctx->device->properties.limits.maxStorageBufferRange;
-    if (get_misalign_bytes(ctx, k) || get_misalign_bytes(ctx, q) || get_misalign_bytes(ctx, dst) || get_misalign_bytes(ctx, m) ||
-        k->ne[2] * k->nb[2] > max_range || ggml_nbytes(q) > max_range || ggml_nbytes(dst) > max_range || ggml_nbytes(m) > max_range) {
-        return false;
-    }
-
-    const uint32_t mr       = (uint32_t) k->ne[2];
-    const uint32_t kd       = (uint32_t) k->ne[0];
-    const uint32_t n        = (uint32_t) (q->ne[2] * HEADSUM_HEADS);
-    const uint32_t stride_a = (uint32_t) (k->nb[2] / ggml_type_size(k->type));
-    const uint32_t stride_d = (uint32_t) (dst->nb[1] / sizeof(float));
-
-    const std::vector<vk_matmul_pipeline_pair> & mmp = *ggml_vk_headsum_pipelines(ctx, k->type);
-    const uint32_t kpad = ggml_vk_align_size(kd, ggml_vk_guess_matmul_pipeline_align_map(ctx, mmp, mr, n, false));
-    const bool aligned = kd == kpad && stride_a % 8 == 0 && mr > 8 && n > 8;
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, mmp, mr, n, aligned, false);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
-    vk_subbuffer a_buf = ggml_vk_tensor_subbuffer(ctx, k);
-    a_buf.size = k->ne[2] * k->nb[2];
-
-    // fusion_flags: 1 the heads of a token summed, 2 a bias, 4 the bias is f16
-    const vk_mat_mat_push_constants pc = {
-        mr, n, kd, stride_a, kd, stride_d, stride_a * mr, kd * n, stride_d * (n / HEADSUM_HEADS),
-        0, 1, kd, 1, 1, 1, 1, n, 1u | 2u | 4u,
-    };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { a_buf, ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, dst), ggml_vk_tensor_subbuffer(ctx, m) }, pc, { mr, n, 1 });
-
-    // the first time, also on stderr with GGML_SCHED_LOG_REALLOC (llama-bench drops the ggml log)
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
-        GGML_LOG_INFO("ggml_vulkan: LIGHTNING_INDEXER of %ld tokens on %s\n", (long) q->ne[2], pipeline->name.c_str());
-        if (getenv("GGML_SCHED_LOG_REALLOC") != nullptr) {
-            fprintf(stderr, "ggml_vulkan: LIGHTNING_INDEXER of %ld tokens on %s\n", (long) q->ne[2], pipeline->name.c_str());
-        }
-    }
-    return true;
 }
 
 static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -767,7 +686,6 @@ bool ggml_vk_fork_fuse_concat_ssm_conv(ggml_backend_vk_context * ctx, const stru
 
 void ggml_vk_fork_fusion_reset(ggml_backend_vk_context * ctx) {
     ctx->fused_hc_post_norm = false;
-    ctx->fused_hc_post_norm_f16 = false;
     ctx->fused_mm_relu = false;
     ctx->fused_mm_headsum = false;
     ctx->fused_mm_headsum_bias = nullptr;
@@ -808,23 +726,6 @@ bool ggml_vk_fork_fuse_mul_mat(ggml_backend_vk_context * ctx, const struct ggml_
 
 bool ggml_vk_fork_fuse_hc_post_norm(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int i,
                                     bool * op_srcs_fused_elementwise, const char *& fusion_string) {
-    // the f16 copy of the normalized streams (qwen4exp, LLAMA_HC_F16) goes into the shader's store
-    if (ggml_can_fuse_subgraph(cgraph, i, hc_post_norm_f16_pattern, { i + 3, i + 6 }) &&
-        ggml_check_edges(cgraph, i, hc_post_norm_f16_edges) &&
-        ggml_vk_can_fuse_hc_post_norm(cgraph, i)) {
-        const ggml_tensor * mul = cgraph->nodes[i + 5];
-        const ggml_tensor * cpy = cgraph->nodes[i + 6];
-        if (cpy->type == GGML_TYPE_F16 && cpy->nb[0] == sizeof(ggml_fp16_t) && ggml_is_contiguous(cpy) &&
-            ggml_are_same_shape(mul, cpy) && ctx->device->pipeline_dsv4_hc_post_norm_f16n) {
-            ctx->num_additional_fused_ops = hc_post_norm_f16_pattern.size() - 1;
-            ctx->fused_ops_write_mask |= 1 << 3;
-            ctx->fused_hc_post_norm = true;
-            ctx->fused_hc_post_norm_f16 = true;
-            fusion_string = "HC_POST_NORM_F16";
-            std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            return true;
-        }
-    }
     if (!(ggml_can_fuse_subgraph(cgraph, i, hc_post_norm_pattern, { i + 3, i + 5 }) &&
           ggml_check_edges(cgraph, i, hc_post_norm_edges) &&
           ggml_vk_can_fuse_hc_post_norm(cgraph, i))) {

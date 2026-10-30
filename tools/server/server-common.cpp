@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "fork/server-role-fork.h" // fork: router child stdin and exit
 
 #include <filesystem>
 #include <random>
@@ -16,7 +17,9 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <atomic>
 #include <chrono>
+#include <iostream>
 #include <thread>
 
 #ifdef _WIN32
@@ -217,6 +220,9 @@ std::vector<std::string> server_model_output_modalities(common_decision_type dec
         case COMMON_DECISION_TYPE_LFM2_D1:
         case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
         case COMMON_DECISION_TYPE_H2O_LIGHTNING:
+        case COMMON_DECISION_TYPE_MINICPM_OCR_JEV:
+        case COMMON_DECISION_TYPE_LFM3_D1:
+        case COMMON_DECISION_TYPE_LFM3_D1_OMNI:
             out = {"decisions"};
             break;
         case COMMON_DECISION_TYPE_GRANITE_SWITCH:
@@ -1313,7 +1319,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             p.erase("input_video");
             p.erase("video_url");
 
-        } else if (type != "text") {
+        } else if (type != "text" && type != "tool_reference") {
             throw std::invalid_argument("unsupported content[].type");
         }
     }
@@ -1439,7 +1445,7 @@ json oaicompat_chat_params_parse(
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
-    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps.at("supports_parallel_tool_calls").get<bool>());
     inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
     inputs.continue_final_message = body.contains("continue_final_message") ?
         common_chat_continuation_parse(body.at("continue_final_message")) :
@@ -2209,4 +2215,67 @@ void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, s
         }
     }
 #endif
+}
+
+//
+// server_role
+//
+
+server_role::server_role() {
+    if (is_managed_by_router()) {
+        cmd_out = server_reserve_stdout();
+    }
+}
+
+server_role::~server_role() {
+    if (cmd_out) {
+        fclose(cmd_out);
+    }
+}
+
+bool server_role::is_managed_by_router() {
+    return std::getenv(SERVER_ENV_ROUTER_PORT) != nullptr;
+}
+
+server_role_type server_role::get_role() {
+    const char * role = std::getenv(SERVER_ENV_CHILD_ROLE);
+    return server_role_type_from_str(role ? role : "");
+}
+
+std::thread server_role::setup(const std::function<void(int)> & shutdown_handler) {
+    // fork: the stop timeout of the router (LLAMA_SERVER_STOP_TIMEOUT), see server_child_watch_router_after_exit
+    const int stop_timeout = server_child_stop_timeout();
+    // setup thread for monitoring stdin
+    return std::thread([shutdown_handler, stop_timeout]() {
+        // wait for EOF on stdin
+        SRV_INF("%s", "child server monitoring thread started, waiting for EOF on stdin...\n");
+        std::string buf;
+        while (server_child_read_stdin(buf)) {
+            if (buf.find(CMD_ROUTER_TO_CHILD_EXIT) != std::string::npos) {
+                SRV_INF("%s", "exit command received, exiting...\n");
+                server_child_watch_router_after_exit(stop_timeout);
+                shutdown_handler(0);
+                return;
+            }
+            // keep only the unfinished line
+            const size_t nl = buf.rfind('\n');
+            if (nl != std::string::npos) {
+                buf.erase(0, nl + 1);
+            }
+        }
+        // EOF detected, that means the router server is unexpectedly exit or killed
+        SRV_INF("%s", "EOF on stdin detected, forcing shutdown...\n");
+        // not exit(): it runs the static destructors while the main thread still uses them
+        exit_now();
+    });
+}
+
+void server_role::notify_to_router(const std::string & state, const json & payload) {
+    json data = {
+        {"state", state},
+        {"payload", payload},
+    };
+    std::lock_guard<std::mutex> lk(mtx_stdout);
+    fprintf(cmd_out, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    fflush(cmd_out);
 }

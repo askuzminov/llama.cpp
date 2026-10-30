@@ -212,37 +212,6 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
 #endif
 }
 
-void ggml_vk_fork_fa_union_init(vk_device & device) {
-    // the sparse attention of a prompt with a tile of neighbouring tokens over the union of their selections
-    // (flash_attn_union.comp, see ggml_vk_fork_fa_union). GGML_VK_FA_UNION: unset or 0 = off (until measured), 1 = on
-    // with coopmat, emulate = the same steps without coopmat on any device (tests)
-    device->fa_union_mode = 0;
-    const char * env = getenv("GGML_VK_FA_UNION");
-    if (env == nullptr || strcmp(env, "0") == 0) {
-        return;
-    }
-    const uint32_t sg = device->subgroup_size;
-    if (!device->fp16 || !device->subgroup_require_full_support || (sg != 16 && sg != 32 && sg != 64)) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_FA_UNION needs fp16 and full subgroups of 16, 32 or 64\n");
-        return;
-    }
-    if (strcmp(env, "emulate") == 0) {
-        device->fa_union_mode = 2;
-        GGML_LOG_INFO("ggml_vulkan: sparse prompt attention over the union of neighbouring tokens, emulated\n");
-        return;
-    }
-#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    if (!device->coopmat_support || !device->coopmat_support_16x16x16_f32acc) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_FA_UNION needs KHR coopmat 16x16x16 with f32 accumulators\n");
-        return;
-    }
-    device->fa_union_mode = 1;
-    GGML_LOG_INFO("ggml_vulkan: sparse prompt attention over the union of neighbouring tokens\n");
-#else
-    GGML_LOG_WARN("ggml_vulkan: GGML_VK_FA_UNION needs a build with coopmat shaders\n");
-#endif
-}
-
 void ggml_vk_fork_shmem_limit(vk_device & device) {
     // the shared memory in bytes that the shaders may declare. above the limit the driver reports, a shader is
     // outside the Vulkan spec: the driver may refuse it, run it, compute garbage or hang the device. the AMD

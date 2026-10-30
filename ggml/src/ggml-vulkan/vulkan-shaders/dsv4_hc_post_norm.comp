@@ -1,9 +1,6 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
-#ifdef N_F16
-#extension GL_EXT_shader_16bit_storage : require
-#endif
 
 // dsv4_hc_post with identity mixing, followed by the grouped RMSNorm and gamma
 // of the next hc mix (qwen4exp hc_combine -> hc_mix):
@@ -48,12 +45,7 @@ layout(binding = 1, std430) readonly buffer R { float data_r[]; };
 layout(binding = 2, std430) readonly buffer P { float data_p[]; };
 layout(binding = 3, std430) readonly buffer W { float data_w[]; };
 layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
-// N_F16: n is stored in f16, the CPY to f16 that follows the norm under LLAMA_HC_F16 (qwen4exp) fused in
-#ifdef N_F16
-layout(binding = 5, std430) writeonly buffer N { float16_t data_n[]; };
-#else
 layout(binding = 5, std430) writeonly buffer N { float data_n[]; };
-#endif
 
 // n_embd <= MAX_COLS*BLOCK_SIZE, the host checks it
 const uint MAX_COLS = 8;
@@ -104,11 +96,7 @@ void main() {
         const uint i0 = k * BLOCK_SIZE + tid;
         if (i0 < n_embd) {
             data_d[db + i0] = v[k];
-#ifdef N_F16
-            data_n[nb + i0] = float16_t(v[k] * scale * data_w[wb + i0]);
-#else
             data_n[nb + i0] = v[k] * scale * data_w[wb + i0];
-#endif
         }
     }
 }

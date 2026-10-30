@@ -96,7 +96,7 @@ bool llama_kv_defer_alloc_fork() {
 }
 
 void llama_kv_cache::alloc_deferred_fork() {
-    if (hparams.no_alloc) {
+    if (ctxs_bufs.no_alloc) {
         return;
     }
     for (auto & [ctx, buf] : ctxs_bufs) {
@@ -122,7 +122,7 @@ void llama_kv_cache::alloc_deferred_fork() {
 bool llama_kv_cache::elastic_init_fork(bool emulate) {
     // one stream, rows per cell (no transposed V), the own tensors of the cache. quantized types pad their tensors in
     // init_tensor, which would write into memory not mapped yet
-    if (elastic_fork || n_stream != 1 || v_trans || other || hparams.no_alloc || layers.empty()) {
+    if (elastic_fork || n_stream != 1 || v_trans || other || ctxs_bufs.no_alloc || layers.empty()) {
         return false;
     }
     for (const auto & layer : layers) {
@@ -253,7 +253,7 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
 
     for (size_t i = 0; i < plans.size(); ++i) {
         auto & p   = plans[i];
-        auto & ctx = ctxs_bufs[i].first;
+        auto & ctx = ctxs_bufs.bufs[i].first;
 
         for (auto & c : p.chunks) {
             char * base = (char *) ggml_backend_buffer_get_base(c.buf);
@@ -289,7 +289,7 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
         }
 
         // the old buffer goes, the new one owns its chunks
-        ctxs_bufs[i].second.reset(bufs.size() == 1 ? bufs[0] : ggml_backend_multi_buffer_alloc_buffer(bufs.data(), bufs.size()));
+        ctxs_bufs.bufs[i].second.reset(bufs.size() == 1 ? bufs[0] : ggml_backend_multi_buffer_alloc_buffer(bufs.data(), bufs.size()));
     }
 
     // an emulated cache has its memory, all of it counts as mapped until the first capacity is set

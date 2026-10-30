@@ -773,6 +773,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(ggml_fp8_e4m3_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1109,11 +1117,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
 
-    "FLASH_ATTN_LIST", // fork
     "GATED_DELTA_NET_LAZY", // fork
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1228,11 +1235,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
 
-    "flash_attn_list(x)", // fork
     "gated_delta_net_lazy(x)", // fork
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1456,6 +1462,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
+        case GGML_FTYPE_MOSTLY_F8_E4M3:       wtype = GGML_TYPE_F8_E4M3; break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
@@ -3317,7 +3324,6 @@ bool ggml_prec_set_acc(
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_FLASH_ATTN_LIST: // fork: its precision is where FLASH_ATTN_EXT keeps it
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 3, prec_i32);
@@ -3362,7 +3368,6 @@ enum ggml_prec ggml_prec_get_acc(
         case GGML_OP_MUL_MAT_ID:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_FLASH_ATTN_LIST: // fork: the F32 of ggml_flash_attn_list, the Vulkan FA reads it here since 8e5a58df8
             return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
         default:
             return GGML_PREC_UNDEFINED;
@@ -3528,7 +3533,7 @@ static struct ggml_tensor * ggml_scale_impl(
         float                 s,
         float                 b,
         bool                  inplace) {
-    GGML_ASSERT(ggml_is_padded_1d(a));
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
@@ -5661,47 +5666,6 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-// fork: ggml_flash_attn_list
-
-struct ggml_tensor * ggml_flash_attn_list(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * vals,
-        struct ggml_tensor  * idx,
-        float                 scale) {
-    GGML_ASSERT(ggml_can_mul_mat(k, q));
-    GGML_ASSERT(q->ne[3] == k->ne[3]);
-    GGML_ASSERT(q->ne[3] == v->ne[3]);
-    GGML_ASSERT(k->ne[1] == v->ne[1]);
-
-    GGML_ASSERT(vals->type == GGML_TYPE_F16 && ggml_is_contiguous(vals));
-    GGML_ASSERT(idx->type  == GGML_TYPE_I32 && ggml_is_contiguous(idx));
-    GGML_ASSERT(vals->ne[0] == idx->ne[0] && vals->ne[1] == idx->ne[1]);
-    GGML_ASSERT(vals->ne[1] >= q->ne[1]);
-    GGML_ASSERT(vals->ne[2] == 1 && idx->ne[2] == vals->ne[3] && idx->ne[3] == 1);
-    GGML_ASSERT(q->ne[3] % vals->ne[3] == 0);
-
-    // permute(0, 2, 1, 3)
-    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    float params[] = { scale, 0.0f, 0.0f };
-    ggml_set_op_params(result, params, sizeof(params));
-    ggml_set_op_params_i32(result, 3, (int32_t) GGML_PREC_F32);
-    ggml_set_op_params_i32(result, 4, (int32_t) idx->ne[0]);
-
-    result->op     = GGML_OP_FLASH_ATTN_LIST;
-    result->src[0] = q;
-    result->src[1] = k;
-    result->src[2] = v;
-    result->src[3] = vals;
-    result->src[5] = idx;
-
-    return result;
-}
-
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -6717,8 +6681,7 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         struct ggml_tensor  * weights,
         float                 scale,
         bool                  gated) {
-    // fork: x may be f16, the normalized hc streams of qwen4exp under LLAMA_HC_F16
-    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
@@ -8336,6 +8299,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_F8_E4M3: result = quantize_f8_e4m3(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

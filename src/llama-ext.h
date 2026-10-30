@@ -5,10 +5,35 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#include "llama-arch.h"
 
 #include <cstdint>
 #include <map>
+#include <string>
 #include <vector>
+
+//
+// llama architecture queries
+//
+
+// all the LLM architectures known to the library
+LLAMA_API std::vector<llm_arch> llama_arch_all();
+
+// the canonical name of an architecture (e.g. "llama"), or "unknown"
+LLAMA_API const char * llama_arch_name(llm_arch arch);
+
+// the architecture with the given canonical name, or LLM_ARCH_UNKNOWN
+LLAMA_API llm_arch llama_arch_from_string(const std::string & name);
+
+// the arch-resolved GGUF key of a KV id, e.g. LLM_KV_CONTEXT_LENGTH -> "llama.context_length"
+LLAMA_API std::string llama_arch_kv_name(llm_arch arch, llm_kv key);
+
+LLAMA_API bool llama_arch_supports_sm_tensor(llm_arch arch);
+
+LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
+
+// FIXME temporary function for better error messages
+LLAMA_API bool llama_arch_supports_save(llm_arch arch);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -108,16 +133,16 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
-// fork: the next decodes are MTP draft steps after the first of a round, whose QSA block takes the block scores of
-// that first step instead of running its indexer (as the reference reuses its top-k across MTP steps). Ignored unless
-// the MTP block attends through QSA (LLAMA_MTP_QSA=1) and LLAMA_MTP_QSA_REUSE is not 0. Default false
-LLAMA_API void llama_set_qsa_reuse(struct llama_context * ctx, bool value);
-
 // fork: the tokens the next decode call starts with, at positions pos0.. of seq_id, when a prompt goes on past it: the
 // inputs of its first ubatch that come from storage (the PLE rows of qwen4exp) are read while the last ubatch of that
 // call computes. Holds for the one decode call after it
 LLAMA_API void llama_set_next_tokens(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens,
                                      llama_pos pos0, llama_seq_id seq_id);
+
+// fork: the recurrent memory of the context keeps the records of its last short ubatch (deferred rollback of the gated
+// delta net, LLAMA_GDN_LAZY), so a rollback may reach the state before that ubatch: after n <= n_rs_seq + 1 tokens it
+// goes back min(n, n_rs_seq), not n - 1 as with the snapshots of the plain net
+LLAMA_API bool llama_memory_rs_lazy_fork(const struct llama_context * ctx);
 
 // fork: a coming decode will hold these tokens at positions pos0.. of seq_id, the cache holds the ones before pos0.
 // What their inputs read from storage (the PLE rows of qwen4exp) is read now by a worker, for the last n_new tokens;

@@ -70,12 +70,14 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
             llm_build_delta_net_base(params), model(model) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
+        // w_down_inject: the merged [w_down | w_inject] weight of newer files, w_down and w_inject are null then
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
                     ggml_tensor * w_norm,
                     ggml_tensor * w_down,
                     ggml_tensor * w_up,
                     ggml_tensor * w_inject,
+                    ggml_tensor * w_down_inject,
                     ggml_tensor ** inject,
                             int   il);
 
@@ -85,16 +87,13 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
-        // keys_only: store K, V and the indexer keys of every row and attend for none (a QSA MTP block over a
-        // catch-up batch with no output row), nullptr then
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_fork_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il,
-                           bool   keys_only = false);
+                            int   il);
 
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
@@ -118,16 +117,14 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
         // the positions the QSA layers take their mask values from instead of the KQ mask - see build_attn_qsa
         llm_graph_input_qsa_pos * qsa_pos_inp = nullptr;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense. keys_only: store the
-        // indexer keys and rebuild the pooled ones, score nothing (nullptr)
+        // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_fork_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il,
-                           bool   keys_only = false);
+                            int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

@@ -152,8 +152,7 @@ struct test_mul_mat_headsum : public test_case {
     }
 };
 
-// LIGHTNING_INDEXER as the qwen4exp graph builds it: unit head weights made by a FILL of 1, which lets a backend run a
-// prompt on its fused head matmul (Vulkan: ggml_vk_fork_lid_headsum, 4 heads, one stream, from 65 tokens)
+// LIGHTNING_INDEXER as the qwen4exp graph builds it: unit head weights made by a FILL of 1
 struct test_lightning_indexer_unit : public test_case {
     const int64_t nh;
     const int64_t kv;
@@ -208,86 +207,6 @@ struct test_lightning_indexer_unit : public test_case {
     }
 };
 
-// fork: GGML_OP_FLASH_ATTN_LIST, each query row over its own list of cells (ggml_flash_attn_list). blk is the run of
-// consecutive cells of a selection (4 for the qwen4exp blocks); the lists hold unique cells in random order, a few -1
-// slots and -inf values, the rest values in [-1, 0]
-struct test_flash_attn_list : public test_case {
-    const int64_t hsk;
-    const int64_t hsv;
-    const int64_t nh;   // KV heads
-    const int64_t gqa;  // query heads per KV head
-    const int64_t kv;
-    const int64_t nb;
-    const int64_t n_list;
-    const int64_t blk;
-    const int64_t ns;   // streams (ne3)
-    const ggml_type type_kv;
-
-    std::string vars() override {
-        return VARS_TO_STR10(hsk, hsv, nh, gqa, kv, nb, n_list, blk, ns, type_kv);
-    }
-
-    double max_nmse_err() override {
-        return 5e-4;
-    }
-
-    test_flash_attn_list(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 1, int64_t gqa = 8, int64_t kv = 4096,
-                         int64_t nb = 16, int64_t n_list = 512, int64_t blk = 4, int64_t ns = 1,
-                         ggml_type type_kv = GGML_TYPE_F16)
-        : hsk(hsk), hsv(hsv), nh(nh), gqa(gqa), kv(kv), nb(nb), n_list(n_list), blk(blk), ns(ns), type_kv(type_kv) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*gqa, ns);
-        ggml_set_name(q, "q");
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_kv, hsk, kv, nh, ns);
-        ggml_set_name(k, "k");
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_kv, hsv, kv, nh, ns);
-        ggml_set_name(v, "v");
-        ggml_tensor * vals = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_list, nb, 1, ns);
-        ggml_set_name(vals, "vals");
-        ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_list, nb, ns);
-        ggml_set_name(idx, "idx");
-
-        ggml_tensor * out = ggml_flash_attn_list(ctx, q, k, v, vals, idx, 1.0f/sqrtf((float) hsk));
-        // the Vulkan FA picks f32 accumulators by ggml_prec_get_acc (8e5a58df8), which has to know this op, or the
-        // list runs with f16 accumulators where the device has fp16
-        GGML_ASSERT(ggml_prec_get_acc(out) == GGML_PREC_F32);
-        ggml_set_name(out, "out");
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        std::mt19937 gen(0x115Fu);
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "idx") == 0) {
-                const int64_t n_blk = kv/blk;
-                std::vector<int32_t> order(n_blk);
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
-                    for (int64_t b = 0; b < n_blk; ++b) {
-                        order[b] = (int32_t) b;
-                    }
-                    std::shuffle(order.begin(), order.end(), gen);
-                    for (int64_t s = 0; s < n_list; ++s) {
-                        const int64_t b = s/blk;
-                        data[row*n_list + s] = (b < n_blk && (s % 37) != 11) ? (int32_t) (order[b]*blk + s % blk) : -1;
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
-            } else if (strcmp(t->name, "vals") == 0) {
-                std::uniform_real_distribution<float> dist(-1.0f, 0.0f);
-                std::vector<ggml_fp16_t> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = ggml_fp32_to_fp16((i % 10) == 3 ? -INFINITY : dist(gen));
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
-            } else if (t->op == GGML_OP_NONE) {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-};
-
 // the qwen4exp hc combine: SCALE, SIGMOID, SCALE of the injection and DSV4_HC_POST with it as the post weights.
 // Vulkan and CUDA run the four as one HC_POST (HC_POST_GATE)
 struct test_hc_post_gate : public test_case {
@@ -324,32 +243,6 @@ struct test_hc_post_gate : public test_case {
         }
         ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc)), 2.0f);
         ggml_tensor * out = ggml_dsv4_hc_post(ctx, x, residual, w, c);
-        ggml_set_name(out, "out");
-        return out;
-    }
-};
-
-// the low-rank activation of the qwen4exp hc mix: SCALE, SILU. CUDA runs the two as one kernel
-struct test_scale_silu : public test_case {
-    const std::array<int64_t, 4> ne;
-
-    std::string vars() override {
-        return VARS_TO_STR1(ne);
-    }
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "SCALE_SILU";
-    }
-
-    bool run_whole_graph() override { return true; }
-
-    test_scale_silu(std::array<int64_t, 4> ne = {320, 3, 1, 1}) : ne(ne) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-        ggml_set_name(a, "a");
-        ggml_tensor * out = ggml_silu(ctx, ggml_scale(ctx, a, 0.25f));
         ggml_set_name(out, "out");
         return out;
     }
@@ -464,96 +357,6 @@ struct test_concat_ssm_conv : public test_case {
         }
         ggml_set_name(out, "out");
 
-        return out;
-    }
-};
-
-// DSV4_HC_PRE over f16 streams, the f16 hc read of qwen4exp (LLAMA_HC_F16): x enters in f32 and is cast in the graph
-struct test_dsv4_hc_pre_f16 : public test_dsv4_hc {
-    const int64_t n_embd;
-    const int64_t n_tokens;
-    const bool    gated;
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "DSV4_HC_PRE_F16";
-    }
-
-    std::string vars() override {
-        return VARS_TO_STR3(n_embd, n_tokens, gated);
-    }
-
-    bool run_whole_graph() override { return true; }
-
-    test_dsv4_hc_pre_f16(int64_t n_embd, int64_t n_tokens, bool gated) : n_embd(n_embd), n_tokens(n_tokens), gated(gated) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
-        ggml_set_name(x, "x");
-
-        ggml_tensor * x16 = ggml_cast(ctx, x, GGML_TYPE_F16);
-
-        if (gated) {
-            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
-            ggml_set_name(gate, "gate");
-
-            out = ggml_dsv4_hc_pre_gated(ctx, x16, gate, 1.0f/hc);
-        } else {
-            ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
-            ggml_set_name(weights, "weights");
-
-            out = ggml_dsv4_hc_pre(ctx, x16, weights);
-        }
-        ggml_set_name(out, "out");
-        return out;
-    }
-};
-
-// the hc_combine of qwen4exp and the grouped RMSNorm of the next hc read, cast to f16 (LLAMA_HC_F16): one shader on
-// Vulkan from 32 tokens (HC_POST_NORM_F16), both outputs checked
-struct test_dsv4_hc_post_norm_f16 : public test_dsv4_hc {
-    const int64_t n_embd;
-    const int64_t n_tokens;
-
-    ggml_tensor * out_post = nullptr;
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "DSV4_HC_POST_NORM_F16";
-    }
-
-    std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_tokens);
-    }
-
-    bool run_whole_graph() override { return true; }
-
-    std::vector<ggml_tensor *> fusion_test_nodes() override {
-        return { out_post, out };
-    }
-
-    test_dsv4_hc_post_norm_f16(int64_t n_embd, int64_t n_tokens) : n_embd(n_embd), n_tokens(n_tokens) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_name(x, "x");
-
-        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
-        ggml_set_name(residual, "residual");
-
-        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
-        ggml_set_name(post, "post");
-
-        post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
-
-        out_post = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
-        ggml_set_name(out_post, "out_post");
-
-        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
-        ggml_set_name(w_norm, "w_norm");
-
-        out = ggml_cast(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, out_post, 1e-6f), w_norm), GGML_TYPE_F16);
-        ggml_set_name(out, "out");
         return out;
     }
 };
@@ -758,21 +561,6 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_gated_delta_net_replay_layers(S, 4, 2));
     }
 
-    // FLASH_ATTN_LIST: the qwen4exp QSA shape (2 KV heads x 12, 256 dims, 2052 cells in blocks of 4), decode, MTP
-    // checks and a prompt ubatch; GQA 8 and 1, two streams, a list longer than the cache
-    for (int64_t nb : {1, 4, 64}) {
-        test_cases.emplace_back(new test_flash_attn_list(256, 256, 2, 12, 8192, nb, 2052, 4));
-    }
-    test_cases.emplace_back(new test_flash_attn_list(128, 128, 1, 8, 4096, 37, 512, 4));
-    test_cases.emplace_back(new test_flash_attn_list(128, 128, 4, 1, 4096, 33, 300, 1));
-    test_cases.emplace_back(new test_flash_attn_list(256, 256, 2, 12, 4096, 16, 1024, 4, 2));
-    test_cases.emplace_back(new test_flash_attn_list(64, 64, 1, 4, 256, 8, 512, 4));
-    // a q8_0 KV cache (-ctk / -ctv q8_0, 22.10): the qwen4exp shape at decode and in a prompt ubatch
-    for (int64_t nb : {1, 64}) {
-        test_cases.emplace_back(new test_flash_attn_list(256, 256, 2, 12, 8192, nb, 2052, 4, 1, GGML_TYPE_Q8_0));
-    }
-    test_cases.emplace_back(new test_flash_attn_list(128, 128, 1, 8, 4096, 37, 512, 4, 1, GGML_TYPE_Q8_0));
-
     // GET_ROWS of short rows (CUDA: one thread per element, fork/getrows-fork.inc): the qwen4exp attention gathers of
     // a 64-token ubatch, the positions of the selected cells (rows of 1, flat), the mask values (rows of 1, per token)
     // and the cells of the selected blocks (rows of 4); a viewed source and index with a column offset
@@ -837,7 +625,7 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
             test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 8, bias, type_a));
         }
     }
-    // the prompt sizes take the fused head matmul on Vulkan, 3 tokens and 64 heads the indexer shader
+    // prompt and decode sizes, 4 and 64 heads
     for (ggml_type type_k : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (auto kn : std::vector<std::array<int64_t, 2>>{{1000, 65}, {1000, 300}, {4097, 512}, {513, 77}, {1000, 3}}) {
             test_cases.emplace_back(new test_lightning_indexer_unit(4, kn[0], kn[1], type_k));
@@ -848,9 +636,7 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         for (bool comb : {false, true}) {
             test_cases.emplace_back(new test_hc_post_gate(2560, nt, comb));
         }
-        test_cases.emplace_back(new test_scale_silu({320, nt, 1, 1}));
     }
-    test_cases.emplace_back(new test_scale_silu({1000, 7, 3, 1}));
 
     // REPEAT of one element (the -inf the qwen4exp QSA mask starts from): Vulkan and CUDA run it as a fill, CUDA 16
     // bytes a thread, so sizes with a tail past a whole number of 16-byte stores
@@ -883,8 +669,8 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
 
     // conv state + transposed tokens, as before ssm_conv: many tiles, with partial tiles at the edges
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-        test_cases.emplace_back(new test_concat(type, {3, 1100, 2, 1}, 67, 0, 32));
-        test_cases.emplace_back(new test_concat(type, {45, 70, 3, 1}, 37, 1, 16));
+        test_cases.emplace_back(new test_concat(type, {3, 1100, 2, 1}, 67, 0, 16));
+        test_cases.emplace_back(new test_concat(type, {45, 70, 3, 1}, 37, 1, 32));
     }
 
     // sparse mask, qwen4exp QSA shape: 24 q heads over 2 kv heads, head_dim 256
@@ -967,22 +753,6 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
             true, 8, 4, true, false, true, false, {1, 1}));
     }
 
-    // the f16 hc read of qwen4exp (LLAMA_HC_F16): the hc down projection (q8_0, 320 x 10240) of f16 streams, int8 on
-    // Vulkan through an f16 quantize; DSV4_HC_PRE over f16 streams; the combine with the next norm stored in f16
-    for (int64_t n : {32, 64, 77}) {
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240, {1, 1}, {1, 1}));
-    }
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 64, 40, 256, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F16, 64, 40, 256, {1, 1}, {1, 1}));
-    for (bool gated : {false, true}) {
-        test_cases.emplace_back(new test_dsv4_hc_pre_f16(31, 17, gated));
-        test_cases.emplace_back(new test_dsv4_hc_pre_f16(2560, 40, gated));
-    }
-    for (int64_t n : {17, 33, 64}) {
-        test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(2560, n));
-    }
-    test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(257, 40));
-
     // the qwen4exp block top-k (513) of a 4096-token ubatch at n_kv 4352, 8448 and 15104, and one column past the
     // widest workgroup of the tournament (1024): radix-select on Vulkan there from 8 rows (ggml_vk_topk_use_radix)
     for (int64_t n_blocks : {1088, 2112, 3776}) {
@@ -1051,8 +821,8 @@ static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & 
         }
     }
 
-    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3,  3328, 1, 1},  512, 0, 32)); // prefill conv input: state + transposed x
-    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 32)); // same, qwen4exp with a 2048 ubatch
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3,  3328, 1, 1},  512, 0, 16)); // prefill conv input: state + transposed x
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 16)); // same, qwen4exp with a 2048 ubatch
     // qwen4exp GDN at a 4096-token ubatch: the conv over the concat sources, the gated output norm, the q/k l2 norm
     test_cases.emplace_back(new test_concat_ssm_conv(10240, 4096, 1, 3, true));
     test_cases.emplace_back(new test_rms_norm_gated({128, 48, 4096, 1}, 0));

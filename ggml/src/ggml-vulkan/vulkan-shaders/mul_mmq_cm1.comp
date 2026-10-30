@@ -207,7 +207,9 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
         if (buf_ib < BM) {                                                                      \
             const uint ib = pos_a_ib + buf_ib * p.stride_a / BK;                                \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                pre_a2[li * BK_STEP + ks] = block_a2_load(ib + ks, loadr_a);                    \
+                /* a k step past end_k re-reads an in-bounds block; its scale is zeroed below */ \
+                const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
+                pre_a2[li * BK_STEP + ks] = block_a2_load(ib_k, loadr_a);                       \
             }                                                                                   \
         }                                                                                       \
     }
@@ -217,7 +219,8 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                block_a2_to_shmem(pre_a2[li * BK_STEP + ks], buf_ib, ks, loadr_a);              \
+                const bool in_bounds = (blk) + ks * BK < end_k;                                 \
+                block_a2_to_shmem(pre_a2[li * BK_STEP + ks], buf_ib, ks, loadr_a, in_bounds);   \
             }                                                                                   \
         }                                                                                       \
     }

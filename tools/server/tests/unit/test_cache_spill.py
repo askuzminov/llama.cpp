@@ -207,7 +207,9 @@ def test_prompt_cache_spill_kill_mid_write():
     # A state is written under a temporary name and renamed when it is complete. A process killed in
     # the middle of a write leaves only the temporary file, and the next start removes it, together
     # with a state file without a header from a build that wrote in place, the files of this model
-    # under another configuration and the files named before the owner was added. Other models' files stay.
+    # under another configuration and the files named before the owner was added. The disk budget is
+    # shared by all models, and every writer holds the directory lock until the rename, so the budget
+    # also removes other models' temporary files found under the lock. Other models' states stay.
     # tinygemma3 is used because its state is tens of MiB, so the write lasts long enough to catch.
     spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-kill-")
 
@@ -252,12 +254,14 @@ def test_prompt_cache_spill_kill_mid_write():
         # an unfinished write of a build that wrote in place: the name is there, the header is not
         open(os.path.join(spill_dir, f"state-{owner}-{sig}-900.bin"), "wb").close()
 
-        # this model under another configuration, and names without owner: nothing restores them
-        for name in [f"state-{owner}-{other_sig}-901.bin", f"state-{other_sig}-902.bin", f"state-{sig}-903.bin.tmp"]:
+        # this model under another configuration, and names without owner: nothing restores them.
+        # another model's temporary file: no write is running while the start holds the lock
+        for name in [f"state-{owner}-{other_sig}-901.bin", f"state-{other_sig}-902.bin", f"state-{sig}-903.bin.tmp",
+                     f"state-{other_owner}-{sig}-900.bin.tmp"]:
             with open(os.path.join(spill_dir, name), "wb") as f:
                 f.write(b"x" * 100)
 
-        keep = [f"state-{other_owner}-{sig}-900.bin.tmp", f"state-{other_owner}-{other_sig}-901.bin", "state-900.bin"]
+        keep = [f"state-{other_owner}-{other_sig}-901.bin", "state-900.bin"]
         for name in keep:
             with open(os.path.join(spill_dir, name), "wb") as f:
                 f.write(b"x" * 100)
@@ -265,7 +269,7 @@ def test_prompt_cache_spill_kill_mid_write():
         server = make_server()
         server.start()
 
-        assert sorted(spill_files(spill_dir)) == sorted(keep), "the start must remove the unfinished files of this model only"
+        assert sorted(spill_files(spill_dir)) == sorted(keep), "the start must remove this model's dead files and all temporary files"
     finally:
         server.stop()
         try:

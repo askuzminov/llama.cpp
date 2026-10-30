@@ -18,18 +18,6 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_edges {
     { 5, 0, 4 }, // mul->src[0]      == rms_norm
 };
 
-// hc_post_norm with the normalized streams then copied to f16 (the f16 hc read of qwen4exp, LLAMA_HC_F16): the shader
-// stores them in f16 itself, the f32 ones are never written
-static constexpr std::initializer_list<ggml_op> hc_post_norm_f16_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
-
-static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_f16_edges {
-    { 1, 0, 0 }, // sigmoid->src[0]  == scale
-    { 2, 0, 1 }, // scale->src[0]    == sigmoid
-    { 3, 2, 2 }, // hc_post->src[2]  == scale (post)
-    { 4, 0, 3 }, // rms_norm->src[0] == hc_post
-    { 5, 0, 4 }, // mul->src[0]      == rms_norm
-    { 6, 0, 5 }, // cpy->src[0]      == mul
-};
 
 struct vk_op_dsv4_hc_post_norm_push_constants {
     uint32_t n_embd;
@@ -115,24 +103,6 @@ struct vk_op_gated_delta_net_lazy_push_constants {
     uint32_t rec_set;
 };
 
-// flash_attn_union.comp, strides in elements
-struct vk_op_fa_union_push_constants {
-    uint32_t N;
-    uint32_t KV;
-    uint32_t n_head;
-    uint32_t G;
-    uint32_t R;
-    uint32_t q_nb1, q_nb2, q_nb3;
-    uint32_t k_nb1, k_nb2, k_nb3;
-    uint32_t v_nb1, v_nb2, v_nb3;
-    uint32_t m_nb1, m_nb3;
-    uint32_t nem3;
-    uint32_t rk3, rv3;
-    uint32_t capacity;
-    uint32_t n_groups;
-    float    scale;
-};
-
 // the large int8 coopmat tiles that GGML_VK_MMQ_INT_TILE, _ID and _GLU set, read by ggml_vk_load_shaders
 struct vk_fork_int_tiles {
     // GGML_VK_MMQ_INT_TILE: the large int8 coopmat tile with its own workgroup size
@@ -169,8 +139,6 @@ size_t ggml_vk_fork_host_buffer_pad(const vk_device & device, size_t size);
 // queue exists
 void ggml_vk_fork_mmid_f16reg_init(vk_device & device);
 bool ggml_vk_fork_coopmat_a_probe(vk_device & device);
-// GGML_VK_FA_UNION: sets fa_union_mode (1 coopmat, 2 emulated), once the compute queue exists
-void ggml_vk_fork_fa_union_init(vk_device & device);
 // GGML_VK_INT_COOPMAT: sets coopmat_int_ops and returns whether int8 coopmat may be enabled; mode gets the env value
 // (-1 when unset)
 bool ggml_vk_fork_int_coopmat(vk_device & device, int & mode);
@@ -230,20 +198,6 @@ vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, con
 // TOP_K: radix-select instead of the tournament (GGML_VK_TOPK_RADIX); tournament_cols: the elements of the widest
 // workgroup of the tournament, what it reduces to k in one pass
 bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t tournament_cols);
-// FLASH_ATTN_EXT, sparse with the heads folded: the split count of the split-major order (GGML_VK_FA_SPARSE_SPLIT),
-// 0 for the upstream order and split count
-// (GGML_VK_FA_SPARSE_KVSPLIT: by KV ranges instead of list slots, kv_range is set then)
-uint32_t ggml_vk_fork_fa_sparse_split(uint32_t base_wgs, uint32_t shader_core_count, bool & kv_range);
-// FLASH_ATTN_EXT on coopmat1: parts of the tile left out to time the rest (GGML_VK_FA_ABLATE, profiling only)
-uint32_t ggml_vk_fork_fa_ablate();
-// FLASH_ATTN_EXT, sparse on coopmat1: K staged in chunks of 64 dims, the cells of a block read once
-// (GGML_VK_FA_SPARSE_WIDE), where the shader takes it and the shared memory holds it
-bool ggml_vk_fork_fa_sparse_wide(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv,
-                                 bool f32acc, ggml_type k_type, ggml_type v_type);
-// FLASH_ATTN_EXT: the sparse prompt attention over the union of neighbouring tokens (flash_attn_union.comp) where it
-// applies, false for the upstream path
-bool ggml_vk_fork_fa_union(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * q, const ggml_tensor * k,
-                           const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst);
 // MUL_MAT_ID: the mul_mmid_f16reg.comp pipeline for these operands, or nullptr for the upstream choice
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
                                      bool y_f32_kernel, uint64_t n_per_expert);
@@ -268,8 +222,6 @@ void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx
 bool ggml_vk_fork_rms_norm_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 // CONCAT, SSM_CONV (+ SILU)
 void ggml_vk_fork_ssm_conv_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
-// LIGHTNING_INDEXER of a prompt on the MUL_MAT_HEADSUM matmul, false when it does not fit (ggml-vulkan-fusion-fork.cpp)
-bool ggml_vk_fork_lid_headsum(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * dst);
 void ggml_vk_mul_mat_headsum(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 
 // the fusion chain of graph_compute: each sets num_additional_fused_ops, the ctx flags, op_srcs_fused_elementwise and

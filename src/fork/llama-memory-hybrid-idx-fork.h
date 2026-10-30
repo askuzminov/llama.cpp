@@ -20,12 +20,12 @@ class llama_memory_hybrid_idx_fork : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx_fork(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -155,10 +155,6 @@ public:
     // F32 [indexer_head_size, kv_size/ratio, n_stream]. null when the model has no indexer
     ggml_tensor * get_pool(int32_t il) const;
 
-    // the block scores of the first draft step of an MTP block, before the bias: F32 [kv_size/ratio, n_stream].
-    // null for a trunk layer
-    ggml_tensor * get_score(int32_t il) const;
-
     // the pool holds derived data, so nothing restores it: every cell move drops it
     void qsa_pool_drop() const;
 
@@ -279,7 +275,6 @@ private:
     mutable bool     qsa_pos_ok       = false;
 
     std::map<int32_t, ggml_tensor *> pool_tensors;
-    std::map<int32_t, ggml_tensor *> score_tensors;
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> pool_bufs;
 };
@@ -353,9 +348,6 @@ public:
 
     // this ubatch's streams of the stored block keys: F32 [indexer_head_size, kv_size/ratio, ns]
     ggml_tensor * get_pool(ggml_context * ctx, int32_t il) const;
-
-    // this ubatch's streams of the saved block scores of an MTP block: F32 [kv_size/ratio, ns], null for a trunk layer
-    ggml_tensor * get_score(ggml_context * ctx, int32_t il) const;
 
 private:
     const llama_memory_hybrid_idx_fork * mem = nullptr;

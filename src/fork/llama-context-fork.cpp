@@ -14,6 +14,8 @@
 #include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -624,23 +626,6 @@ int32_t llama_context::state_seq_apply_delta(
     return -1;
 }
 
-void llama_context::set_qsa_reuse(bool value) {
-    // only an MTP block that attends through QSA has a score to take: anything else would just lose its graph
-    // reuse between the first draft step and the next ones. LLAMA_MTP_QSA_REUSE=0 runs the indexer at every step
-    static const bool enabled = [] {
-        return llama_fork_env_int("LLAMA_MTP_QSA_REUSE", 1) != 0;
-    }();
-    const auto & hp = model.hparams;
-    const bool qsa_mtp = model.arch == LLM_ARCH_QWEN4EXP && hp.n_layer_nextn > 0 &&
-        hp.dsv4_compress_ratios[hp.n_layer()] > 0;
-
-    cparams.qsa_reuse = value && enabled && qsa_mtp;
-}
-
-void llama_set_qsa_reuse(llama_context * ctx, bool value) {
-    ctx->set_qsa_reuse(value);
-}
-
 uint32_t llama_mtp_window_kv(const llama_context * ctx, uint32_t * n_window) {
     // the cache llama_model::create_memory made for the dense MTP head: a plain KV cache, an SWA one of the window when
     // mtp_window_kv gave it the window only. read from the cache, not from the rule again: the signature of the prompt
@@ -742,6 +727,17 @@ void llama_context::fork_prefetch_first() {
     // the phase step after this picks the ubatch: the tokens of the largest one, the first takes its share of the rows
     const uint32_t n = std::min<uint32_t>((uint32_t) batch.n_tokens, cparams.n_ubatch);
     llama_fork_prefetch_first(model, memory.get(), llama_fork_tokens_ubatch(batch.token, n, batch.pos[0], seq));
+}
+
+bool llama_memory_rs_lazy_fork(const llama_context * ctx) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (const auto * recr = dynamic_cast<const llama_memory_recurrent *>(mem)) {
+        return recr->lazy_on();
+    }
+    if (const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_recr() != nullptr && hyb->get_mem_recr()->lazy_on();
+    }
+    return false;
 }
 
 void llama_set_next_tokens(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id) {

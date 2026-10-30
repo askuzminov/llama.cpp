@@ -1896,10 +1896,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            // fork: a step after the first selects from the block scores of the first (a QSA MTP block, see
-            // llama_set_qsa_reuse); the steps of chained heads and of shared memory decode other rows
-            llama_set_qsa_reuse(ctx_dft, i > 0 && !chain_heads && !is_mem_shared);
-
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -2065,7 +2061,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
         }
-        llama_set_qsa_reuse(ctx_dft, false);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];

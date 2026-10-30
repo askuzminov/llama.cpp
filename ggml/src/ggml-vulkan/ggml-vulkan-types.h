@@ -388,6 +388,7 @@ enum vk_conv_shapes {
     CONV_SHAPE_64x32,
     CONV_SHAPE_32x256,
     CONV_SHAPE_64x128,
+    CONV_SHAPE_256x128,
     CONV_SHAPE_COUNT,
 };
 
@@ -403,6 +404,7 @@ inline vk_conv_block_size vk_conv_block_sizes[CONV_SHAPE_COUNT] = {
     {  64,  32, 32 }, // CONV_SHAPE_64x32
     {  32, 256, 16 }, // CONV_SHAPE_32x256
     {  64, 128, 16 }, // CONV_SHAPE_64x128
+    { 256, 128, 16 }, // CONV_SHAPE_256x128
 };
 
 enum dmmv_wg_sizes {
@@ -793,7 +795,6 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
-    vk_pipeline pipeline_quantize_q8_1_x4_f16; // fork: from an f16 source (qwen4exp, LLAMA_HC_F16)
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -854,18 +855,18 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
-    vk_pipeline pipeline_rms_norm_f32;
-    vk_pipeline pipeline_rms_norm_mul_f32;
-    vk_pipeline pipeline_rms_norm_mul_add_f32;
-    vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f16;
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
-    vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
-    vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
 
@@ -950,8 +951,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
-    vk_pipeline pipeline_dsv4_hc_pre_f16;       // fork: f16 streams (qwen4exp, LLAMA_HC_F16)
-    vk_pipeline pipeline_dsv4_hc_pre_gated_f16;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1034,7 +1033,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_concat_transpose_16, pipeline_concat_transpose_32;
     vk_pipeline pipeline_dsv4_hc_post_norm_f32;
-    vk_pipeline pipeline_dsv4_hc_post_norm_f16n; // fork: the normalized streams stored in f16
     // RMS norm of rows up to 512 columns, several rows per workgroup: [weight][sigmoid gate]
     vk_pipeline pipeline_rms_norm_rows_f32[2][2];
     // SSM_CONV (+ SILU) over CONCAT(state, x) without the concat: [silu]
@@ -1043,10 +1041,6 @@ struct vk_device_struct {
     int mmid_f16reg_mode;
     // [q4_K, q5_K, q5_1, q8_0][fused gate/up]
     vk_pipeline pipeline_mmid_f16reg[4][2];
-    // the sparse prompt attention over the union of neighbouring tokens (flash_attn_union.comp, GGML_VK_FA_UNION): 0 off,
-    // 1 coopmat, 2 emulated; pipelines per (head size, list slots per step)
-    int fa_union_mode;
-    std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_union;
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
     ggml_backend_buffer_type buffer_type_shared;
     ggml_backend_buffer_type_t extra_bufts[2] = {};
@@ -1335,7 +1329,6 @@ struct ggml_backend_vk_context {
     // fork: see fork/ggml-vulkan-fork.h
     // HC_POST_GATE + the RMS_NORM and MUL of the next hc mix
     bool fused_hc_post_norm {};
-    bool fused_hc_post_norm_f16 {}; // fork: with the cpy of the normalized streams to f16 fused in
     bool fused_mm_relu {};
     // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
     bool fused_mm_headsum {};

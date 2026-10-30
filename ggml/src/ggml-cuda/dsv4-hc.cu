@@ -331,5 +331,3 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
             gate_in, gate_out);
 }
-
-#include "fork/dsv4-hc-fork.inc"

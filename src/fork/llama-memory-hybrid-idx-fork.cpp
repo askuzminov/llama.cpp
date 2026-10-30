@@ -54,12 +54,12 @@ static bool qsa_kv_host(const llama_model & model, ggml_type type_k, ggml_type t
 
 llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -77,7 +77,8 @@ llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
     const layer_filter_cb & filter_idx) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        no_alloc,
+        type_k, type_v, v_trans, kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr, qsa_kv_host(model, type_k, type_v, v_trans)),
@@ -99,8 +100,8 @@ llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, no_alloc, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     if (kv_host) {
@@ -174,22 +175,12 @@ llama_memory_hybrid_idx_fork::llama_memory_hybrid_idx_fork(
         ggml_format_name(t, "qsa_pool_l%d", il);
 
         pool_tensors[il] = t;
-
-        // an MTP block: the block scores of its first draft step, which the next steps select from again
-        // (cparams.qsa_reuse, see build_qsa_top_k). one row per stream, cleared below: a stale row is finite
-        if (il >= hp.n_layer()) {
-            ggml_tensor * s = ggml_new_tensor_2d(it->second.get(), GGML_TYPE_F32, (n_cells + r - 1)/r, n_stream);
-
-            ggml_format_name(s, "qsa_score_l%d", il);
-
-            score_tensors[il] = s;
-        }
     }
 
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
 
-        if (hp.no_alloc) {
+        if (no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf;
@@ -496,12 +487,6 @@ llama_kv_cache * llama_memory_hybrid_idx_fork::get_mem_idx() const {
 //
 // qwen4exp QSA: pooled block keys
 //
-
-ggml_tensor * llama_memory_hybrid_idx_fork::get_score(int32_t il) const {
-    const auto it = score_tensors.find(il);
-
-    return it == score_tensors.end() ? nullptr : it->second;
-}
 
 ggml_tensor * llama_memory_hybrid_idx_fork::get_pool(int32_t il) const {
     const auto it = pool_tensors.find(il);
@@ -2056,21 +2041,6 @@ void llama_memory_hybrid_idx_fork_context::set_input_qsa_dirty(
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa_dirty(dirty_cells, dirty_pos, dirty_rows, ratio);
-}
-
-ggml_tensor * llama_memory_hybrid_idx_fork_context::get_score(ggml_context * ctx, int32_t il) const {
-    GGML_ASSERT(mem != nullptr);
-    GGML_ASSERT(get_idx() != nullptr);
-
-    ggml_tensor * score = mem->get_score(il);
-
-    if (score == nullptr) {
-        return nullptr;
-    }
-
-    const int64_t s0 = get_idx()->get_s0();
-
-    return ggml_view_2d(ctx, score, score->ne[0], get_n_stream(), score->nb[1], s0*score->nb[1]);
 }
 
 ggml_tensor * llama_memory_hybrid_idx_fork_context::get_pool(ggml_context * ctx, int32_t il) const {

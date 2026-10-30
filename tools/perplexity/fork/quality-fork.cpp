@@ -112,6 +112,27 @@ static int run(common_params & params, const json & plan) {
     params.sampling.backend_sampling = false;
     const int rows = plan.value("max_outputs", 32);
     require(rows > 0 && rows <= 128, "max_outputs must be in 1..128");
+    // positions in a decode range go in batches of at most decode_batch tokens, so their logits come from the decode
+    // path of the model (a few tokens per ubatch: incomplete QSA tail blocks, the small-batch kernels) and not from a
+    // prompt ubatch. 0: everything in batches of n_batch
+    const int decode_batch = plan.value("decode_batch", 0);
+    require(decode_batch >= 0 && decode_batch <= 64, "decode_batch must be in 0..64");
+    std::vector<std::pair<int64_t, int64_t>> decode_ranges;
+    for (const auto & r : plan.value("decode_ranges", json::array())) {
+        const auto a = r.at(0).get<int64_t>(), b = r.at(1).get<int64_t>();
+        require(0 <= a && a < b && b <= context, "decode_ranges must be [start, end) inside the context");
+        require(decode_ranges.empty() || decode_ranges.back().second <= a, "decode_ranges must be sorted and disjoint");
+        decode_ranges.emplace_back(a, b);
+    }
+    require(decode_ranges.empty() || decode_batch > 0, "decode_ranges need decode_batch");
+    const auto in_decode = [&](int64_t pos) {
+        for (const auto & r : decode_ranges) {
+            if (pos >= r.first && pos < r.second) {
+                return true;
+            }
+        }
+        return false;
+    };
     params.n_batch = std::min(params.n_batch, params.n_ctx);
     params.n_outputs_max = rows;
     params.n_outputs_max_per_seq = rows;
@@ -157,7 +178,13 @@ static int run(common_params & params, const json & plan) {
     while (processed < context) {
         batch.clear();
         std::vector<std::pair<int32_t, uint32_t>> outputs;
-        while (processed < context && batch.size() < params.n_batch) {
+        const bool decode = in_decode(processed);
+        const int32_t limit = decode ? decode_batch : params.n_batch;
+        while (processed < context && batch.size() < limit) {
+            // a batch is all decode or all prompt
+            if (batch.size() > 0 && in_decode(processed) != decode) {
+                break;
+            }
             const bool score = next < positions.size() && positions[next] == uint32_t(processed);
             if (score && outputs.size() == size_t(rows)) {
                 break;
@@ -174,7 +201,7 @@ static int run(common_params & params, const json & plan) {
             require(logits != nullptr, "missing logits");
             const double z = log_sum_exp(logits, vocab);
             const auto label = tokens[output.second + 1];
-            json sample = {{"position", output.second}, {"nll", z - logits[label]}};
+            json sample = {{"position", output.second}, {"nll", z - logits[label]}, {"decode", decode}};
             if (action == "capture") {
                 out.write(reinterpret_cast<const char *>(logits), size_t(vocab) * sizeof(float));
                 require(out.good(), "cannot write logits");
@@ -197,7 +224,9 @@ static int run(common_params & params, const json & plan) {
             }
             samples.push_back(std::move(sample));
         }
-        std::cerr << "processed " << processed << '/' << context << ", probes " << samples.size() << '/' << positions.size() << '\n';
+        if (!decode || processed == context) {
+            std::cerr << "processed " << processed << '/' << context << ", probes " << samples.size() << '/' << positions.size() << '\n';
+        }
     }
     if (action == "capture") {
         out.close();
@@ -206,7 +235,7 @@ static int run(common_params & params, const json & plan) {
     }
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     write_json(plan.at("report"), {{"context", context}, {"processed", processed}, {"vocab", vocab},
-               {"native_context", llama_model_n_ctx_train(model)}, {"max_outputs", rows},
+               {"native_context", llama_model_n_ctx_train(model)}, {"max_outputs", rows}, {"decode_batch", decode_batch},
                {"reference_bytes", expected_bytes}, {"seconds", elapsed}, {"samples", samples}});
     return 0;
 }

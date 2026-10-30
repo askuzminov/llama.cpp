@@ -466,10 +466,6 @@ private:
     //
 
 public:
-    // the MTP draft steps after the first take the block scores of the first (llama_set_qsa_reuse); ignored unless
-    // the model's MTP block attends through QSA and LLAMA_MTP_QSA_REUSE is not 0
-    void set_qsa_reuse(bool value);
-
     // the tokens the next decode call starts with (llama_set_next_tokens), and the tokens a coming decode will hold
     // whose inputs are read from storage now (llama_prefetch_tokens)
     void set_next_tokens(const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id);

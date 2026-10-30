@@ -377,8 +377,8 @@ public:
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     // note: assumes v_rot^2 == I
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_v_rot = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
+    std::vector<ggml_tensor *> self_v_rot;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -458,7 +458,7 @@ public:
     ggml_tensor * self_kq_mask_lid     = nullptr; // F32     [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_lid_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    ggml_tensor * self_k_rot_lid = nullptr;
+    std::vector<ggml_tensor *> self_k_rot_lid;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -546,11 +546,11 @@ public:
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_v_rot = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
+    std::vector<ggml_tensor *> self_v_rot;
 
-    ggml_tensor * self_k_rot_swa = nullptr;
-    ggml_tensor * self_v_rot_swa = nullptr;
+    std::vector<ggml_tensor *> self_k_rot_swa;
+    std::vector<ggml_tensor *> self_v_rot_swa;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -588,8 +588,8 @@ public:
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_k_rot_swa = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
+    std::vector<ggml_tensor *> self_k_rot_swa;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -618,7 +618,7 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    ggml_tensor * self_k_rot = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
 
     const llama_cparams cparams;
 
@@ -641,7 +641,7 @@ public:
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
 
-        ggml_tensor * k_rot      = nullptr;
+        std::vector<ggml_tensor *> k_rot;
     };
 
     llm_graph_input_dsv4(
@@ -909,11 +909,6 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
-            return false;
-        }
-
-        // fork: a reused-score step builds no indexer query
-        if (cparams.qsa_reuse != other.cparams.qsa_reuse) {
             return false;
         }
 
@@ -1402,15 +1397,10 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    // ggml_top_k_mask with top_k, score and extra viewed in the row layout of kq_mask, see ggml.h
-    // mask replaces kq_mask as the source of the kept values, it broadcasts to the rows
+    // ggml_top_k_mask with top_k viewed in the row layout of kq_mask, see ggml.h
     ggml_tensor * build_fused_top_k_mask(
             ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
             ggml_tensor * top_k,   // [n_top, n_tokens]
-            ggml_tensor * score,   // [n_pick, n_tokens], can be null
-            ggml_tensor * blocks,  // [n_blk, n_pick], can be null
-            ggml_tensor * extra,   // [n_extra, n_tokens], can be null
-            ggml_tensor * mask,    // [n_kv], kq_mask if null
                     int   il) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;

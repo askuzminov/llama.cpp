@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-decision.h
     server-context.cpp
     server-context.h
+    server-realtime.cpp
+    server-realtime.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
@@ -41,6 +43,8 @@ target_sources(${TARGET} PRIVATE
     fork/server-context-fork.h
     fork/server-task-fork.cpp
     fork/server-task-fork.h
+    fork/server-role-fork.cpp
+    fork/server-role-fork.h
 )
 
 # llama-server-impl: server logic, reusable by app
@@ -55,6 +59,8 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    server-models-sched.cpp
+    server-models-sched.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
@@ -71,7 +77,6 @@ endif()
 # fork: sources kept apart from the upstream list above
 target_sources(${TARGET} PRIVATE
     fork/server-models-fork.cpp
-    fork/server-models-fork.h
     fork/server-trace-fork.cpp
     fork/server-trace-fork.h
 )

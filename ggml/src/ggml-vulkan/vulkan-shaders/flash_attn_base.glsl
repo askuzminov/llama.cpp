@@ -26,11 +26,6 @@ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
 const bool USE_SPARSE      = (Flags & 16) != 0;
-// fork: the sparse coopmat1 path stages K in chunks of 64 dims and reads the cells of a block once (flash_attn_cm1.comp)
-const bool SPARSE_WIDE     = (Flags & 48) == 48; // with USE_SPARSE; a && of spec constants turns into a branch
-// fork: GGML_OP_FLASH_ATTN_LIST: binding 7 is the given list (unsorted, -1 anywhere), the mask holds the value of each
-// slot at the same index as the list
-const bool SPARSE_LIST     = (Flags & 80) == 80;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -80,10 +75,6 @@ layout (push_constant) uniform parameter {
 } p;
 
 #define SINK_ENABLE_BIT (1<<24)
-// fork: split_k index is the slow part of gl_WorkGroupID.x, see init_indices
-#define SPLIT_MAJOR_BIT (1<<25)
-// fork: sparse split s takes the listed cells of KV range s instead of a share of the list slots
-#define KV_RANGE_BIT (1<<26)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -157,24 +148,7 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride, sparse_base, sparse_lo, sparse_hi;
-
-// fork: the first slot of the sparse list at sparse_base whose cell is not below kv (the list is ascending, the -1
-// padding at its end counts as past every cell)
-uint32_t fa_sparse_lower_bound(const uint32_t kv) {
-    uint32_t lo = 0;
-    uint32_t hi = p.split_kv;
-    while (lo < hi) {
-        const uint32_t mid = (lo + hi) / 2;
-        const int cell = data_sparse[sparse_base + mid];
-        if (cell >= 0 && uint32_t(cell) < kv) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
+         q_stride, k_stride, v_stride, m_stride, sparse_base;
 
 void init_indices()
 {
@@ -182,14 +156,7 @@ void init_indices()
     KV = p.KV;
 
     if (p.k_num > 1) {
-        if (p.gqa_ratio > 1 && (p.mask_n_head_log2 & SPLIT_MAJOR_BIT) != 0) {
-            // fork: the workgroups that run at the same time take the same split of neighbouring rows, so their
-            // sparse lists cover the same stretch of KV and the cache serves the gather
-            i = 0;
-            const uint32_t n_rows_wg = gl_NumWorkGroups.x / p.k_num;
-            gqa_iq1 = gl_WorkGroupID.x % n_rows_wg;
-            split_k_index = gl_WorkGroupID.x / n_rows_wg;
-        } else if (p.gqa_ratio > 1) {
+        if (p.gqa_ratio > 1) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
             gqa_iq1 = gl_WorkGroupID.x / p.k_num;
@@ -258,37 +225,24 @@ void init_indices()
         uint32_t per_blocks   = CEIL_DIV(total_blocks, p.k_num);
         start_j = min(split_k_index * per_blocks, total_blocks);
         end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
-
-        sparse_lo = 0;
-        sparse_hi = p.split_kv;
-        if ((p.mask_n_head_log2 & KV_RANGE_BIT) != 0 && p.k_num > 1) {
-            // fork: the slots of this split's KV range; with the split-major order all rows walk one range at a time
-            const uint32_t range = CEIL_DIV(KV, p.k_num);
-            sparse_lo = fa_sparse_lower_bound(split_k_index * range);
-            sparse_hi = fa_sparse_lower_bound(min(KV, (split_k_index + 1) * range));
-            start_j = sparse_lo / Bc;
-            end_j   = CEIL_DIV(sparse_hi, Bc);
-        }
     }
 }
 
 // The list is ascending and -1 padded, so a block that starts on padding ends the walk.
 bool fa_sparse_tail(uint lin) {
-    return USE_SPARSE && !SPARSE_LIST && data_sparse[sparse_base + lin] < 0;
+    return USE_SPARSE && data_sparse[sparse_base + lin] < 0;
 }
 
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
 bool fa_kv_index(uint lin, out uint kv_col) {
     if (USE_SPARSE) {
-        if (lin >= p.split_kv || lin < sparse_lo || lin >= sparse_hi) {
+        if (lin >= p.split_kv) {
             kv_col = 0;
             return false;
         }
         int idx = data_sparse[sparse_base + lin];
-        // a given list (SPARSE_LIST) can name cells past KV, which count as left out
-        const bool in_list = idx >= 0 && (!SPARSE_LIST || uint(idx) < KV);
-        kv_col = in_list ? uint(idx) : 0;
-        return in_list;
+        kv_col = idx >= 0 ? uint(idx) : 0;
+        return idx >= 0;
     }
     kv_col = lin;
     return !KV_bounds_check || lin < KV;

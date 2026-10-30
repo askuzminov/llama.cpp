@@ -1,7 +1,7 @@
 @echo off
 setlocal
 call "%~dp0_config.bat"
-rem 00-build.bat stable: the tag stable in its own worktree, for the arms with @stable (README)
+rem 00-build.bat stable: the tag stable in its own worktree, an old build to compare with by hand (README)
 if /i "%~1"=="stable" goto :stable
 
 rem msbuild does not build cuda on its own: it needs the integration files that the toolkit
@@ -72,7 +72,7 @@ if not defined CP goto :nvcc_done
 if exist "%CP%\bin\nvcc.exe" set "NVCCARG="-DCMAKE_CUDA_COMPILER=%CP:\=/%/bin/nvcc.exe""
 :nvcc_done
 
-rem a running llama-server (serve.bat, 04-decode) keeps its exe and dlls open. windows does not
+rem a running llama-server (serve.bat, 02-long, 03-profile) keeps its exe and dlls open. windows does not
 rem let the link replace them, and bin keeps the old build next to the new parts
 if not exist "%BUILD%" goto :lock_done
 powershell -NoProfile -Command "$b = [IO.Path]::GetFullPath('%BUILD%').TrimEnd('\') + '\'; $p = @(Get-Process | Where-Object { try { $_.Path.StartsWith($b, [StringComparison]::OrdinalIgnoreCase) } catch { $false } }); $p | ForEach-Object { '  ' + $_.Id + '  ' + $_.Path }; if ($p.Count) { exit 3 }"
@@ -117,8 +117,8 @@ rmdir /s /q "%BUILD%"
 :configure
 echo building into %BUILD%, backend %BACKEND% %CMAKE_BACKEND% %GENARG% %TOOLSET% %NVCCARG%
 if /i "%BACKEND%"=="cpu" echo   no cuda toolkit and no vulkan sdk found, this is a cpu only build
-rem the id of the sources goes next to the binaries after a good build: _run.py keeps the results under it
-if defined PY if exist "%~dp0_run.py" %PY% "%~dp0_run.py" build-begin
+rem the id of the sources goes next to the binaries after a good build: _qa.py keeps the results under it
+if defined PY if exist "%~dp0_qa.py" %PY% "%~dp0_qa.py" build-begin
 cmake -S "%~dp0..\.." -B "%BUILD%" %GENARG% %TOOLSET% %NVCCARG% %CMAKE_BACKEND% -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
 if not "%ERRORLEVEL%"=="0" goto :failed
 
@@ -134,7 +134,7 @@ echo binaries in %BIN%
 for %%f in (llama-perplexity.exe llama-quality-fork.exe llama-server.exe test-backend-ops.exe) do (
     if exist "%BIN%\%%f" (echo   ok      %%f) else (echo   MISSING %%f)
 )
-if defined PY if exist "%~dp0_run.py" %PY% "%~dp0_run.py" build-end
+if defined PY if exist "%~dp0_qa.py" %PY% "%~dp0_qa.py" build-end
 
 rem the server prints the commit it was built from, it must be the commit of this checkout
 set "HEADREV="
@@ -163,5 +163,5 @@ if not defined PY (
     echo Python 3 is required: py -3 or python on PATH
     exit /b 1
 )
-%PY% "%~dp0_run.py" build-stable
+%PY% "%~dp0_qa.py" build-stable
 exit /b %ERRORLEVEL%
