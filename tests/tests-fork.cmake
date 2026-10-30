@@ -13,6 +13,10 @@ llama_build_and_test(test-spec-auto-fork.cpp)
 # the fork's knobs of the environment: a value that is not a whole number gives the default, not the 0 of atoi
 llama_build_and_test(test-env-fork.cpp)
 
+# the qwen4exp indexer timed on one device at the shapes of the model (lightning indexer, the head matmul of the Vulkan
+# graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines
+llama_build(test-micro-fork.cpp LINK ggml)
+
 # the elastic buffers of the backends (CUDA VMM, Vulkan sparse buffers) on every GPU device that has them, skipped
 # elsewhere; 01-check runs it on the machines (CHECKUNITS)
 llama_build_and_test(test-elastic-buffer-fork.cpp)

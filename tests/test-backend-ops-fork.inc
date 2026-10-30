@@ -152,7 +152,8 @@ struct test_mul_mat_headsum : public test_case {
     }
 };
 
-// LIGHTNING_INDEXER as the qwen4exp graph builds it: unit head weights made by a FILL of 1
+// LIGHTNING_INDEXER as the qwen4exp graph builds it: unit head weights made by a FILL of 1, which lets a backend run a
+// prompt on its fused head matmul (Vulkan: ggml_vk_fork_lid_headsum, 4 heads, one stream, from 65 tokens)
 struct test_lightning_indexer_unit : public test_case {
     const int64_t nh;
     const int64_t kv;
@@ -625,7 +626,7 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
             test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 8, bias, type_a));
         }
     }
-    // prompt and decode sizes, 4 and 64 heads
+    // the prompt sizes take the fused head matmul on Vulkan, 3 tokens and 64 heads the indexer shader
     for (ggml_type type_k : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (auto kn : std::vector<std::array<int64_t, 2>>{{1000, 65}, {1000, 300}, {4097, 512}, {513, 77}, {1000, 3}}) {
             test_cases.emplace_back(new test_lightning_indexer_unit(4, kn[0], kn[1], type_k));

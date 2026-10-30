@@ -1507,6 +1507,11 @@ def cmd_profile():
             proc.wait()
             mark_end()
         out = {}
+        # the compute buffers the server reserved (the largest size of each buffer type over the run), MiB
+        buffers = {}
+        for m in re.finditer(r"(\S+) compute buffer size =\s*([\d.]+) MiB", log.read_text(encoding="utf-8", errors="replace")):
+            buffers[m[1]] = max(buffers.get(m[1], 0.0), float(m[2]))
+        out["buffers"] = buffers
         for d in depths:
             pp_text, tg_text, end_text = slices[f"pp{d}"], slices[f"tg{d}"], slices[f"end{d}"]
             host = [[float(m[2]), float(m[3]), float(m[4])] for m in
@@ -1611,7 +1616,13 @@ def cmd_profile():
             return None
         main = next((g for g in x["tg_groups"] if g[0].startswith(("verify", "decode"))), None)
         tg = by_kind(main[2]) if main else {}
-        return sum(o[2] for o in x["pp"]), sum(tg.values()), tg.get("delta net", 0.0), tg.get("rows, copies", 0.0)
+        pp = by_kind(x["pp"])
+        return (sum(o[2] for o in x["pp"]), sum(tg.values()), pp.get("qsa select", 0.0), tg.get("qsa select", 0.0),
+                tg.get("delta net", 0.0), tg.get("rows, copies", 0.0))
+
+    def device_mib(res):
+        # the compute buffers on the devices, without the host ones
+        return sum(v for k, v in res.get("buffers", {}).items() if not re.match(r"(?i)^(cpu|.*host|.*_Host)", k))
 
     for name, res, kept_arm in results:
         for d in depths:
@@ -1625,17 +1636,56 @@ def cmd_profile():
             for d in depths:
                 tot = totals(res, d)
                 if tot:
-                    rows.append([name, str(res[str(d)]["depth"]), f"{tot[0]:.1f}", f"{tot[1]:.2f}", f"{tot[2]:.2f}",
-                                 f"{tot[3]:.2f}" + (" k" if kept_arm else "")])
-        run.add("", "variants: GPU ms of the prompt ubatch and of the decode step (its verify with MTP), with the delta "
-                    "net and the row copies of that step",
-                *table(["variant", "depth", "prompt", "decode", "delta net", "rows, copies"], rows))
+                    rows.append([name, str(res[str(d)]["depth"]), f"{tot[0]:.1f}", f"{tot[2]:.1f}", f"{tot[1]:.2f}",
+                                 f"{tot[3]:.2f}", f"{tot[4]:.2f}", f"{tot[5]:.2f}", f"{device_mib(res):.0f}" + (" k" if kept_arm else "")])
+        run.add("", "variants: GPU ms of the prompt ubatch and of the decode step (its verify with MTP), the block selection "
+                    "of QSA in both, the delta net and the row copies of the step, the compute buffers on the device (MiB)",
+                *table(["variant", "depth", "prompt", "qsa", "decode", "qsa", "delta net", "rows, copies", "compute"], rows))
+    return run.finish()
+
+
+# ---------------------------------------------------------------- micro
+
+def cmd_micro():
+    """The QSA indexer alone on the device of the machine (test-micro-fork): the lightning indexer, the head matmul of the
+    Vulkan graph and of the other backends at the token counts of decode, MTP checks and prompts and the depths to the
+    end of the context; microseconds per graph, TFLOP/s, GB/s and the largest difference to the first case.
+    QA_MICRO_ARGS: arguments of the tool (-c, -t, -b, --ms); QA_MARMS: variants (name VAR=value ...;...), a run each."""
+    run = Run("micro")
+    exe = binary("test-micro-fork")
+    device = env("CHECKDEVICE", DEVICES.get(env("BACKEND"), "CPU"))
+    args = ["-d", device, *split_args(env("QA_MICRO_ARGS", ""))]
+    arms = variants("QA_MARMS", "default")
+    run.add(f"micro: the QSA indexer on {device}, build {current_build()}, {' '.join(args)}")
+    for name, arm_env in arms:
+        run_env = dict(os.environ, **arm_env)
+        identity = {"v": VERSION, "kind": "micro", "build": build_id(exe.parent), "args": args,
+                    "env": env_identity(run_env), "machine": machine()}
+        label = "micro" if name == "default" else f"micro {name}"
+
+        def go(log, run_env=run_env):
+            execute([exe, *args], log, run_env)
+            return [l for l in log.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if re.match(r"^(device |\s*blocks|\s*\d+\s+\d+\s)", l)]
+
+        try:
+            lines, kept = run.measure(label, identity, go)
+        except Fail as e:
+            run.failed = True
+            run.add("", f"{label}: FAIL {e}")
+            continue
+        run.add("", label + (" k" if kept else ""), *lines)
+        for l in lines:
+            m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s", l)
+            if m:
+                point = f"b{m[1]} t{m[2]} {m[3]}" if name == "default" else f"{name} b{m[1]} t{m[2]} {m[3]}"
+                run.record("micro", point, {"us": float(m[4])}, kept, exe.parent)
     return run.finish()
 
 
 # ---------------------------------------------------------------- main
 
-COMMANDS = {"check": cmd_check, "long": cmd_long, "profile": cmd_profile, "build-begin": cmd_build_begin,
+COMMANDS = {"check": cmd_check, "long": cmd_long, "profile": cmd_profile, "micro": cmd_micro, "build-begin": cmd_build_begin,
             "build-end": cmd_build_end, "build-stable": cmd_build_stable}
 
 
