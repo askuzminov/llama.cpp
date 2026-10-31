@@ -565,9 +565,13 @@ def vulkan_blocks(text):
             cur = None
     return blocks
 
-def cuda_report(text):
-    """The first GGML_CUDA_OP_TIMING report of a log part: (compute calls, [[op, count, ms], ...]) or None"""
+def cuda_reports(text):
+    """The GGML_CUDA_OP_TIMING reports of a log part in order: [(compute calls, [[op, count, ms], ...]), ...]. With
+    =idle a report comes at the first compute after the GPU idled and holds the work since the last one, so the first
+    report of a request holds the end of the request before it; on the 3090 the GPU also idles while the CPU runs the
+    experts, and one request leaves many reports"""
     lines = text.splitlines()
+    out = []
     for i, line in enumerate(lines):
         m = re.match(r"cuda_op_timing \S+: (\d+) compute calls", line)
         if not m:
@@ -578,8 +582,24 @@ def cuda_report(text):
             if not r:
                 break
             ops.append([r[3].strip(), int(r[2]), float(r[1])])
-        return int(m[1]), ops
-    return None
+        out.append((int(m[1]), ops))
+    return out
+
+
+def cuda_work(this_text, next_text):
+    """The work of a request: its reports after the first (which holds the request before) and the first report of the
+    next request (the end of this one). (compute calls, [[op, count, ms], ...]) or None"""
+    reports = cuda_reports(this_text)[1:] + cuda_reports(next_text)[:1]
+    if not reports:
+        return None
+    total = {}
+    for _, ops in reports:
+        for op, c, ms in ops:
+            x = total.setdefault(op, [0, 0.0])
+            x[0] += c
+            x[1] += ms
+    return (sum(n for n, _ in reports),
+            sorted(([op, c, ms] for op, (c, ms) in total.items()), key=lambda o: -o[2]))
 
 def block_kind(block):
     """("target" | "head", tokens) of a GGML_VK_PERF_LOGGER block: the target has an expert matmul per layer, the MTP
@@ -977,8 +997,10 @@ def probe_rows(samples, depths, window):
 
 def probe_flags(rows):
     """a depth where the decode path differs from the prompt path much more than rounding does: the 90th percentile
-    of the KL ten times that of the prompt probes at that depth and above 0.002, or 10 points more tokens above 0.01.
-    The decode and prompt probes of one depth share the context, the reference ran the same batches"""
+    of the KL ten times that of the prompt probes at that depth and above 0.002, or 10 points more tokens above 0.01;
+    and a path whose top-1 agrees on less than 85% (the noise of the upstream reference on the real model reached 84%
+    with 32 probes a path, 31.10). The decode and prompt probes of one depth share the context, the reference ran the
+    same batches"""
     flags = {}
     by_depth = {}
     for r in rows:
@@ -989,7 +1011,7 @@ def probe_flags(rows):
             if (dec["kl_p90"] > 10 * pro["kl_p90"] and dec["kl_p90"] > 0.002) or dec["over_001"] > pro["over_001"] + 0.10:
                 flags[d] = "DECODE DIFFERS"
         for r in p.values():
-            if r["top1"] < 0.9:
+            if r["top1"] < 0.85:
                 flags[d] = (flags.get(d, "") + " LOW TOP1").strip()
     return flags
 
@@ -1005,7 +1027,7 @@ def quality(run, label, ctx, depths, qargs=None):
     ctx = native if ctx <= 0 else ctx
     if ctx > native:
         raise Fail(f"the context {ctx} is past the native context of the model, {native}")
-    window, dbatch = env_int("QA_WINDOW", 64), env_int("QA_DECODE_BATCH", 3)
+    window, dbatch = env_int("QA_WINDOW", 128), env_int("QA_DECODE_BATCH", 3)
     depths, positions, ranges = probe_plan(ctx, depths, window, dbatch)
     tokens = corpus_tokens(run, exe, model, ctx + 1)
     plan = {"context": ctx, "positions": positions, "tokens": str(tokens), "max_outputs": 32,
@@ -1480,6 +1502,7 @@ def cmd_profile():
                 answer = json.loads(raw)
                 if messages is None:
                     msgs.append({"role": "assistant", "content": answer["choices"][0]["message"].get("content") or ""})
+                slices[name + ":n"] = answer["timings"].get("predicted_n", n)
                 return answer["timings"]
 
             offset, depth = 0, 0
@@ -1548,12 +1571,13 @@ def cmd_profile():
                 entry["tg_groups"] = [[label, len(bl), [[o, c / len(bl), t / len(bl)] for o, c, t in sum_ops(bl)]]
                                       for label, bl in sorted(groups.items(), key=lambda g: -len(g[1]))]
             else:
-                big = [m.end() for m in re.finditer(r"ubatch timing: (\d+) tokens", pp_text) if int(m[1]) > 1024]
-                pp_r = cuda_report((pp_text + tg_text)[big[-1]:] if big else tg_text)
-                tg_r = cuda_report(end_text)
+                # the target and the MTP head together: the reports do not tell the graphs apart
+                pp_r = cuda_work(pp_text, tg_text)
+                tg_r = cuda_work(tg_text, end_text)
+                n_tg = max(1, int(slices.get(f"tg{d}:n", ntg)))
                 entry["pp"] = pp_r[1] if pp_r else []
                 entry["pp_graphs"] = pp_r[0] if pp_r else 0
-                entry["tg_groups"] = [["decode, per token", ntg, [[o, c / ntg, t / ntg] for o, c, t in tg_r[1]]]] if tg_r else []
+                entry["tg_groups"] = [["decode, all graphs per token", n_tg, [[o, c / n_tg, t / n_tg] for o, c, t in tg_r[1]]]] if tg_r else []
             out[str(d)] = entry
         return out
 

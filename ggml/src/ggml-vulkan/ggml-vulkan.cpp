@@ -14870,6 +14870,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
+        // fork: work recorded before this graph and not submitted yet (an async read of the last outputs or an async
+        // copy of a split input, the MTP draft steps at depth on the 395) goes out and is waited for here, so that the
+        // timestamps cover the graph alone; upstream asserts instead
+        if (!ctx->compute_ctx.expired()) {
+            ggml_vk_synchronize(ctx);
+        }
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;

@@ -2,6 +2,7 @@
 #include "lightning-indexer.cuh"
 #include "fattn-common.cuh"
 #include "convert.cuh"
+#include "fork/lightning-indexer-fork.inc" // fork: the token tile from two tokens
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
@@ -697,7 +698,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
             GGML_ABORT("fatal error");
         }
-    } else if (n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
+    } else if (n_embd == 128 && n_head == 4 && n_batch >= ggml_cuda_fork_lid_tile_min()) { // fork: LIGHTNING_INDEXER_TILE_TOKENS upstream
         // too few heads for a wmma tile, the tile kernel shares the keys across the tokens
         constexpr int WARPS_PER_BLOCK = 8;
         constexpr int K_VECS_PER_BLOCK = 64;
