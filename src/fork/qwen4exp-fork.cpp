@@ -495,6 +495,35 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_hc_mix(
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
 
+    // the normalized streams in f16 (LLAMA_HC_F16, 0 = f32 as upstream). three nodes read them (the down projection, the
+    // gated mean and the injection), each a pass over hc_dim floats per token; the reference keeps the whole residual in
+    // FP8 "with almost no loss" (tech report, 2.2), the residual itself stays f32 here. on Vulkan only, which stores
+    // them in f16 in the combine before (HC_POST_NORM_F16), quantizes them for the int8 matmul from f16 and reads them in
+    // the mean, and from 32 tokens, where that fusion runs. the 395 (14.10): -2.7 to -3.0 percent of the GPU time of a
+    // prompt ubatch at 0 / 15K / 118K, KLD 0.015284 against 0.015465 (13.10)
+    static const bool hc_f16 = [] {
+        return llama_fork_env_int("LLAMA_HC_F16", 1) != 0;
+    }();
+    if (hc_f16 && il >= 0 && nt >= 32 && cparams.fused_dsv4_hc_pre &&
+            qwen4exp_dev_is_vulkan(model.dev_layer(il))) {
+        xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+
+        // the inputs of the combine before (block output, residual, injection) stay alive until the f16 copy is
+        // allocated: half the size of the f32 streams, it fit where they had been freed, and Vulkan then dropped the
+        // fusion of the combine with the norm and the copy, whose shader still reads them (395, 13.10: 45 of 93
+        // fused). the copy reads only its src[0], extra sources only order the allocation
+        if (x->op == GGML_OP_DSV4_HC_POST) {
+            const ggml_tensor * w = x->src[2]; // 2*sigmoid(inject/hc): scale <- sigmoid <- scale <- inject
+            ggml_tensor * inj = w && w->src[0] && w->src[0]->src[0] ? w->src[0]->src[0]->src[0] : nullptr;
+            ggml_tensor * keep[] = { x->src[0], x->src[1], inj };
+            int slot = 2;
+            for (ggml_tensor * t : keep) {
+                if (t != nullptr && slot < GGML_MAX_SRC) {
+                    xn->src[slot++] = t;
+                }
+            }
+        }
+    }
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
@@ -1139,6 +1168,12 @@ public:
     ggml_tensor * dirty_pos   = nullptr; // I32 [4*n_dirty*n_stream]
     ggml_tensor * dirty_rows  = nullptr; // I32 [n_dirty, n_stream], rows of the pool view
 
+    // the views of the inputs that every layer of this ratio reads, built once by the first layer: an input sits on the
+    // CPU, and the scheduler copies each distinct source of a node on another backend, so a view per layer was a copy
+    // per layer (see qsa_kq_mask_rows)
+    ggml_tensor * blk_cells_3d = nullptr; // I32 [ratio, n_blocks, n_stream]
+    ggml_tensor * bias_lid     = nullptr; // F16 [n_blocks, n_tokens/n_stream, 1, n_stream], the lightning indexer's mask
+
     // when the budget covers the cache the indexer is skipped and only k_idxs is built
     bool    bypass = false;
     int64_t budget = 0;
@@ -1179,8 +1214,11 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->set_input_qsa_pos(cell_pos, tok_pos, tok_half, ubatch);
 
-        const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
-        ggml_backend_tensor_set(neg_inf, &drop, 0, sizeof(drop));
+        // with LLAMA_QSA_FA_LIST no mask is filled and nothing reads the -inf, so it is never allocated
+        if (neg_inf->buffer) {
+            const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+            ggml_backend_tensor_set(neg_inf, &drop, 0, sizeof(drop));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -1331,8 +1369,10 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
 
         // blk_cells row b lists the cells of block b, so this turns the chosen blocks into cells
         // an i32 source keeps get_rows in i32, which is what the mask build wants
-        ggml_tensor * gathered = ggml_get_rows(ctx0,
-                ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks, n_stream),
+        if (!inp->blk_cells_3d) {
+            inp->blk_cells_3d = ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks, n_stream);
+        }
+        ggml_tensor * gathered = ggml_get_rows(ctx0, inp->blk_cells_3d,
                 ggml_reshape_2d(ctx0, top_k_blk, width_blk*n_tps, n_stream));
 
         // [r, width_blk*n_tps, n_stream] -> [n_top_k, n_batch, 1, n_stream], as build_attn_qsa reads it
@@ -1448,7 +1488,14 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(
         ggml_tensor * k4 = ggml_view_4d(ctx0, pool, idx_dim, 1, n_blocks, n_stream,
                 pool->nb[1], pool->nb[1], n_pool*pool->nb[1], 0);
         ggml_tensor * w  = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, n_tps, 1, n_stream), 1.0f);
-        ggml_tensor * m  = ggml_reshape_4d(ctx0, bias, n_blocks, n_tps, 1, n_stream);
+
+        // one view for all layers, as upstream passes its mask input itself: with a view per layer the 395 held 12
+        // copies of the bias at once with LLAMA_QSA_LID=1 (512 MiB each at 262144 x 4096, compute buffer 9720 MiB
+        // against 3931 for the head matmul, 31.10); with the experts on the CPU (the 3090) each copy was an upload
+        if (!inp->bias_lid) {
+            inp->bias_lid = ggml_reshape_4d(ctx0, bias, n_blocks, n_tps, 1, n_stream);
+        }
+        ggml_tensor * m  = inp->bias_lid;
 
         ggml_tensor * lid = ggml_lightning_indexer(ctx0, q4, k4, w, m); // [n_blocks, n_tps, 1, n_stream]
 
@@ -1697,6 +1744,29 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     const bool from_pos  = pos_mode && cparams.causal_attn && !hparams.use_alibi && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
         qsa_mask_pos_ubatch(ubatch) && (!pos_multi || mctx_hyb->qsa_pos_multi_ok(&ubatch));
 
+    // fork: on Vulkan the attention can take the selected cells and their values as a list (GGML_OP_FLASH_ATTN_LIST):
+    // no -inf mask of n_kv x n_batch (2 GiB at 262144 x 4096), no set_rows into it and no pre-pass of the sparse path
+    // that finds the cells in it again; on the 395 (13.10, 122880, ubatch 4096) the pre-pass took ~90 ms and the fill
+    // of the mask 52 ms, both growing with the depth. only where Vulkan takes the sparse path anyway (KV at least
+    // 2 x n_top_k and 4096), the dense attention over the mask is faster below (13.10: dense 821.7 against 878.2 t/s
+    // at depth 4096, equal at 2048). 13.10 on the 395: PP at 122880 810.4 against 781.8 t/s, the attention 810 against
+    // 909 ms, the mask fill 52 -> 3 ms, TG 25.74 against 25.39, KLD 0.015593 against 0.015741, FLASH_ATTN_LIST 7/7;
+    // the compute buffer stays (its peak is in the indexer). LLAMA_QSA_FA_LIST: 1 = on (default), 0 = the mask
+    static const int list_mode = [] {
+        return (int) llama_fork_env_int("LLAMA_QSA_FA_LIST", 1);
+    }();
+    // LLAMA_QSA_FA_LIST_MIN: the KV size from which, -1 (default) = the sparse threshold of Vulkan above
+    static const int64_t list_min = [] {
+        return llama_fork_env_int("LLAMA_QSA_FA_LIST_MIN", -1);
+    }();
+    bool use_list = false;
+    // A partial final block can need repeated live cells when every cache cell is occupied.
+    if (list_mode == 1 && from_pos && cparams.flash_attn && n_kv_m % hparams.dsv4_compress_ratios[il] == 0) {
+        ggml_backend_dev_t dev_l = model.dev_layer(il);
+        const bool vk_l = qwen4exp_dev_is_vulkan(dev_l);
+        use_list = vk_l && n_kv_m >= (list_min >= 0 ? list_min : std::max<int64_t>(4096, 2*top_k->ne[0]));
+    }
+
     ggml_tensor * kq_mask_all = nullptr;
     ggml_tensor * kept        = nullptr;
 
@@ -1746,7 +1816,9 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, kept);
 
         // a node, so that the allocator frees it after the attention as it did the fill of the mask view
-        kq_mask_all = ggml_repeat_4d(ctx0, qsa_pos_inp->neg_inf, 1, n_kv_m, n_tps_m, n_str_m);
+        if (!use_list) {
+            kq_mask_all = ggml_repeat_4d(ctx0, qsa_pos_inp->neg_inf, 1, n_kv_m, n_tps_m, n_str_m);
+        }
     } else {
         // view of the mask with rows of size 1, to read the selected rows out of:
         // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream].
@@ -1772,6 +1844,39 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    if (use_list) {
+        // the values f16 as the attention reads them, [1, n_top_k, n_batch, n_stream] -> [n_top_k, n_batch, 1, n_stream]
+        ggml_tensor * vals = ggml_cast(ctx0, kept, GGML_TYPE_F16);
+        vals = ggml_reshape_4d(ctx0, vals, top_k->ne[0], top_k->ne[1], 1, top_k->ne[3]);
+        ggml_tensor * idx = ggml_is_contiguous(top_k_3d) ? top_k_3d : ggml_cont(ctx0, top_k_3d);
+
+        // the attention as build_attn_mha does it for ggml_flash_attn_ext
+        const bool v_trans  = v->nb[1] > v->nb[2];
+        const auto n_stream = k->ne[3];
+        q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (v_trans) {
+            v = ggml_transpose(ctx0, v);
+        }
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+        ggml_tensor * cur = ggml_flash_attn_list(ctx0, q, k, v, vals, idx, kq_scale);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot[il]) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
+        }
+        return cur;
+    }
 
     // modify KQ mask by restoring the elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])

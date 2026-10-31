@@ -17,7 +17,8 @@
 //   with a position at or past it in a cell or a token takes the dense mask, every other one the mask from positions,
 //   both with the logits of the dense run. QSA keeps its positions below n_kv, so the 2^18 of the default takes a
 //   cache of more than 262144 cells to cross: the test lowers the stride to 2^7 (LLAMA_QSA_POS_STRIDE_LOG2)
-// - no repeated cells in a selection: the padding of a partial block is empty cells hidden from every sequence
+// - no repeated cells in a selection: the padding of a partial block is empty cells hidden from every sequence (Vulkan
+//   FLASH_ATTN_LIST counts every entry of its list)
 // - a prompt copied to other sequences: shared cells, so the dense mask and nothing carried, the logits as alone
 //
 // usage: test-qsa-multi-fork -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>]

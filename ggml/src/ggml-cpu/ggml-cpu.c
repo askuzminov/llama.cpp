@@ -1350,7 +1350,8 @@ UseGgmlGemm1:;
         // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
         const bool widen = src1->type != GGML_TYPE_F32;
 
-        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        // fork: or packed from F16 into a quantized vec_dot_type through F32 (the f16 hc read of qwen4exp)
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     #if 0
@@ -1376,7 +1377,15 @@ UseGgmlGemm1:;
 
                     const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
 
-                    if (src1->type == GGML_TYPE_F16) {
+                    if (src1->type == GGML_TYPE_F16 && vec_dot_type != GGML_TYPE_F32) {
+                        // fork: through F32 in pieces of whole blocks
+                        float tmp[1024];
+                        for (int64_t k = 0; k < ne10_block_size; k += 1024) {
+                            const int64_t nk = MIN(1024, ne10_block_size - k);
+                            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row + k, tmp, nk);
+                            from_float(tmp, (char *) wdata_row + (k/bs)*nbw0, nk);
+                        }
+                    } else if (src1->type == GGML_TYPE_F16) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else if (src1->type == GGML_TYPE_BF16) {
                         ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
@@ -2055,6 +2064,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_FLASH_ATTN_LIST: // fork
+            {
+                ggml_compute_forward_flash_attn_list(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2461,6 +2474,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_LIST: // fork
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -3018,6 +3032,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TOP_K:
                     {
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                    } break;
+                case GGML_OP_FLASH_ATTN_LIST: // fork: K, V rows and the V accumulator per thread
+                    {
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
+                        cur += sizeof(float)*(DK + 2*DV + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {

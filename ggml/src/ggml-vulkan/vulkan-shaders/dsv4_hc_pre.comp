@@ -1,6 +1,9 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
+#ifdef X_F16
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 
 // Collapse the hc residual streams of a token into one, weighted per stream:
 //
@@ -31,7 +34,12 @@ layout(push_constant) uniform parameter
     float scale;
 };
 
+// fork: X_F16, the normalized streams in f16 (qwen4exp under LLAMA_HC_F16)
+#ifdef X_F16
+layout(binding = 0, std430) readonly buffer X { float16_t data_x[]; };
+#else
 layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+#endif
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
 layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
 
@@ -68,7 +76,7 @@ void main() {
         } else {
             wv = w[ih];
         }
-        result = fma(data_x[xb + ih * nbx1], wv, result);
+        result = fma(float(data_x[xb + ih * nbx1]), wv, result);
     }
 
     data_d[d_offset + i0 * nbd0 + it * nbd1] = scale * result;

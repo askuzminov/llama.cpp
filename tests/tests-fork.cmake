@@ -17,6 +17,10 @@ llama_build_and_test(test-env-fork.cpp)
 # graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines
 llama_build(test-micro-fork.cpp LINK ggml)
 
+# the f16 hc read of qwen4exp (LLAMA_HC_F16) and other formats and places of rounding emulated on the CPU, on a deep
+# model built from the generated qwen4exp-moe.gguf: a measurement of minutes, built but not a ctest
+llama_build(test-hc-round-fork.cpp)
+
 # the elastic buffers of the backends (CUDA VMM, Vulkan sparse buffers) on every GPU device that has them, skipped
 # elsewhere; 01-check runs it on the machines (CHECKUNITS)
 llama_build_and_test(test-elastic-buffer-fork.cpp)

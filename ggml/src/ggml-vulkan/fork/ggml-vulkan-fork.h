@@ -18,6 +18,18 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_edges {
     { 5, 0, 4 }, // mul->src[0]      == rms_norm
 };
 
+// hc_post_norm with the normalized streams then copied to f16 (the f16 hc read of qwen4exp, LLAMA_HC_F16): the shader
+// stores them in f16 itself, the f32 ones are never written
+static constexpr std::initializer_list<ggml_op> hc_post_norm_f16_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
+
+static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_f16_edges {
+    { 1, 0, 0 }, // sigmoid->src[0]  == scale
+    { 2, 0, 1 }, // scale->src[0]    == sigmoid
+    { 3, 2, 2 }, // hc_post->src[2]  == scale (post)
+    { 4, 0, 3 }, // rms_norm->src[0] == hc_post
+    { 5, 0, 4 }, // mul->src[0]      == rms_norm
+    { 6, 0, 5 }, // cpy->src[0]      == mul
+};
 
 struct vk_op_dsv4_hc_post_norm_push_constants {
     uint32_t n_embd;

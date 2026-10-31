@@ -795,6 +795,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_f16; // fork: from an f16 source (qwen4exp, LLAMA_HC_F16)
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -951,6 +952,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
+    vk_pipeline pipeline_dsv4_hc_pre_f16;       // fork: f16 streams (qwen4exp, LLAMA_HC_F16)
+    vk_pipeline pipeline_dsv4_hc_pre_gated_f16;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1033,6 +1036,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_concat_transpose_16, pipeline_concat_transpose_32;
     vk_pipeline pipeline_dsv4_hc_post_norm_f32;
+    vk_pipeline pipeline_dsv4_hc_post_norm_f16n; // fork: the normalized streams stored in f16
     // RMS norm of rows up to 512 columns, several rows per workgroup: [weight][sigmoid gate]
     vk_pipeline pipeline_rms_norm_rows_f32[2][2];
     // SSM_CONV (+ SILU) over CONCAT(state, x) without the concat: [silu]
@@ -1329,6 +1333,7 @@ struct ggml_backend_vk_context {
     // fork: see fork/ggml-vulkan-fork.h
     // HC_POST_GATE + the RMS_NORM and MUL of the next hc mix
     bool fused_hc_post_norm {};
+    bool fused_hc_post_norm_f16 {}; // fork: with the cpy of the normalized streams to f16 fused in
     bool fused_mm_relu {};
     // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
     bool fused_mm_headsum {};

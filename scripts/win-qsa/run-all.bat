@@ -7,16 +7,13 @@ rem RUN_LONG=0 there leave a step out. serve.bat is not part of it and has to be
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem the questions of 30.10 (README): the lightning indexer as the one indexer of the Vulkan graph (micro: the shader
-rem against the head matmul inside the op; check: accuracy; profile: time and compute buffer), and whether the
-rem deferred rollback of the delta net pays (profile)
-if /i not "%BACKEND%"=="vulkan" goto :cuda_arms
-if not defined QA_MARMS set "QA_MARMS=default;scalar GGML_VK_LID_HEADSUM=0"
-if not defined QA_QARMS set "QA_QARMS=default;lid LLAMA_QSA_LID=1"
-if not defined QA_PARMS set "QA_PARMS=default;lid LLAMA_QSA_LID=1;nolazy LLAMA_GDN_LAZY=0"
-goto :arms_done
-:cuda_arms
-if not defined QA_PARMS set "QA_PARMS=default;nolazy LLAMA_GDN_LAZY=0"
+rem the questions of 31.10 (README): the lightning indexer as the one indexer of the Vulkan graph, with the head
+rem matmul inside the op at every token count and one copy of its mask; the attention over the list of cells and
+rem the f16 hc streams, back on Vulkan since 31.10 evening (check: the accuracy against upstream and of the decode
+rem path; profile: time and compute buffer without each); the 3090 runs the defaults
+if /i not "%BACKEND%"=="vulkan" goto :arms_done
+if not defined QA_QARMS set "QA_QARMS=default;lid LLAMA_QSA_LID=1;nolist LLAMA_QSA_FA_LIST=0;nohcf16 LLAMA_HC_F16=0"
+if not defined QA_PARMS set "QA_PARMS=default;lid LLAMA_QSA_LID=1;nolist LLAMA_QSA_FA_LIST=0;nohcf16 LLAMA_HC_F16=0"
 :arms_done
 rem the probes of 02-long take the default only, the variants of the probes are a question for 01-check
 if not defined LONG_QARMS set "LONG_QARMS=default"

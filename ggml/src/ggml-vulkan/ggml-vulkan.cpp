@@ -220,11 +220,12 @@ uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const uint64_t size_N = node->ne[3] / OC * node->ne[0] * node->ne[1] * node->ne[2];
         return OC * size_N * (size_K + (size_K - 1));
     }
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_FLASH_ATTN_LIST) {
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
-        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+        const int64_t n_kv = node->op == GGML_OP_FLASH_ATTN_LIST ? node->src[5]->ne[0] : k->ne[1];
+        return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * n_kv * q->ne[3];
     }
     return 0;
 }
@@ -3339,8 +3340,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4_f16, "quantize_q8_1_x4_f16", quantize_q8_1_x4_f16_subgroup_len, quantize_q8_1_x4_f16_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4_f16, "quantize_q8_1_x4_f16", quantize_q8_1_x4_f16_len, quantize_q8_1_x4_f16_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
     }
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
@@ -3718,9 +3721,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f16,        "dsv4_hc_pre_f16",        dsv4_hc_pre_f16_len,  dsv4_hc_pre_f16_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f16,  "dsv4_hc_pre_gated_f16",  dsv4_hc_pre_f16_len,  dsv4_hc_pre_f16_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f32,  "dsv4_hc_post_norm_f32",  dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f16n, "dsv4_hc_post_norm_f16n", dsv4_hc_post_norm_f16n_len, dsv4_hc_post_norm_f16n_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
     // fork: short-row RMS norm (32 x 8 invocations, a row per 32) and the conv over the concat sources
     for (uint32_t w = 0; w < 2; ++w) {
         for (uint32_t g = 0; g < 2; ++g) {
@@ -6633,8 +6639,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
+    // fork: or from an f16 src1, the f16 hc read of qwen4exp (LLAMA_HC_F16) feeding int8 matmuls
+    const bool y_f16_q8 = src1->type == GGML_TYPE_F16 && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
     const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
-                                src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 &&
+                                (src1->type == GGML_TYPE_F32 || y_f16_q8) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 &&
                                 !ggml_vk_mul_mat_int8_off(ctx, dst, ne10) && ggml_vk_src1_prec_allows_q8(dst);
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
@@ -6701,7 +6709,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+        to_q8_1 = src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_quantize_q8_1_x4_f16 : ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
     {
@@ -7508,6 +7516,10 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     vk_pipeline pipeline = gated ? ctx->device->pipeline_dsv4_hc_pre_gated_f32 : ctx->device->pipeline_dsv4_hc_pre_f32;
+    if (x->type == GGML_TYPE_F16) {
+        // fork: f16 streams (qwen4exp, LLAMA_HC_F16)
+        pipeline = gated ? ctx->device->pipeline_dsv4_hc_pre_gated_f16 : ctx->device->pipeline_dsv4_hc_pre_f16;
+    }
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -8531,6 +8543,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // Sparse mask hint (op_params[4]): compact the <= n_kv_max finite positions and gather only those.
     const int32_t n_kv_max = mask ? ggml_get_op_params_i32(dst, 4) : 0;
+    // fork: GGML_OP_FLASH_ATTN_LIST gives the list itself (src[5], the cells of each row) and the values of its slots as
+    // the mask: always the sparse path, without the pre-pass, see ggml_flash_attn_list
+    const ggml_tensor * list_idx = dst->op == GGML_OP_FLASH_ATTN_LIST ? dst->src[5] : nullptr;
     static const bool disable_sparse = getenv("GGML_VK_FA_SPARSE_DISABLE") != nullptr;
     const bool kv_f16 = k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16;
     // coopmat2 vector decode requires 8B strides.
@@ -8539,6 +8554,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
     auto sparse_ok = [&](FaCodePath path) {
+        if (list_idx) {
+            return path != FA_COOPMAT2; // fork: no dense mask to fall back to (supports_op keeps coopmat2 out)
+        }
         // cm2 dense is fast, so it needs a larger reduction to win.
         // With quantized K/V, sparse only breaks even around 16x (measured on RDNA3/RDNA4).
         const int64_t min_ratio = path == FA_COOPMAT2 ? 4 : (kv_f16 ? 2 : 16);
@@ -8563,7 +8581,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return val != nullptr && atoi(val) != 0;
     }();
 
-    if ((N <= 8 || (!sparse_upstream && sparse_gqa && sparse_ok(tuning_params.path))) &&
+    if ((N <= 8 || (!sparse_upstream && sparse_gqa && sparse_ok(tuning_params.path)) || list_idx) &&
         qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
@@ -8596,7 +8614,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const int64_t row_tile_ratio = 8;
 
     const int64_t group_ratio = group_ratio_env >= 0 ? group_ratio_env : 1;
-    const bool    multi_row   = !sparse_upstream && sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1;
+    const bool    multi_row   = !sparse_upstream && sparse_shape_ok && gqa_ratio == 1 && tuning_params.block_rows > 1 && !list_idx;
+
+    // fork: a list without the fold needs a tile of one row
+    if (list_idx && gqa_ratio == 1 && tuning_params.block_rows > 1) {
+        tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 1, KV, k_type_eff, v_type_eff, f32acc);
+        GGML_ASSERT(tuning_params.block_rows == 1);
+    }
 
     // the tile keeps its rows and walks their union. Without the tile size in the threshold the
     // list can be as long as KV, and then the gather costs a pre-pass and buys nothing
@@ -8611,7 +8635,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // block_rows == 1 only happens on the scalar path, where the tile is one query row
-    const bool use_sparse = sparse_upstream ?
+    const bool use_sparse = list_idx ? true : sparse_upstream ?
         sparse_shape_ok && (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1)) :
         sparse_shape_ok && (use_group || gqa_ratio > 1 || tuning_params.block_rows == 1);
 
@@ -8652,6 +8676,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    // fork: the list of GGML_OP_FLASH_ATTN_LIST, the mask values by slot (SPARSE_LIST of flash_attn_base.glsl)
+    if (list_idx) {
+        fa_pipeline_state.flags |= 64;
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -8702,7 +8730,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // case is rows_per_group * n_kv_max cells but never more than KV.
     const uint32_t sparse_rows_per_group = (gqa_ratio > 1) ? 1 : Br;
     const uint32_t sparse_n_groups       = CEIL_DIV(nem1, sparse_rows_per_group);
-    const uint32_t sparse_capacity       = std::min<uint32_t>(sparse_rows_per_group * (uint32_t)n_kv_max, KV);
+    const uint32_t sparse_capacity       = list_idx ? (uint32_t) list_idx->ne[0] : std::min<uint32_t>(sparse_rows_per_group * (uint32_t)n_kv_max, KV);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
     // Sparse: split_kv carries the list capacity, split_k partitions its blocks for occupancy.
@@ -8811,13 +8839,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Sparse index scratch reuses prealloc_y (mutually exclusive with mask opt).
-    const uint64_t sparse_idx_size = use_sparse
+    const uint64_t sparse_idx_size = use_sparse && !list_idx
         ? sizeof(int32_t) * (uint64_t)sparse_capacity * sparse_n_groups * nem2 * nem3
         : 0;
     vk_pipeline sparse_compact_pipeline = ctx->device->fa_sparse_compact_use_subgroups
         ? ctx->device->pipeline_fa_sparse_compact_subgroup
         : ctx->device->pipeline_fa_sparse_compact;
-    if (use_sparse) {
+    if (use_sparse && !list_idx) {
         ggml_pipeline_request_descriptor_sets(ctx, sparse_compact_pipeline, 1);
         if (ctx->prealloc_size_y < sparse_idx_size) {
             ctx->prealloc_size_y = sparse_idx_size;
@@ -8840,8 +8868,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    if (use_mask_opt || use_sparse) {
+    vk_subbuffer sparse_buf = list_idx ? ggml_vk_tensor_subbuffer(ctx, list_idx) :
+                              use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    if (use_mask_opt || (use_sparse && !list_idx)) {
         // the mask opt bits and the sparse index list overwrite a matmul input converted into prealloc_y
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
@@ -8925,7 +8954,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    if (use_sparse)
+    if (use_sparse && !list_idx)
     {
         const vk_op_flash_attn_sparse_compact_push_constants sc_pc = {
             KV,
@@ -9060,7 +9089,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (use_mask_opt || use_sparse) {
+    if (use_mask_opt || (use_sparse && !list_idx)) {
         ctx->prealloc_y_need_sync = true;
     }
 }
@@ -13280,6 +13309,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_FLASH_ATTN_LIST: // fork: the sparse path over the given list
+        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, nullptr, node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -15443,6 +15477,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         &rms_norm_mul_rope_view_set_rows_pattern,
         &rms_norm_view_set_rows_pattern,
         &rope_view_set_rows_pattern,
+        &hc_post_norm_f16_pattern, // fork: before the shorter one, so the cpy stays next to it
         &hc_post_norm_pattern,
         &hc_post_gate_pattern,
         &rms_norm_mul_sigmoid_mul_pattern,
@@ -16283,6 +16318,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_FLASH_ATTN_LIST: // fork: the scalar and coopmat1 sparse paths walk the list
+            if (device->coopmat2 || op->src[5]->type != GGML_TYPE_I32 || op->src[3]->type != GGML_TYPE_F16) {
+                return false;
+            }
+            [[fallthrough]];
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;
@@ -16593,7 +16633,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 for (uint32_t i = 0; i < GGML_MAX_SRC; ++i) {
-                    if (op->src[i] && op->src[i]->type != GGML_TYPE_F32) {
+                    // fork: the streams of DSV4_HC_PRE may be f16 (qwen4exp, LLAMA_HC_F16)
+                    const bool f16_ok = op->op == GGML_OP_DSV4_HC_PRE && i == 0;
+                    if (op->src[i] && op->src[i]->type != GGML_TYPE_F32 && !(f16_ok && op->src[i]->type == GGML_TYPE_F16)) {
                         return false;
                     }
                 }
@@ -17311,7 +17353,7 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
         name += "(" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," + std::to_string(node->ne[2]) + "," + std::to_string(node->ne[3]) + ")";
         return fusion_str + name;
     }
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_FLASH_ATTN_LIST) {
         const ggml_tensor * dst = node;
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];

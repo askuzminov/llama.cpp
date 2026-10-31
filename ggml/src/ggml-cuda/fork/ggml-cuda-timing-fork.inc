@@ -435,6 +435,20 @@ static void ggml_cuda_op_timing_fork_report(const char * name, ggml_cuda_op_timi
         fprintf(stderr, "cuda_op_timing %s: %9.3f ms %8lld x %8.2f us  %s\n", name, 1e-3 * rows[r].second.second,
                 (long long) rows[r].second.first, rows[r].second.second / (double) rows[r].second.first, rows[r].first.c_str());
     }
+    // the rows past the first 40 by op (a fused group keeps its ops), so that the rows add up to the total: a label
+    // carries the shape, and a decode report has hundreds of them (scripts/win-qsa sums the rows per kind of op)
+    std::map<std::string, std::pair<int64_t, double>> rest;
+    for (size_t r = 40; r < rows.size(); ++r) {
+        const std::string & label = rows[r].first;
+        const size_t cut = label.find_first_of(" [(", label.compare(0, 6, "FUSED ") == 0 ? 6 : 0);
+        auto & x = rest[label.substr(0, cut) + " (rest)"];
+        x.first  += rows[r].second.first;
+        x.second += rows[r].second.second;
+    }
+    for (const auto & x : rest) {
+        fprintf(stderr, "cuda_op_timing %s: %9.3f ms %8lld x %8.2f us  %s\n", name, 1e-3 * x.second.second,
+                (long long) x.second.first, x.second.second / (double) x.second.first, x.first.c_str());
+    }
     fflush(stderr);
     t->agg.clear();
     t->n_calls = 0;

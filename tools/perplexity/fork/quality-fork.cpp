@@ -147,20 +147,27 @@ static int run(common_params & params, const json & plan) {
         require(token >= 0 && token < vocab, "token outside vocabulary");
     }
     const auto reference = fs::u8path(plan.at("reference").get<std::string>());
-    const auto temporary = fs::u8path(plan.at("reference").get<std::string>() + ".tmp");
     std::ofstream out;
     std::ifstream in;
     const std::vector<uint32_t> header = {1, uint32_t(context), uint32_t(vocab), uint32_t(positions.size())};
     const uint64_t header_bytes = 8 + header.size() * 4 + tokens.size() * 4 + positions.size() * 4;
     require(positions.size() <= (UINT64_MAX - header_bytes) / (uint64_t(vocab) * sizeof(float)), "reference size overflow");
     const uint64_t expected_bytes = header_bytes + uint64_t(positions.size()) * vocab * sizeof(float);
-    if (action == "capture") {
-        out.open(temporary, std::ios::binary | std::ios::trunc);
+    // compare can also capture its own logits ("capture": a path), as the reference of a second run of the same build
+    // through other batches (the decode path against the prompt path at the same positions)
+    const bool capture = action == "capture" || plan.contains("capture");
+    const std::string captured_path = action == "capture" ? plan.at("reference").get<std::string>()
+                                                          : plan.value("capture", std::string());
+    const auto captured     = fs::u8path(captured_path);
+    const auto captured_tmp = fs::u8path(captured_path + ".tmp");
+    if (capture) {
+        out.open(captured_tmp, std::ios::binary | std::ios::trunc);
         out.write("LQFREF01", 8);
         write_values(out, header);
         write_values(out, tokens);
         write_values(out, positions);
-    } else {
+    }
+    if (action == "compare") {
         require(fs::file_size(reference) == expected_bytes, "wrong reference size");
         in.open(reference, std::ios::binary);
         char magic[8];
@@ -202,10 +209,11 @@ static int run(common_params & params, const json & plan) {
             const double z = log_sum_exp(logits, vocab);
             const auto label = tokens[output.second + 1];
             json sample = {{"position", output.second}, {"nll", z - logits[label]}, {"decode", decode}};
-            if (action == "capture") {
+            if (capture) {
                 out.write(reinterpret_cast<const char *>(logits), size_t(vocab) * sizeof(float));
                 require(out.good(), "cannot write logits");
-            } else {
+            }
+            if (action == "compare") {
                 auto ref = read_values<float>(in, size_t(vocab));
                 const double rz = log_sum_exp(ref.data(), vocab);
                 double kl = 0, tv = 0, max_diff = 0;
@@ -228,10 +236,10 @@ static int run(common_params & params, const json & plan) {
             std::cerr << "processed " << processed << '/' << context << ", probes " << samples.size() << '/' << positions.size() << '\n';
         }
     }
-    if (action == "capture") {
+    if (capture) {
         out.close();
-        require(out.good() && fs::file_size(temporary) == expected_bytes, "incomplete reference");
-        fs::rename(temporary, reference);
+        require(out.good() && fs::file_size(captured_tmp) == expected_bytes, "incomplete reference");
+        fs::rename(captured_tmp, captured);
     }
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     write_json(plan.at("report"), {{"context", context}, {"processed", processed}, {"vocab", vocab},

@@ -567,13 +567,15 @@ def vulkan_blocks(text):
 
 def cuda_reports(text):
     """The GGML_CUDA_OP_TIMING reports of a log part in order: [(compute calls, [[op, count, ms], ...]), ...]. With
-    =idle a report comes at the first compute after the GPU idled and holds the work since the last one, so the first
-    report of a request holds the end of the request before it; on the 3090 the GPU also idles while the CPU runs the
-    experts, and one request leaves many reports"""
+    =idle a report comes at a compute call that starts 300 ms or more after the one before and holds the calls since the
+    last report, so the first report of a request holds the end of the request before it (when that one computed); on
+    the 3090 the CPU experts make such gaps inside a prompt too, and one request leaves many reports. A report lists its
+    40 longest labels and, since 31.10, the rest by op ("OP (rest)"); what the lines of an older report leave out of its
+    total is a row named (unlisted)"""
     lines = text.splitlines()
     out = []
     for i, line in enumerate(lines):
-        m = re.match(r"cuda_op_timing \S+: (\d+) compute calls", line)
+        m = re.match(r"cuda_op_timing \S+: (\d+) compute calls, \d+ ops, ([\d.]+) ms of kernels", line)
         if not m:
             continue
         ops = []
@@ -582,6 +584,9 @@ def cuda_reports(text):
             if not r:
                 break
             ops.append([r[3].strip(), int(r[2]), float(r[1])])
+        rest = float(m[2]) - sum(o[2] for o in ops)
+        if rest > 0.01:
+            ops.append(["(unlisted)", 0, rest])
         out.append((int(m[1]), ops))
     return out
 
@@ -969,25 +974,31 @@ def corpus_tokens(run, exe, model, count):
 
 
 def probe_plan(ctx, depths, window, decode_batch):
-    """the probe positions: the last window positions before each depth, the second half of each window through the
-    decode path (batches of decode_batch tokens), the first half in the prompt batch; the context end is a depth"""
+    """the probe positions: the last window positions before each depth (the context end is a depth); and the decode
+    ranges of the second run of a variant, the whole windows in batches of decode_batch tokens (the decode path)"""
     depths = sorted({min(ctx, d) for d in depths if d >= window} | {ctx})
     positions = sorted({p for d in depths for p in range(d - window, d)})
-    ranges = [[d - window // 2, d] for d in depths] if decode_batch > 0 else []
+    ranges = []
+    for d in depths if decode_batch > 0 else []:
+        if ranges and ranges[-1][1] >= d - window:
+            ranges[-1][1] = d
+        else:
+            ranges.append([d - window, d])
     return depths, positions, ranges
 
 
-def probe_rows(samples, depths, window):
-    """per depth and path: the KL of the reference to the variant (median, 90th percentile), the share of tokens above
-    0.01 and above 0.5, the top-1 agreement and the mean NLL difference"""
+def probe_rows(prompt, decode, depths, window):
+    """per depth and path: the KL to the reference (median, 90th percentile), the share of tokens above 0.01 and above
+    0.5, the top-1 agreement and the mean NLL difference. prompt: the samples of the prompt path against the reference
+    build; decode: the decode path against the prompt path of the same variant, at the same positions"""
     out = []
     for d in depths:
-        for decode in (False, True):
-            s = [x for x in samples if d - window <= x["position"] < d and bool(x.get("decode")) == decode]
+        for path, samples in (("prompt", prompt), ("decode", decode)):
+            s = [x for x in samples if d - window <= x["position"] < d]
             if not s:
                 continue
             kl = stats([x["kl"] for x in s])
-            out.append({"depth": d, "path": "decode" if decode else "prompt", "n": len(s), "kl_median": kl["median"],
+            out.append({"depth": d, "path": path, "n": len(s), "kl_median": kl["median"],
                         "kl_p90": kl["p90"], "kl_max": kl["max"],
                         "over_001": sum(x["kl"] > 0.01 for x in s) / len(s), "over_05": sum(x["kl"] > 0.5 for x in s),
                         "top1": sum(bool(x["top1_equal"]) for x in s) / len(s),
@@ -996,30 +1007,31 @@ def probe_rows(samples, depths, window):
 
 
 def probe_flags(rows):
-    """a depth where the decode path differs from the prompt path much more than rounding does: the 90th percentile
-    of the KL ten times that of the prompt probes at that depth and above 0.002, or 10 points more tokens above 0.01;
-    and a path whose top-1 agrees on less than 85% (the noise of the upstream reference on the real model reached 84%
-    with 32 probes a path, 31.10). The decode and prompt probes of one depth share the context, the reference ran the
-    same batches"""
+    """per depth: DECODE DIFFERS where the decode path strays from the prompt path of the same variant at the same
+    positions more than rounding does: the 90th percentile of the KL above QA_DECODE_P90 (0.02). Single tokens can go
+    far where rounding flips a near tie of the block selection (Mac Vulkan0, test model at top-k 16, 31.10: p90 0.001 -
+    0.004, up to 4 tokens above 0.5 of 128, the CPU 0). LOW TOP1 where the prompt path agrees with the reference build
+    on less than 85% of the tokens (the noise of the upstream copy on the real model reached 84% with 32 probes, 31.10).
+    Before 31.10 the two paths took the two halves of a window, both against the reference: the halves differ in text,
+    and the flag fired on that (395, 32768)"""
     flags = {}
-    by_depth = {}
+    p90 = float(env("QA_DECODE_P90", "0.02"))
     for r in rows:
-        by_depth.setdefault(r["depth"], {})[r["path"]] = r
-    for d, p in by_depth.items():
-        if "decode" in p and "prompt" in p:
-            dec, pro = p["decode"], p["prompt"]
-            if (dec["kl_p90"] > 10 * pro["kl_p90"] and dec["kl_p90"] > 0.002) or dec["over_001"] > pro["over_001"] + 0.10:
-                flags[d] = "DECODE DIFFERS"
-        for r in p.values():
-            if r["top1"] < 0.85:
-                flags[d] = (flags.get(d, "") + " LOW TOP1").strip()
+        f = ""
+        if r["path"] == "decode" and r["kl_p90"] > p90:
+            f = "DECODE DIFFERS"
+        if r["path"] == "prompt" and r["top1"] < 0.85:
+            f = "LOW TOP1"
+        if f:
+            flags[(r["depth"], r["path"])] = f
     return flags
 
 
 def quality(run, label, ctx, depths, qargs=None):
-    """The logits at the probe positions against the reference (REF_ENV), for the default settings and the variants
-    of QA_QARMS; the reference and the variants run the same batches (qargs, else QA_QARGS). Returns True when nothing
-    was flagged."""
+    """The logits at the probe positions, for the default settings and the variants of QA_QARMS: the prompt path
+    against the reference (REF_ENV; the same batches, qargs, else QA_QARGS), which also keeps the variant's own logits;
+    then a second run of the variant through the decode path (batches of QA_DECODE_BATCH tokens) at the same positions
+    against them. Returns True when nothing was flagged."""
     qargs = quality_args() if qargs is None else qargs
     model = model_path()
     exe = binary("llama-quality-fork")
@@ -1031,9 +1043,9 @@ def quality(run, label, ctx, depths, qargs=None):
     depths, positions, ranges = probe_plan(ctx, depths, window, dbatch)
     tokens = corpus_tokens(run, exe, model, ctx + 1)
     plan = {"context": ctx, "positions": positions, "tokens": str(tokens), "max_outputs": 32,
-            "decode_batch": dbatch, "decode_ranges": ranges}
+            "decode_batch": dbatch, "decode_ranges": []}
     base = {"v": VERSION, "kind": "quality", "build": build_id(exe.parent), "model": model_identity(model),
-            "tokens": digest(tokens), "plan": {k: v for k, v in plan.items() if k != "tokens"},
+            "tokens": digest(tokens), "plan": {k: v for k, v in plan.items() if k != "tokens"}, "decode_ranges": ranges,
             "args": [str(a) for a in [*model_args(model), *qargs]], "machine": machine()}
     ref_env = dict(os.environ, **env_pairs(env("QA_REF_ENV", REF_ENV), "QA_REF_ENV"))
     ref_id = {**base, "env": env_identity(ref_env)}
@@ -1051,19 +1063,33 @@ def quality(run, label, ctx, depths, qargs=None):
         tool_run(run, exe, model, f"{label}-reference", dict(plan, action="capture", reference=str(ref)), ref_env,
                  qargs=qargs)
     run.add(f"{label}: logits at {len(positions)} positions before the depths {' '.join(map(str, depths))} of one "
-            f"context of {ctx} tokens against the reference ({env('QA_REF_ENV', REF_ENV)}); in each window of "
-            f"{window} the first half through the prompt batch, the second in batches of {dbatch} (the decode path)")
+            f"context of {ctx} tokens: prompt - the prompt batch against the reference ({env('QA_REF_ENV', REF_ENV)}); "
+            f"decode - the same positions in batches of {dbatch} (the decode path) against the prompt path of the "
+            f"same variant")
     clean = True
     for name, venv in variants("QA_QARMS", "default"):
         run_env = dict(os.environ, **venv)
         identity = {**base, "env": env_identity(run_env), "reference": digest(ref)}
 
         def go(log, name=name, run_env=run_env):
-            r = tool_run(run, exe, model, f"{label}-{name}", dict(plan, action="compare", reference=str(ref)), run_env,
-                         qargs=qargs)
-            if r["processed"] != ctx or len(r["samples"]) != len(positions):
-                raise Fail(f"the probe run stopped at {r['processed']} of {ctx} tokens")
-            return probe_rows(r["samples"], depths, window)
+            # the variant's own logits of the prompt path, the reference of its decode run; large, so only until then
+            own = folder / ("own-" + re.sub(r"[^\w.-]+", "_", name) + ".ref")
+            try:
+                r = tool_run(run, exe, model, f"{label}-{name}",
+                             dict(plan, action="compare", reference=str(ref), capture=str(own)), run_env, qargs=qargs)
+                if r["processed"] != ctx or len(r["samples"]) != len(positions):
+                    raise Fail(f"the probe run stopped at {r['processed']} of {ctx} tokens")
+                dec = []
+                if ranges:
+                    rd = tool_run(run, exe, model, f"{label}-{name}-decode",
+                                  dict(plan, action="compare", reference=str(own), decode_ranges=ranges), run_env,
+                                  qargs=qargs)
+                    if rd["processed"] != ctx or len(rd["samples"]) != len(positions):
+                        raise Fail(f"the decode run stopped at {rd['processed']} of {ctx} tokens")
+                    dec = [x for x in rd["samples"] if x.get("decode")]
+            finally:
+                own.unlink(missing_ok=True)
+            return probe_rows(r["samples"], dec, depths, window)
 
         try:
             rows, kept = run.measure(f"{label}-{name}", identity, go)
@@ -1076,7 +1102,7 @@ def quality(run, label, ctx, depths, qargs=None):
         clean &= not flags
         table_rows = [[r["depth"], r["path"], r["n"], f"{r['kl_median']:.6f}", f"{r['kl_p90']:.5f}", f"{r['kl_max']:.3f}",
                        f"{100 * r['over_001']:.1f}%", r["over_05"], f"{100 * r['top1']:.1f}%", f"{r['dnll']:+.4f}",
-                       flags.get(r["depth"], "") if r["path"] == "decode" else ""] for r in rows]
+                       flags.get((r["depth"], r["path"]), "")] for r in rows]
         run.add("", f"{label} {name}" + (" k" if kept else ""),
                 *table(["depth", "path", "n", "KL median", "KL p90", "KL max", ">0.01", ">0.5", "top-1", "dNLL", ""],
                        table_rows))
@@ -1425,10 +1451,11 @@ def cmd_long():
 
 # ---------------------------------------------------------------- profile
 
-# the kinds of op of the profile tables, by the start of the op name (the first match counts)
+# the kinds of op of the profile tables, by the start of the op name (the first match counts); op_kind sorts the top-k
+# ops and the expert router of CUDA first
 OP_KINDS = [("attention", ("FLASH_ATTN", "SOFT_MAX")),
-            ("qsa select", ("LIGHTNING_INDEXER", "MUL_MAT_HEADSUM", "MUL_MAT_RELU", "TOP_K", "TOPK", "ARGSORT")),
-            ("moe", ("MUL_MAT_ID", "ADD_ID", "MULTI_ADD")),
+            ("qsa select", ("LIGHTNING_INDEXER", "MUL_MAT_HEADSUM", "MUL_MAT_RELU")),
+            ("moe", ("MUL_MAT_ID", "ADD_ID", "MULTI_ADD", "TOPK_MOE")),
             ("matmul", ("MUL_MAT",)),
             ("delta net", ("GATED_DELTA_NET", "SSM_CONV", "CONCAT_SSM_CONV")),
             ("hyper conn", ("DSV4_HC", "HC_POST")),
@@ -1437,11 +1464,24 @@ OP_KINDS = [("attention", ("FLASH_ATTN", "SOFT_MAX")),
             ("elementwise", ("ADD", "SUB", "MUL", "DIV", "SCALE", "SILU", "SIGMOID", "GELU", "RELU", "GLU", "SWIGLU",
                              "EXP", "LOG", "SOFTPLUS", "STEP", "ABS", "SQR", "SUM", "ROPE", "CLAMP", "FILL"))]
 
+# the form of a kept profile result: the log parts of the requests since 31.10, read into tables when reported, so that
+# a fix of the reading applies to the kept results too
+PROFILE_FORM = 2
+
 
 def op_kind(name):
     op = op_group(name)
     if op.startswith("FUSED "):
-        op = op[6:].split("+")[0]
+        parts = op[6:].split("+")
+        # CUDA fuses the expert router: the softmax of the gate, argsort, gather, norm
+        if "ARGSORT" in parts:
+            return "moe"
+        op = parts[0]
+    if op == "TOP_K":
+        # the block selection of QSA keeps 513 blocks (Vulkan names K=513, CUDA the dst [513,...]); a small K is the top-k
+        # of the MTP draft over the vocabulary
+        m = re.search(r"K=(\d+)|\[(\d+),", name)
+        return "qsa select" if m and int(m[1] or m[2]) > 64 else "other"
     for kind, prefixes in OP_KINDS:
         if op.startswith(prefixes):
             return kind
@@ -1455,13 +1495,92 @@ def by_kind(ops):
     return out
 
 
+def graph_tokens(block):
+    """the tokens of a GGML_VK_PERF_LOGGER block: the dst of its attention, else the n of the first plain matmul (the
+    attention can run elsewhere), None without either"""
+    n = block_kind(block)[1]
+    if n is None:
+        m = next((re.search(r"\bn=(\d+)", op) for op, _, _ in block if op.startswith(("MUL_MAT ", "MUL_MAT_VEC "))), None)
+        n = int(m[1]) if m else None
+    return n
+
+
+def profile_read(raw, depths, vulkan, mtp):
+    """The tables of one profile run out of its log parts, per depth: the target's graphs of the prompt (more than 8
+    tokens: the checkpoint splits the last tokens off into a graph of their own), the decode groups (the verify of each
+    size and the head's steps with MTP), the GPU time of the reply per generated token and the draft acceptance"""
+    s = raw["slices"]
+    out = {}
+    for d in depths:
+        if f"pp{d}" not in s:
+            continue
+        pp_text, tg_text, end_text = s[f"pp{d}"], s[f"tg{d}"], s[f"end{d}"]
+        host = [[float(m[2]), float(m[3]), float(m[4])] for m in
+                (re.match(r".*ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", x)
+                 for x in pp_text.splitlines()) if m and int(m[1]) > 64]
+        n_tg = max(1, int(s.get(f"tg{d}:n", 1)))
+        acc = re.search(r"draft acceptance = ([\d.]+)", tg_text)
+        prompt_n = re.search(r"prompt eval time = +[\d.]+ ms / +(\d+) tokens", pp_text)
+        entry = {"depth": s[f"depth{d}"], "host": [sum(h[i] for h in host) for i in range(3)] if host else None,
+                 "acceptance": float(acc[1]) if acc else None}
+        if vulkan:
+            # the target has an expert matmul per layer (a fused gate and up count once), the MTP head one layer
+            is_target = lambda b: not mtp or block_kind(b)[0] == "target"
+            pp_blocks = [b for b in vulkan_blocks(pp_text) if is_target(b) and (graph_tokens(b) or 0) > 8]
+            groups, step = {}, []
+            for b in vulkan_blocks(tg_text):
+                n = graph_tokens(b)
+                if n is not None and n > 8 or is_target(b) and n is None:
+                    continue  # the prompt of the reply, the target's and the head's
+                label = (("verify of %d tokens" % n if mtp else "decode step") if is_target(b)
+                         else "head draft step" if n else "head catch-up")
+                groups.setdefault(label, []).append(b)
+                step.append(b)
+            entry["pp"] = sum_ops(pp_blocks)
+            entry["pp_graphs"] = len(pp_blocks)
+            entry["pp_tokens"] = sum(graph_tokens(b) for b in pp_blocks)
+            entry["tg_groups"] = [[label, len(bl), [[o, c / len(bl), t / len(bl)] for o, c, t in sum_ops(bl)]]
+                                  for label, bl in sorted(groups.items(), key=lambda g: -len(g[1]))]
+            entry["per_token"] = sum(t for b in step for _, _, t in b) / n_tg
+        else:
+            # the target and the MTP head together: the reports do not tell the graphs apart
+            pp_r = cuda_work(pp_text, tg_text)
+            tg_r = cuda_work(tg_text, end_text)
+            entry["pp"] = pp_r[1] if pp_r else []
+            entry["pp_graphs"] = pp_r[0] if pp_r else 0
+            entry["pp_tokens"] = int(prompt_n[1]) if prompt_n else None
+            entry["tg_groups"] = [["decode, all graphs per token", n_tg, [[o, c / n_tg, t / n_tg] for o, c, t in tg_r[1]]]] if tg_r else []
+            entry["per_token"] = sum(o[2] for o in tg_r[1]) / n_tg if tg_r else None
+        out[str(d)] = entry
+    return out
+
+
+def verify_size(reads, depths):
+    """the largest verify that every depth of every run has, so that a column compares the same step; None without MTP"""
+    common = None
+    for r in reads:
+        for d in depths:
+            x = r.get(str(d))
+            if x:
+                have = {int(m[1]) for m in (re.match(r"verify of (\d+) tokens", g[0]) for g in x["tg_groups"]) if m}
+                common = have if common is None else common & have
+    return max(common) if common else None
+
+
+def step_group(x, nv):
+    """the decode group of a depth that the tables compare: the verify of nv tokens, or the one decode group"""
+    want = f"verify of {nv} tokens" if nv else None
+    return next((g for g in x["tg_groups"] if (g[0] == want if want else g[0].startswith("decode"))), None)
+
+
 def cmd_profile():
     """Where the time goes on the server at each depth of QA_PROF_DEPTHS (tokens): a conversation reaches the depth
-    with the prompt cache, then a part of QA_PROF_PART tokens (pp: one prompt ubatch at that depth) and a reply of
+    with the prompt cache, then a part of QA_PROF_PART tokens (pp: the prompt ubatches at that depth) and a reply of
     QA_PROF_TG tokens (tg: the decode steps). Vulkan: GGML_VK_PERF_LOGGER, a block per graph compute; CUDA:
     GGML_CUDA_OP_TIMING=idle, a report when the GPU has been idle. LLAMA_INPUT_TIMING gives the host steps.
     QA_PARMS: variants to compare (name VAR=value ...;...), each a run of its own; the tables are those of the first,
-    then the totals of every variant side by side."""
+    then the totals of every variant side by side. With MTP the tables compare the verify of one size, the largest that
+    every depth of every variant has: a reply mixes verifies of 1 to 4 tokens, and their mix differs per text."""
     run = Run("profile")
     model = model_path()
     exe = binary("llama-server")
@@ -1471,6 +1590,7 @@ def cmd_profile():
     part, ntg = env_int("QA_PROF_PART", 4000), env_int("QA_PROF_TG", 32)
     depths = [d for d in env_ints("QA_PROF_DEPTHS", f"0 65536 131072 {ctx - 3 * part - 2048}") if d + 2 * part + 1024 < ctx]
     args = server_args(model, ctx, 1, port, ["-lv", "4"])
+    mtp = "-md" in args
     text = corpus_text()
     arms = variants("QA_PARMS", "default")
     run.add(f"profile: llama-server, {'GGML_VK_PERF_LOGGER' if vulkan else 'GGML_CUDA_OP_TIMING'} per op, depths "
@@ -1505,6 +1625,9 @@ def cmd_profile():
                 slices[name + ":n"] = answer["timings"].get("predicted_n", n)
                 return answer["timings"]
 
+            # a request that computes before the first part: CUDA's first report of a request holds the request
+            # before it, and without one the first report of the part of depth 0 was its own prompt
+            ask("start", 1, [{"role": "user", "content": "ok"}])
             offset, depth = 0, 0
             for d in depths:
                 # up to the depth in parts of at most 32768 tokens, each a turn of its own
@@ -1529,65 +1652,21 @@ def cmd_profile():
             proc.kill()
             proc.wait()
             mark_end()
-        out = {}
         # the compute buffers the server reserved (the largest size of each buffer type over the run), MiB
         buffers = {}
         for m in re.finditer(r"(\S+) compute buffer size =\s*([\d.]+) MiB", log.read_text(encoding="utf-8", errors="replace")):
             buffers[m[1]] = max(buffers.get(m[1], 0.0), float(m[2]))
-        out["buffers"] = buffers
-        for d in depths:
-            pp_text, tg_text, end_text = slices[f"pp{d}"], slices[f"tg{d}"], slices[f"end{d}"]
-            host = [[float(m[2]), float(m[3]), float(m[4])] for m in
-                    (re.match(r".*ubatch timing: (\d+) tokens, graph ([\d.]+) ms, inputs ([\d.]+) ms, submit ([\d.]+) ms", x)
-                     for x in pp_text.splitlines()) if m and int(m[1]) > 64]
-            entry = {"depth": slices[f"depth{d}"], "host": [sum(h[i] for h in host) for i in range(3)] if host else None}
-            if vulkan:
-                pp_all, tg_all = vulkan_blocks(pp_text), vulkan_blocks(tg_text)
-                # with the MTP head the target's graphs have an expert matmul per layer, the head's one layer: the
-                # graphs with the most of them are the target's. without a head every graph is the target's
-                n_mmid = lambda b: sum(c for op, c, _ in b if op.startswith("MUL_MAT_ID"))
-                top = max([n_mmid(b) for b in pp_all + tg_all] or [0])
-                is_target = lambda b: "-md" not in args or n_mmid(b) >= top
-                pp_blocks = [b for b in pp_all if is_target(b)]
-                groups = {}
-                def tokens_of(b):
-                    # the dst of the attention, else the n of the first plain matmul (the attention can run elsewhere)
-                    n = block_kind(b)[1]
-                    if n is None:
-                        m = next((re.search(r"\bn=(\d+)", op) for op, _, _ in b
-                                  if op.startswith(("MUL_MAT ", "MUL_MAT_VEC "))), None)
-                        n = int(m[1]) if m else None
-                    return n
-
-                for b in tg_all:
-                    n = tokens_of(b)
-                    if is_target(b) and (n is None or n > 8):
-                        continue  # the prompt of the reply
-                    label = (("verify of %d tokens" % n if "-md" in args else "decode step") if is_target(b)
-                             else "head draft step" if n else "head catch-up")
-                    groups.setdefault(label, []).append(b)
-                entry["pp"] = sum_ops(pp_blocks)
-                entry["pp_graphs"] = len(pp_blocks)
-                entry["tg_groups"] = [[label, len(bl), [[o, c / len(bl), t / len(bl)] for o, c, t in sum_ops(bl)]]
-                                      for label, bl in sorted(groups.items(), key=lambda g: -len(g[1]))]
-            else:
-                # the target and the MTP head together: the reports do not tell the graphs apart
-                pp_r = cuda_work(pp_text, tg_text)
-                tg_r = cuda_work(tg_text, end_text)
-                n_tg = max(1, int(slices.get(f"tg{d}:n", ntg)))
-                entry["pp"] = pp_r[1] if pp_r else []
-                entry["pp_graphs"] = pp_r[0] if pp_r else 0
-                entry["tg_groups"] = [["decode, all graphs per token", n_tg, [[o, c / n_tg, t / n_tg] for o, c, t in tg_r[1]]]] if tg_r else []
-            out[str(d)] = entry
-        return out
+        # the parts the tables need: the fills are left out
+        return {"buffers": buffers, "slices": {k: v for k, v in slices.items() if not k.startswith(("fill", "start"))}}
 
     results = []
     for name, arm_env in arms:
         run_env = dict(os.environ, LLAMA_INPUT_TIMING="1", **({"GGML_VK_PERF_LOGGER": "1"} if vulkan else {"GGML_CUDA_OP_TIMING": "idle"}),
                        **arm_env)
-        identity = {"v": VERSION, "kind": "profile", "build": build_id(exe.parent), "args": args, "env": env_identity(run_env),
-                    "model": model_identity(model), "depths": depths, "part": part, "tg": ntg, "corpus": text_digest(text),
-                    "machine": machine(), "draft": model_identity(Path(env("SPECDRAFT"))) if "-md" in args else None}
+        identity = {"v": VERSION, "kind": "profile", "form": PROFILE_FORM, "build": build_id(exe.parent), "args": args,
+                    "env": env_identity(run_env), "model": model_identity(model), "depths": depths, "part": part,
+                    "tg": ntg, "corpus": text_digest(text), "machine": machine(),
+                    "draft": model_identity(Path(env("SPECDRAFT"))) if mtp else None}
         label = "profile" if name == "default" else f"profile {name}"
         try:
             r_arm, kept_arm = run.measure(label, identity, lambda log, e=run_env: go(log, e))
@@ -1595,10 +1674,12 @@ def cmd_profile():
             run.failed = True
             run.add("", f"{label}: FAIL {e}")
             continue
-        results.append((name, r_arm, kept_arm))
+        results.append((name, r_arm, profile_read(r_arm, depths, vulkan, mtp), kept_arm))
     if not results:
         return run.finish()
-    name0, r, kept = results[0]
+    nv = verify_size([x[2] for x in results], depths) if mtp else None
+    step_name = f"verify of {nv} tokens" if nv else "decode step"
+    name0, _, r, kept = results[0]
     k = " k" if kept else ""
     kinds = [kind for kind, _ in OP_KINDS] + ["other"]
     pp_cols, tg_cols, heads = {}, {}, []
@@ -1608,63 +1689,76 @@ def cmd_profile():
             continue
         heads.append(str(x["depth"]))
         pp_cols[d] = by_kind(x["pp"])
-        main = next((g for g in x["tg_groups"] if g[0].startswith(("verify", "decode"))), None)
+        main = step_group(x, nv)
         tg_cols[d] = by_kind(main[2]) if main else {}
         pp_total = sum(o[2] for o in x["pp"])
-        lines = [f"", f"at {x['depth']} tokens: prompt ubatch of {part} tokens {pp_total:.1f} ms of GPU time over "
-                      f"{x['pp_graphs']} {'graphs' if vulkan else 'compute calls'}" + k]
+        tps = f" ({rate(x['pp_tokens'], pp_total):.0f} t/s)" if x.get("pp_tokens") and pp_total else ""
+        lines = [f"", f"at {x['depth']} tokens: prompt of {x.get('pp_tokens') or part} tokens {pp_total:.1f} ms of GPU time"
+                      f"{tps} over {x['pp_graphs']} {'graphs' if vulkan else 'compute calls'}" + k]
         if x.get("host"):
             h = x["host"]
             lines.append(f"  host for the prompt: graph build {h[0]:.1f} ms, inputs {h[1]:.1f} ms, submit {h[2]:.1f} ms")
-        for label, n, ops in x["tg_groups"]:
+        for label, n, ops in sorted(x["tg_groups"], key=lambda g: g[0]):
             lines.append(f"  {label}: {sum(o[2] for o in ops):.2f} ms of GPU time (mean of {n})")
+        if x.get("per_token") is not None:
+            lines.append(f"  the reply: {x['per_token']:.2f} ms of GPU time per generated token" +
+                         (f", draft acceptance {x['acceptance']:.2f}" if x.get("acceptance") is not None else ""))
         run.add(*lines)
     if pp_cols:
         cols = [d for d in depths if d in pp_cols]
-        run.add("", "prompt ubatch: GPU ms per kind of op by depth",
+        run.add("", "prompt: GPU ms per kind of op by depth",
                 *table(["kind", *heads], [[kind, *[f"{pp_cols[d].get(kind, 0):.1f}" for d in cols]] for kind in kinds] +
                        [["total", *[f"{sum(pp_cols[d].values()):.1f}" for d in cols]]]))
-        run.add("", "decode step of the target (its verify with MTP): GPU ms per kind of op by depth",
+        run.add("", f"{step_name} of the target: GPU ms per kind of op by depth",
                 *table(["kind", *heads], [[kind, *[f"{tg_cols[d].get(kind, 0):.2f}" for d in cols]] for kind in kinds] +
                        [["total", *[f"{sum(tg_cols[d].values()):.2f}" for d in cols]]]))
         deepest = r.get(str(cols[-1]))
-        run.add("", f"the ops of the prompt ubatch at {deepest['depth']} tokens",
+        run.add("", f"the ops of the prompt at {deepest['depth']} tokens",
                 *table(["  ms", "count", "op"], [[f"  {ms:.2f}", f"{c:g}", name] for name, c, ms in deepest["pp"][:25]]))
-        main = next((g for g in deepest["tg_groups"] if g[0].startswith(("verify", "decode"))), None)
+        main = step_group(deepest, nv)
         if main:
-            run.add("", f"the ops of the decode step at {deepest['depth']} tokens ({main[0]})",
+            run.add("", f"the ops of the {main[0]} at {deepest['depth']} tokens",
                     *table(["  ms", "count", "op"], [[f"  {ms:.3f}", f"{c:g}", name] for name, c, ms in main[2][:25]]))
-    def totals(res, d):
-        x = res.get(str(d))
-        if not x:
-            return None
-        main = next((g for g in x["tg_groups"] if g[0].startswith(("verify", "decode"))), None)
+
+    def totals(x):
+        main = step_group(x, nv)
         tg = by_kind(main[2]) if main else {}
         pp = by_kind(x["pp"])
-        return (sum(o[2] for o in x["pp"]), sum(tg.values()), pp.get("qsa select", 0.0), tg.get("qsa select", 0.0),
-                tg.get("delta net", 0.0), tg.get("rows, copies", 0.0))
+        pp_ms = sum(o[2] for o in x["pp"])
+        return {"pp": pp_ms, "pp_tps": x["pp_tokens"] / pp_ms * 1000 if x.get("pp_tokens") and pp_ms else None,
+                "pp_qsa": pp.get("qsa select", 0.0), "tg": sum(tg.values()) if main else None,
+                "tg_qsa": tg.get("qsa select", 0.0), "delta": tg.get("delta net", 0.0), "rows": tg.get("rows, copies", 0.0),
+                "tok": x.get("per_token"), "acc": x.get("acceptance")}
 
     def device_mib(res):
         # the compute buffers on the devices, without the host ones
         return sum(v for k, v in res.get("buffers", {}).items() if not re.match(r"(?i)^(cpu|.*host|.*_Host)", k))
 
-    for name, res, kept_arm in results:
+    tg_metric = f"gpu_verify{nv}" if nv else "gpu_tg"
+    for name, _, rd, kept_arm in results:
         for d in depths:
-            tot = totals(res, d)
-            if tot:
+            if str(d) in rd:
+                t = totals(rd[str(d)])
                 point = f"d{d}" if name == "default" else f"{name} d{d}"
-                run.record("profile", point, {"gpu_pp": tot[0], "gpu_tg": tot[1]}, kept_arm, exe.parent)
+                run.record("profile", point, {"gpu_pp": t["pp"], "gpu_pp_tps": t["pp_tps"], tg_metric: t["tg"],
+                                              "gpu_tok": t["tok"]}, kept_arm, exe.parent)
     if len(results) > 1:
         rows = []
-        for name, res, kept_arm in results:
+        f2 = lambda v, fmt: "-" if v is None else fmt % v
+        for name, raw, rd, kept_arm in results:
             for d in depths:
-                tot = totals(res, d)
-                if tot:
-                    rows.append([name, str(res[str(d)]["depth"]), f"{tot[0]:.1f}", f"{tot[2]:.1f}", f"{tot[1]:.2f}",
-                                 f"{tot[3]:.2f}", f"{tot[4]:.2f}", f"{tot[5]:.2f}", f"{device_mib(res):.0f}" + (" k" if kept_arm else "")])
-        run.add("", "variants: GPU ms of the prompt ubatch and of the decode step (its verify with MTP), the block selection "
-                    "of QSA in both, the delta net and the row copies of the step, the compute buffers on the device (MiB)",
-                *table(["variant", "depth", "prompt", "qsa", "decode", "qsa", "delta net", "rows, copies", "compute"], rows))
+                if str(d) in rd:
+                    t = totals(rd[str(d)])
+                    rows.append([name, str(rd[str(d)]["depth"]), f2(t["pp"], "%.1f"), f2(t["pp_tps"], "%.0f"),
+                                 f2(t["pp_qsa"], "%.1f"), f2(t["tg"], "%.2f"), f2(t["tg_qsa"], "%.2f"), f2(t["delta"], "%.2f"),
+                                 f2(t["rows"], "%.2f"), f2(t["tok"], "%.2f"), f2(t["acc"], "%.2f"),
+                                 f"{device_mib(raw):.0f}" + (" k" if kept_arm else "")])
+        run.add("", f"variants: GPU ms of the prompt (t/s) and of the {step_name} of the target, the block selection of "
+                    "QSA in both, the delta net and the row copies of that step, GPU ms of the reply per generated token "
+                    "(with MTP it depends on the acceptance, which differs with the text), the compute buffers on the "
+                    "device (MiB)",
+                *table(["variant", "depth", "prompt", "t/s", "qsa", nv and f"verify {nv}" or "decode", "qsa", "delta net",
+                        "rows, copies", "per token", "accept", "compute"], rows))
     return run.finish()
 
 

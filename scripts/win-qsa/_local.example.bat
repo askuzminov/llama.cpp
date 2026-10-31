@@ -18,7 +18,7 @@ rem set "QA_CORPUS=C:\data\long-text.txt"
 
 rem ---- a switch measured against the default in the probes of 01 and 02 ----
 rem set "QA_QARMS=default;pool32 LLAMA_QSA_POOL_F32=1"
-rem set "QA_PARMS=default;nolazy LLAMA_GDN_LAZY=0"
+rem set "QA_PARMS=default;nolist LLAMA_QSA_FA_LIST=0"
 rem run-all.bat: a step out, and the variants of the probes of 02-long
 rem set "RUN_LONG=0"
 rem set "LONG_QARMS=default"
