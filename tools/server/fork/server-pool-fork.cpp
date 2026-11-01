@@ -276,6 +276,9 @@ struct pool_config {
 
 // a chunk of the move of a conversation, and of the probe of a link
 static constexpr uint64_t POOL_CHUNK = 16ull << 20;
+// the end of an answer the pool keeps for its timings (the last event of a stream, the end of a JSON body). at file
+// scope: MSVC does not let a lambda use a constexpr local it does not capture (C3493)
+static constexpr size_t POOL_TAIL = 16*1024;
 
 // one way to a node: a direct cable, the WiFi
 struct pool_link {
@@ -1257,14 +1260,13 @@ struct server_pool_fork::impl {
             const bool   sample     = !moved && r.shared[n] >= cfg.move_tokens && r.prompt_tokens > 0;
             const double shared     = sample ? (double) r.shared[n] / r.prompt_tokens : 0.0;
             const double shared_max = sample ? (double) r.shared_max[n] / r.prompt_tokens : 0.0;
-            constexpr size_t TAIL = 16*1024;
             auto tail = std::make_shared<std::string>();
             auto next = proxy->next;
             proxy->next = [next, tail](std::string & out) -> bool {
                 const bool more = next(out);
                 tail->append(out);
-                if (tail->size() > TAIL) {
-                    tail->erase(0, tail->size() - TAIL);
+                if (tail->size() > POOL_TAIL) {
+                    tail->erase(0, tail->size() - POOL_TAIL);
                 }
                 return more;
             };
