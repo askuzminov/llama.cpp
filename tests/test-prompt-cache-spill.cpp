@@ -141,9 +141,9 @@ static void test_rewrite_step(const std::string & dir) {
     server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
     cache.min_tokens = 64;
 
-    // turn 1: nothing on disk yet, so the state goes out whatever its length
+    // turn 1: nothing on disk yet, so the state goes out (it holds the minimum)
     cache.states.push_back(make_state(100, 1, 40960, 0));
-    assert(cache.write_behind(nullptr) == 1);
+    assert(cache.write_behind(nullptr, true) == 1);
 
     const uint64_t uid_100 = cache.states.front().uid;
 
@@ -151,22 +151,118 @@ static void test_rewrite_step(const std::string & dir) {
 
     // turn 2: 32 tokens past the prefix is not worth moving the blob again
     cache.states.push_back(make_state(132, 1, 40960, 0));
-    assert(cache.write_behind(nullptr) == 0);
+    assert(cache.write_behind(nullptr, true) == 0);
     assert(!cache.states.back().on_disk);
     assert(std::filesystem::exists(cache.spill_path(uid_100)));
 
     // turn 3: a full minimum past the prefix, so it is written and the prefix file is now redundant
     cache.states.push_back(make_state(164, 1, 40960, 0));
-    assert(cache.write_behind(nullptr) == 1);
+    assert(cache.write_behind(nullptr, true) == 1);
     assert(cache.states.back().is_clean());
     assert(!std::filesystem::exists(cache.spill_path(uid_100)));
     assert(cache.states.size() == 2);
 
     // without a minimum nothing is held back
     cache.min_tokens = 0;
-    assert(cache.write_behind(nullptr) == 1);
+    assert(cache.write_behind(nullptr, true) == 1);
     for (const auto & st : cache.states) {
         assert(st.is_clean());
+    }
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
+// the copy on disk ends with the answer it generated, which the next prompt renders again, often otherwise: the step
+// counts the prefix they share, when the copy keeps at least a quarter of itself in it (a slot restores it then)
+static void test_rewrite_step_shared(const std::string & dir) {
+    server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+    cache.min_tokens = 64;
+
+    cache.states.push_back(make_state(100, 1, 40960, 0));
+    assert(cache.write_behind(nullptr, true) == 1);
+    const uint64_t uid_100 = cache.states.front().uid;
+    cache.evict_state(cache.states.front());
+
+    // the first 96 tokens of it, then 30 of its own: no whole prefix, 30 past the shared one
+    const auto grown = [](size_t n_own) {
+        llama_tokens t = make_tokens(96, 1);
+        const llama_tokens own = make_tokens(n_own, 5000);
+        t.insert(t.end(), own.begin(), own.end());
+        server_prompt_cache_state st;
+        st.prompt.tokens = server_tokens(t, false);
+        st.data.main     = make_blob(40960, 7);
+        return st;
+    };
+    cache.states.push_back(grown(30));
+    assert(cache.below_step(cache.states.back()));
+    assert(cache.write_behind(nullptr, true) == 0);
+
+    // 64 past the shared prefix: written. the copy it grew from is no whole prefix of it, so that file stays
+    cache.states.push_back(grown(64));
+    assert(!cache.below_step(cache.states.back()));
+    assert(cache.write_behind(nullptr, true) == 1);
+    assert(std::filesystem::exists(cache.spill_path(uid_100)));
+
+    // another conversation that shares only the start of a long copy: a slot would not restore that copy for it
+    server_prompt_cache_state other;
+    llama_tokens t = make_tokens(20, 1);
+    const llama_tokens own = make_tokens(80, 9000);
+    t.insert(t.end(), own.begin(), own.end());
+    other.prompt.tokens = server_tokens(t, false);
+    other.data.main     = make_blob(40960, 8);
+    cache.states.push_back(std::move(other));
+    assert(!cache.below_step(cache.states.back()));
+
+    clear_cache(cache);
+    assert(dir_empty(dir));
+}
+
+// by default the idle round writes only what the RAM limit pushes out (write_behind(..., false)), the oldest first,
+// and a state below the step leaves RAM without a write
+static void test_ram_limit_only(const std::string & dir) {
+    server_prompt_cache cache(1, 0, 0, dir, 0, SIG); // 1 MiB
+    cache.min_tokens = 64;
+
+    for (int32_t base : { 1, 1000, 2000 }) {
+        cache.states.push_back(make_state(100, base, 512*1024, 0));
+    }
+    // 1.5 MiB in a limit of 1: the oldest goes out with a write, the other two stay in RAM, not written
+    assert(cache.write_behind(nullptr, false) == 1);
+    auto it = cache.states.begin();
+    assert(it->on_disk && it->data.size() == 0);
+    const uint64_t uid_first = it->uid;
+    for (++it; it != cache.states.end(); ++it) {
+        assert(!it->on_disk && it->data.size() > 0);
+    }
+    assert(cache.write_behind(nullptr, false) == 0); // within the limit: nothing more
+
+    const auto n_files = [&]() {
+        size_t n = 0;
+        for (const auto & entry : std::filesystem::directory_iterator(fs_path(dir))) {
+            n += entry.path().extension() == ".bin";
+        }
+        return n;
+    };
+
+    // the oldest in RAM is the first one grown 30 past its copy on disk: it leaves RAM without a write, in the idle
+    // round and when a write may run (a task launch) - the younger states in RAM are not written in its place
+    for (int round = 0; round < 2; ++round) {
+        server_prompt_cache_state grown = make_state(130, 1, 512*1024, 0);
+        cache.states.insert(std::next(cache.states.begin()), std::move(grown));
+        assert(cache.below_step(*std::next(cache.states.begin())));
+        const size_t n_before = n_files();
+        if (round == 0) {
+            assert(cache.write_behind(nullptr, false) == 0);
+        } else {
+            cache.update(true);
+        }
+        assert(n_files() == n_before);
+        assert(cache.states.size() == 3);
+        for (const auto & st : cache.states) {
+            assert(st.prompt.tokens.size() == 100);
+        }
+        assert(std::filesystem::exists(cache.spill_path(uid_first)));
     }
 
     clear_cache(cache);
@@ -221,8 +317,8 @@ static void test_write_behind(const std::string & dir) {
         ref.push_back(st.data);
     }
 
-    assert(cache.write_behind(nullptr) == ref.size());
-    assert(cache.write_behind(nullptr) == 0); // nothing is dirty any more
+    assert(cache.write_behind(nullptr, true) == ref.size());
+    assert(cache.write_behind(nullptr, true) == 0); // nothing is dirty any more
 
     size_t i = 0;
     for (auto & st : cache.states) {
@@ -269,14 +365,14 @@ static void test_write_behind_cancel(const std::string & dir) {
     int n_polls = 0;
     const std::function<bool()> stop_after_start = [&n_polls]() { return ++n_polls > 1; };
 
-    assert(cache.write_behind(stop_after_start) == 0);
+    assert(cache.write_behind(stop_after_start, true) == 0);
     assert(n_polls > 1);                       // the write was stopped, not skipped
     assert(!cache.states.front().on_disk);
     assert(cache.states.front().data.main == ref);
     assert(dir_empty(dir));                    // no half-written file
 
     // and the next idle writes it out for real
-    assert(cache.write_behind(nullptr) == 1);
+    assert(cache.write_behind(nullptr, true) == 1);
     assert(cache.states.front().is_clean());
 
     clear_cache(cache);
@@ -330,7 +426,7 @@ static void test_ram_outside(const std::string & dir) {
 
     // the rest written out while idle: update(false) frees its RAM, with no write
     outside = 1024*1024;
-    assert(cache.write_behind(nullptr) == 1);
+    assert(cache.write_behind(nullptr, true) == 1);
     cache.update(false);
     for (const auto & st : cache.states) {
         assert(st.on_disk && st.data.size() == 0);
@@ -544,7 +640,7 @@ static void test_shared_budget(const std::string & dir) {
     server_prompt_cache b(0, 0, 0, dir, 60000, SIG ^ 1, 2);
     a.states.push_back(make_state(100, 1, 40960, 0));
     const auto ref = a.states.front().data;
-    assert(a.write_behind(nullptr) == 1);
+    assert(a.write_behind(nullptr, true) == 1);
     const auto old = a.spill_path(a.states.front().uid);
     auto orphan = old;
     orphan += ".tmp";
@@ -553,7 +649,7 @@ static void test_shared_budget(const std::string & dir) {
     const auto unrelated = fs_path(dir) / "notes.bin";
     { std::ofstream f(unrelated); f << "keep"; }
     b.states.push_back(make_state(100, 2, 40960, 0));
-    assert(b.write_behind(nullptr) == 1);
+    assert(b.write_behind(nullptr, true) == 1);
     assert(a.disk_size() <= 60000 && b.disk_size() == a.disk_size());
     assert(!std::filesystem::exists(old));
     assert(!std::filesystem::exists(orphan));
@@ -565,7 +661,7 @@ static void test_shared_budget(const std::string & dir) {
     b.evict_state(b.states.front());
     const auto b_path = b.spill_path(b.states.front().uid);
     std::filesystem::last_write_time(b_path, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
-    assert(a.write_behind(nullptr) == 1);
+    assert(a.write_behind(nullptr, true) == 1);
     assert(!std::filesystem::exists(b_path));
     assert(!b.unspill_state(b.states.front()));
     b.enforce_disk_limit();
@@ -583,11 +679,11 @@ static void test_shared_writers(const std::string & dir) {
     {
         common_file_lock lock(fs_path(dir) / ".prompt-cache.lock");
         assert(lock.acquire());
-        assert(a.write_behind(nullptr) == 0);
+        assert(a.write_behind(nullptr, true) == 0);
         assert(!a.states.front().on_disk);
     }
-    assert(a.write_behind(nullptr) == 1);
-    assert(b.write_behind(nullptr) == 1);
+    assert(a.write_behind(nullptr, true) == 1);
+    assert(b.write_behind(nullptr, true) == 1);
     assert(a.states.front().uid != b.states.front().uid);
     a.evict_state(a.states.front());
     assert(a.unspill_state(a.states.front()));
@@ -602,8 +698,8 @@ static void test_shared_lru(const std::string & dir) {
     server_prompt_cache b(0, 0, 0, dir, 100000, SIG ^ 1, 2);
     a.states.push_back(make_state(100, 1, 40960, 0));
     b.states.push_back(make_state(100, 2, 40960, 0));
-    assert(a.write_behind(nullptr) == 1);
-    assert(b.write_behind(nullptr) == 1);
+    assert(a.write_behind(nullptr, true) == 1);
+    assert(b.write_behind(nullptr, true) == 1);
     const auto old_a = a.spill_path(a.states.front().uid);
     const auto old_b = b.spill_path(b.states.front().uid);
     const auto now = std::filesystem::file_time_type::clock::now();
@@ -611,7 +707,7 @@ static void test_shared_lru(const std::string & dir) {
     std::filesystem::last_write_time(old_b, now - std::chrono::hours(1));
     assert(a.unspill_state(a.states.front()));
     b.states.push_back(make_state(100, 3, 40960, 0));
-    assert(b.write_behind(nullptr) == 1);
+    assert(b.write_behind(nullptr, true) == 1);
     assert(std::filesystem::exists(old_a));
     assert(!std::filesystem::exists(old_b));
     assert(a.disk_size() <= 100000);
@@ -625,14 +721,14 @@ static void test_no_rewrite_after_eviction(const std::string & dir) {
     server_prompt_cache b(0, 0, 0, dir, 60000, SIG ^ 1, 2);
     a.states.push_back(make_state(100, 1, 40960, 0));
     b.states.push_back(make_state(100, 2, 40960, 0));
-    assert(a.write_behind(nullptr) == 1);
+    assert(a.write_behind(nullptr, true) == 1);
     const auto old = a.spill_path(a.states.front().uid);
     std::filesystem::last_write_time(old, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
-    assert(b.write_behind(nullptr) == 1);
+    assert(b.write_behind(nullptr, true) == 1);
     const auto keep = b.spill_path(b.states.front().uid);
     for (int i = 0; i < 4; ++i) {
-        assert(a.write_behind(nullptr) == 0);
-        assert(b.write_behind(nullptr) == 0);
+        assert(a.write_behind(nullptr, true) == 0);
+        assert(b.write_behind(nullptr, true) == 0);
         assert(std::filesystem::exists(keep));
     }
     a.persist();
@@ -640,7 +736,7 @@ static void test_no_rewrite_after_eviction(const std::string & dir) {
     assert(!a.states.front().data.main.empty());
     // Reusing the RAM copy makes it eligible for persistence again.
     assert(a.unspill_state(a.states.front()));
-    assert(a.write_behind(nullptr) == 1);
+    assert(a.write_behind(nullptr, true) == 1);
     clear_cache(a);
     clear_cache(b);
     assert(dir_empty(dir));
@@ -697,7 +793,7 @@ static void test_ram_limit_spill_failure(const std::string & dir) {
         assert(cache.alloc(prompt, 700*1024, 0));
     }
     cache.defer_writes = false;
-    assert(cache.write_behind(nullptr) == 0);
+    assert(cache.write_behind(nullptr, true) == 0);
     assert(cache.size() <= cache.limit_size);
     assert(cache.states.size() == 1);
     assert(cache.states.front().prompt.tokens[0] == 800);
@@ -779,6 +875,8 @@ int main(int argc, char ** argv) {
         { "ram-outside-alloc",  test_ram_outside_alloc  },
         { "reserve-no-write",   test_reserve_no_write   },
         { "rewrite-step",       test_rewrite_step       },
+        { "rewrite-step-shared", test_rewrite_step_shared },
+        { "ram-limit-only",     test_ram_limit_only     },
         { "cold-start",         test_cold_start         },
         { "signature-mismatch", test_signature_mismatch },
         { "legacy-names",       test_legacy_names       },

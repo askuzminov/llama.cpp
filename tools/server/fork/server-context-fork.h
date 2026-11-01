@@ -96,6 +96,14 @@ uint64_t server_prompt_cache_signature(
         const llama_context * ctx_tgt,
         const llama_context * ctx_dft);
 
+// fork: --pool, the same without the machine (the model path and the file times): equal on another node of the same
+// model and configuration, so that a cached state can move to it
+uint64_t server_prompt_cache_signature_portable(
+        const common_params & params,
+        const llama_model * model_tgt,
+        const llama_context * ctx_tgt,
+        const llama_context * ctx_dft);
+
 // context checkpoints of a slot: a base and the deltas after it form a chain
 using server_ckpt_list = std::list<common_prompt_checkpoint>;
 

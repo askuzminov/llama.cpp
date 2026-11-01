@@ -72,7 +72,7 @@ int64_t llama_model_qwen4exp_fork::mtp_window() {
 
 bool llama_model_qwen4exp_fork::mtp_window_kv(const llama_cparams & cparams, uint32_t & kv_size, uint32_t & n_swa, llama_swa_type & swa_type) {
     static const int mode = [] {
-        return (int) llama_fork_env_int("LLAMA_MTP_WINDOW_KV", -1);
+        return (int) llama_fork_env_int("LLAMA_MTP_WINDOW_KV", 1);
     }();
     const llama_mtp_window_kv_fork res = llama_mtp_window_kv_rule_fork(mtp_window(), mode, cparams.n_seq_max,
             cparams.kv_unified, cparams.n_ubatch, cparams.n_ctx_seq);
@@ -926,12 +926,13 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
     // cells of the draft memory follow the positions (one sequence, filled in order), so the last ones are the
     // nearest. the 395 (15.10 night, chats to 213K): 16384 against the whole context TG 38.64 / 36.39 / 36.84
     // against 37.08 / 34.76 / 35.37 at 120-160K / 160-200K / 200K+, acceptance 0.719 against 0.723
-    // with several slots (or LLAMA_MTP_WINDOW_KV=1) the cache itself is the window (mtp_window_kv) and its mask
-    // has the positions; its cells are reused out of order, so the last ones are not the nearest.
+    // by default (LLAMA_MTP_WINDOW_KV=1, and -1 with several slots) the cache itself is the window (mtp_window_kv) and
+    // its mask has the positions; its cells are reused out of order, so the last ones are not the nearest. the view
+    // below is for one slot with the whole cache (LLAMA_MTP_WINDOW_KV=-1 or 0).
     // n_kv is padded to a multiple of 256 (llama_kv_cache::get_n_kv, the graph stays the same across ubatches),
     // so its last up to 255 cells are empty: the view starts that much earlier and takes the window and up to 255
     // older cells. a view of the last <cells> of n_kv lost up to 255 cells of the window, and a window below the
-    // padding could hold no cell in use at all (24.10). an exact window is LLAMA_MTP_WINDOW_KV=1
+    // padding could hold no cell in use at all (24.10). the window KV is the exact window
     static constexpr int64_t mtp_window_pad = 255;
     const int64_t mtp_window = llama_model_qwen4exp_fork::mtp_window();
     // the cache as it was made, not the rule again

@@ -702,6 +702,10 @@ private:
 
 } // namespace
 
+std::filesystem::path server_fs_path_fork(const std::string & utf8) {
+    return spill_fs_path(utf8);
+}
+
 server_prompt_cache::server_prompt_cache(size_t limit_size_mib, size_t limit_tokens, size_t reserve_bytes,
                                          const std::string & spill_dir, size_t spill_limit_bytes,
                                          uint64_t signature, uint64_t owner, bool has_mtmd) {
@@ -914,12 +918,51 @@ void server_prompt_cache::persist() {
             n_disk, states.size(), disk_size() / (1024.0 * 1024.0));
 }
 
+// how many leading tokens of `st` an entry on disk gives back: the prefix they share, when a slot would restore that
+// entry for it (find_best: the entry keeps at least a quarter of itself). Writing `st` out buys only the tokens past
+// that point. Not only an entry that is a whole prefix of `st`: the state of a chat ends with the answer it generated,
+// which the next request renders again, often otherwise (a template that drops the reasoning of the last answer), and
+// a hybrid model goes back to the checkpoint of the entry at the end of the prompt before that answer
+static size_t spill_prefix_on_disk(const std::list<server_prompt_cache_state> & states,
+        const server_prompt_cache_state & st) {
+    size_t res = 0;
+
+    for (const auto & other : states) {
+        if (&other == &st || !other.on_disk) {
+            continue;
+        }
+
+        const size_t len = other.prompt.tokens.get_common_prefix(st.prompt.tokens);
+        if (len > 0 && 4*len >= other.prompt.tokens.size()) {
+            res = std::max(res, len);
+        }
+    }
+
+    return res;
+}
+
+// the smallest piece of work worth a disk write (--cache-min-tokens): a shorter state stays in RAM only, and one whose
+// front is on disk already waits until it grew that much past it - a rewrite moves gigabytes to win back only the tokens
+// past that point. What leaving RAM meanwhile costs is that much recompute, not the whole prompt
+bool server_prompt_cache::below_step(const server_prompt_cache_state & st) const {
+    if (min_tokens == 0) {
+        return false;
+    }
+    const size_t n_tok  = st.prompt.tokens.size();
+    const size_t n_have = spill_prefix_on_disk(states, st);
+    return n_tok < min_tokens || (n_have > 0 && n_tok - n_have < min_tokens);
+}
+
 bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel, size_t disk_free) {
     if (spill_dir.empty() || spill_exists(st)) {
         return false;
     }
     if (st.data.main.empty() && st.data.drft.empty()) {
         return false; // nothing big to write out
+    }
+    if (below_step(st)) {
+        SRV_TRC(" - a state of %d tokens is below the %zu token step, not written\n", st.prompt.n_tokens(), min_tokens);
+        return false;
     }
     common_file_lock lock(spill_dir_path() / ".prompt-cache.lock");
     // Skip a busy directory instead of delaying a request behind another model's write.
@@ -1055,7 +1098,436 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     st.ckpt_on_disk = h.n_ckpt;
     st.on_disk      = true;
     st.disk_evicted = false;
-    return spill_exists(st);
+    if (!spill_exists(st)) {
+        return false;
+    }
+
+    // the new file repeats what the shorter disk-only entries in front of it hold, so those go. This is deduplication,
+    // not eviction: nothing that is still the only copy of something is touched. Only other entries are erased, so the
+    // callers that walk `states` keep their place
+    for (auto it = states.begin(); it != states.end();) {
+        if (&*it == &st || !it->on_disk || it->data.size() > 0 || it->prompt.tokens.empty() ||
+                it->prompt.tokens.get_common_prefix(st.prompt.tokens) != it->prompt.tokens.size()) {
+            ++it;
+            continue;
+        }
+
+        SRV_TRC(" - dropping the disk copy of a %d token prefix, the %d token state covers it\n",
+                it->prompt.n_tokens(), st.prompt.n_tokens());
+
+        erase_spill(*it);
+        it = states.erase(it);
+    }
+    return true;
+}
+
+// fork: --pool. a state leaves for another node in the layout of a spill file, with nothing written for it: a state on
+// disk goes as pieces of its file, a state only in RAM as a copy of its blobs. of the checkpoints only the one the
+// request goes back to goes along, after the base of its chain: none when the request goes on from the end of the state
+// or the memory rolls back by itself, else the one the restore of a slot picks (the newest within the prefix the
+// request shares with the state) - where a template that drops the reasoning of the last answer goes back to
+bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iterator it, const std::filesystem::path & link,
+                                      size_t n_match, size_t n_req, bool need_ckpt, int32_t n_swa, size_t min_reuse,
+                                      server_pool_plan_fork & plan, std::string & error) {
+    server_prompt_cache_state & st = *it;
+    plan = {};
+
+    const bool resident = st.data.size() > 0;
+    const bool on_disk  = spill_exists(st);
+    if (!resident && !on_disk) {
+        error = "the state holds no data";
+        return false;
+    }
+
+    // a state on disk: the header and the index of the checkpoints of its file
+    spill_header fh = {};
+    std::vector<spill_ckpt> findex;
+    if (on_disk) {
+        std::ifstream f(spill_path(st.uid), std::ios::binary);
+        if (!f.read((char *) &fh, sizeof(fh)) || !spill_header_sane(fh)) {
+            error = "cannot read the state file";
+            return false;
+        }
+        findex.resize(fh.n_ckpt);
+        f.seekg((std::streamoff) spill_layout_of(fh).off_index);
+        if (fh.n_ckpt > 0 && !f.read((char *) findex.data(), findex.size()*sizeof(spill_ckpt))) {
+            error = "cannot read the checkpoints of the state";
+            return false;
+        }
+    }
+
+    // the checkpoints, oldest first: those of the file, unless the disk budget left some only in RAM
+    const bool ckpt_file = on_disk && fh.n_ckpt >= st.prompt.checkpoints.size();
+    struct ckpt_ref {
+        int64_t   n_tokens;
+        llama_pos pos_min;
+        llama_pos pos_max;
+        bool      delta; // applied on top of the ones before it
+        bool      data;  // not a failed capture
+    };
+    std::vector<ckpt_ref> ckpts;
+    if (ckpt_file) {
+        for (const auto & e : findex) {
+            ckpts.push_back({e.n_tokens, e.pos_min, e.pos_max, e.base_pos >= 0, e.n_tgt > 0});
+        }
+    } else {
+        for (const auto & cp : st.prompt.checkpoints) {
+            ckpts.push_back({cp.n_tokens, cp.pos_min, cp.pos_max, cp.is_delta(), !cp.data_tgt.empty()});
+        }
+    }
+
+    // the checkpoints that go along: [k_first, k_end). the one a slot restores, as server_context_impl searches for it:
+    // it ends within the shared prefix and starts before the first position computed again (minus the window of a SWA
+    // memory), and the slot goes on from its last position
+    const size_t n_state = st.prompt.tokens.size();
+    size_t k_first = 0;
+    size_t k_end   = 0;
+    plan.n_reuse = n_match;
+    if (need_ckpt && n_match >= n_state && n_req > n_state) {
+        plan.n_reuse = n_state;
+    } else if (need_ckpt) {
+        plan.n_reuse = 0;
+        const llama_pos pos_next = st.prompt.tokens.pos_next((int64_t) n_match);
+        const llama_pos pos_eval = pos_next - (n_match < n_req ? 0 : 1);
+        const llama_pos thold    = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+        for (size_t k = ckpts.size(); k-- > 0; ) {
+            const ckpt_ref & c = ckpts[k];
+            if (!c.data || c.pos_max > pos_next || !(c.pos_min < thold || c.pos_min == 0)) {
+                continue;
+            }
+            size_t b = k;
+            while (b > 0 && (ckpts[b].delta || !ckpts[b].data)) {
+                --b;
+            }
+            if (!ckpts[b].delta && ckpts[b].data) {
+                k_first      = b;
+                k_end        = k + 1;
+                plan.n_reuse = std::min(st.prompt.tokens.size_up_to_pos(std::min(pos_next, std::max(c.pos_min + 1, c.pos_max))),
+                                        (size_t) c.n_tokens);
+            }
+            break;
+        }
+    }
+    plan.n_ckpt     = k_end - k_first;
+    plan.n_ckpt_all = ckpts.size();
+    if (plan.n_reuse < min_reuse) {
+        error = string_format("the request takes %zu tokens from the state, fewer than %zu", (size_t) plan.n_reuse, min_reuse);
+        return false;
+    }
+
+    std::vector<char> prompt;
+    spill_header h = fh;
+    if (!on_disk) {
+        try {
+            prompt = st.prompt.tokens.serialize();
+        } catch (const std::exception & e) {
+            error = std::string("cannot serialize the prompt of the state: ") + e.what();
+            return false;
+        }
+        memcpy(h.magic, SPILL_MAGIC, sizeof(h.magic));
+        h.version   = SPILL_VERSION;
+        h.n_used    = st.prompt.n_used;
+        h.uid       = st.uid;
+        h.signature = signature;
+        h.n_prompt  = prompt.size()/sizeof(llama_token);
+        h.n_main    = st.data.main.size();
+        h.n_drft    = st.data.drft.size();
+    }
+    std::vector<spill_ckpt> index;
+    if (ckpt_file) {
+        index.assign(findex.begin() + k_first, findex.begin() + k_end);
+    } else {
+        size_t k = 0;
+        for (const auto & cp : st.prompt.checkpoints) {
+            if (k >= k_first && k < k_end) {
+                index.push_back({
+                    cp.n_tokens, cp.id_task, cp.pos_min, cp.pos_max, cp.base_pos,
+                    cp.data_tgt.size(), cp.data_dft.size(), cp.data_spec.size(),
+                });
+            }
+            ++k;
+        }
+    }
+    h.n_ckpt       = index.size();
+    h.n_ckpt_bytes = 0;
+    for (const auto & e : index) {
+        h.n_ckpt_bytes += spill_align_up(e.n_tgt) + spill_align_up(e.n_dft) + spill_align_up(e.n_spec);
+    }
+
+    // the sections in the order of the file, each padded as the file pads it
+    try {
+        const auto add_mem = [&](const void * p, size_t n) {
+            if (n > 0) {
+                std::string s(spill_align_up(n), '\0');
+                memcpy(&s[0], p, n);
+                plan.pieces.push_back({0, s.size(), std::move(s)});
+            }
+        };
+        const spill_layout fl = spill_layout_of(fh);
+        add_mem(&h, sizeof(h));
+        if (on_disk) {
+            plan.pieces.push_back({fl.off_prompt, fl.off_index - fl.off_prompt, {}});
+        } else {
+            add_mem(prompt.data(), prompt.size());
+            add_mem(st.data.main.data(), st.data.main.size());
+            add_mem(st.data.drft.data(), st.data.drft.size());
+        }
+        add_mem(index.data(), index.size()*sizeof(spill_ckpt));
+        if (ckpt_file) {
+            uint64_t off = fl.off_ckpt;
+            for (size_t k = 0; k < findex.size(); ++k) {
+                const spill_ckpt & e = findex[k];
+                const uint64_t len = spill_align_up(e.n_tgt) + spill_align_up(e.n_dft) + spill_align_up(e.n_spec);
+                if (k >= k_first && k < k_end) {
+                    plan.pieces.push_back({off, len, {}});
+                }
+                off += len;
+            }
+            if (off != fl.size) {
+                error = "the checkpoints of the state do not add up to its file";
+                return false;
+            }
+        } else {
+            size_t k = 0;
+            for (const auto & cp : st.prompt.checkpoints) {
+                if (k >= k_first && k < k_end) {
+                    add_mem(cp.data_tgt.data(),  cp.data_tgt.size());
+                    add_mem(cp.data_dft.data(),  cp.data_dft.size());
+                    add_mem(cp.data_spec.data(), cp.data_spec.size());
+                }
+                ++k;
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        error = "not enough memory for a copy of the state";
+        return false;
+    }
+
+    // the file is read through a link, so that the disk budget can drop the state meanwhile; the file itself where the
+    // file system has no links
+    if (on_disk) {
+        std::error_code ec;
+        if (!link.empty()) {
+            std::filesystem::remove(link, ec);
+            ec.clear();
+            std::filesystem::create_hard_link(spill_path(st.uid), link, ec);
+        }
+        plan.file      = link.empty() || ec ? spill_path(st.uid) : link;
+        plan.file_link = !link.empty() && !ec;
+    }
+
+    for (const auto & pc : plan.pieces) {
+        plan.size += pc.len;
+    }
+    GGML_ASSERT(plan.size == spill_layout_of(h).size);
+    return true;
+}
+
+// fork: --pool, a state that comes in chunks: each section is written into the buffer it ends up in, those of the
+// checkpoints once the index before them is in
+struct server_pool_inbox_fork::impl {
+    struct target {
+        uint64_t  off;
+        uint64_t  len;
+        uint8_t * dst;
+    };
+
+    uint64_t     received  = 0;
+    bool         has_head  = false;
+    bool         has_index = false;
+    spill_header h   = {};
+    spill_layout lay = {};
+
+    std::vector<char>                   prompt;
+    server_state_buf                    main;
+    server_state_buf                    drft;
+    std::vector<spill_ckpt>             index;
+    std::list<common_prompt_checkpoint> ckpts; // a list: the targets point into its elements
+    std::vector<target>                 targets;
+
+    impl() {
+        add(0, sizeof(h), &h);
+    }
+
+    void add(uint64_t off, uint64_t len, void * dst) {
+        if (len > 0) {
+            targets.push_back({off, len, (uint8_t *) dst});
+        }
+    }
+
+    bool parse_head(uint64_t max_bytes, std::string & error) {
+        if (memcmp(h.magic, SPILL_MAGIC, sizeof(h.magic)) != 0 || h.version != SPILL_VERSION || !spill_header_sane(h)) {
+            error = "not a prompt-cache state of this build";
+            return false;
+        }
+        lay = spill_layout_of(h);
+        if (max_bytes > 0 && lay.size > max_bytes) {
+            error = string_format("the state (%.0f MiB) is larger than the prompt cache of this node (%.0f MiB)",
+                                  lay.size / (1024.0 * 1024.0), max_bytes / (1024.0 * 1024.0));
+            return false;
+        }
+        try {
+            prompt.resize(h.n_prompt*sizeof(llama_token));
+            main.resize(h.n_main);
+            drft.resize(h.n_drft);
+            index.resize(h.n_ckpt);
+        } catch (const std::bad_alloc &) {
+            error = "not enough memory for the state";
+            return false;
+        }
+        add(lay.off_prompt, prompt.size(), prompt.data());
+        add(lay.off_main,   main.size(),   main.data());
+        add(lay.off_drft,   drft.size(),   drft.data());
+        add(lay.off_index,  index.size()*sizeof(spill_ckpt), index.data());
+        has_head = true;
+        return true;
+    }
+
+    bool parse_index(std::string & error) {
+        uint64_t n_bytes = 0;
+        for (const auto & e : index) {
+            if (!spill_ckpt_sane(e)) {
+                n_bytes = h.n_ckpt_bytes + 1;
+                break;
+            }
+            n_bytes += spill_align_up(e.n_tgt) + spill_align_up(e.n_dft) + spill_align_up(e.n_spec);
+        }
+        if (n_bytes != h.n_ckpt_bytes) {
+            error = "the checkpoints of the state do not add up";
+            return false;
+        }
+        uint64_t off = lay.off_ckpt;
+        try {
+            for (const auto & e : index) {
+                common_prompt_checkpoint & cp = ckpts.emplace_back();
+                cp.n_tokens = e.n_tokens;
+                cp.id_task  = -1; // not a task of this node
+                cp.pos_min  = e.pos_min;
+                cp.pos_max  = e.pos_max;
+                cp.base_pos = e.base_pos;
+                cp.data_tgt.resize(e.n_tgt);
+                cp.data_dft.resize(e.n_dft);
+                cp.data_spec.resize(e.n_spec);
+                add(off, e.n_tgt,  cp.data_tgt.data());  off += spill_align_up(e.n_tgt);
+                add(off, e.n_dft,  cp.data_dft.data());  off += spill_align_up(e.n_dft);
+                add(off, e.n_spec, cp.data_spec.data()); off += spill_align_up(e.n_spec);
+            }
+        } catch (const std::bad_alloc &) {
+            error = "not enough memory for the state";
+            return false;
+        }
+        has_index = true;
+        return true;
+    }
+};
+
+server_pool_inbox_fork::server_pool_inbox_fork() : pimpl(std::make_unique<impl>()) {}
+
+server_pool_inbox_fork::~server_pool_inbox_fork() = default;
+
+bool server_pool_inbox_fork::write(uint64_t offset, const char * data, size_t n, uint64_t max_bytes, std::string & error) {
+    impl & in = *pimpl;
+    if (offset != in.received) {
+        error = "a chunk out of order: " + std::to_string(in.received) + " bytes came before it";
+        return false;
+    }
+    if (in.has_head && n > in.lay.size - in.received) {
+        error = "more bytes than the state holds";
+        return false;
+    }
+    in.received += n;
+
+    // a section becomes known once the bytes before it are in, and takes its part of this chunk too: the header gives
+    // the sections up to the index, the index (filled in the round after) those of the checkpoints
+    size_t from = 0;
+    while (from < in.targets.size()) {
+        const size_t to = in.targets.size();
+        for (size_t i = from; i < to; ++i) {
+            const auto & t = in.targets[i];
+            const uint64_t lo = std::max(offset, t.off);
+            const uint64_t hi = std::min(offset + n, t.off + t.len);
+            if (lo < hi) {
+                memcpy(t.dst + (lo - t.off), data + (lo - offset), hi - lo);
+            }
+        }
+        from = to;
+        if (!in.has_head) {
+            if (in.received >= sizeof(in.h) && !in.parse_head(max_bytes, error)) {
+                return false;
+            }
+        } else if (!in.has_index && in.received >= in.lay.off_index + in.h.n_ckpt*sizeof(spill_ckpt)) {
+            if (!in.parse_index(error)) {
+                return false;
+            }
+        }
+    }
+    if (in.has_head && in.received > in.lay.size) {
+        error = "more bytes than the state holds";
+        return false;
+    }
+    return true;
+}
+
+// fork: --pool. a state another node sent joins this cache in RAM, as the save of a slot does: alloc() drops the prompts
+// it holds whole and makes room, then the blobs the inbox filled move in without a copy. the portable signatures (the
+// model and the configuration, not the machine) must match
+bool server_prompt_cache::pool_import(server_pool_inbox_fork & inbox, uint64_t signature_from, size_t & n_tokens, std::string & error) {
+    if (signature_portable == 0 || signature_from != signature_portable) {
+        error = "the node runs another model or configuration (the portable cache signatures differ)";
+        return false;
+    }
+    server_pool_inbox_fork::impl & in = *inbox.pimpl;
+    if (!in.has_index || in.received != in.lay.size) {
+        error = "the state came short";
+        return false;
+    }
+
+    llama_tokens packed(in.h.n_prompt);
+    if (!packed.empty()) {
+        memcpy(packed.data(), in.prompt.data(), in.prompt.size());
+    }
+    server_prompt prompt;
+    try {
+        prompt.tokens = server_tokens::deserialize(packed, has_mtmd);
+    } catch (const std::exception & e) {
+        error = std::string("the prompt of the state cannot be restored: ") + e.what();
+        return false;
+    }
+    prompt.n_used = in.h.n_used;
+    n_tokens = prompt.tokens.size();
+
+    // the conversation was here before: a state holds the whole prompt already
+    for (const auto & st : states) {
+        if (st.prompt.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size()) {
+            return true;
+        }
+    }
+
+    size_t size = in.main.size() + in.drft.size();
+    for (const auto & cp : in.ckpts) {
+        size += cp.size();
+    }
+    if (limit_size > 0 && size > limit_size) {
+        error = string_format("the state (%.0f MiB) is larger than the prompt cache of this node (%.0f MiB)",
+                              size / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return false;
+    }
+
+    // the request it came for takes it, whatever --cache-min-tokens says (a minimum for disk writes, see write_state)
+    const size_t min_tokens_disk = min_tokens;
+    min_tokens = 0;
+    server_prompt_cache_state * st = alloc(prompt, 0, 0);
+    min_tokens = min_tokens_disk;
+    if (st == nullptr) {
+        error = "the prompt cache cannot take the state";
+        return false;
+    }
+    st->data.main          = std::move(in.main);
+    st->data.drft          = std::move(in.drft);
+    st->prompt.checkpoints = std::move(in.ckpts);
+    // the request it came for takes it into a slot right away: write_behind does not write it out meanwhile
+    st->disk_evicted = true;
+    return true;
 }
 
 bool server_prompt_cache::spill_exists(server_prompt_cache_state & st) {
@@ -1263,8 +1735,8 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
     if (!spill_dir.empty()) {
         const size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit;
 
-        // a clean state already has its copy on disk (write_behind put it there while idle), so
-        // releasing its RAM costs no I/O at all. Take those first
+        // a clean state already has its copy on disk (a cache hit read it back, or write_behind put it there while
+        // idle), so releasing its RAM costs no I/O at all. Take those first
         for (auto & st : states) {
             if (freed >= need) {
                 break;
@@ -1277,17 +1749,29 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
             freed += big - st.size();
         }
 
-        for (auto & st : states) {
-            if (freed >= need || !may_write) {
-                break;
-            }
+        // then oldest first: a state below the --cache-min-tokens step is not written (write_state), so it leaves RAM
+        // as it is and costs that much recompute; a longer one is written out first, when a write may run now. The
+        // writes erase only other entries (the prefixes they cover), so the walk keeps its place
+        for (auto it = states.begin(); it != states.end() && freed < need; ) {
+            server_prompt_cache_state & st = *it;
             if (st.on_disk || st.data.size() == 0) {
+                ++it;
                 continue;
             }
-            const size_t big = st.size();
-            if (spill_state(st, disk_free)) {
-                freed     += big - st.size();
+            if (below_step(st)) {
+                SRV_TRC(" - a state of %d tokens below the %zu token step leaves RAM without a write\n",
+                        st.prompt.n_tokens(), min_tokens);
+                freed += st.size();
+                it = states.erase(it);
+                continue;
             }
+            if (may_write) {
+                const size_t big = st.size();
+                if (spill_state(st, disk_free)) {
+                    freed += big - st.size();
+                }
+            }
+            ++it;
         }
 
         // checkpoints the disk budget refused, or ones read back by a cache hit, are still in RAM.
@@ -1351,27 +1835,7 @@ size_t server_prompt_cache::drop_resident(size_t need) {
     return freed;
 }
 
-// how many leading tokens of `st` some other entry already holds on disk. Writing `st` out buys
-// only the tokens past that point
-static size_t spill_prefix_on_disk(const std::list<server_prompt_cache_state> & states,
-        const server_prompt_cache_state & st) {
-    size_t res = 0;
-
-    for (const auto & other : states) {
-        if (&other == &st || !other.on_disk) {
-            continue;
-        }
-
-        const size_t len = other.prompt.tokens.get_common_prefix(st.prompt.tokens);
-        if (len == other.prompt.tokens.size()) {
-            res = std::max(res, len);
-        }
-    }
-
-    return res;
-}
-
-size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupted) {
+size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupted, bool all) {
     if (spill_dir.empty() || (interrupted && interrupted())) {
         return 0;
     }
@@ -1379,27 +1843,37 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
     enforce_disk_limit();
     const size_t disk_free = spill_limit == 0 ? SIZE_MAX : spill_limit;
 
+    // the RAM the cache holds over its limit: what the saves of a busy server left for later (defer_writes)
+    const auto over_limit = [this]() -> size_t {
+        if (limit_size == 0) {
+            return 0;
+        }
+        const size_t resident = size();
+        const size_t outside  = ram_outside ? ram_outside() : 0;
+        const size_t budget   = limit_size - std::min(limit_size, outside);
+        return resident > budget ? resident - budget : 0;
+    };
+
     size_t n_written = 0;
     size_t n_bytes   = 0;
 
     const int64_t t_start = ggml_time_us();
 
-    // oldest first, the same order free_ram spills in: those are the states it will evict next, and
-    // evicting a state that is already on disk is free
-    for (auto it = states.begin(); it != states.end(); ++it) {
+    // oldest first, the same order free_ram spills in: those are the states it will evict next, and evicting a state that
+    // is already on disk is free. all: every changed state; else only as many as the RAM limit pushes out
+    size_t need = all ? 0 : over_limit();
+    for (auto it = states.begin(); it != states.end() && (all || need > 0); ++it) {
         auto & st = *it;
 
-        if (spill_exists(st) || st.disk_evicted || st.data.size() == 0) {
+        if (st.data.size() == 0) {
             continue;
         }
-
-        // an older file already holds the front of this state. A rewrite would move gigabytes to
-        // win back only the tokens past that point, so let them pile up to the minimum first. What
-        // a crash costs is then that much recompute, not the whole prompt
-        const size_t n_have = spill_prefix_on_disk(states, st);
-        if (n_have > 0 && st.prompt.tokens.size() - n_have < min_tokens) {
-            SRV_TRC(" - %zu of %zu tokens are on disk already, below the %zu token rewrite step, skipping\n",
-                    n_have, st.prompt.tokens.size(), min_tokens);
+        // leaves RAM with no write in the eviction below: a clean state, one below the --cache-min-tokens step
+        if (!all && (st.is_clean() || below_step(st))) {
+            need -= std::min(need, st.size());
+            continue;
+        }
+        if (spill_exists(st) || st.disk_evicted) {
             continue;
         }
 
@@ -1408,6 +1882,7 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
             break;
         }
 
+        const size_t ram = st.size();
         if (!write_state(st, &interrupted, disk_free)) {
             if (interrupted && interrupted()) {
                 break; // stopped part way through, the file is gone and the state is still in RAM
@@ -1417,43 +1892,22 @@ size_t server_prompt_cache::write_behind(const std::function<bool()> & interrupt
 
         n_bytes   += st.disk_bytes;
         n_written += 1;
-
-        // the new file repeats what the shorter ones in front of it hold, so those go. This is
-        // deduplication, not eviction: nothing that is still the only copy of something is touched
-        for (auto it2 = states.begin(); it2 != states.end();) {
-            if (it2 == it || !it2->on_disk || it2->data.size() > 0 ||
-                    it2->prompt.tokens.get_common_prefix(st.prompt.tokens) != it2->prompt.tokens.size()) {
-                ++it2;
-                continue;
-            }
-
-            SRV_TRC(" - dropping the disk copy of a %d token prefix, the %d token state covers it\n",
-                    it2->prompt.n_tokens(), st.prompt.n_tokens());
-
-            erase_spill(*it2);
-            it2 = states.erase(it2);
-        }
+        need      -= std::min(need, ram);
     }
 
     // Writes that failed or were skipped must not leave the idle cache above its RAM budget.
-    if (limit_size > 0) {
-        const size_t resident = size();
-        const size_t outside = ram_outside ? ram_outside() : 0;
-        const size_t budget = limit_size - std::min(limit_size, outside);
-        if (resident > budget) {
-            const size_t need = resident - budget;
-            const size_t freed = free_ram(need, false);
-            if (freed < need) {
-                drop_resident(need - freed);
-            }
+    if (const size_t need_now = over_limit(); need_now > 0) {
+        const size_t freed = free_ram(need_now, false);
+        if (freed < need_now) {
+            drop_resident(need_now - freed);
         }
     }
 
     if (n_written > 0) {
         const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
-        SRV_INF(" - prompt cache: wrote %zu state(s) to disk while idle, %.3f MiB in %.0f ms (%.2f GB/s)\n",
-                n_written, n_bytes / (1024.0 * 1024.0), t_ms, n_bytes / (t_ms * 1e6));
+        SRV_INF(" - prompt cache: wrote %zu state(s) to disk while idle%s, %.3f MiB in %.0f ms (%.2f GB/s)\n",
+                n_written, all ? "" : " (over the RAM limit)", n_bytes / (1024.0 * 1024.0), t_ms, n_bytes / (t_ms * 1e6));
     }
 
     return n_written;

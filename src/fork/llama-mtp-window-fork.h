@@ -13,8 +13,8 @@ struct llama_mtp_window_kv_fork {
     uint32_t n_swa   = 0; // positions of each sequence it keeps
 };
 
-// window: LLAMA_MTP_WINDOW, 0 or less for the whole context. mode: LLAMA_MTP_WINDOW_KV, -1 with several sequences, 1
-// always, 0 never
+// window: LLAMA_MTP_WINDOW, 0 or less for the whole context. mode: LLAMA_MTP_WINDOW_KV, 1 always (the default), -1 with
+// several sequences only, 0 never
 static inline llama_mtp_window_kv_fork llama_mtp_window_kv_rule_fork(
         int64_t window, int mode, uint32_t n_seq_max, bool kv_unified, uint32_t n_ubatch, uint32_t n_ctx_seq) {
     llama_mtp_window_kv_fork res;

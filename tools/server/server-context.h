@@ -56,6 +56,11 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // fork: --pool, the node side (tools/server/fork/server-pool-fork.cpp)
+    uint64_t    pool_signature_fork = 0; // the portable signature of the prompt cache, 0 = no cache
+    std::string pool_spill_dir_fork;     // --cache-spill-dir, where the links of the exports go (UTF-8)
+    uint64_t    pool_cache_ram_fork = 0; // the RAM limit of the prompt cache in bytes, 0 = none: the largest state taken
 };
 
 using server_state_callback_t = std::function<void(server_state, json /* payload */)>;
@@ -136,6 +141,22 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+
+    // fork: the node side of --pool (tools/server/fork/server-pool-fork.cpp): GET /pool/node (devices, model, the cache
+    // signature), the move of a conversation: POST /pool/export, GET /pool/export/data, POST /pool/export/done,
+    // POST /pool/import/data, POST /pool/import/done, and the probe of a link: GET and POST /pool/probe
+    server_http_context::handler_t get_pool_node_fork;
+    server_http_context::handler_t post_pool_export_fork;
+    server_http_context::handler_t get_pool_export_data_fork;
+    server_http_context::handler_t post_pool_export_done_fork;
+    server_http_context::handler_t post_pool_import_data_fork;
+    server_http_context::handler_t post_pool_import_done_fork;
+    server_http_context::handler_t get_pool_probe_fork;
+    server_http_context::handler_t post_pool_probe_fork;
+    // a node with a prompt cache moves conversations; --api-key guards it, as every other route
+    bool pool_migrate_fork() const {
+        return meta->pool_signature_fork != 0;
+    }
 
     // to be used in router mode
     json get_model_info() const;

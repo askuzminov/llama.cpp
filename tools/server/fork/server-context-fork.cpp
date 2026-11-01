@@ -141,6 +141,7 @@ void server_prompt_cache_init(
             (size_t) cache_ram_mib_eff, n_ctx, reserve_bytes, params.cache_spill_dir, spill_limit,
             server_prompt_cache_signature(params, model_tgt, ctx_tgt, ctx_dft), (uint64_t) std::hash<std::string>{}(params.model.path), has_mtmd);
     prompt_cache->min_tokens = (size_t) std::max(0, params.cache_min_tokens);
+    prompt_cache->signature_portable = server_prompt_cache_signature_portable(params, model_tgt, ctx_tgt, ctx_dft); // fork: --pool
 
     if (params.cache_min_tokens > 0) {
         SRV_INF("prompt cache minimum prompt length: %d tokens\n", params.cache_min_tokens);
@@ -153,7 +154,9 @@ void server_prompt_cache_init(
     }
 }
 
-static std::string server_cache_file_identity(const std::string & name, const llama_model * model = nullptr) {
+// portable (fork: --pool): only the size of each file, the same copy of a model on another machine has another path
+// and file time
+static std::string server_cache_file_identity(const std::string & name, const llama_model * model = nullptr, bool portable = false) {
     if (name.empty()) {
         return "|no-file";
     }
@@ -162,6 +165,11 @@ static std::string server_cache_file_identity(const std::string & name, const ll
     auto add = [&](const std::string & file) {
         const auto path = std::filesystem::u8path(file);
         std::error_code ec;
+        if (portable) {
+            const auto size = std::filesystem::file_size(path, ec);
+            out << '|' << (ec ? 0 : size);
+            return;
+        }
         const auto canonical = std::filesystem::weakly_canonical(path, ec);
         out << '|' << std::quoted(ec ? file : canonical.u8string());
         const auto size = std::filesystem::file_size(path, ec);
@@ -187,30 +195,45 @@ static std::string server_cache_file_identity(const std::string & name, const ll
     return out.str();
 }
 
-uint64_t server_prompt_cache_signature(
+// portable (fork: --pool): only what the format of a saved state depends on, so that another node of the same model has
+// the same and a cached state can move to it: no path of the model or times of its files, and the number of KV streams
+// in place of the slots and the context sizes (a state larger than the context of the node fails to restore and is
+// recomputed there). the text holds hexfloats, so it matches between builds of one standard library only
+static uint64_t server_prompt_cache_signature_impl(
         const common_params & params,
         const llama_model * model_tgt,
         const llama_context * ctx_tgt,
-        const llama_context * ctx_dft) {
+        const llama_context * ctx_dft,
+        bool portable) {
     char desc[256] = {};
     llama_model_desc(model_tgt, desc, sizeof(desc));
 
     std::string s;
     s += desc;
-    s += "|" + params.model.path;
+    if (!portable) {
+        s += "|" + params.model.path;
+    }
     s += "|" + std::to_string(llama_model_size(model_tgt));
-    s += "|" + std::to_string(llama_n_ctx(ctx_tgt));
-    s += "|" + std::to_string(llama_n_ctx_seq(ctx_tgt));
-    s += "|" + std::to_string(llama_n_rs_seq(ctx_tgt));
+    if (!portable) {
+        s += "|" + std::to_string(llama_n_ctx(ctx_tgt));
+        s += "|" + std::to_string(llama_n_ctx_seq(ctx_tgt));
+        s += "|" + std::to_string(llama_n_rs_seq(ctx_tgt));
+    }
     s += "|" + std::to_string((int) params.cache_type_k);
     s += "|" + std::to_string((int) params.cache_type_v);
-    s += "|" + std::to_string(params.n_parallel);
+    if (!portable) {
+        s += "|" + std::to_string(params.n_parallel);
+    }
     s += "|" + std::to_string((int) params.swa_full);
-    s += "|" + std::to_string((int) params.kv_unified);
+    if (!portable) {
+        s += "|" + std::to_string((int) params.kv_unified);
+    } else {
+        s += "|streams " + std::to_string(params.kv_unified ? 1 : params.n_parallel);
+    }
     s += "|" + std::to_string(ctx_dft != nullptr);
     s += "|" + std::to_string(LLAMA_STATE_SEQ_VERSION);
     // File timestamps avoid reading all weights at startup. Exact float text preserves close overrides.
-    s += "|compat 2" + server_cache_file_identity(params.model.path, model_tgt);
+    s += "|compat 2" + server_cache_file_identity(params.model.path, model_tgt, portable);
     std::ostringstream config;
     config.imbue(std::locale::classic());
     config << std::hexfloat << '|' << params.rope_scaling_type << '|' << params.rope_freq_base << '|' << params.rope_freq_scale
@@ -231,20 +254,21 @@ uint64_t server_prompt_cache_signature(
     }
     config << "|lora " << params.lora_init_without_apply;
     for (const auto & adapter : params.lora_adapters) {
-        config << server_cache_file_identity(adapter.path) << '|' << adapter.scale;
+        config << server_cache_file_identity(adapter.path, nullptr, portable) << '|' << adapter.scale;
     }
     config << "|control " << params.control_vector_layer_start << '|' << params.control_vector_layer_end;
     for (const auto & cv : params.control_vectors) {
-        config << server_cache_file_identity(cv.fname) << '|' << cv.strength;
+        config << server_cache_file_identity(cv.fname, nullptr, portable) << '|' << cv.strength;
     }
-    config << "|mmproj" << server_cache_file_identity(params.mmproj.path);
+    config << "|mmproj" << server_cache_file_identity(params.mmproj.path, nullptr, portable);
     config << '|' << params.image_min_tokens << '|' << params.image_max_tokens << '|' << params.video_fps;
     if (ctx_dft) {
         const auto & draft = params.speculative.draft;
-        config << "|draft" << server_cache_file_identity(draft.mparams.path, llama_get_model(ctx_dft))
-               << '|' << llama_n_ctx(ctx_dft) << '|' << llama_n_ctx_seq(ctx_dft)
-               << '|' << llama_n_rs_seq(ctx_dft)
-               << '|' << draft.cache_type_k << '|' << draft.cache_type_v;
+        config << "|draft" << server_cache_file_identity(draft.mparams.path, llama_get_model(ctx_dft), portable);
+        if (!portable) {
+            config << '|' << llama_n_ctx(ctx_dft) << '|' << llama_n_ctx_seq(ctx_dft) << '|' << llama_n_rs_seq(ctx_dft);
+        }
+        config << '|' << draft.cache_type_k << '|' << draft.cache_type_v;
     }
     s += config.str();
     char arch[32] = {};
@@ -258,10 +282,29 @@ uint64_t server_prompt_cache_signature(
     uint32_t n_window_dft = 0;
     const uint32_t n_cells_dft = ctx_dft ? llama_mtp_window_kv(ctx_dft, &n_window_dft) : 0;
     if (n_cells_dft > 0) {
-        s += "|mtp-window-kv " + std::to_string(n_window_dft) + " " + std::to_string(n_cells_dft);
+        s += "|mtp-window-kv " + std::to_string(n_window_dft);
+        if (!portable) {
+            s += " " + std::to_string(n_cells_dft);
+        }
     }
 
     return (uint64_t) std::hash<std::string>{}(s);
+}
+
+uint64_t server_prompt_cache_signature(
+        const common_params & params,
+        const llama_model * model_tgt,
+        const llama_context * ctx_tgt,
+        const llama_context * ctx_dft) {
+    return server_prompt_cache_signature_impl(params, model_tgt, ctx_tgt, ctx_dft, false);
+}
+
+uint64_t server_prompt_cache_signature_portable(
+        const common_params & params,
+        const llama_model * model_tgt,
+        const llama_context * ctx_tgt,
+        const llama_context * ctx_dft) {
+    return server_prompt_cache_signature_impl(params, model_tgt, ctx_tgt, ctx_dft, true);
 }
 
 //

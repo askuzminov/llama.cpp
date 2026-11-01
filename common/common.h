@@ -794,6 +794,10 @@ struct common_params {
     std::string cache_spill_dir   = "";  // [experimental] spill cold prompt-cache states to this dir (on disk) instead of dropping them ("" = disabled)
     int32_t cache_disk_mib        = 0;   // disk budget (MiB) for spilled prompt-cache states; least-recently-used dropped over this (0 = unlimited)
     int32_t cache_min_tokens      = 0;   // do not cache prompts shorter than this many tokens (0 = no minimum)
+    bool    cache_idle_write      = false; // --cache-idle-write: copy every changed state to disk while idle (write-behind)
+
+    // fork: --pool, run the server as a router over remote instances of one model (tools/server/fork/server-pool-fork.cpp)
+    std::string pool_file = ""; // the INI file of the nodes ("" = disabled)
 };
 
 // call once at the start of a program if it uses libcommon

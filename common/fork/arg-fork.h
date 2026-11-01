@@ -17,6 +17,7 @@ enum common_arg_fork_at {
     COMMON_ARG_FORK_AT_CACHE_RAM,        // after --cache-ram: --cache-spill-dir, --cache-disk, --cache-min-tokens
     COMMON_ARG_FORK_AT_N_CPU_MOE,        // after --n-cpu-moe: --moe-cache, --phase-mem
     COMMON_ARG_FORK_AT_SPEC_SYNTH_RATES, // after --spec-synth-rates: --spec-auto
+    COMMON_ARG_FORK_AT_MODELS_PRESET,    // after --models-preset: --pool
 };
 
 void common_fork_add_args(common_arg_fork_at at, const common_params & params, const std::function<void(common_arg)> & add_opt);

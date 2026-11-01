@@ -13,8 +13,9 @@ rem two timeouts bound the wait:
 rem   stop-timeout in models.ini (10 s by default) - after that the router force-kills the child
 rem   HungAppTimeout in HKCU\Control Panel\Desktop (5 s by default) - after that windows kills us
 rem     on a window close or a pc shutdown. Ctrl+C has no such limit
-rem most of the time the wait is short anyway: while the slots are idle the server already copies
-rem their states out to the spill dir, so the exit has little left to write
+rem the exit writes the long conversations still in RAM (cache-min-tokens and more): the server no
+rem longer copies them out while idle, cache-idle-write = true in models.ini brings that back. with a
+rem few of them that is seconds, about 1 s per 2-3 GB, so give the children time: stop-timeout = 60
 setlocal
 
 rem git bash / msys puts its own find, sort and friends ahead of the windows ones on PATH

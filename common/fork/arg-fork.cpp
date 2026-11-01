@@ -30,9 +30,11 @@ static void common_params_add_args_cache_ram(const common_params & params, const
     add_opt(common_arg(
         {"--cache-spill-dir"}, "PATH",
         "[experimental] spill cold prompt-cache states to PATH (on disk) instead of dropping them under memory "
-        "pressure; loaded back on a cache hit, which leaves the file in place. While the server is idle, resident "
-        "states are copied out as well, so a later eviction frees the RAM with no I/O and a crash does not lose the "
-        "cache. The files are kept on shutdown and picked up again on the next start (cold-start reuse) as long as "
+        "pressure; loaded back on a cache hit, which leaves the file in place. A state is written when it leaves RAM "
+        "(over --cache-ram or the host-RAM reserve) and on shutdown, the writes of the RAM limit wait for a moment "
+        "when no slot runs; --cache-min-tokens sets the smallest state written and the rewrite step, "
+        "--cache-idle-write also copies every changed state out while idle. "
+        "The files are kept on shutdown and picked up again on the next start (cold-start reuse) as long as "
         "the model and KV configuration match. The context checkpoints go out with the state, so a prompt that "
         "matches only a prefix can still roll back after a restart. Several models may share one directory: a file "
         "is read only by its matching configuration; the disk budget is shared by all models in PATH. "
@@ -59,8 +61,8 @@ static void common_params_add_args_cache_ram(const common_params & params, const
             "Prompts shorter than N are not cached at all: they are cheap to recompute, while a hybrid model stores the "
             "same fixed recurrent state for any length, so caching one mostly takes room from the long prompts that pay "
             "off. A state whose front is already on disk is also not written again until it grows N tokens past it, "
-            "which keeps a chat that gains a few hundred tokens per turn from rewriting gigabytes every turn. A crash "
-            "then costs up to N tokens of recompute", params.cache_min_tokens),
+            "which keeps a chat that gains a few hundred tokens per turn from rewriting gigabytes every turn: it leaves "
+            "RAM without a write, and coming back costs up to N tokens of recompute", params.cache_min_tokens),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("cache-min-tokens must be >= 0");
@@ -68,6 +70,17 @@ static void common_params_add_args_cache_ram(const common_params & params, const
             params.cache_min_tokens = value;
         }
     ).set_env("LLAMA_ARG_CACHE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-idle-write"},
+        {"--no-cache-idle-write"},
+        string_format("while all slots are idle, copy every changed prompt-cache state to --cache-spill-dir "
+            "(write-behind): a later eviction then frees the RAM with no write and a crash loses at most "
+            "--cache-min-tokens tokens of a conversation, at the cost of a disk write per changed state "
+            "(default: %s)", params.cache_idle_write ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cache_idle_write = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_IDLE_WRITE").set_examples({LLAMA_EXAMPLE_SERVER}));
 }
 
 static void common_params_add_args_n_cpu_moe(const common_params & /*params*/, const std::function<void(common_arg)> & add_opt) {
@@ -108,12 +121,26 @@ static void common_params_add_args_spec_synth_rates(const common_params & params
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_AUTO"));
 }
 
+static void common_params_add_args_models_preset(const common_params & /*params*/, const std::function<void(common_arg)> & add_opt) {
+    add_opt(common_arg(
+        {"--pool"}, "PATH",
+        "[experimental] run as a router over remote llama-server instances of one model, listed in the INI file PATH "
+        "([pool] options, a [node.<name>] section with url = http://host:port per node): the agents use one address, a "
+        "conversation keeps to the node that holds its prompt cache, a new one goes to the node with free slots; "
+        "a dashboard at /pool (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.pool_file = value;
+        }
+    ).set_env("LLAMA_ARG_POOL").set_examples({LLAMA_EXAMPLE_SERVER}));
+}
+
 void common_fork_add_args(common_arg_fork_at at, const common_params & params, const std::function<void(common_arg)> & add_opt) {
     switch (at) {
         case COMMON_ARG_FORK_AT_CTX_CHECKPOINTS:  common_params_add_args_ctx_checkpoints (params, add_opt); break;
         case COMMON_ARG_FORK_AT_CACHE_RAM:        common_params_add_args_cache_ram       (params, add_opt); break;
         case COMMON_ARG_FORK_AT_N_CPU_MOE:        common_params_add_args_n_cpu_moe       (params, add_opt); break;
         case COMMON_ARG_FORK_AT_SPEC_SYNTH_RATES: common_params_add_args_spec_synth_rates(params, add_opt); break;
+        case COMMON_ARG_FORK_AT_MODELS_PRESET:    common_params_add_args_models_preset   (params, add_opt); break;
     }
 }
 

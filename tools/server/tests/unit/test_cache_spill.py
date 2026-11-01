@@ -148,8 +148,81 @@ def test_prompt_cache_spill_written_on_shutdown():
             pass
 
 
+def test_prompt_cache_writes_what_leaves_ram():
+    # By default nothing is written while the server is idle. A state goes to disk when the RAM limit pushes it out and
+    # holds at least --cache-min-tokens tokens, and not again until it grew that much past its copy on disk: below that
+    # step it leaves RAM without a write, and the copy it grew from stays. The copy ends with the token it generated,
+    # which the next prompt does not repeat, so it is no whole prefix of the grown state - the step counts what they
+    # share. tinygemma3: a prompt of 1202 tokens is a state of 35 MiB, two of them do not fit --cache-ram 50.
+    spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-evict-")
+
+    server = ServerPreset.tinygemma3()
+    server.no_mmproj = True
+    server.n_ctx = 4096
+    server.n_slots = 1
+    server.n_predict = 1
+    server.temperature = 0.0
+    server.cache_ram = 50
+    server.cache_spill_dir = spill_dir
+    server.cache_disk = 1024       # the disk budget bounds the files, not the token limit of the cache
+    server.cache_min_tokens = 100
+
+    def run(prompt: str) -> dict:
+        res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True})
+        assert res.status_code == 200, res.body
+        return res.body["timings"]
+
+    def files() -> list:
+        return sorted(f for f in spill_files(spill_dir) if f.endswith(".bin"))
+
+    def story(word: str) -> str:
+        return f"The quick brown {word} jumps over the lazy dog. " * 120
+
+    try:
+        server.start()
+
+        run(story("fox"))
+        run(story("cat"))  # fox goes to the cache, it fits
+        time.sleep(0.5)
+        assert files() == [], "a state was written while idle"
+
+        run(story("owl"))  # cat goes to the cache, fox no longer fits: it leaves RAM with a write
+        fox = files()
+        assert len(fox) == 1, fox
+
+        short = story("fox") + "The fox ran on."
+        t = run(short)  # read back from its file, which stays; cat leaves RAM with a write
+        assert t["cache_n"] > 1100, t  # SWA: back to the checkpoint a few tokens before its end
+        run(story("eel"))  # the grown fox goes to the cache, owl leaves RAM with a write
+        before = files()
+        assert len(before) == 3 and fox[0] in before, before
+        run(story("ant"))  # the grown fox leaves RAM: a few tokens past its file, below the step, so no write
+        assert files() == before, "a state below the step was written"
+
+        t = run(short)  # its file is still there; eel leaves RAM with a write
+        assert t["cache_n"] > 1100, t
+
+        long = story("fox") + "The fox ran into the old forest and met an owl who knew every path. " * 12
+        run(long)  # ant leaves RAM with a write
+        run(story("bee"))  # the long fox goes to the cache
+        before = files()
+        run(story("elk"))  # it leaves RAM: past the step, so it is written
+        after = files()
+        assert len(after) == len(before) + 1 and fox[0] in after, (before, after)
+        t = run(long)
+        assert t["cache_n"] > 1300, t
+    finally:
+        server.stop()
+        try:
+            for f in os.listdir(spill_dir):
+                os.remove(os.path.join(spill_dir, f))
+            os.rmdir(spill_dir)
+        except OSError:
+            pass
+
+
 def test_prompt_cache_write_behind_while_idle():
-    # Write-behind: the cache must reach the disk while the server is idle, not only at shutdown.
+    # --cache-idle-write (write-behind): the cache must reach the disk while the server is idle, not only at shutdown.
     # The blobs stay in RAM as well, so a later eviction needs no I/O and a crash loses nothing.
     spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-idle-")
 
@@ -161,6 +234,7 @@ def test_prompt_cache_write_behind_while_idle():
     server.cache_ram = 100
     server.cache_spill_dir = spill_dir
     server.cache_disk = 512
+    server.cache_idle_write = True # what this test is about
 
     try:
         server.start()
@@ -222,6 +296,7 @@ def test_prompt_cache_spill_kill_mid_write():
         server.server_slots = True
         server.cache_spill_dir = spill_dir
         server.cache_disk = 1024
+        server.cache_idle_write = True # the write while idle is the one the test catches
         return server
 
     server = make_server()
@@ -293,6 +368,7 @@ def test_prompt_cache_spill_with_mmproj():
     server.cache_ram = 100
     server.cache_spill_dir = spill_dir
     server.cache_disk = 512
+    server.cache_idle_write = True # the write while idle puts the state on disk
 
     try:
         server.start()
@@ -356,6 +432,7 @@ def test_prompt_cache_spill_with_image():
         server.cache_ram = 100
         server.cache_spill_dir = spill_dir
         server.cache_disk = 512
+        server.cache_idle_write = True # the write while idle puts the state on disk
         # gemma3 is a SWA model: without the full KV a restored state starts past position 0 and the
         # slot has to reprocess the prompt, which would hide what this test is after
         server.swa_full = True
@@ -432,6 +509,7 @@ def test_prompt_cache_hit_keeps_the_file():
     server.cache_spill_dir = spill_dir
     server.cache_disk = 512
     server.cache_min_tokens = 32   # under LONG_PROMPT, over the short prompt and over the follow-up
+    server.cache_idle_write = True # the write while idle puts the state on disk
 
     try:
         server.start()
@@ -495,6 +573,7 @@ def test_prompt_cache_min_tokens_skips_short_prompts():
     server.cache_spill_dir = spill_dir
     server.cache_disk = 512
     server.cache_min_tokens = 4096   # far above anything this test sends
+    server.cache_idle_write = True   # what enters the cache reaches the disk while idle
 
     try:
         server.start()

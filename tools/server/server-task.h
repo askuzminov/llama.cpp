@@ -34,6 +34,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_POOL_EXPORT, // fork: --pool, the cached state of a prompt to a file another node takes
+    SERVER_TASK_TYPE_POOL_IMPORT, // fork: --pool, a state file of another node into the prompt cache
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -200,6 +202,15 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // fork: used by SERVER_TASK_TYPE_POOL_EXPORT (the prompt in `tokens`) and SERVER_TASK_TYPE_POOL_IMPORT
+    struct pool_action {
+        std::string id;        // the transfer
+        uint64_t    signature; // import: the portable cache signature of the node the state comes from
+        size_t      min_match; // export: a state the request takes fewer tokens from is not worth the move
+        std::shared_ptr<server_pool_inbox_fork> inbox; // import: the state as it came
+    };
+    pool_action pool_action = {};
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -829,16 +840,20 @@ struct server_prompt_cache {
     std::filesystem::path spill_path(uint64_t uid) const;
     // RAM -> disk, keeps st.data (the state becomes clean). `cancel` is polled between device
     // transfers: when it fires the partial file is removed and the state stays dirty. A state whose
-    // file would not fit in `disk_free` bytes is skipped
+    // file would not fit in `disk_free` bytes is skipped, so is one below the --cache-min-tokens step.
+    // The disk-only prefixes the new file covers are erased from `states`
     bool write_state(server_prompt_cache_state & st, const std::function<bool()> * cancel = nullptr, size_t disk_free = SIZE_MAX);
+    // the state is not worth a disk write: shorter than --cache-min-tokens, or grown less than it past a front on disk
+    bool below_step(const server_prompt_cache_state & st) const;
     void evict_state(server_prompt_cache_state & st);   // free st.data of a clean state, no I/O
     bool spill_state(server_prompt_cache_state & st, size_t disk_free = SIZE_MAX); // write_state + evict_state, keeps st in the list
     bool unspill_state(server_prompt_cache_state & st); // disk -> RAM (reads st.data back, keeps the file)
 
-    // write-behind: copy dirty states to disk while nothing else runs, then enforce the RAM budget without more writes.
+    // write dirty states to disk while nothing else runs, then enforce the RAM budget without more writes. all: every
+    // dirty state (write-behind, --cache-idle-write); else only those the RAM limit pushes out (fork default).
     // `interrupted` is polled between states so a request that arrives does not wait for the rest.
     // Returns the number of states written.
-    size_t write_behind(const std::function<bool()> & interrupted);
+    size_t write_behind(const std::function<bool()> & interrupted, bool all);
     void erase_spill(const server_prompt_cache_state & st); // delete the backing file, if any
     bool spill_exists(server_prompt_cache_state & st); // refresh after another process evicts a file
     void enforce_disk_limit(); // global LRU over spill_limit
@@ -866,6 +881,28 @@ struct server_prompt_cache {
     // fork: host RAM the server holds outside the cache within the cache's RAM limit - the states of slots paused for
     // room (room_pause_fork): the limit counts them, the cache gives way. empty = none
     std::function<size_t()> ram_outside;
+
+    // fork: --pool, a conversation moves to another node with its state. the signature without the machine (no path
+    // or file time of the model): another node of the same model and configuration has the same
+    uint64_t signature_portable = 0;
+    // the state `it` for a request of `n_req` tokens that shares `n_match` with it: `plan` sends its file (linked at
+    // `link`) or a copy of its blobs, with the checkpoint the request goes back to. need_ckpt: the memory cannot roll
+    // back part of a sequence; n_swa: its window, 0 = none. false, with plan.n_reuse below min_reuse, when the request
+    // takes less from the state
+    bool pool_export(std::list<server_prompt_cache_state>::iterator it, const std::filesystem::path & link, size_t n_match,
+                     size_t n_req, bool need_ckpt, int32_t n_swa, size_t min_reuse, server_pool_plan_fork & plan,
+                     std::string & error);
+    // a state another node of `signature_from` sent joins this cache in RAM
+    bool pool_import(server_pool_inbox_fork & inbox, uint64_t signature_from, size_t & n_tokens, std::string & error);
+};
+
+// fork: the result of SERVER_TASK_TYPE_POOL_EXPORT / SERVER_TASK_TYPE_POOL_IMPORT
+struct server_task_result_pool_fork : server_task_result {
+    json data;
+    virtual json to_json() override { return data; }
+    virtual server_task_result * clone() const override {
+        return new server_task_result_pool_fork(*this);
+    }
 };
 
 // used exclusively by router mode

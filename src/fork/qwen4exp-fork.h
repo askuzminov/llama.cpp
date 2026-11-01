@@ -57,8 +57,10 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
 
     // whether the draft context keeps the KV of the dense MTP head as a window of mtp_window() positions per sequence
     // (a SWA cache of window*n_seq + n_ubatch cells). with several slots the last cells of a shared cache are not
-    // the last positions of each slot, which the window over the last cells needs. LLAMA_MTP_WINDOW_KV: -1 (default)
-    // with several sequences, 1 always, 0 never. when true, sets the size and the SWA of the cache
+    // the last positions of each slot, which the window over the last cells needs; with one slot it is the exact window
+    // in a small cache, and the states of every slot count have the same layout (a pool moves them between nodes).
+    // LLAMA_MTP_WINDOW_KV: 1 (default) always, -1 with several sequences only, 0 never. when true, sets the size and
+    // the SWA of the cache
     static bool mtp_window_kv(const llama_cparams & cparams, uint32_t & kv_size, uint32_t & n_swa, llama_swa_type & swa_type);
 
     struct graph : public llm_build_delta_net_base {

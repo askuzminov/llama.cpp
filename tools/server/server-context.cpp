@@ -25,6 +25,7 @@
 #include "base64.hpp"
 
 #include "fork/server-context-fork.h"
+#include "fork/server-pool-fork.h" // fork: --pool, the node side
 #include "../../src/llama-ext.h" // fork: llama_set_next_tokens
 
 #include <algorithm>
@@ -1995,6 +1996,91 @@ private:
         return saved;
     }
 
+    // fork: --pool, a conversation moves to another node with its state, and nothing is written to disk for it. the
+    // export takes the cached state that holds the most of the prompt in `task.tokens`, after an idle slot holding more
+    // of it saved its state to the cache: the file of a state on disk is read as it is, a state only in RAM is copied
+    // here (behind the batch the node is computing). the import takes the state another node sent into the cache, in
+    // RAM, where the next request of the conversation finds it
+    void pool_task_fork(const server_task & task) {
+        if (!prompt_cache || prompt_cache->signature_portable == 0) {
+            send_error(task, "this node cannot move conversations: it has no prompt cache", ERROR_TYPE_NOT_SUPPORTED);
+            return;
+        }
+
+        std::string error;
+        json data;
+        if (task.type == SERVER_TASK_TYPE_POOL_EXPORT) {
+            // the state with the longest prefix of the prompt, the shortest of them (find_best weighs what a slot keeps)
+            size_t n_match = 0;
+            auto best = [&]() {
+                auto it_best = prompt_cache->states.end();
+                n_match = 0;
+                for (auto it = prompt_cache->states.begin(); it != prompt_cache->states.end(); ++it) {
+                    const size_t n = it->prompt.tokens.get_common_prefix(task.tokens);
+                    if (n > n_match || (n == n_match && n > 0 && it->prompt.tokens.size() < it_best->prompt.tokens.size())) {
+                        it_best = it;
+                        n_match = n;
+                    }
+                }
+                return it_best;
+            };
+            auto it = best();
+            // a conversation shorter than --cache-min-tokens moves too: that minimum is for disk writes, and the state
+            // of a move is in RAM. it does not reach the disk from there either (write_state keeps to the minimum)
+            const size_t min_tokens = prompt_cache->min_tokens;
+            prompt_cache->min_tokens = 0;
+            for (auto & slot : slots) {
+                if (!slot.is_processing() && slot.prompt.tokens.get_common_prefix(task.tokens) > n_match && prompt_save_fork(slot)) {
+                    it = best();
+                }
+            }
+            prompt_cache->min_tokens = min_tokens;
+            const size_t min_reuse = std::max<size_t>(1, task.pool_action.min_match);
+            if (it == prompt_cache->states.end() || n_match < min_reuse) {
+                send_error(task, "no cached state holds this conversation", ERROR_TYPE_NOT_FOUND);
+                return;
+            }
+            // a memory that cannot roll back part of a sequence (recurrent, hybrid, SWA) goes back to a checkpoint
+            const bool need_ckpt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                   ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0;
+            const auto link = server_pool_xfer_path_fork(prompt_cache->spill_dir, "export", task.pool_action.id);
+            server_pool_plan_fork plan;
+            if (!prompt_cache->pool_export(it, link, n_match, task.tokens.size(), need_ckpt, n_swa, min_reuse, plan, error)) {
+                send_error(task, error, plan.n_reuse < min_reuse ? ERROR_TYPE_NOT_FOUND : ERROR_TYPE_SERVER);
+                return;
+            }
+            data = {
+                {"id", task.pool_action.id}, {"n_tokens", it->prompt.tokens.size()}, {"n_match", n_match},
+                {"n_reuse", plan.n_reuse}, {"size", plan.size}, {"n_ckpt", plan.n_ckpt}, {"n_ckpt_all", plan.n_ckpt_all},
+                {"from_disk", !plan.file.empty()},
+                {"signature", string_format("%016llx", (unsigned long long) prompt_cache->signature_portable)},
+            };
+            SRV_INF("pool: exported a state of %zu tokens from %s (%llu of the request reused) with %llu of %llu checkpoints, %.1f MiB\n",
+                    it->prompt.tokens.size(), plan.file.empty() ? "RAM" : "disk", (unsigned long long) plan.n_reuse,
+                    (unsigned long long) plan.n_ckpt, (unsigned long long) plan.n_ckpt_all, plan.size / (1024.0 * 1024.0));
+            server_pool_xfer_plan_fork(task.pool_action.id, std::move(plan));
+        } else {
+            size_t n_tokens = 0;
+            if (!task.pool_action.inbox) {
+                send_error(task, "no such transfer", ERROR_TYPE_NOT_FOUND);
+                return;
+            }
+            if (!prompt_cache->pool_import(*task.pool_action.inbox, task.pool_action.signature, n_tokens, error)) {
+                send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
+                return;
+            }
+            // the RAM limit with the new state, without a disk write while slots run
+            prompt_cache->update(!others_run_fork(nullptr));
+            data = {{"n_tokens", n_tokens}};
+            SRV_INF("pool: imported a state of %zu tokens into RAM\n", n_tokens);
+        }
+
+        auto res = std::make_unique<server_task_result_pool_fork>();
+        res->id   = task.id;
+        res->data = std::move(data);
+        queue_results.send(std::move(res));
+    }
+
     // fork: clear the idle slot used least recently, other than `keep`, and keep its state in the prompt cache first
     // (server_slot_room_fork). it runs while other slots generate or wait for a decode, so the save writes nothing to
     // disk (defer_writes): the cache can stay above its RAM limit until the next update(), at a task launch, and
@@ -3850,6 +3936,11 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_POOL_EXPORT:
+            case SERVER_TASK_TYPE_POOL_IMPORT:
+                {
+                    pool_task_fork(task); // fork: --pool
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4048,16 +4139,17 @@ private:
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
 
-                // write-behind: nothing runs now, so hand the slots to the cache and copy what is
-                // still RAM-only out to disk. A later eviction then frees the RAM with no I/O, and
-                // a crash no longer takes the whole cache with it
+                // nothing runs now, so the states the RAM limit pushes out go to disk, with no request waiting for the
+                // write. --cache-idle-write (write-behind): hand the slots to the cache and copy every state still
+                // RAM-only out, so a later eviction frees the RAM with no I/O and a crash no longer takes the whole cache
+                // with it - at the price of a disk write for each changed state
                 if (prompt_cache && !params_base.cache_spill_dir.empty()) {
                     // the same save cache_idle_slots does on a new task, only earlier
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_write && params_base.cache_idle_slots) {
                         save_slots_to_cache();
                     }
 
-                    prompt_cache->write_behind([this]() { return queue_tasks.has_new_task(); });
+                    prompt_cache->write_behind([this]() { return queue_tasks.has_new_task(); }, params_base.cache_idle_write);
 
                     // fork: the RAM limit the saves of evicted slots left behind (defer_writes), from the states now on
                     // disk - no write, a request that arrives does not wait for one
@@ -5958,6 +6050,10 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params          */ llama_model_n_params(impl->model_tgt),
         /* model_size              */ llama_model_size(impl->model_tgt),
         /* model_ftype             */ ftype_name,
+
+        /* pool_signature_fork     */ impl->prompt_cache ? impl->prompt_cache->signature_portable : 0,
+        /* pool_spill_dir_fork     */ impl->prompt_cache ? impl->prompt_cache->spill_dir : std::string(),
+        /* pool_cache_ram_fork     */ impl->prompt_cache ? (uint64_t) impl->prompt_cache->limit_size : 0,
     };
 }
 
@@ -7440,6 +7536,236 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    //
+    // fork: the node side of --pool (tools/server/fork/server-pool-fork.cpp): GET /pool/node for the dashboard, and the
+    // move of a conversation with its cached state: the pool exports the state from the node that holds it
+    // (POST /pool/export with the request that goes on with it), reads it in chunks (GET /pool/export/data) and writes
+    // them to the target (POST /pool/import/data), which takes the state into its prompt cache (POST /pool/import/done);
+    // POST /pool/export/done drops the export. nothing is written to disk for a move
+    //
+
+    static constexpr const char * POOL_NO_MIGRATE_FORK =
+        "this node does not move conversations: it has no prompt cache (--cache-ram 0)";
+
+    // a transfer the pool stopped midway: it posts a chunk every few seconds and gives one up after 60 s
+    static constexpr int POOL_XFER_IDLE_S_FORK = 120;
+
+    this->get_pool_node_fork = [this](const server_http_req &) {
+        auto res = create_response(true);
+        // the pool polls this: the RAM a pool that stopped midway left goes even when no other move comes
+        server_pool_xfer_clean_fork(std::string(), POOL_XFER_IDLE_S_FORK);
+        res->ok({
+            {"devices",    server_pool_node_devices_fork()},
+            {"n_parallel", params.n_parallel},
+            {"n_ctx",      params.n_ctx},
+            {"n_ctx_slot", meta->slot_n_ctx},
+            {"model", {
+                {"n_params", meta->model_n_params}, {"size", meta->model_size}, {"ftype", meta->model_ftype},
+                {"n_vocab", meta->model_vocab_n_tokens}, {"n_ctx_train", meta->model_n_ctx_train},
+            }},
+            // hex: a JSON number past 2^53 loses digits in a browser
+            {"cache_signature", meta->pool_signature_fork != 0
+                ? string_format("%016llx", (unsigned long long) meta->pool_signature_fork) : std::string()},
+            {"cache_ram", meta->pool_cache_ram_fork},
+            {"migrate", pool_migrate_fork()},
+        });
+        return res;
+    };
+
+    // {"kind": "chat" | "responses" | "anthropic" | "completion", "body": <the request>, "min_match": <tokens>}
+    this->post_pool_export_fork = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!pool_migrate_fork()) {
+            res->error(format_error_response(POOL_NO_MIGRATE_FORK, ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        const std::string kind = json_value(body, "kind", std::string("chat"));
+        json request = body.at("body");
+
+        // the prompt as the request will be read
+        std::vector<raw_buffer> files;
+        json prompt;
+        if (kind == "completion") {
+            prompt = request.at("prompt");
+        } else {
+            if (kind == "responses") {
+                request = server_chat_convert_responses_to_chatcmpl(request);
+            } else if (kind == "anthropic") {
+                request = server_chat_convert_anthropic_to_oai(request);
+            } else if (kind != "chat") {
+                res->error(format_error_response("unknown kind " + kind + ", expected chat, responses, anthropic or completion", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            common_chat_session session; // unused
+            prompt = oaicompat_chat_params_parse(ctx_server.vocab, request, meta->chat_params, files, session).at("prompt");
+        }
+        server_tokens tokens;
+        if (kind != "completion" && ctx_server.mctx != nullptr) {
+            tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt);
+        } else {
+            tokens = std::move(tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt).at(0));
+        }
+
+        server_pool_xfer_clean_fork(meta->pool_spill_dir_fork, POOL_XFER_IDLE_S_FORK);
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_POOL_EXPORT);
+            task.id                    = rd.get_new_id();
+            task.tokens                = std::move(tokens);
+            task.pool_action.id        = server_pool_xfer_id_fork();
+            task.pool_action.min_match = json_value(body, "min_match", (size_t) 0);
+            rd.post_task(std::move(task), true);
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            return res; // the export goes with the cleanup
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // ?id=<transfer>&offset=<bytes>&size=<bytes>
+    this->get_pool_export_data_fork = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!pool_migrate_fork()) {
+            res->error(format_error_response(POOL_NO_MIGRATE_FORK, ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        uint64_t offset = 0;
+        uint64_t size   = 0;
+        try {
+            offset = std::stoull(req.get_param("offset", "0"));
+            size   = std::min<uint64_t>(std::stoull(req.get_param("size", "16777216")), 64ull << 20);
+        } catch (const std::exception &) {
+            res->error(format_error_response("bad offset or size", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::string error;
+        if (!server_pool_xfer_read_fork(req.get_param("id"), offset, size, res->data, error)) {
+            res->error(format_error_response(error, ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res->status       = 200;
+        res->content_type = "application/octet-stream";
+        return res;
+    };
+
+    // ?size=<bytes>: the probe of a link by the pool, that many bytes from the node (one chunk of a move)
+    this->get_pool_probe_fork = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!pool_migrate_fork()) {
+            res->error(format_error_response(POOL_NO_MIGRATE_FORK, ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        uint64_t size = 0;
+        try {
+            size = std::min<uint64_t>(std::stoull(req.get_param("size", "16777216")), 64ull << 20);
+        } catch (const std::exception &) {
+            res->error(format_error_response("bad size", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->data.assign(size, '\0');
+        res->status       = 200;
+        res->content_type = "application/octet-stream";
+        return res;
+    };
+
+    // the probe of a link the other way: the bytes in the body go nowhere
+    this->post_pool_probe_fork = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!pool_migrate_fork()) {
+            res->error(format_error_response(POOL_NO_MIGRATE_FORK, ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        res->ok({{"size", req.body.size()}});
+        return res;
+    };
+
+    // {"id": "<transfer>"}
+    this->post_pool_export_done_fork = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const json body = json::parse(req.body);
+        server_pool_xfer_forget_fork(json_value(body, "id", std::string()));
+        res->ok({{"done", true}});
+        return res;
+    };
+
+    // ?id=<transfer>&offset=<bytes>, the chunk in the body
+    this->post_pool_import_data_fork = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!pool_migrate_fork()) {
+            res->error(format_error_response(POOL_NO_MIGRATE_FORK, ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        uint64_t offset = 0;
+        try {
+            offset = std::stoull(req.get_param("offset", "0"));
+        } catch (const std::exception &) {
+            res->error(format_error_response("bad offset", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (offset == 0) {
+            server_pool_xfer_clean_fork(meta->pool_spill_dir_fork, POOL_XFER_IDLE_S_FORK);
+        }
+        std::string error;
+        if (!server_pool_inbox_write_fork(req.get_param("id"), offset, req.body, meta->pool_cache_ram_fork, error)) {
+            res->error(format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok({{"size", offset + req.body.size()}});
+        return res;
+    };
+
+    // {"id": "<transfer>", "signature": "<the portable cache signature of the source, hex>"}, or {"id", "abort": true}
+    this->post_pool_import_done_fork = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!pool_migrate_fork()) {
+            res->error(format_error_response(POOL_NO_MIGRATE_FORK, ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        auto inbox = server_pool_inbox_take_fork(json_value(body, "id", std::string()));
+        if (json_value(body, "abort", false)) {
+            res->ok({{"dropped", inbox != nullptr}});
+            return res;
+        }
+        if (!inbox) {
+            res->error(format_error_response("no such transfer", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        uint64_t signature = 0;
+        try {
+            signature = std::stoull(json_value(body, "signature", std::string()), nullptr, 16);
+        } catch (const std::exception &) {
+            res->error(format_error_response("bad signature", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_POOL_IMPORT);
+            task.id                    = rd.get_new_id();
+            task.pool_action.signature = signature;
+            task.pool_action.inbox     = std::move(inbox);
+            rd.post_task(std::move(task), true);
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
         res->ok(result->to_json());
         return res;
     };

@@ -36,8 +36,7 @@ int main() {
     CHECK(!on(16384, 0, 4, true,  1024, n_ctx));
     CHECK(!on(16384, 0, 1, false, 1024, n_ctx));
 
-    // -1 (the default): only with several sequences, one slot keeps the whole cache (its window is a view of the last
-    // cells)
+    // -1: only with several sequences, one slot keeps the whole cache (its window is a view of the last cells)
     CHECK(!on(16384, -1, 1, true,  1024, n_ctx));
     CHECK(!on(16384, -1, 1, false, 1024, n_ctx));
 
@@ -57,7 +56,7 @@ int main() {
         CHECK(r.n_swa == 16384);
     }
 
-    // 1: one slot too (the mtpkv arm)
+    // 1 (the default since 01.11): one slot too, so the states of nodes with one slot and with several have one layout
     {
         const auto r = llama_mtp_window_kv_rule_fork(16384, 1, 1, true, 512, n_ctx);
         CHECK(r.on);
