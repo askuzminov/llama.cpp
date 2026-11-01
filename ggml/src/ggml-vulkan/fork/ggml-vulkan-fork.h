@@ -210,6 +210,9 @@ vk_pipeline ggml_vk_concat_transpose_pipeline(ggml_backend_vk_context * ctx, con
 // TOP_K: radix-select instead of the tournament (GGML_VK_TOPK_RADIX); tournament_cols: the elements of the widest
 // workgroup of the tournament, what it reduces to k in one pass
 bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t tournament_cols);
+// TOP_K radix-select with an output in index order and the ties from the lowest index (GGML_VK_TOPK_RADIX_STABLE):
+// 1 with subgroups where the device has them (else upstream), 2 without subgroups, 0 the upstream atomic compaction
+int ggml_vk_topk_radix_stable();
 // MUL_MAT_ID: the mul_mmid_f16reg.comp pipeline for these operands, or nullptr for the upstream choice
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
                                      bool y_f32_kernel, uint64_t n_per_expert);

@@ -3667,8 +3667,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // variant (spec constant 1) additionally gathers the qwen4 indexer input on the fly.
     {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
+        // fork: the select with an output that does not depend on the order of the invocations (ggml_vk_topk_radix_stable)
+        const int stable = ggml_vk_topk_radix_stable();
+        const bool stable_sg = stable == 1 && device->subgroup_ballot && device->subgroup_require_full_support && BLOCK_SIZE % device->subgroup_size == 0;
+        if (requested == nullptr) { // the first call for the device, not the compile of one pipeline later
+            GGML_LOG_INFO("ggml_vulkan: top-k radix select %s\n", stable_sg ? "in index order, subgroups" : stable == 2 ? "in index order, no subgroups" : "of upstream (atomic order)");
+        }
+        if (stable_sg) {
+            const uint32_t n_sg = BLOCK_SIZE / device->subgroup_size;
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_stable_subgroup_f32_len, topk_radix_select_stable_subgroup_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0, n_sg}, 1, true, true, device->subgroup_size);
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_stable_subgroup_f32_len, topk_radix_select_stable_subgroup_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1, n_sg}, 1, true, true, device->subgroup_size);
+        } else if (stable == 2) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_stable_f32_len, topk_radix_select_stable_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_stable_f32_len, topk_radix_select_stable_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+        } else {
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+        }
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);

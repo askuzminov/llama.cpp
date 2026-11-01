@@ -7,14 +7,22 @@ rem RUN_LONG=0 there leave a step out. serve.bat is not part of it and has to be
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem the questions of 31.10 (README): the lightning indexer as the one indexer of the Vulkan graph, with the head
-rem matmul inside the op at every token count and one copy of its mask; the attention over the list of cells and
-rem the f16 hc streams, back on Vulkan since 31.10 evening (check: the accuracy against upstream and of the decode
-rem path; profile: time and compute buffer without each); the 3090 runs the defaults
-if /i not "%BACKEND%"=="vulkan" goto :arms_done
-if not defined QA_QARMS set "QA_QARMS=default;lid LLAMA_QSA_LID=1;nolist LLAMA_QSA_FA_LIST=0;nohcf16 LLAMA_HC_F16=0"
-if not defined QA_PARMS set "QA_PARMS=default;lid LLAMA_QSA_LID=1;nolist LLAMA_QSA_FA_LIST=0;nohcf16 LLAMA_HC_F16=0"
+rem the questions of 01.11 (README). the 395: the lightning indexer as the default of the Vulkan graph (mm: the head
+rem matmul in the graph, the default before) and the radix-select of the block top-k in index order (radix0: the
+rem atomic order of upstream). check: again (a second default, an unread variable) and mm give the logits of default
+rem bit for bit, radix0 not past the first ubatch of 4096 tokens; profile: the time and compute buffer of each. the
+rem 3090: again, its radix-select (CUDA top-k.cu) still compacts with atomics; the MTP window KV on by default since
+rem 01.11 also with one slot (nowin: the default before)
+if /i not "%BACKEND%"=="vulkan" goto :arms_cuda
+if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1;mm LLAMA_QSA_LID=0;radix0 GGML_VK_TOPK_RADIX_STABLE=0"
+if not defined QA_PARMS set "QA_PARMS=default;mm LLAMA_QSA_LID=0;radix0 GGML_VK_TOPK_RADIX_STABLE=0"
+goto :arms_done
+:arms_cuda
+if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
+if not defined QA_PARMS set "QA_PARMS=default;nowin LLAMA_MTP_WINDOW_KV=-1"
 :arms_done
+rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
+if not defined RUN_MICRO set "RUN_MICRO=0"
 rem the probes of 02-long take the default only, the variants of the probes are a question for 01-check
 if not defined LONG_QARMS set "LONG_QARMS=default"
 

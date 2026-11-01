@@ -1252,13 +1252,15 @@ public:
 
 // the lightning indexer for the block scores. its CUDA and Vulkan kernels take a head size of 128.
 // 08.10, 395 (Vulkan): a 4096-token prompt 6 percent slower than MUL_MAT_HEADSUM, with a larger compute buffer; a
-// decode step at 122880 0.77 ms faster. Vulkan keeps the head matmul for every batch, so that a prompt and a decode
-// step score the blocks the same way (30.10); every other backend takes the lightning indexer (3090: the prompt the
-// same, TG +1.7 percent). LLAMA_QSA_LID=1: always, 0: never
+// decode step at 122880 0.77 ms faster. Since 31.10 the Vulkan op runs on the head matmul at every token count
+// (ggml_vk_fork_lid_headsum: 4 heads, one stream) and its bias is one input: the 395 (31.10 evening) had the same prompt
+// and verify speed as with the head matmul in the graph (742 t/s at 252161 tokens, a verify of 4 tokens 55.6 ms), the
+// same KL, and a compute buffer of 2704 against 4124 MiB; the Mac (01.11, test models with 4 heads) the same block
+// selection and logits bit for bit. So Vulkan takes it where it runs on the head matmul, and the head matmul in the
+// graph elsewhere (lightning_indexer.comp is slower); every other backend takes the lightning indexer (3090: the prompt
+// the same, TG +1.7 percent). LLAMA_QSA_LID=1: always, 0: never
 static bool qsa_use_lid(int64_t idx_dim, int64_t n_idx_h, int64_t n_tps, int64_t n_stream, bool is_vulkan) {
-    GGML_UNUSED(n_idx_h);
     GGML_UNUSED(n_tps);
-    GGML_UNUSED(n_stream);
     static const int mode = [] {
         // unset (or -1): the default of the backend
         const int64_t v = llama_fork_env_int("LLAMA_QSA_LID", -1);
@@ -1267,7 +1269,7 @@ static bool qsa_use_lid(int64_t idx_dim, int64_t n_idx_h, int64_t n_tps, int64_t
     if (idx_dim != 128 || mode == 0) {
         return false;
     }
-    return mode == 1 || !is_vulkan;
+    return mode == 1 || !is_vulkan || (n_idx_h == 4 && n_stream == 1);
 }
 
 ggml_tensor * llama_model_qwen4exp_fork::graph::build_qsa_top_k(

@@ -1067,6 +1067,7 @@ def quality(run, label, ctx, depths, qargs=None):
             f"decode - the same positions in batches of {dbatch} (the decode path) against the prompt path of the "
             f"same variant")
     clean = True
+    same = {}  # per variant: the NLL of every probe on both paths, to compare with default bit for bit
     for name, venv in variants("QA_QARMS", "default"):
         run_env = dict(os.environ, **venv)
         identity = {**base, "env": env_identity(run_env), "reference": digest(ref)}
@@ -1089,15 +1090,21 @@ def quality(run, label, ctx, depths, qargs=None):
                     dec = [x for x in rd["samples"] if x.get("decode")]
             finally:
                 own.unlink(missing_ok=True)
-            return probe_rows(r["samples"], dec, depths, window)
+            return {"rows": probe_rows(r["samples"], dec, depths, window),
+                    "positions": [x["position"] for x in r["samples"]],
+                    "nll": [x["nll"] for x in r["samples"]], "nll_decode": [x["nll"] for x in dec]}
 
         try:
-            rows, kept = run.measure(f"{label}-{name}", identity, go)
+            res, kept = run.measure(f"{label}-{name}", identity, go)
         except Fail as e:
             run.failed = True
             clean = False
             run.add("", f"{label} {name}: FAIL {e}")
             continue
+        # a result kept before 01.11 holds the rows alone
+        rows = res["rows"] if isinstance(res, dict) else res
+        if isinstance(res, dict):
+            same[name] = res
         flags = probe_flags(rows)
         clean &= not flags
         table_rows = [[r["depth"], r["path"], r["n"], f"{r['kl_median']:.6f}", f"{r['kl_p90']:.5f}", f"{r['kl_max']:.3f}",
@@ -1109,6 +1116,20 @@ def quality(run, label, ctx, depths, qargs=None):
         for r in rows:
             run.record(label, f"{name} d{r['depth']} {r['path']}", {"kl_median": r["kl_median"], "kl_p90": r["kl_p90"],
                        "top1": r["top1"], "dnll": r["dnll"]}, kept, exe.parent)
+    # which variants give the logits of default: equal logits give an equal NLL. a second default (an unread variable)
+    # shows whether a run repeats itself, as the radix-select of the block top-k did not before 01.11
+    base_nll = same.get("default")
+    others = [n for n in same if n != "default"]
+    if base_nll and others:
+        cmp_rows = []
+        for n in others:
+            o = same[n]
+            pp = [a == b for a, b in zip(o["nll"], base_nll["nll"])]
+            dd = [a == b for a, b in zip(o["nll_decode"], base_nll["nll_decode"])]
+            first = next((base_nll["positions"][i] for i, eq in enumerate(pp) if not eq), None)
+            cmp_rows.append([n, f"{sum(pp)}/{len(pp)}", f"{sum(dd)}/{len(dd)}", "-" if first is None else first])
+        run.add("", f"{label}: probes with the NLL of default bit for bit",
+                *table(["variant", "prompt path", "decode path", "first other probe"], cmp_rows))
     if not clean:
         run.failed = True
     return clean

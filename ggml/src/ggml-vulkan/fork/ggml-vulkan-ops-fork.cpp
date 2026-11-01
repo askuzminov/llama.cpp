@@ -59,6 +59,22 @@ bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t
     return radix_mode == 1 || (radix_mode != 0 && radix_wins);
 }
 
+int ggml_vk_topk_radix_stable() {
+    // the upstream select compacts its picks with an atomic counter: the order of the output and, at ties, the elements it
+    // takes changed from run to run. the qwen4exp block top-k of a prompt past 4096 cells (k 513, rows longer than the
+    // 1024 of the tournament) runs here, and with another order the attention adds the chosen blocks in another order:
+    // the logits of two equal runs on the 395 differed from the first ubatch of 4096 tokens on (01.11). default 1: with
+    // subgroups (5500M: 0 to 6 percent over upstream), on a device without full subgroups upstream, since the select
+    // without them reads a contiguous run per invocation (5500M: +40 percent at 32768 columns, 3-11x at 131072);
+    // GGML_VK_TOPK_RADIX_STABLE=0: upstream, 2: the stable select without subgroups
+    static const int mode = [] {
+        const char * env = getenv("GGML_VK_TOPK_RADIX_STABLE");
+        const int v = env ? atoi(env) : 1;
+        return v == 0 || v == 2 ? v : 1;
+    }();
+    return mode;
+}
+
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10) {
     // GGML_VK_INT_COOPMAT=3: int8 for MUL_MAT_ID only; with coopmat the q8_1 pipelines are the int8 coopmat ones.
     // a graph output (the logits) stays off int8 too: the error of the q8_1 activations goes straight into the

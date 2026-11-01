@@ -331,8 +331,8 @@ void ggml_vk_mul_mat_headsum(ggml_backend_vk_context * ctx, vk_context& subctx, 
 // and the same bits for both, where lightning_indexer.comp took 115 against 65 us for one token at 65536 blocks on the
 // 395 and 62 against 19 ms for 4096 tokens. lightning_indexer.comp stays for every case below: 4 heads, unit weights (a
 // FILL of 1, as the qwen4exp graph builds them), one stream, an f32 or f16 key pool. GGML_VK_LID_HEADSUM=0:
-// lightning_indexer.comp always (upstream). 30.10: the candidate for one indexer path on every backend (the graph still
-// takes the head matmul on Vulkan, see qsa_use_lid)
+// lightning_indexer.comp always (upstream). Since 01.11 the qwen4exp graph takes the op on Vulkan where it runs here
+// (qsa_use_lid)
 bool ggml_vk_fork_lid_headsum(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * dst) {
     static const bool disabled = [] { const char * env = getenv("GGML_VK_LID_HEADSUM"); return env && atoi(env) == 0; }();
     const ggml_tensor * q = dst->src[0];

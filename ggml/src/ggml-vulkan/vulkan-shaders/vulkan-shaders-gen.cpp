@@ -1122,6 +1122,9 @@ void process_shaders() {
     string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
+    // fork: the output in index order and the ties from the lowest index, see topk_radix_select.comp (STABLE)
+    string_to_spv("topk_radix_select_stable_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}, {"STABLE", "1"}});
+    string_to_spv("topk_radix_select_stable_subgroup_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}, {"STABLE", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("shmem_probe", "shmem_probe.comp", {});

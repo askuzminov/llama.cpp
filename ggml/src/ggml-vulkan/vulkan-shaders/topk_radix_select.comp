@@ -2,11 +2,18 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
+#if defined(STABLE) && defined(USE_SUBGROUPS)
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
 
 #include "types.glsl"
 
 layout(constant_id = 0) const int BLOCK_SIZE = 1024;
 layout(constant_id = 1) const int QSA = 0; // 1: fuse the qwen4 QSA indexer gather + f16 mask
+#ifdef STABLE
+layout(constant_id = 2) const uint NUM_SUBGROUPS = 1; // fork: the subgroups of the workgroup (USE_SUBGROUPS)
+#endif
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -32,6 +39,15 @@ shared uint histo[RADIX_SIZE];
 shared uint sh_bucket;
 shared uint sh_above;
 shared uint out_count;
+#ifdef STABLE
+#ifdef USE_SUBGROUPS
+shared uint sg_above[NUM_SUBGROUPS];
+shared uint sg_tie[NUM_SUBGROUPS];
+#else
+shared uint scan_above[BLOCK_SIZE];
+shared uint scan_tie[BLOCK_SIZE];
+#endif
+#endif
 
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
@@ -68,6 +84,116 @@ float load(uint row, uint i, bool first) {
     }
     return scratch[off];
 }
+
+#ifdef STABLE
+// fork: the input of element i. the stable select reads elements that other invocations loaded in the passes, so the QSA
+// variant gathers them again instead of reading the scratch of another invocation
+float value(const uint row, const uint i) {
+    return QSA == 0 ? data_a[row * p.ncols + i] : gather(row, i);
+}
+
+// fork: the elements above the threshold in ascending index order, then the ties from the lowest index, so that the output
+// does not depend on the order the invocations run in. the atomic compaction below gave another order and, at ties, other
+// elements from run to run, and with them the order the attention adds the chosen blocks in (the qwen4exp block top-k of a
+// prompt past 4096 cells, 01.11). as flash_attn_sparse_compact.comp: a contiguous segment per subgroup (per invocation
+// without subgroups) and one scan over the segments
+void emit_stable(const uint row, const uint row_out, const uint threshold, const uint n_above) {
+    const uint ncols = p.ncols;
+#ifdef USE_SUBGROUPS
+    const uint sg        = gl_SubgroupID;
+    const uint lane      = gl_SubgroupInvocationID;
+    const uint seg       = (ncols + gl_NumSubgroups - 1) / gl_NumSubgroups;
+    const uint seg_begin = min(sg * seg, ncols);
+    const uint seg_end   = min(seg_begin + seg, ncols);
+
+    uint n_a = 0;
+    uint n_t = 0;
+    for (uint i0 = seg_begin; i0 < seg_end; i0 += gl_SubgroupSize) {
+        const uint i   = i0 + lane;
+        const uint key = i < seg_end ? f2ui(value(row, i)) : 0u;
+        n_a += subgroupBallotBitCount(subgroupBallot(i < seg_end && key >  threshold));
+        n_t += subgroupBallotBitCount(subgroupBallot(i < seg_end && key == threshold));
+    }
+    if (subgroupElect()) {
+        sg_above[sg] = n_a;
+        sg_tie[sg]   = n_t;
+    }
+    barrier();
+
+    uint at = 0;
+    uint tt = 0;
+    for (uint s = 0; s < sg; ++s) {
+        at += sg_above[s];
+        tt += sg_tie[s];
+    }
+    for (uint i0 = seg_begin; i0 < seg_end; i0 += gl_SubgroupSize) {
+        const uint  i     = i0 + lane;
+        const uint  key   = i < seg_end ? f2ui(value(row, i)) : 0u;
+        const bool  above = i < seg_end && key >  threshold;
+        const bool  tie   = i < seg_end && key == threshold;
+        const uvec4 ba    = subgroupBallot(above);
+        const uvec4 bt    = subgroupBallot(tie);
+        if (above) {
+            data_d[row_out + at + subgroupBallotExclusiveBitCount(ba)] = int(i);
+        }
+        const uint pos = n_above + tt + subgroupBallotExclusiveBitCount(bt);
+        if (tie && pos < p.k) {
+            data_d[row_out + pos] = int(i);
+        }
+        at += subgroupBallotBitCount(ba);
+        tt += subgroupBallotBitCount(bt);
+    }
+    // sg_above and sg_tie are written again by the next row
+    barrier();
+#else
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint run   = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint begin = min(tid * run, ncols);
+    const uint end   = min(begin + run, ncols);
+
+    uint n_a = 0;
+    uint n_t = 0;
+    for (uint i = begin; i < end; ++i) {
+        const uint key = f2ui(value(row, i));
+        n_a += key >  threshold ? 1u : 0u;
+        n_t += key == threshold ? 1u : 0u;
+    }
+    // Hillis-Steele inclusive prefix sums of the counts of the invocations
+    scan_above[tid] = n_a;
+    scan_tie[tid]   = n_t;
+    barrier();
+    for (uint off = 1; off < BLOCK_SIZE; off <<= 1) {
+        uint a = 0;
+        uint t = 0;
+        if (tid >= off) {
+            a = scan_above[tid - off];
+            t = scan_tie[tid - off];
+        }
+        barrier();
+        scan_above[tid] += a;
+        scan_tie[tid]   += t;
+        barrier();
+    }
+    uint at = scan_above[tid] - n_a;
+    uint tt = scan_tie[tid] - n_t;
+    for (uint i = begin; i < end; ++i) {
+        const uint key = f2ui(value(row, i));
+        if (key > threshold) {
+            data_d[row_out + at] = int(i);
+            at++;
+        } else if (key == threshold) {
+            const uint pos = n_above + tt;
+            tt++;
+            if (pos < p.k) {
+                data_d[row_out + pos] = int(i);
+            }
+        }
+    }
+    // scan_above and scan_tie are written again by the next row
+    barrier();
+#endif
+}
+#endif
 
 // one workgroup per row: radix-select the K-th largest, then compact it plus enough ties
 void topk(const uint row) {
@@ -114,6 +240,10 @@ void topk(const uint row) {
         barrier();
     }
 
+#ifdef STABLE
+    // desired is what the ties still give, so the elements above the threshold are the rest of k
+    emit_stable(row, row_out, prefix, p.k - desired);
+#else
     if (tid == 0) {
         out_count = 0;
     }
@@ -135,6 +265,7 @@ void topk(const uint row) {
             }
         }
     }
+#endif
 }
 
 void main() {
