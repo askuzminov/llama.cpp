@@ -235,8 +235,15 @@ static bool top_k_radix_stable_fork(
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
-    // the blocks of a row as upstream, each over whole tiles of BLOCK_SIZE columns
-    const int blocks_per_row = (int) std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 64);
+    // the blocks of a row: as upstream (a block per 1024 columns, at most 64) while the rows are few (a decode, a draft
+    // check), fewer when the rows fill the GPU by themselves (a prompt ubatch): enough for 4 waves of 8 blocks per SM.
+    // per pass each block writes a histogram that the select reads and the next pass reads again for the counts: 3 KB
+    // against 3.9 KB of input per block with 64 blocks over 63040 columns; with the blocks of upstream a call of 4424
+    // rows took 12.4 ms against 10.6 ms of the upstream gather (3090 02.11). each block takes whole tiles of BLOCK_SIZE
+    const int64_t nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int64_t upstream_blocks = std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 64);
+    const int64_t fill_blocks = (32 * nsm + nrows - 1) / std::max<int64_t>(nrows, 1);
+    const int blocks_per_row = (int) std::max<int64_t>(1, std::min(upstream_blocks, fill_blocks));
     const int64_t per_block = ((int64_t) ncols + blocks_per_row - 1) / blocks_per_row;
     const int cols_per_block = (int) ((per_block + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE);
 
