@@ -37,14 +37,16 @@
 Плечи 395 `mm LLAMA_QSA_LID=0` (матмул голов) и `radix0 GGML_VK_TOPK_RADIX_STABLE=0` (radix апстрима) сняты после
 прогонов 01.11 и 02.11: `mm` дал те же биты и время при compute-буфере на 1.4 ГиБ больше, `radix0` - то же время и
 другие биты от прогона к прогону. Плечо 3090 `nowin LLAMA_MTP_WINDOW_KV=-1` снято 02.11: время операций GPU в профиле
-не включает экспертов на CPU, и разницу окна KV головы MTP профиль на 3090 не показывает.
+не включает экспертов на CPU, и разницу окна KV головы MTP профиль на 3090 не показывает. Плечо 3090
+`radix0 GGML_CUDA_TOPK_RADIX_STABLE=0` (сбор upstream) снято 03.11: TOP_K на глубине 252K - 10.6 мс за вызов против
+8.6 мс у стабильного.
 
 
 | Шаг | 395 (Vulkan) | 3090 (CUDA) | Вопрос |
 |---|---|---|---|
 | 04 `QA_MARMS` | не запускается (`RUN_MICRO=1` - запустить) | не запускается | ядра индексатора не менялись с 31.10 |
 | 01 `QA_QARMS` | `default;again LLAMA_QA_AGAIN=1` | `default;again LLAMA_QA_AGAIN=1` | повторяет ли себя прогон (395: да с 01.11; 3090: стабильный radix CUDA с 02.11) |
-| 03 `QA_PARMS` | `default` | `default;radix0 GGML_CUDA_TOPK_RADIX_STABLE=0` | 3090: сколько стоит стабильный radix-select CUDA (`qsa select`) против сбора upstream (с 02.11) |
+| 03 `QA_PARMS` | `default` | `default` | где идёт время с текущими умолчаниями |
 | 02 `LONG_QARMS` | `default` | `default` | весь контекст с новыми умолчаниями |
 
 `RUN_BUILD`, `RUN_MICRO`, `RUN_CHECK`, `RUN_PROFILE`, `RUN_LONG` = 0 в `_local.bat` убирают шаг. Повторный запуск без

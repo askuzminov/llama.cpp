@@ -7,20 +7,15 @@ rem RUN_LONG=0 there leave a step out. serve.bat is not part of it and has to be
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem the questions (README). the 395: again (a second default, an unread variable) gives the logits of default bit
-rem for bit. settled by the runs of 01.11 and 02.11 and left out: mm (the head matmul in the graph: the same bits and
-rem time, 1.4 GiB more compute buffer) and radix0 (the radix-select of upstream: the same time, not repeatable). the
-rem 3090: again, the stable radix-select of CUDA top-k.cu since 02.11 (GGML_CUDA_TOPK_RADIX_STABLE; before it the
-rem probes parted at 16256); radix0 in the profile: what the stable one costs in qsa select against the gather of
-rem upstream. left out 02.11: nowin (the MTP window KV off; the GPU op time of the profile leaves out the CPU experts)
-if /i not "%BACKEND%"=="vulkan" goto :arms_cuda
+rem the questions (README): again (a second default, an unread variable) gives the logits of default bit for bit,
+rem on the 395 since 01.11, on the 3090 since the stable radix-select of CUDA top-k.cu (02.11,
+rem GGML_CUDA_TOPK_RADIX_STABLE; before it the probes parted at 16256). settled and left out: on the 395 mm (the head
+rem matmul in the graph: the same bits and time, 1.4 GiB more compute buffer) and radix0 (the radix-select of upstream:
+rem the same time, not repeatable) by the runs of 01.11 and 02.11; on the 3090 nowin (the MTP window KV off: the GPU op
+rem time of the profile leaves out the CPU experts) and radix0 (the gather of upstream: TOP_K 10.6 against 8.6 ms of
+rem the stable one per call at 252K, 03.11)
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PARMS set "QA_PARMS=default"
-goto :arms_done
-:arms_cuda
-if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
-if not defined QA_PARMS set "QA_PARMS=default;radix0 GGML_CUDA_TOPK_RADIX_STABLE=0"
-:arms_done
 rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
 if not defined RUN_MICRO set "RUN_MICRO=0"
 rem the probes of 02-long take the default only, the variants of the probes are a question for 01-check
