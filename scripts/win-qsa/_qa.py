@@ -57,6 +57,11 @@ IDLE_USED = CACHE / "idle-used.json"
 # memory the driver has not released yet. The Vulkan memory budget the 395 reports does not see it
 GPU_COUNTERS = ("Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | "
                 "ForEach-Object { [string]$_.DedicatedUsage + ' ' + [string]$_.SharedUsage }")
+# the lines of the crash report of a Windows build (src/fork/llama-load-watch-fork.cpp): the event and the thread, the
+# last C++ exception of that thread, the step of a model load; the frames of the stack follow as module+offset
+CRASH_EVENT = re.compile(r"^(abort\(\)|an invalid parameter of a C runtime function) in thread ")
+CRASH_DETAIL = re.compile(r"^(the last C\+\+ exception of this thread|a model load is at)")
+CRASH_FRAME = re.compile(r"^  \S+\+0x[0-9a-f]+$")
 SHOWN_USED = []
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 HISTORY_FIELDS = ["time", "host", "backend", "test", "point", "metric", "value", "build", "head", "dirty"]
@@ -355,12 +360,31 @@ def mark_end():
 def exit_text(code):
     return f"exit {code}" if 0 <= code < 256 else f"exit {code & 0xffffffff:#010x}"
 
+def is_crash_line(s):
+    return bool(CRASH_EVENT.match(s) or CRASH_DETAIL.match(s))
+
 def last_error(text):
-    lines = [s.strip() for s in text.splitlines() if s.strip()]
+    # the lines of the crash report are not the error: crash_report() adds them
+    lines = [s.strip() for s in text.splitlines() if s.strip() and not is_crash_line(s.strip()) and not CRASH_FRAME.match(s)]
     errors = [s for s in lines if re.search(r"error|exception|failed|abort", s, re.IGNORECASE)]
     if errors:
         return errors[-1][:200]
     return "no error message, the log ends with: " + (lines or [""])[-1][:160]
+
+def lifetime(code, seconds):
+    """How long a process that ended on an exception code ran: the fail-fast exit 0xc0000409 of a Windows build writes
+    nothing into the log, and the log of a model load is silent from the first buffers to the end of the load. 395,
+    31.10-01.11: eight loads ended so after 'mapMemory: ErrorMemoryMapFailed' and the 2 s retry of the buffer."""
+    return f" after {seconds:.1f} s" if code & 0xffffffff >= 0xC0000000 else ""
+
+def crash_report(text):
+    """The crash report of a Windows build in short: the event and the thread, the last C++ exception of that thread,
+    the step of a model load."""
+    lines = [s.strip() for s in text.splitlines()]
+    for i, s in enumerate(lines):
+        if CRASH_EVENT.match(s):
+            return "; " + ", ".join([s] + [t for t in lines[i + 1:] if CRASH_DETAIL.match(t)])[:400]
+    return ""
 
 def load_watch(log):
     """The step a stopped model load stopped in, from the watchdog of load_all_data (src/fork/llama-load-watch-fork.h)."""
@@ -385,7 +409,9 @@ def retryable(code, text):
     # 75: the load watchdog ended a load that stopped (LLAMA_LOAD_WATCH_EXIT, src/fork/llama-load-watch-fork.h)
     if code == 75 and "load_all_data: no progress" in text:
         return True
-    return any(s in text for s in MEMORY_ERRORS) or (code & 0xffffffff >= 0xC0000000 and "error" not in text.lower())
+    # the crash report counts as no message, its exception can still name a memory error
+    plain = "\n".join(s for s in text.splitlines() if not is_crash_line(s.strip()) and not CRASH_FRAME.match(s))
+    return any(s in text for s in MEMORY_ERRORS) or (code & 0xffffffff >= 0xC0000000 and "error" not in plain.lower())
 
 def execute(cmd, log, run_env, stdout=None, model=True, check=True, cwd=None, timed=True):
     """Run cmd with its output in log, its stdout in a separate file when given, in cwd when given. A model run that
@@ -402,23 +428,32 @@ def execute(cmd, log, run_env, stdout=None, model=True, check=True, cwd=None, ti
             f.write(json.dumps({"command": cmd, "env": env_identity(run_env)}) + "\n")
             f.flush()
             out = stdout.open("w", encoding="utf-8") if stdout else f
+            began = time.time()
             try:
-                code = subprocess.run(cmd, stdout=out, stderr=f, env=run_env, cwd=cwd).returncode
+                proc = subprocess.Popen(cmd, stdout=out, stderr=f, env=run_env, cwd=cwd)
+                try:
+                    code = proc.wait()
+                except BaseException:
+                    proc.kill()
+                    proc.wait()
+                    raise
             finally:
                 if stdout:
                     out.close()
+        lived = time.time() - began
         if model:
             mark_end()
         text = read_log(log)
         if code == 0 or not check:
             return code, text
+        why = f"{last_error(text)}{crash_report(text)}"
         if attempt < 3 and model and retryable(code, text):
             wait = retry_wait(attempt)
-            print(f"{log.name}: {exit_text(code)}, {last_error(text)}; one more try" + (f" in {wait:.0f} s" if wait else ""), flush=True)
+            print(f"{log.name}: {exit_text(code)}{lifetime(code, lived)}, {why}; one more try" + (f" in {wait:.0f} s" if wait else ""), flush=True)
             time.sleep(wait)
             log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue
-        raise Fail(f"{exit_text(code)}: {last_error(text)} ({log.name}, try {attempt})")
+        raise Fail(f"{exit_text(code)}{lifetime(code, lived)}: {why} ({log.name}, try {attempt})")
 
 class Tee:
     """A console stream that also writes into the console.txt of the current run: why a try was repeated (a stall
@@ -506,7 +541,11 @@ def start_server(exe, args, run_env, log):
         stall = env_int("DECSTALL", 240)
         last_size, last_growth, stalled = -1, time.time(), False
         while proc.poll() is None:
-            time.sleep(3)
+            # wait() rather than sleep(): the time of an exit is exact
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
             try:
                 if http(url + "/health")[0] == 200:
                     break
@@ -526,6 +565,7 @@ def start_server(exe, args, run_env, log):
                            + f"{load_watch(log)} ({log.name}, try {attempt})")
         if proc.poll() is None:
             break
+        lived = time.time() - start
         mark_end()
         text = read_log(log)
         if stalled:
@@ -534,13 +574,15 @@ def start_server(exe, args, run_env, log):
             time.sleep(pause)
             log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue
+        note = lifetime(proc.returncode, lived)
+        why = f"{last_error(text)}{crash_report(text)}"
         if attempt < 3 and retryable(proc.returncode, text):
             pause = retry_wait(attempt)
-            print(f"{log.name}: {exit_text(proc.returncode)} while loading, {last_error(text)}; one more try" + (f" in {pause:.0f} s" if pause else ""), flush=True)
+            print(f"{log.name}: {exit_text(proc.returncode)}{note} while loading, {why}; one more try" + (f" in {pause:.0f} s" if pause else ""), flush=True)
             time.sleep(pause)
             log = first.with_name(f"{first.stem}-try{attempt + 1}.log")
             continue
-        raise Fail(f"llama-server {exit_text(proc.returncode)} while loading: {last_error(text)} ({log.name}, try {attempt})")
+        raise Fail(f"llama-server {exit_text(proc.returncode)}{note} while loading: {why} ({log.name}, try {attempt})")
     return proc, log
 
 def op_group(name):

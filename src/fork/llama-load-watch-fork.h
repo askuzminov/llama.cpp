@@ -5,7 +5,8 @@
 // (06.10-11.10), the log ending there. the loader sets the step before every call that can block; a step lasting
 // LLAMA_LOAD_WATCH seconds (15, 0 = off) is logged once, and again with its time when it ends. a step lasting
 // LLAMA_LOAD_WATCH_EXIT seconds (180, 0 = never) ends the process with exit code 75 (EX_TEMPFAIL), so that whoever
-// started it can start it again: the stops seen on the 395 never ended on their own
+// started it can start it again: the stops seen on the 395 never ended on their own.
+// on Windows the same file reports a process that ends on abort(), see the crash report in the .cpp
 
 #include <chrono>
 #include <condition_variable>
@@ -20,6 +21,9 @@ struct llama_load_watch_fork {
 
     // tensor and chunk only describe the step, chunk < 0 for none
     void step(const char * name, const char * tensor = nullptr, int64_t chunk = -1);
+
+    // the step now and how long it lasts, for the crash report; false without the watchdog or while a step changes
+    bool current(std::string & out, double & seconds);
 
 private:
     void run();

@@ -1268,6 +1268,13 @@ static bool alloc_tensor_range_fork(struct ggml_context * ctx,
         usleep(2000*1000);
 #endif
         buffer = ggml_backend_buft_alloc_buffer(buft, size);
+        if (buffer != NULL) {
+            // a process that dies later ends its log here: the retry itself went through (395, 01.11: five loads died
+            // with no message after 'mapMemory: ErrorMemoryMapFailed' and this retry, in it or later was unknown).
+            // stderr directly: the log of llama goes through a queue that a crash does not drain
+            fprintf(stderr, "%s: allocated %s buffer of size %zu on try %d\n", __func__, ggml_backend_buft_name(buft), size, i + 2);
+            fflush(stderr);
+        }
     }
     bool ok = buffer != NULL;
     if (!ok) {
