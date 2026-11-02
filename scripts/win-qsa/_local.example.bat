@@ -10,7 +10,7 @@ rem 3090:
 rem set "MODEL=E:\ml\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
 rem set "SPECDRAFT=E:\ml\lm-studio-models\unsloth\Qwen3.8-Flash-Next-GGUF\mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"
 
-rem ---- the 3090: the -ncmoe that fits the card in the probe runs (30 by default) ----
+rem ---- the 3090: the layout of the probe runs (48 by default, as the server; about 1.5 GiB a layer on the card) ----
 rem set "EXTRA=-ngl 99 -ncmoe 46"
 
 rem ---- a long natural text for 02-long: at least the native context plus one token (about 1.1 M characters) ----

@@ -7,15 +7,14 @@ rem RUN_LONG=0 there leave a step out. serve.bat is not part of it and has to be
 setlocal enabledelayedexpansion
 call "%~dp0_config.bat"
 
-rem the questions of 01.11 (README). the 395: the lightning indexer as the default of the Vulkan graph (mm: the head
-rem matmul in the graph, the default before) and the radix-select of the block top-k in index order (radix0: the
-rem atomic order of upstream). check: again (a second default, an unread variable) and mm give the logits of default
-rem bit for bit, radix0 not past the first ubatch of 4096 tokens; profile: the time and compute buffer of each. the
+rem the questions (README). the 395: again (a second default, an unread variable) gives the logits of default bit
+rem for bit. settled by the runs of 01.11 and 02.11 and left out: mm (the head matmul in the graph: the same bits and
+rem time, 1.4 GiB more compute buffer) and radix0 (the radix-select of upstream: the same time, not repeatable). the
 rem 3090: again, its radix-select (CUDA top-k.cu) still compacts with atomics; the MTP window KV on by default since
 rem 01.11 also with one slot (nowin: the default before)
 if /i not "%BACKEND%"=="vulkan" goto :arms_cuda
-if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1;mm LLAMA_QSA_LID=0;radix0 GGML_VK_TOPK_RADIX_STABLE=0"
-if not defined QA_PARMS set "QA_PARMS=default;mm LLAMA_QSA_LID=0;radix0 GGML_VK_TOPK_RADIX_STABLE=0"
+if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
+if not defined QA_PARMS set "QA_PARMS=default"
 goto :arms_done
 :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"

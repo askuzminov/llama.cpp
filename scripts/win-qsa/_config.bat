@@ -53,9 +53,13 @@ if not defined CHECKARMS set "CHECKARMS=default;int8 GGML_VK_MMID_F16REG=0 GGML_
 goto :defaults_done
 
 :cuda_defaults
-rem the 3090 (cuda): the static layout of the probe runs (llama-quality-fork has no expert cache) keeps 30 MoE
-rem layers on the cpu; the server (DECARGS) all 48 with the expert cache in the free VRAM
-if not defined EXTRA     set "EXTRA=-ngl 99 -ncmoe 30"
+rem the 3090 (cuda): the probe runs keep all 48 MoE layers on the cpu as the server (DECARGS) does: a prompt batch
+rem uploads the experts (op offload), a small batch runs them on the cpu. the server also runs the experts of its
+rem cache on the card (--moe-cache, small batches only); the probes go without it, so their decode rows run every
+rem expert on the cpu. layers on the card do not fit: about 1.5 GiB a layer, -ncmoe 30 put 28 GiB on the 24 of the
+rem card, the driver moved the rest to system memory (sysmem fallback) and the probes ran 25 times slower (32768
+rem tokens: 26 s with 46 on 31.10, 600-700 s with 30 since), a long run did not end
+if not defined EXTRA     set "EXTRA=-ngl 99 -ncmoe 48"
 if not defined DECARGS   set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phase-mem --no-repack -b 16384 -ub 8192"
 if not defined CHECKOPS  set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;GATED_DELTA_NET_LAZY"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
