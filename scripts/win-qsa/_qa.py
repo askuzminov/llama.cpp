@@ -1048,19 +1048,23 @@ def probe_rows(prompt, decode, depths, window):
     return out
 
 
-def probe_flags(rows):
-    """per depth: DECODE DIFFERS where the decode path strays from the prompt path of the same variant at the same
-    positions more than rounding does: the 90th percentile of the KL above QA_DECODE_P90 (0.02). Single tokens can go
-    far where rounding flips a near tie of the block selection (Mac Vulkan0, test model at top-k 16, 31.10: p90 0.001 -
-    0.004, up to 4 tokens above 0.5 of 128, the CPU 0). LOW TOP1 where the prompt path agrees with the reference build
-    on less than 85% of the tokens (the noise of the upstream copy on the real model reached 84% with 32 probes, 31.10).
-    Before 31.10 the two paths took the two halves of a window, both against the reference: the halves differ in text,
-    and the flag fired on that (395, 32768)"""
+def probe_flags(rows, ref_p90):
+    """per depth: DECODE DIFFERS where the decode path of a variant strays from its prompt path more than the decode
+    path of the reference build strays from its own on the same machine (ref_p90, per depth; none without the decode
+    run of the reference, QA_REF_DECODE=0): the 90th percentile of the KL above QA_DECODE_RATIO (2) times that of the
+    reference. How far the two paths part by rounding depends on the machine and the model: the test model on the Mac
+    Vulkan0 (top-k 16, 31.10) 0.001 - 0.004 with up to 4 tokens above 0.5 of 128, the CPU 0; the real model 0.012 -
+    0.074 on the 3090 and the 395 (02.11), where a fixed bar of 0.02 from the Mac fired at every depth. The decode fault
+    of 13.10 gave 4-5; a variant run twice, 1.4 times apart at one depth (the 3090, 02.11, before the stable radix-select
+    of the block top-k). LOW TOP1 where the prompt path agrees with the reference build on less than 85% of the tokens
+    (the noise of the upstream copy on the real model reached 84% with 32 probes, 31.10). Before 31.10 the two paths
+    took the two halves of a window, both against the reference: the halves differ in text, and the flag fired on that
+    (395, 32768)"""
     flags = {}
-    p90 = float(env("QA_DECODE_P90", "0.02"))
+    ratio = float(env("QA_DECODE_RATIO", "2"))
     for r in rows:
         f = ""
-        if r["path"] == "decode" and r["kl_p90"] > p90:
+        if r["path"] == "decode" and r["depth"] in ref_p90 and r["kl_p90"] > ratio * ref_p90[r["depth"]]:
             f = "DECODE DIFFERS"
         if r["path"] == "prompt" and r["top1"] < 0.85:
             f = "LOW TOP1"
@@ -1073,7 +1077,8 @@ def quality(run, label, ctx, depths, qargs=None):
     """The logits at the probe positions, for the default settings and the variants of QA_QARMS: the prompt path
     against the reference (REF_ENV; the same batches, qargs, else QA_QARGS), which also keeps the variant's own logits;
     then a second run of the variant through the decode path (batches of QA_DECODE_BATCH tokens) at the same positions
-    against them. Returns True when nothing was flagged."""
+    against them. The reference takes the decode path as well, against its own prompt path: the rounding between the
+    two paths on this machine, the measure of the decode rows (probe_flags). Returns True when nothing was flagged."""
     qargs = quality_args() if qargs is None else qargs
     model = model_path()
     exe = binary("llama-quality-fork")
@@ -1107,8 +1112,48 @@ def quality(run, label, ctx, depths, qargs=None):
     run.add(f"{label}: logits at {len(positions)} positions before the depths {' '.join(map(str, depths))} of one "
             f"context of {ctx} tokens: prompt - the prompt batch against the reference ({env('QA_REF_ENV', REF_ENV)}); "
             f"decode - the same positions in batches of {dbatch} (the decode path) against the prompt path of the "
-            f"same variant")
+            f"same variant; p90/ref - its 90th percentile over that of the decode path of the reference")
     clean = True
+    header = ["depth", "path", "n", "KL median", "KL p90", "KL max", ">0.01", ">0.5", "top-1", "dNLL"]
+
+    def table_row(r):
+        return [r["depth"], r["path"], r["n"], f"{r['kl_median']:.6f}", f"{r['kl_p90']:.5f}", f"{r['kl_max']:.3f}",
+                f"{100 * r['over_001']:.1f}%", r["over_05"], f"{100 * r['top1']:.1f}%", f"{r['dnll']:+.4f}"]
+
+    def record_rows(name, rows, kept):
+        for r in rows:
+            run.record(label, f"{name} d{r['depth']} {r['path']}", {"kl_median": r["kl_median"], "kl_p90": r["kl_p90"],
+                       "top1": r["top1"], "dnll": r["dnll"]}, kept, exe.parent)
+
+    # the decode path of the reference against its own prompt path (the reference file)
+    ref_p90 = {}
+    if ranges and env("QA_REF_DECODE", "1") != "0":
+        def go_ref(log):
+            rd = tool_run(run, exe, model, f"{label}-reference-decode",
+                          dict(plan, action="compare", reference=str(ref), decode_ranges=ranges), ref_env, qargs=qargs)
+            if rd["processed"] != ctx or len(rd["samples"]) != len(positions):
+                raise Fail(f"the decode run stopped at {rd['processed']} of {ctx} tokens")
+            return probe_rows([], [x for x in rd["samples"] if x.get("decode")], depths, window)
+
+        try:
+            ref_rows, kept = run.measure(f"{label}-reference-decode",
+                                         {**ref_id, "kind": "quality-reference-decode", "reference": digest(ref)},
+                                         go_ref)
+            ref_p90 = {r["depth"]: r["kl_p90"] for r in ref_rows}
+            run.add("", f"{label} reference ({env('QA_REF_ENV', REF_ENV)})" + (" k" if kept else ""),
+                    *table(header, [table_row(r) for r in ref_rows]))
+            record_rows("reference", ref_rows, kept)
+        except Fail as e:
+            run.failed = True
+            clean = False
+            run.add("", f"{label} reference decode: FAIL {e}")
+
+    def vs_ref(r):
+        p = ref_p90.get(r["depth"]) if r["path"] == "decode" else None
+        if p is None:
+            return ""
+        return f"{r['kl_p90'] / p:.2f}" if p > 0 else ("-" if r["kl_p90"] == 0 else "inf")
+
     same = {}  # per variant: the NLL of every probe on both paths, to compare with default bit for bit
     for name, venv in variants("QA_QARMS", "default"):
         run_env = dict(os.environ, **venv)
@@ -1147,17 +1192,12 @@ def quality(run, label, ctx, depths, qargs=None):
         rows = res["rows"] if isinstance(res, dict) else res
         if isinstance(res, dict):
             same[name] = res
-        flags = probe_flags(rows)
+        flags = probe_flags(rows, ref_p90)
         clean &= not flags
-        table_rows = [[r["depth"], r["path"], r["n"], f"{r['kl_median']:.6f}", f"{r['kl_p90']:.5f}", f"{r['kl_max']:.3f}",
-                       f"{100 * r['over_001']:.1f}%", r["over_05"], f"{100 * r['top1']:.1f}%", f"{r['dnll']:+.4f}",
-                       flags.get((r["depth"], r["path"]), "")] for r in rows]
         run.add("", f"{label} {name}" + (" k" if kept else ""),
-                *table(["depth", "path", "n", "KL median", "KL p90", "KL max", ">0.01", ">0.5", "top-1", "dNLL", ""],
-                       table_rows))
-        for r in rows:
-            run.record(label, f"{name} d{r['depth']} {r['path']}", {"kl_median": r["kl_median"], "kl_p90": r["kl_p90"],
-                       "top1": r["top1"], "dnll": r["dnll"]}, kept, exe.parent)
+                *table(header + ["p90/ref", ""],
+                       [table_row(r) + [vs_ref(r), flags.get((r["depth"], r["path"]), "")] for r in rows]))
+        record_rows(name, rows, kept)
     # which variants give the logits of default: equal logits give an equal NLL. a second default (an unread variable)
     # shows whether a run repeats itself, as the radix-select of the block top-k did not before 01.11
     base_nll = same.get("default")

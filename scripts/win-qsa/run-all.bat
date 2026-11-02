@@ -10,15 +10,16 @@ call "%~dp0_config.bat"
 rem the questions (README). the 395: again (a second default, an unread variable) gives the logits of default bit
 rem for bit. settled by the runs of 01.11 and 02.11 and left out: mm (the head matmul in the graph: the same bits and
 rem time, 1.4 GiB more compute buffer) and radix0 (the radix-select of upstream: the same time, not repeatable). the
-rem 3090: again, its radix-select (CUDA top-k.cu) still compacts with atomics; the MTP window KV on by default since
-rem 01.11 also with one slot (nowin: the default before)
+rem 3090: again, the stable radix-select of CUDA top-k.cu since 02.11 (GGML_CUDA_TOPK_RADIX_STABLE; before it the
+rem probes parted at 16256); radix0 in the profile: what the stable one costs in qsa select against the gather of
+rem upstream. left out 02.11: nowin (the MTP window KV off; the GPU op time of the profile leaves out the CPU experts)
 if /i not "%BACKEND%"=="vulkan" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PARMS set "QA_PARMS=default"
 goto :arms_done
 :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
-if not defined QA_PARMS set "QA_PARMS=default;nowin LLAMA_MTP_WINDOW_KV=-1"
+if not defined QA_PARMS set "QA_PARMS=default;radix0 GGML_CUDA_TOPK_RADIX_STABLE=0"
 :arms_done
 rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
 if not defined RUN_MICRO set "RUN_MICRO=0"

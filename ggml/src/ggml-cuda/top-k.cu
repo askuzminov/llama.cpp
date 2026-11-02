@@ -209,9 +209,16 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+#include "fork/top-k-fork.inc" // fork: GGML_CUDA_TOPK_RADIX, the stable radix select
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    // fork: GGML_CUDA_TOPK_RADIX_STABLE
+    if (top_k_radix_stable_fork(pool, src, dst, ncols, nrows, k, stream)) {
+        return;
+    }
+
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
@@ -277,10 +284,6 @@ static void top_k_argsort_cuda(
         dst += (size_t) k     * iter_nrows;
     }
 }
-
-#if defined(GGML_CUDA_USE_CUB)
-#include "fork/top-k-fork.inc"
-#endif // defined(GGML_CUDA_USE_CUB)
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
