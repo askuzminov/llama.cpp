@@ -54,12 +54,17 @@ def status(i: int = 0) -> dict:
 
 
 def with_pool(r: ServerProcess, options: str):
-    # the options of the pool go into the preset of the router, next to pool = on: "move_tokens=16 wait_max=0" is
-    # pool-move-tokens = 16 and pool-wait-max = 0
-    with open(r.models_preset, "a") as f:
-        for item in options.split():
-            k, v = item.split("=", 1)
-            f.write(f"pool-{k.replace('_', '-')} = {v}\n")
+    # the options of the pool go into the preset of the router, in [*] for every model of it: "move_tokens=16
+    # wait_max=0" is pool-move-tokens = 16 and pool-wait-max = 0
+    lines = ""
+    for item in options.split():
+        k, v = item.split("=", 1)
+        lines += f"pool-{k.replace('_', '-')} = {v}\n"
+    with open(r.models_preset) as f:
+        text = f.read()
+    text = "[*]\n" + lines + text[4:] if text.startswith("[*]\n") else "[*]\n" + lines + "\n" + text
+    with open(r.models_preset, "w") as f:
+        f.write(text)
 
 
 def start_pool(options: str = "", slots: int | None = None, broadcast_port: int | None = None) -> dict:
@@ -155,6 +160,76 @@ def test_pool_stops_on_a_bad_option():
         routers[0].start()
     with open(routers[0].log_path) as f:
         assert "pool-move-tokens = many: not a number" in f.read()
+
+
+def test_pool_loads_the_model_on_demand():
+    # the pool polls without loading a model and sends requests only to the nodes that have it loaded: the requests
+    # for the model make every router of the pool with room for it load it, they wait in the pool meanwhile
+    for i, r in enumerate(routers):
+        r.models_preset = preset(f"r{i}", body="hf-repo = ggml-org/test-model-stories260K\npool = on\nalias = tiny-alias\n")
+    ports = [r.server_port for r in routers]
+    for i, r in enumerate(routers):
+        with_pool(r, f"name=n{i} discover=0 peers=127.0.0.1:{ports[1 - i]} poll_ms=200")
+        r.start()
+    deadline = time.time() + 20
+    while [n["status"] for n in status()["nodes"]] != ["unloaded", "unloaded"]:
+        assert time.time() < deadline, status()["nodes"]
+        time.sleep(0.1)
+    time.sleep(1)
+    assert events("load") == []  # no request, no load
+    chat([{"role": "user", "content": "the first request loads the model"}])
+    deadline = time.time() + 20
+    while status()["pool"]["nodes_up"] != 2:
+        assert time.time() < deadline, status()["nodes"]
+        time.sleep(0.1)
+    assert sorted(e["node"] for e in events("load")) == ["n0", "n1"], events("load")
+
+
+def test_pool_shows_a_failed_load():
+    # a model that fails to load leaves its node unloaded, the card of the node says why; the load is not asked again
+    routers[1].models_preset = preset("r1", body="model = /no/such/model.gguf\npool = on\nalias = tiny-alias\n")
+    ports = [r.server_port for r in routers]  # the second node never comes up: no wait_nodes
+    for i, r in enumerate(routers):
+        with_pool(r, f"name=n{i} discover=0 peers=127.0.0.1:{ports[1 - i]} poll_ms=200")
+        r.start()
+    deadline = time.time() + 20
+    while not any(n["name"] == "n1" for n in status()["nodes"]) or status()["pool"]["nodes_up"] != 1:
+        assert time.time() < deadline, status()["nodes"]
+        time.sleep(0.1)
+    chat([{"role": "user", "content": "on the node that works"}])
+    deadline = time.time() + 20
+    while "failed to load" not in node_of("n1")["error"]:
+        assert time.time() < deadline, node_of("n1")
+        time.sleep(0.1)
+    assert node_of("n1")["status"] == "unloaded"
+    chat([{"role": "user", "content": "again on the node that works"}])
+    assert [e["node"] for e in events("new")] == ["n0", "n0"]
+    assert [e["node"] for e in events("load")] == ["n1"], events("load")
+
+
+def test_pool_shares_two_models():
+    # two models with pool = on: a pool for each, the requests for either go through its own; one discovery finds the
+    # routers for both, the dashboard shows one pool by ?model=
+    two = (TINY + "alias = tiny-alias\n" + "\n[moe]\nhf-repo = ggml-org/stories15M_MOE\nhf-file = stories15M_MOE-F16.gguf\n"
+           "load-on-startup = true\npool = on\n")
+    for i, r in enumerate(routers):
+        r.models_preset = preset(f"r{i}", body=two)
+    start_pool(slots=2)
+    deadline = time.time() + 20
+    while status(0)["pool"]["nodes_up"] != 2 or routers[0].make_request("GET", "/pool/status?model=moe").body["pool"]["nodes_up"] != 2:
+        assert time.time() < deadline
+        time.sleep(0.1)
+    st = routers[0].make_request("GET", "/pool/status?model=moe").body
+    assert sorted(st["pools"]) == ["moe", "tiny"] and st["config"]["model"] == "moe"
+    assert [n["name"] for n in st["nodes"]] == ["n0", "n1"]
+    chat([{"role": "user", "content": "a tiny question"}], model="tiny")
+    chat([{"role": "user", "content": "a moe question"}], model="moe")
+    assert len(events("new")) == 1
+    assert len([e for e in st["events"] if e["kind"] == "conflict"]) == 0
+    moe_new = [e for e in routers[0].make_request("GET", "/pool/status?model=moe").body["events"] if e["kind"] == "new"]
+    assert len(moe_new) == 1
+    res = routers[0].make_request("GET", "/pool/status?model=nope")
+    assert res.status_code == 400
 
 
 def test_pool_takes_the_model_under_every_name():
@@ -344,10 +419,12 @@ def test_pool_moves_no_state_with_migrate_0():
 
 
 def test_pool_pull_needs_a_known_node():
-    # POST /pool/pull reads a state only from a node of the pool of that router
+    # POST /pool/pull reads a state only from a node of the pool of the model it names
     start_pool()
-    res = routers[1].make_request("POST", "/pool/pull", data={"from": "nowhere:1", "id": "00ff", "size": 10})
+    res = routers[1].make_request("POST", "/pool/pull", data={"from": "nowhere:1", "id": "00ff", "size": 10, "model": "tiny"})
     assert res.status_code == 400 and "no node nowhere:1" in res.body["error"]["message"], res.body
+    res = routers[1].make_request("POST", "/pool/pull", data={"from": "nowhere:1", "id": "00ff", "size": 10})
+    assert res.status_code == 400 and "no pool of the model" in res.body["error"]["message"], res.body
     res = routers[0].make_request("POST", "/pool/drain", data={"node": "nowhere", "drain": True})
     assert res.status_code == 400 and "no node nowhere" in res.body["error"]["message"], res.body
 

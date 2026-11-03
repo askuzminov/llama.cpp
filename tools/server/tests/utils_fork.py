@@ -12,6 +12,7 @@ class ServerProcessFork:
     cache_spill_dir: str | None = None
     cache_disk: int | None = None
     cache_min_tokens: int | None = None
+    cache_ram_min_tokens: int | None = None
     cache_idle_write: bool | None = None
     # variables set in the environment of the server, None removes one (the pool tests take out
     # LLAMA_SERVER_DEBUG_FAKE_TIMING: a router sleeps 2 s in every request it proxies, the polls of a pool among them)
@@ -31,6 +32,8 @@ class ServerProcessFork:
             server_args.extend(["--cache-disk", self.cache_disk])
         if self.cache_min_tokens is not None:
             server_args.extend(["--cache-min-tokens", self.cache_min_tokens])
+        if self.cache_ram_min_tokens is not None:
+            server_args.extend(["--cache-ram-min-tokens", self.cache_ram_min_tokens])
         if self.cache_idle_write:
             server_args.append("--cache-idle-write")
         return server_args

@@ -558,8 +558,8 @@ def test_prompt_cache_hit_keeps_the_file():
             pass
 
 
-def test_prompt_cache_min_tokens_skips_short_prompts():
-    # --cache-min-tokens keeps short prompts out of the cache. With write-behind on, anything that
+def test_prompt_cache_ram_min_tokens_skips_short_prompts():
+    # --cache-ram-min-tokens keeps short prompts out of the cache. With write-behind on, anything that
     # does enter the cache reaches the disk while idle, so an empty spill dir means nothing was kept.
     spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-min-")
 
@@ -572,7 +572,7 @@ def test_prompt_cache_min_tokens_skips_short_prompts():
     server.cache_ram = 100
     server.cache_spill_dir = spill_dir
     server.cache_disk = 512
-    server.cache_min_tokens = 4096   # far above anything this test sends
+    server.cache_ram_min_tokens = 4096   # far above anything this test sends
     server.cache_idle_write = True   # what enters the cache reaches the disk while idle
 
     try:
@@ -600,6 +600,45 @@ def test_prompt_cache_min_tokens_skips_short_prompts():
         except OSError:
             pass
 
+
+
+def test_prompt_cache_min_tokens_keeps_short_prompts_in_ram():
+    # --cache-min-tokens is the minimum of a disk write only: a prompt below it still enters the RAM cache when its slot
+    # goes to another prompt, and comes back from there, while the spill dir stays empty
+    spill_dir = tempfile.mkdtemp(prefix="llama-cache-spill-ram-")
+
+    server = ServerPreset.tinyllama2()
+    server.n_slots = 1
+    server.n_predict = 4
+    server.temperature = 0.0
+    server.cache_ram = 100
+    server.cache_spill_dir = spill_dir
+    server.cache_disk = 512
+    server.cache_min_tokens = 4096   # far above anything this test sends
+    server.cache_idle_write = True   # what may reach the disk does so while idle
+
+    try:
+        server.start()
+        first = {}
+        for prompt in (LONG_PROMPT, "The quick brown fox jumps over the lazy dog"):
+            res = server.make_request("POST", "/completion", data={"prompt": prompt, "cache_prompt": True, "temperature": 0.0})
+            assert res.status_code == 200, res.body
+            first = first or res.body["timings"]
+        # the one slot took the second prompt: the first comes back from the RAM cache (not just the first token they
+        # share)
+        res = server.make_request("POST", "/completion", data={"prompt": LONG_PROMPT, "cache_prompt": True, "temperature": 0.0})
+        assert res.status_code == 200, res.body
+        assert res.body["timings"]["cache_n"] >= first["prompt_n"] - 1, (first, res.body["timings"])
+        time.sleep(0.5)
+        assert spill_files(spill_dir) == [], "a state below --cache-min-tokens reached the disk"
+    finally:
+        server.stop()
+        try:
+            for f in os.listdir(spill_dir):
+                os.remove(os.path.join(spill_dir, f))
+            os.rmdir(spill_dir)
+        except OSError:
+            pass
 
 def test_prompt_cache_spill_dir_shared_by_two_models():
     # Two models may point at one spill dir. The file name carries the signature of the

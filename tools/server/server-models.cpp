@@ -2,6 +2,7 @@
 #include "http.h"
 #include "server-models.h"
 #include "fork/env-fork.h" // fork: LLAMA_SERVER_STOP_TIMEOUT
+#include "fork/server-pool-fork.h" // fork: server_pool_quiet_fork
 #include "server-context.h"
 #include "server-stream.h"
 
@@ -1717,7 +1718,12 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
         // sleep after req_count++, so the model counts as busy while we wait here
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
-    SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
+    if (server_pool_quiet_fork(req)) {
+        // fork: a request of a pool: its polls (every second from every router) and the chunks of a move
+        SRV_DBG("proxying request to model %s on port %d\n", name.c_str(), meta->port);
+    } else {
+        SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
+    }
     std::string proxy_path = req.path;
     if (!req.query_string.empty()) {
         proxy_path += '?' + req.query_string;

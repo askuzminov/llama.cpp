@@ -104,6 +104,7 @@ td.n { text-align: right; } th.n { text-align: right; }
 R"POOLUI(<body>
 <header>
   <h1>llama pool</h1>
+  <span class="sub" id="pools"></span>
   <span class="sub" id="sub"></span>
   <span class="legend"><span class="lg">generating</span><span class="lp">prompt</span><span class="li">idle</span></span>
   <span class="live"><span class="dot" id="dot"></span><span id="live">connecting</span></span>
@@ -129,7 +130,9 @@ R"POOLUI(<body>
 const HMAX = 300;
 const hist = { gen: [], pp: [] };
 const base = location.pathname.replace(/\/pool\/?$/, "");
-const key = new URLSearchParams(location.search).get("key");
+const query = new URLSearchParams(location.search);
+const key = query.get("key");
+const model = query.get("model");
 const H = key ? { "Authorization": "Bearer " + key } : {};
 
 function esc(s) {
@@ -268,6 +271,13 @@ function table(head, rows, empty) {
 function render(s) {
   const p = s.pool;
   const c = s.config;
+  // a router with several pools: a link to each, this one in bold
+  const others = s.pools && s.pools.length > 1 ? s.pools : [];
+  document.getElementById("pools").innerHTML = others.map(m => {
+    const q = new URLSearchParams(location.search);
+    q.set("model", m);
+    return m === c.model ? "<b>" + esc(m) + "</b>" : '<a href="?' + esc(q.toString()) + '">' + esc(m) + "</a>";
+  }).join(" \u00b7 ");
   document.getElementById("sub").textContent = [s.name, c.names && c.names.length ? "model " + c.names.join(", ") : "",
     "a conversation with ~" + tok(c.move_tokens) + " tok of its own on a busy node waits for it, up to " + c.wait_max + " s" +
     (c.migrate ? ", or moves with its state" : ""),
@@ -320,7 +330,7 @@ async function tick() {
   if (busy) return;
   busy = true;
   try {
-    const r = await fetch(base + "/pool/status", { headers: H, cache: "no-store" });
+    const r = await fetch(base + "/pool/status" + (model ? "?model=" + encodeURIComponent(model) : ""), { headers: H, cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
     document.getElementById("dot").className = "dot";

@@ -380,22 +380,39 @@ static void test_write_behind_cancel(const std::string & dir) {
 }
 
 // the minimum prompt length keeps short prompts out of the cache
+// --cache-ram-min-tokens keeps a short prompt out of RAM; --cache-min-tokens only off the disk: such a state stays in
+// RAM and is not written
 static void test_min_tokens(const std::string & dir) {
-    server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
-    cache.min_tokens = 64;
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        cache.ram_min_tokens = 64;
 
-    server_prompt prompt;
+        server_prompt prompt;
 
-    prompt.tokens = server_tokens(make_tokens(63, 1), false);
-    assert(cache.alloc(prompt, 1024, 0) == nullptr);
-    assert(cache.states.empty());
+        prompt.tokens = server_tokens(make_tokens(63, 1), false);
+        assert(cache.alloc(prompt, 1024, 0) == nullptr);
+        assert(cache.states.empty());
 
-    prompt.tokens = server_tokens(make_tokens(64, 1), false);
-    assert(cache.alloc(prompt, 1024, 0) != nullptr);
-    assert(cache.states.size() == 1);
+        prompt.tokens = server_tokens(make_tokens(64, 1), false);
+        assert(cache.alloc(prompt, 1024, 0) != nullptr);
+        assert(cache.states.size() == 1);
 
-    cache.states.clear();
-    assert(dir_empty(dir));
+        cache.states.clear();
+        assert(dir_empty(dir));
+    }
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        cache.min_tokens = 64;
+
+        server_prompt prompt;
+        prompt.tokens = server_tokens(make_tokens(63, 1), false);
+        server_prompt_cache_state * st = cache.alloc(prompt, 1024, 0);
+        assert(st != nullptr && cache.states.size() == 1);
+        assert(!cache.write_state(*st));
+        assert(dir_empty(dir));
+
+        cache.states.clear();
+    }
 }
 
 // fork: the RAM limit counts the RAM the server holds outside the cache (ram_outside: the states of slots paused for

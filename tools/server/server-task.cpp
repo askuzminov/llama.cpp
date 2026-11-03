@@ -1766,9 +1766,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // a short prompt is cheap to recompute, while the recurrent part of a hybrid state costs the
     // same no matter how long the prompt is - caching one only takes room from the long prompts
-    if (min_tokens > 0 && prompt.tokens.size() < min_tokens) {
-        SRV_TRC(" - prompt has %zu tokens, below the cache minimum of %zu, skipping\n",
-                prompt.tokens.size(), min_tokens);
+    if (ram_min_tokens > 0 && prompt.tokens.size() < ram_min_tokens) {
+        SRV_TRC(" - prompt has %zu tokens, below the RAM cache minimum of %zu, skipping\n",
+                prompt.tokens.size(), ram_min_tokens);
         return nullptr;
     }
 

@@ -58,11 +58,11 @@ static void common_params_add_args_cache_ram(const common_params & params, const
     add_opt(common_arg(
         {"--cache-min-tokens"}, "N",
         string_format("smallest piece of work worth a prompt-cache disk write, in tokens (default: %d, 0 = no minimum). "
-            "Prompts shorter than N are not cached at all: they are cheap to recompute, while a hybrid model stores the "
-            "same fixed recurrent state for any length, so caching one mostly takes room from the long prompts that pay "
-            "off. A state whose front is already on disk is also not written again until it grows N tokens past it, "
-            "which keeps a chat that gains a few hundred tokens per turn from rewriting gigabytes every turn: it leaves "
-            "RAM without a write, and coming back costs up to N tokens of recompute", params.cache_min_tokens),
+            "A shorter state stays in RAM only and is not written out on eviction or exit: it is cheap to recompute. A "
+            "state whose front is already on disk is also not written again until it grows N tokens past it, which "
+            "keeps a chat that gains a few hundred tokens per turn from rewriting gigabytes every turn: it leaves RAM "
+            "without a write, and coming back costs up to N tokens of recompute. The RAM cache has its own minimum, "
+            "--cache-ram-min-tokens", params.cache_min_tokens),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("cache-min-tokens must be >= 0");
@@ -70,6 +70,19 @@ static void common_params_add_args_cache_ram(const common_params & params, const
             params.cache_min_tokens = value;
         }
     ).set_env("LLAMA_ARG_CACHE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ram-min-tokens"}, "N",
+        string_format("prompts shorter than N tokens are not kept in the RAM prompt cache (default: %d, 0 = no minimum): "
+            "a hybrid model stores the same fixed recurrent state for any length, so many short states take room from "
+            "the long ones. With more conversations than slots, a conversation that is not kept is computed again from "
+            "the start when it comes back", params.cache_ram_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-ram-min-tokens must be >= 0");
+            }
+            params.cache_ram_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-idle-write"},
         {"--no-cache-idle-write"},

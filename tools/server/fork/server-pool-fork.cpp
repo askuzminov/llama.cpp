@@ -140,6 +140,12 @@ static std::string pool_random_hex() {
     return buf;
 }
 
+// this process, the same for every pool of the router: a router of another machine with the same id has another
+static const std::string & pool_instance() {
+    static const std::string s = pool_random_hex();
+    return s;
+}
+
 // host:port or http://host:port, [ipv6]:port; the path is ignored
 static void pool_parse_host_port(const std::string & s, std::string & host, int & port) {
     const size_t p = s.find("://");
@@ -423,6 +429,8 @@ static constexpr size_t POOL_TAIL = 16*1024;
 static constexpr int POOL_MAX_NODES = 64;
 // the header of a request the pool sends to a node: the router there serves it itself
 static constexpr const char * POOL_HOP_HEADER = "X-Llama-Pool";
+// the header of the requests the pool makes itself: polls, probes, moves; logged at the debug level
+static constexpr const char * POOL_QUIET_HEADER = "X-Llama-Pool-Poll";
 
 // one way to a node: a direct cable, the WiFi
 struct pool_link {
@@ -503,6 +511,11 @@ struct pool_node {
     std::string status = "down"; // up, down, loading, unloaded
     bool        draining = false;
     bool        mismatch = false; // another model than the most of the nodes (same_model): it takes no request
+    bool        failed   = false; // the load of the model failed there (the exit code in error): no load is asked of it
+    int         n_running  = 0;   // the other models its router runs, loaded or loading
+    int         max_models = 0;   // models_max of its router (GET /props), 0 = no limit
+    bool        want_load  = false; // a load of the model to ask of its router at the next poll
+    int64_t     t_load     = 0;   // the last load asked of it
     std::string signature;       // the portable signature of its prompt cache, "" = unknown (GET /pool/node)
     bool        migrate = false; // it moves conversations: the fork with a prompt cache
     uint64_t    cache_ram = 0;   // the RAM limit of its prompt cache, the largest state it takes; 0 = none
@@ -570,7 +583,7 @@ struct server_pool_fork::impl {
     std::string model;           // the model of this router: the name of its preset
     std::set<std::string> names; // its name and aliases: a request for any of them goes through the pool
     std::string id;              // this router in the pool: <name or host>:<port>
-    std::string instance = pool_random_hex(); // this process: another router with the same id is another machine
+    std::string instance = pool_instance(); // this process: another router with the same id is another machine
     std::string self_host;       // how this router reaches itself
     int         http_port = 0;
     std::string api_key;         // --api-key of this router: the other routers of the pool have it too
@@ -621,14 +634,6 @@ struct server_pool_fork::impl {
     std::condition_variable  cv_stop;
     std::mutex               mu_threads;
     std::vector<std::thread> pollers; // under mu_threads
-    std::thread              discovery;
-
-    // the discovery: broadcasts come to sock_bcast (the port of the pool), the answers to sock_reply (a port of its own,
-    // as the broadcasts go out from it)
-    socket_t sock_bcast = INVALID_SOCKET;
-    socket_t sock_reply = INVALID_SOCKET;
-    std::map<std::string, int64_t> challenges; // the challenges of this router -> when sent, discovery thread only
-    int64_t t_conflict = 0;                    // the last warning about a router with the same id, discovery thread only
 
     impl(const common_params & params, server_models_routes & models_routes) : params(params), models_routes(models_routes) {}
 
@@ -673,8 +678,9 @@ struct server_pool_fork::impl {
         n_nodes = 1;
     }
 
+    // the headers of the requests the pool makes itself
     httplib::Headers auth_headers() const {
-        httplib::Headers h;
+        httplib::Headers h = {{POOL_QUIET_HEADER, "1"}};
         if (!api_key.empty()) {
             h.emplace("Authorization", "Bearer " + api_key);
         }
@@ -1030,9 +1036,40 @@ struct server_pool_fork::impl {
         }
     }
 
-    // a node for a request: waits for a free slot, -1 when the client went away, -2 when no node is up. while no node
-    // takes requests and this router answers (its model loading, or unloaded), the requests go to it in turn as without
-    // a pool: the router waits for the model there
+    // the requests for the model wait or come: the routers that have it unloaded load it, so that every node takes a
+    // part - those with room for it (fewer other models running than their models_max), each once a minute at most; and
+    // when no node has it or loads it and none has room, one more that unloads another model for it, this router
+    // first, as a router without a pool would. a failed load is not asked again. under mu
+    void wake(int64_t now) {
+        auto loadable = [&](const pool_node & n) {
+            return n.status == "unloaded" && !n.failed && !n.draining && !n.mismatch && !n.want_load &&
+                   now - n.t_load > 60000;
+        };
+        bool have = false;
+        for (int i = 0; i < n_nodes.load(); ++i) {
+            const pool_node & n = nodes[i];
+            have = have || usable(n) || n.status == "loading" || n.want_load;
+        }
+        bool room = false;
+        for (int i = 0; i < n_nodes.load(); ++i) {
+            pool_node & n = nodes[i];
+            if (loadable(n) && (n.max_models <= 0 || n.n_running < n.max_models)) {
+                n.want_load = true;
+                room = true;
+            }
+        }
+        if (!have && !room) {
+            for (int i = 0; i < n_nodes.load(); ++i) {
+                if (loadable(nodes[i])) {
+                    nodes[i].want_load = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // a node for a request: waits for a free slot, -1 when the client went away, -2 when no node is up. the model
+    // loads on the routers that do not have it (wake); while one loads the requests wait for it
     int acquire(pool_req & r, const std::function<bool()> & should_stop) {
         std::unique_lock<std::mutex> lk(mu);
         queue.push_back(&r);
@@ -1044,6 +1081,7 @@ struct server_pool_fork::impl {
                 event("gone", r.conv, -1, stopping.load() ? "the router stops" : "the client left while it waited");
                 return -1;
             }
+            wake(now);
             int n = choose(r, now);
             if (n >= 0) {
                 // an older request that would take the same node goes first
@@ -1057,15 +1095,6 @@ struct server_pool_fork::impl {
                     }
                 }
             }
-            bool any = false;
-            for (int i = 0; i < n_nodes.load(); ++i) {
-                any = any || usable(nodes[i]);
-            }
-            const pool_node & self = nodes[0];
-            if (n < 0 && !any && (self.status == "loading" || self.status == "unloaded") && !self.draining &&
-                queue.front() == &r) {
-                n = 0;
-            }
             if (n >= 0) {
                 queue.erase(std::find(queue.begin(), queue.end(), &r));
                 nodes[n].inflight++;
@@ -1075,7 +1104,13 @@ struct server_pool_fork::impl {
                 running[r.id] = r;
                 return n;
             }
-            if (!any) {
+            bool any = false;
+            bool loading = false;
+            for (int i = 0; i < n_nodes.load(); ++i) {
+                any = any || usable(nodes[i]);
+                loading = loading || nodes[i].status == "loading" || nodes[i].want_load;
+            }
+            if (!any && !loading) {
                 t_none = t_none == 0 ? now : t_none;
                 if (now - t_none > 30000) {
                     queue.erase(std::find(queue.begin(), queue.end(), &r));
@@ -1604,8 +1639,10 @@ struct server_pool_fork::impl {
         n.prompt_tps = pp;
     }
 
-    // the state of the model on a router: up when its instance is loaded
-    static std::string model_state(httplib::Client & cli, const httplib::Headers & hdrs, const std::string & name, std::string & error) {
+    // the state of the model on a router: up when its instance is loaded; failed when its load failed, n_running the
+    // other models the router runs
+    static std::string model_state(httplib::Client & cli, const httplib::Headers & hdrs, const std::string & name, std::string & error,
+                                   bool & failed, int & n_running) {
         auto rm = cli.Get("/models", hdrs);
         if (!rm || rm->status != 200) {
             error = rm ? "models: HTTP " + std::to_string(rm->status) : httplib::to_string(rm.error());
@@ -1618,25 +1655,38 @@ struct server_pool_fork::impl {
         } else if (!j.is_discarded() && j.is_array()) {
             list = &j;
         }
-        if (list) {
-            for (const auto & m : *list) {
-                if (!m.is_object() || !pool_model_named(m, name)) {
-                    continue;
-                }
-                const std::string v = m.contains("status") && m.at("status").is_object()
-                    ? json_value(m.at("status"), "value", std::string()) : std::string();
-                if (v == "loaded" || v == "sleeping") {
-                    return "up";
-                }
-                if (v == "loading" || v == "downloading") {
-                    return "loading";
-                }
-                error = "model " + name + " is " + (v.empty() ? "unknown" : v);
-                return "unloaded";
+        std::string state = "down";
+        error = "no model " + name + " on the node";
+        failed = false;
+        n_running = 0;
+        for (size_t k = 0; list && k < list->size(); ++k) {
+            const json & m = (*list)[k];
+            if (!m.is_object()) {
+                continue;
+            }
+            const json st = m.contains("status") && m.at("status").is_object() ? m.at("status") : json::object();
+            const std::string v = json_value(st, "value", std::string());
+            const bool running = v == "loaded" || v == "sleeping" || v == "loading" || v == "downloading";
+            if (!pool_model_named(m, name)) {
+                n_running += running ? 1 : 0;
+                continue;
+            }
+            error.clear();
+            if (v == "loaded" || v == "sleeping") {
+                state = "up";
+            } else if (v == "loading" || v == "downloading") {
+                state = "loading";
+            } else if (json_value(st, "failed", false)) {
+                failed = true;
+                error  = string_format("the model %s failed to load, exit code %d: see the log of that router", name.c_str(),
+                                       json_value(st, "exit_code", 0));
+                state  = "unloaded";
+            } else {
+                error = "model " + name + " is " + (v.empty() ? "unknown" : v) + ", not loaded on that router";
+                state = "unloaded";
             }
         }
-        error = "no model " + name + " on the node";
-        return "down";
+        return state;
     }
 
     // a node of another model than the most of the others takes no request (same_model). the first node decides a tie
@@ -1676,6 +1726,9 @@ struct server_pool_fork::impl {
         json        slots;
         json        info;
         json        router;
+        bool        failed     = false;
+        int         n_running  = 0;
+        int         max_models = -1; // -1 = not read this time
     };
 
     // one poll of a node over one link
@@ -1698,12 +1751,20 @@ struct server_pool_fork::impl {
                 return pr;
             }
             if (want_router) {
-                auto rr = cli.Get("/pool/router", hdrs);
+                auto rr = cli.Get("/pool/router?model=" + node.model, hdrs);
                 if (rr && rr->status == 200) {
                     pr.router = json::parse_no_throw(rr->body);
                 }
             }
-            pr.status = model_state(cli, hdrs, node.model, pr.error);
+            pr.status = model_state(cli, hdrs, node.model, pr.error, pr.failed, pr.n_running);
+            if (want_props) {
+                // the props of the router itself: how many models it runs at once
+                auto rp = cli.Get("/props", hdrs);
+                const json j = rp && rp->status == 200 ? json::parse_no_throw(rp->body) : json();
+                if (j.is_object() && j.contains("max_instances")) {
+                    pr.max_models = json_value(j, "max_instances", 0);
+                }
+            }
             if (pr.status == "up") {
                 // the router passes these to the instance of the model; autoload=0: a poll never loads it
                 const std::string q = "?model=" + node.model + "&autoload=0";
@@ -1847,6 +1908,13 @@ struct server_pool_fork::impl {
                 }
                 node.status = status;
                 node.error  = error;
+                if (used >= 0) {
+                    node.failed    = pr.failed;
+                    node.n_running = pr.n_running;
+                    if (pr.max_models >= 0) {
+                        node.max_models = pr.max_models;
+                    }
+                }
                 if (status == "up") {
                     node.t_ok = now;
                 }
@@ -1879,6 +1947,28 @@ struct server_pool_fork::impl {
                 node.slots    = reported;
                 node.external = std::max(0, node.busy - node.inflight);
                 cv.notify_all();
+            }
+
+            // a load the requests for the model asked for (wake): the router there loads it as on a request of its own
+            bool load;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                load = node.want_load && used >= 0;
+                node.want_load = false;
+                if (load) {
+                    node.t_load = ggml_time_ms();
+                }
+            }
+            if (load) {
+                httplib::Client cli(pool_base(links[used]));
+                cli.set_connection_timeout(1, 0);
+                cli.set_read_timeout(10, 0);
+                auto rl = cli.Post("/models/load", hdrs, json{{"model", node.model}}.dump(), "application/json");
+                std::lock_guard<std::mutex> lk(mu);
+                const bool ok = rl && rl->status == 200;
+                event("load", "", i, ok ? "asked to load " + node.model : "cannot load " + node.model + ": " + pool_error_text(rl));
+                SRV_INF("pool: %s %s on %s%s%s\n", ok ? "loading" : "cannot load", node.model.c_str(), node.name.c_str(),
+                        ok ? "" : ": ", ok ? "" : pool_error_text(rl).c_str());
             }
 
             // a link is measured when it first answers (one that did not answer, every probe_s seconds), the moves
@@ -1924,182 +2014,29 @@ struct server_pool_fork::impl {
         }
     }
 
-    //
-    // the discovery
-    //
-
-    std::string proof_of(const std::string & challenge, const std::string & prover) const {
-        if (api_key.empty()) {
-            return "";
-        }
-        const std::string s = api_key + "|" + challenge + "|" + prover;
-        return hash_sha256_hex(s.data(), s.size());
-    }
-
-    json hello_of(const char * type) const {
-        return {{"llama_pool", 1}, {"t", type}, {"id", id}, {"i", instance}, {"name", cfg.name}, {"port", http_port},
-                {"names", std::vector<std::string>(names.begin(), names.end())}};
-    }
-
-    std::string challenge() {
-        const std::string c = pool_random_hex();
-        const int64_t now = ggml_time_ms();
-        for (auto it = challenges.begin(); it != challenges.end(); ) {
-            it = now - it->second > 60000 ? challenges.erase(it) : std::next(it);
-        }
-        challenges[c] = now;
-        return c;
-    }
-
-    // a datagram from addr:port. hello (a broadcast): answer with a proof of the key for its challenge and a challenge
-    // of our own; proof: the other router answered our challenge, the link counts, and it gets a proof back if it asks
-    void on_datagram(const std::string & data, uint32_t addr, int port) {
-        const json m = json::parse_no_throw(data);
-        if (m.is_discarded() || !m.is_object() || json_value(m, "llama_pool", 0) != 1) {
-            return;
-        }
-        const std::string peer = json_value(m, "id", std::string());
-        const int peer_port    = json_value(m, "port", 0);
-        if (peer == id && json_value(m, "i", instance) != instance) {
-            // a router of another machine with the same host name and port: they cannot tell each other apart
-            const int64_t now = ggml_time_ms();
-            if (now - t_conflict > 60000) {
-                t_conflict = now;
-                char host[INET_ADDRSTRLEN] = {};
-                in_addr ia = {};
-                ia.s_addr = addr;
-                inet_ntop(AF_INET, &ia, host, sizeof(host));
-                SRV_WRN("pool: the router at %s has the same id %s: give one of them a name (pool-name in models.ini)\n", host, id.c_str());
-                std::lock_guard<std::mutex> lk(mu);
-                event("conflict", "", 0, std::string("the router at ") + host + " has the same id " + id + ": pool-name in models.ini on one of them");
-            }
-            return;
-        }
-        if (peer.empty() || peer == id || peer_port <= 0 || !m.contains("names") || !m.at("names").is_array()) {
-            return;
-        }
-        std::vector<std::string> peer_names;
-        bool shared = false;
-        for (const auto & nm : m.at("names")) {
-            if (nm.is_string()) {
-                peer_names.push_back(nm.get<std::string>());
-                shared = shared || names.count(peer_names.back()) > 0;
-            }
-        }
-        if (!shared) {
-            return; // another model, another pool
-        }
-        const std::string type = json_value(m, "t", std::string());
-        const std::string c    = json_value(m, "c", std::string());
-        if (type == "hello" || (type == "proof" && !c.empty())) {
-            json ans = hello_of("proof");
-            ans["a"] = c;
-            ans["p"] = proof_of(c, id);
-            if (type == "hello") {
-                ans["c"] = challenge();
-            }
-            pool_udp_send(sock_reply, addr, port, ans.dump());
-        }
-        if (type != "proof") {
-            return;
-        }
-        const std::string a = json_value(m, "a", std::string());
-        const std::string p = json_value(m, "p", std::string());
-        if (challenges.count(a) == 0 || p != proof_of(a, peer)) {
-            SRV_DBG("pool: %s did not answer the challenge (another key)\n", peer.c_str());
-            return;
-        }
-        char host[INET_ADDRSTRLEN] = {};
-        in_addr ia = {};
-        ia.s_addr = addr;
-        inet_ntop(AF_INET, &ia, host, sizeof(host));
-        found(peer, json_value(m, "name", std::string()), host, peer_port, peer_names, "broadcast");
-    }
-
-    // a router given in peers: GET /pool/router with the key, which the config trusts it with
-    void try_peer(const std::string & peer) {
-        std::string host;
-        int port = 0;
-        try {
-            pool_parse_host_port(peer, host, port);
-        } catch (const std::exception & e) {
-            SRV_WRN("pool: %s\n", e.what());
-            return;
-        }
-        httplib::Client cli(host, port);
-        cli.set_connection_timeout(1, 0);
-        cli.set_read_timeout(3, 0);
-        auto r = cli.Get("/pool/router", auth_headers());
-        const json j = r && r->status == 200 ? json::parse_no_throw(r->body) : json();
-        if (!j.is_object() || !j.contains("names") || !j.at("names").is_array()) {
-            return;
-        }
-        std::vector<std::string> peer_names;
-        bool shared = false;
-        for (const auto & nm : j.at("names")) {
-            if (nm.is_string()) {
-                peer_names.push_back(nm.get<std::string>());
-                shared = shared || names.count(peer_names.back()) > 0;
-            }
-        }
-        const std::string peer_id = json_value(j, "id", std::string());
-        if (shared && !peer_id.empty() && peer_id != id) {
-            found(peer_id, json_value(j, "name", std::string()), host, port, peer_names, "peers");
+    void start() {
+        if (!started.exchange(true)) {
+            start_poller(0);
         }
     }
 
-    void discovery_loop() {
-        int64_t t_hello = 0;
-        int64_t t_peers = 0;
-        const int64_t t_start = ggml_time_ms();
-        std::vector<char> buf(4096);
-        while (!stopping.load()) {
-            const int64_t now = ggml_time_ms();
-            // a hello every 2 s for the first 30 s, then every 15 s: a router that starts is found within a round trip
-            const int64_t every = now - t_start < 30000 ? 2000 : 15000;
-            if (cfg.discover && sock_reply != INVALID_SOCKET && now - t_hello >= every) {
-                t_hello = now;
-                json h = hello_of("hello");
-                h["c"] = challenge();
-                const std::string msg = h.dump();
-                for (uint32_t a : pool_broadcast_addrs()) {
-                    pool_udp_send(sock_reply, a, cfg.port, msg);
-                }
-            }
-            if (!cfg.peers.empty() && now - t_peers >= every) {
-                t_peers = now;
-                for (const auto & peer : cfg.peers) {
-                    try_peer(peer);
-                }
-            }
-            if (sock_reply == INVALID_SOCKET && sock_bcast == INVALID_SOCKET) {
-                std::unique_lock<std::mutex> lk(mu_stop);
-                cv_stop.wait_for(lk, std::chrono::milliseconds(250), [&] { return stopping.load(); });
-                continue;
-            }
-            fd_set rd;
-            FD_ZERO(&rd);
-            socket_t hi = 0;
-            for (socket_t s : {sock_bcast, sock_reply}) {
-                if (s != INVALID_SOCKET) {
-                    FD_SET(s, &rd);
-                    hi = std::max(hi, s);
-                }
-            }
-            timeval tv = {0, 250000};
-            if (select((int) hi + 1, &rd, nullptr, nullptr, &tv) <= 0) {
-                continue;
-            }
-            for (socket_t s : {sock_bcast, sock_reply}) {
-                if (s == INVALID_SOCKET || !FD_ISSET(s, &rd)) {
-                    continue;
-                }
-                sockaddr_in from = {};
-                socklen_t len = sizeof(from);
-                const int n = (int) recvfrom(s, buf.data(), (int) buf.size(), 0, (sockaddr *) &from, &len);
-                if (n > 0) {
-                    on_datagram(std::string(buf.data(), n), from.sin_addr.s_addr, ntohs(from.sin_port));
-                }
+    void stop() {
+        if (stopping.exchange(true)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_stop);
+        }
+        cv_stop.notify_all();
+        cv.notify_all();
+        std::vector<std::thread> threads;
+        {
+            std::lock_guard<std::mutex> lk(mu_threads);
+            threads.swap(pollers);
+        }
+        for (auto & t : threads) {
+            if (t.joinable()) {
+                t.join();
             }
         }
     }
@@ -2260,6 +2197,273 @@ struct server_pool_fork::impl {
 };
 
 //
+// the discovery: one for all the pools of the router. broadcasts come to sock_bcast (the port of the pools), the answers
+// to sock_reply (a port of its own, as the broadcasts go out from it); a hello names the models of every pool, and a
+// router that answered the challenge joins each pool it shares a model with
+//
+
+struct server_pool_fork::discovery_t {
+    std::vector<impl *> pools;
+    std::string id;              // the id, name, key and port of the first pool: the same router in every pool
+    std::string name;
+    std::string api_key;
+    std::string instance = pool_instance();
+    int         http_port = 0;
+    int         port      = 12345;
+    bool        discover  = false; // any pool with pool-discover
+    std::vector<std::string> peers; // pool-peers of every pool
+    std::set<std::string>    names; // the names of the models of every pool
+    httplib::Headers         hdrs;
+
+    socket_t sock_bcast = INVALID_SOCKET;
+    socket_t sock_reply = INVALID_SOCKET;
+    std::map<std::string, int64_t> challenges; // the challenges of this router -> when sent, discovery thread only
+    int64_t t_conflict = 0;                    // the last warning about a router with the same id, discovery thread only
+
+    std::atomic<bool>       stopping{false};
+    std::mutex              mu_stop;
+    std::condition_variable cv_stop;
+    std::thread             th;
+
+    explicit discovery_t(const std::vector<std::unique_ptr<impl>> & all) {
+        for (const auto & p : all) {
+            pools.push_back(p.get());
+            discover = discover || p->cfg.discover;
+            for (const auto & peer : p->cfg.peers) {
+                if (std::find(peers.begin(), peers.end(), peer) == peers.end()) {
+                    peers.push_back(peer);
+                }
+            }
+            names.insert(p->names.begin(), p->names.end());
+        }
+        const impl * first = pools.front();
+        id        = first->id;
+        name      = first->cfg.name;
+        api_key   = first->api_key;
+        http_port = first->http_port;
+        port      = first->cfg.port;
+        hdrs      = first->auth_headers();
+    }
+
+    std::string proof_of(const std::string & challenge, const std::string & prover) const {
+        if (api_key.empty()) {
+            return "";
+        }
+        const std::string s = api_key + "|" + challenge + "|" + prover;
+        return hash_sha256_hex(s.data(), s.size());
+    }
+
+    json hello_of(const char * type) const {
+        return {{"llama_pool", 1}, {"t", type}, {"id", id}, {"i", instance}, {"name", name}, {"port", http_port},
+                {"names", std::vector<std::string>(names.begin(), names.end())}};
+    }
+
+    std::string challenge() {
+        const std::string c = pool_random_hex();
+        const int64_t now = ggml_time_ms();
+        for (auto it = challenges.begin(); it != challenges.end(); ) {
+            it = now - it->second > 60000 ? challenges.erase(it) : std::next(it);
+        }
+        challenges[c] = now;
+        return c;
+    }
+
+    // a router of the pools reached at host:port joins every pool it shares a model with
+    void found(const std::string & peer, const std::string & peer_name, const std::string & host, int peer_port,
+               const std::vector<std::string> & peer_names, const char * how) {
+        for (impl * p : pools) {
+            bool shared = false;
+            for (const auto & nm : peer_names) {
+                shared = shared || p->names.count(nm) > 0;
+            }
+            if (shared) {
+                p->found(peer, peer_name, host, peer_port, peer_names, how);
+            }
+        }
+    }
+
+    // a datagram from addr:port. hello (a broadcast): answer with a proof of the key for its challenge and a challenge
+    // of our own; proof: the other router answered our challenge, the link counts, and it gets a proof back if it asks
+    void on_datagram(const std::string & data, uint32_t addr, int from_port) {
+        const json m = json::parse_no_throw(data);
+        if (m.is_discarded() || !m.is_object() || json_value(m, "llama_pool", 0) != 1) {
+            return;
+        }
+        const std::string peer = json_value(m, "id", std::string());
+        const int peer_port    = json_value(m, "port", 0);
+        char host[INET_ADDRSTRLEN] = {};
+        in_addr ia = {};
+        ia.s_addr = addr;
+        inet_ntop(AF_INET, &ia, host, sizeof(host));
+        if (peer == id && json_value(m, "i", instance) != instance) {
+            // a router of another machine with the same host name and port: they cannot tell each other apart
+            const int64_t now = ggml_time_ms();
+            if (now - t_conflict > 60000) {
+                t_conflict = now;
+                SRV_WRN("pool: the router at %s has the same id %s: give one of them a name (pool-name in models.ini)\n", host, id.c_str());
+                for (impl * p : pools) {
+                    std::lock_guard<std::mutex> lk(p->mu);
+                    p->event("conflict", "", 0, std::string("the router at ") + host + " has the same id " + id + ": pool-name in models.ini on one of them");
+                }
+            }
+            return;
+        }
+        if (peer.empty() || peer == id || peer_port <= 0 || !m.contains("names") || !m.at("names").is_array()) {
+            return;
+        }
+        std::vector<std::string> peer_names;
+        bool shared = false;
+        for (const auto & nm : m.at("names")) {
+            if (nm.is_string()) {
+                peer_names.push_back(nm.get<std::string>());
+                shared = shared || names.count(peer_names.back()) > 0;
+            }
+        }
+        if (!shared) {
+            return; // other models, other pools
+        }
+        const std::string type = json_value(m, "t", std::string());
+        const std::string c    = json_value(m, "c", std::string());
+        if (type == "hello" || (type == "proof" && !c.empty())) {
+            json ans = hello_of("proof");
+            ans["a"] = c;
+            ans["p"] = proof_of(c, id);
+            if (type == "hello") {
+                ans["c"] = challenge();
+            }
+            pool_udp_send(sock_reply, addr, from_port, ans.dump());
+        }
+        if (type != "proof") {
+            return;
+        }
+        const std::string a = json_value(m, "a", std::string());
+        const std::string p = json_value(m, "p", std::string());
+        if (challenges.count(a) == 0 || p != proof_of(a, peer)) {
+            SRV_DBG("pool: %s did not answer the challenge (another key)\n", peer.c_str());
+            return;
+        }
+        found(peer, json_value(m, "name", std::string()), host, peer_port, peer_names, "broadcast");
+    }
+
+    // a router given in pool-peers: GET /pool/router with the key, which the config trusts it with
+    void try_peer(const std::string & peer) {
+        std::string host;
+        int peer_port = 0;
+        try {
+            pool_parse_host_port(peer, host, peer_port);
+        } catch (const std::exception & e) {
+            SRV_WRN("pool: %s\n", e.what());
+            return;
+        }
+        httplib::Client cli(host, peer_port);
+        cli.set_connection_timeout(1, 0);
+        cli.set_read_timeout(3, 0);
+        auto r = cli.Get("/pool/router", hdrs);
+        const json j = r && r->status == 200 ? json::parse_no_throw(r->body) : json();
+        const char * key = j.is_object() && j.contains("all_names") ? "all_names" : "names";
+        if (!j.is_object() || !j.contains(key) || !j.at(key).is_array()) {
+            return;
+        }
+        std::vector<std::string> peer_names;
+        for (const auto & nm : j.at(key)) {
+            if (nm.is_string()) {
+                peer_names.push_back(nm.get<std::string>());
+            }
+        }
+        const std::string peer_id = json_value(j, "id", std::string());
+        if (!peer_id.empty() && peer_id != id) {
+            found(peer_id, json_value(j, "name", std::string()), host, peer_port, peer_names, "peers");
+        }
+    }
+
+    void loop() {
+        int64_t t_hello = 0;
+        int64_t t_peers = 0;
+        const int64_t t_start = ggml_time_ms();
+        std::vector<char> buf(4096);
+        while (!stopping.load()) {
+            const int64_t now = ggml_time_ms();
+            // a hello every 2 s for the first 30 s, then every 15 s: a router that starts is found within a round trip
+            const int64_t every = now - t_start < 30000 ? 2000 : 15000;
+            if (discover && sock_reply != INVALID_SOCKET && now - t_hello >= every) {
+                t_hello = now;
+                json h = hello_of("hello");
+                h["c"] = challenge();
+                const std::string msg = h.dump();
+                for (uint32_t a : pool_broadcast_addrs()) {
+                    pool_udp_send(sock_reply, a, port, msg);
+                }
+            }
+            if (!peers.empty() && now - t_peers >= every) {
+                t_peers = now;
+                for (const auto & peer : peers) {
+                    try_peer(peer);
+                }
+            }
+            if (sock_reply == INVALID_SOCKET && sock_bcast == INVALID_SOCKET) {
+                std::unique_lock<std::mutex> lk(mu_stop);
+                cv_stop.wait_for(lk, std::chrono::milliseconds(250), [&] { return stopping.load(); });
+                continue;
+            }
+            fd_set rd;
+            FD_ZERO(&rd);
+            socket_t hi = 0;
+            for (socket_t s : {sock_bcast, sock_reply}) {
+                if (s != INVALID_SOCKET) {
+                    FD_SET(s, &rd);
+                    hi = std::max(hi, s);
+                }
+            }
+            timeval tv = {0, 250000};
+            if (select((int) hi + 1, &rd, nullptr, nullptr, &tv) <= 0) {
+                continue;
+            }
+            for (socket_t s : {sock_bcast, sock_reply}) {
+                if (s == INVALID_SOCKET || !FD_ISSET(s, &rd)) {
+                    continue;
+                }
+                sockaddr_in from = {};
+                socklen_t len = sizeof(from);
+                const int n = (int) recvfrom(s, buf.data(), (int) buf.size(), 0, (sockaddr *) &from, &len);
+                if (n > 0) {
+                    on_datagram(std::string(buf.data(), n), from.sin_addr.s_addr, ntohs(from.sin_port));
+                }
+            }
+        }
+    }
+
+    void start() {
+        sock_reply = pool_udp_socket(0, false);
+        if (discover) {
+            sock_bcast = pool_udp_socket(port, true);
+            if (sock_bcast == INVALID_SOCKET) {
+                // the answers to its own broadcasts still come: it finds the others, they find it only by their answers
+                SRV_WRN("pool: cannot listen on UDP port %d, the other routers find this one only when it asks\n", port);
+            }
+        }
+        if (sock_reply == INVALID_SOCKET) {
+            SRV_WRN("%s", "pool: no UDP socket, the routers of the pool are found only from pool-peers\n");
+        }
+        th = std::thread([this]() { loop(); });
+    }
+
+    void stop() {
+        if (stopping.exchange(true)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_stop);
+        }
+        cv_stop.notify_all();
+        if (th.joinable()) {
+            th.join();
+        }
+        pool_sock_close(sock_bcast);
+        pool_sock_close(sock_reply);
+    }
+};
+
+//
 // server_pool_fork
 //
 
@@ -2274,21 +2478,34 @@ std::unique_ptr<server_pool_fork> server_pool_fork::create(const common_params &
     if (pooled.empty()) {
         return nullptr;
     }
-    if (pooled.size() > 1) {
-        SRV_WRN("pool: %zu models have pool = on, the pool takes %s only\n", pooled.size(), pooled.front().c_str());
-    }
-    return std::make_unique<server_pool_fork>(params, models_routes, pooled.front());
+    return std::make_unique<server_pool_fork>(params, models_routes, pooled);
 }
 
-server_pool_fork::server_pool_fork(const common_params & params, server_models_routes & models_routes, const std::string & model)
-        : pimpl(std::make_unique<impl>(params, models_routes)) {
-    pimpl->init(model);
-    std::string list;
-    for (const auto & nm : pimpl->names) {
-        list += (list.empty() ? "" : ", ") + nm;
+server_pool_fork::server_pool_fork(const common_params & params, server_models_routes & models_routes, const std::vector<std::string> & models) {
+    for (const auto & model : models) {
+        auto p = std::make_unique<impl>(params, models_routes);
+        p->init(model);
+        std::string list;
+        for (const auto & nm : p->names) {
+            list += (list.empty() ? "" : ", ") + nm;
+        }
+        SRV_INF("pool: %s shares %s (%s) as %s%s\n", p->id.c_str(), model.c_str(), list.c_str(), p->cfg.name.c_str(),
+                p->api_key.empty() ? "" : ", its links need the key");
+        pools.push_back(std::move(p));
     }
-    SRV_INF("pool: %s shares %s (%s) as %s%s\n", pimpl->id.c_str(), model.c_str(), list.c_str(), pimpl->cfg.name.c_str(),
-            pimpl->api_key.empty() ? "" : ", its links need the key");
+    // one router in every pool: the id and the name of the first (pool-name may differ between the models)
+    for (size_t k = 1; k < pools.size(); ++k) {
+        impl & p = *pools[k];
+        if (p.id != pools[0]->id) {
+            SRV_WRN("pool: %s takes the name of the pool of %s (%s), the router has one id in every pool\n", p.model.c_str(),
+                    pools[0]->model.c_str(), pools[0]->id.c_str());
+        }
+        p.id = pools[0]->id;
+        p.cfg.name = pools[0]->cfg.name;
+        p.nodes[0].id   = p.id;
+        p.nodes[0].name = p.cfg.name;
+    }
+    disc = std::make_unique<discovery_t>(pools);
 }
 
 server_pool_fork::~server_pool_fork() {
@@ -2296,62 +2513,45 @@ server_pool_fork::~server_pool_fork() {
 }
 
 void server_pool_fork::start() {
-    impl * p = pimpl.get();
-    if (p->started.exchange(true)) {
-        return;
+    for (auto & p : pools) {
+        p->start();
     }
-    p->start_poller(0);
-    p->sock_reply = pool_udp_socket(0, false);
-    if (p->cfg.discover) {
-        p->sock_bcast = pool_udp_socket(p->cfg.port, true);
-        if (p->sock_bcast == INVALID_SOCKET) {
-            // the answers to its own broadcasts still come: it finds the others, they find it only by their answers
-            SRV_WRN("pool: cannot listen on UDP port %d, the other routers find this one only when it asks\n", p->cfg.port);
-        }
-    }
-    if (p->sock_reply == INVALID_SOCKET) {
-        SRV_WRN("%s", "pool: no UDP socket, the routers of the pool are found only from pool-peers\n");
-    }
-    p->discovery = std::thread([p]() { p->discovery_loop(); });
+    disc->start();
 }
 
 void server_pool_fork::stop() {
-    impl * p = pimpl.get();
-    if (p->stopping.exchange(true)) {
-        return;
+    if (disc) {
+        disc->stop(); // it adds nodes to the pools
     }
-    {
-        std::lock_guard<std::mutex> lk(p->mu_stop);
-    }
-    p->cv_stop.notify_all();
-    p->cv.notify_all();
-    if (p->discovery.joinable()) {
-        p->discovery.join();
-    }
-    pool_sock_close(p->sock_bcast);
-    pool_sock_close(p->sock_reply);
-    std::vector<std::thread> threads;
-    {
-        std::lock_guard<std::mutex> lk(p->mu_threads);
-        threads.swap(p->pollers);
-    }
-    for (auto & t : threads) {
-        if (t.joinable()) {
-            t.join();
-        }
+    for (auto & p : pools) {
+        p->stop();
     }
 }
 
 void server_pool_fork::attach(server_http_context & ctx_http, server_routes & routes) {
-    impl * p = pimpl.get();
+    // the pool of a model by any of its names; nullptr = none
+    auto pool_of = [this](const std::string & name) -> impl * {
+        for (auto & p : pools) {
+            if (p->names.count(name) > 0) {
+                return p.get();
+            }
+        }
+        return nullptr;
+    };
+    // the pool a request of the dashboard or of another router names in ?model=, the first one without it
+    auto pool_by_param = [this, pool_of](const server_http_req & req) -> impl * {
+        const std::string name = req.get_param("model");
+        return name.empty() ? pools.front().get() : pool_of(name);
+    };
 
-    // a request for the model goes through the pool, unless another router of the pool sent it here; any other request
-    // stays with this router
-    auto wrap = [p](server_http_context::handler_t own) -> server_http_context::handler_t {
-        return [p, own](const server_http_req & req) -> server_http_res_ptr {
+    // a request for a model of a pool goes through that pool, unless another router of the pool sent it here; any other
+    // request stays with this router
+    auto wrap = [pool_of](server_http_context::handler_t own) -> server_http_context::handler_t {
+        return [pool_of, own](const server_http_req & req) -> server_http_res_ptr {
             if (pool_header(req.headers, "x-llama-pool").empty()) {
                 const json body = json::parse_no_throw(req.body);
-                if (body.is_object() && p->names.count(json_value(body, "model", std::string())) > 0) {
+                impl * p = body.is_object() ? pool_of(json_value(body, "model", std::string())) : nullptr;
+                if (p != nullptr) {
                     return p->forward_slot(req, "POST", body);
                 }
             }
@@ -2379,43 +2579,72 @@ void server_pool_fork::attach(server_http_context & ctx_http, server_routes & ro
         }
         return res;
     });
-    ctx_http.get("/pool/status", [p](const server_http_req &) {
+    // ?model=: the pool of that model, the first one without it; "pools" lists the models of all of them
+    ctx_http.get("/pool/status", [this, pool_by_param](const server_http_req & req) {
+        impl * p = pool_by_param(req);
+        if (p == nullptr) {
+            return pool_error(400, "no pool of the model " + req.get_param("model"));
+        }
         auto res = std::make_unique<server_http_res>();
         try {
-            res->data = safe_json_to_str(p->status_json());
+            json st = p->status_json();
+            st["pools"] = json::array();
+            for (const auto & q : pools) {
+                st["pools"].push_back(q->model);
+            }
+            res->data = safe_json_to_str(st);
         } catch (const std::exception & e) {
             return pool_error(500, e.what());
         }
         return res;
     });
-    // {"node": "<name>", "drain": true}: this router sends no new request to the node, the running ones finish
-    ctx_http.post("/pool/drain", [p](const server_http_req & req) {
+    // {"node": "<name>", "drain": true}: this router sends no new request to the node (in every pool), the running ones
+    // finish
+    ctx_http.post("/pool/drain", [this](const server_http_req & req) {
         const json body = json::parse_no_throw(req.body);
         if (body.is_discarded() || !body.is_object() || !body.contains("node")) {
             return pool_error(400, "expected {\"node\": \"<name>\", \"drain\": true|false}");
         }
         const std::string name = json_value(body, "node", std::string());
         const bool drain = json_value(body, "drain", true);
-        std::lock_guard<std::mutex> lk(p->mu);
-        for (int i = 0; i < p->n_nodes.load(); ++i) {
-            if (p->nodes[i].name == name) {
-                p->nodes[i].draining = drain;
-                p->event(drain ? "drain" : "undrain", "", i, "");
-                p->cv.notify_all();
-                auto res = std::make_unique<server_http_res>();
-                res->data = safe_json_to_str({{"node", name}, {"draining", drain}});
-                return res;
+        bool found = false;
+        for (auto & p : pools) {
+            std::lock_guard<std::mutex> lk(p->mu);
+            for (int i = 0; i < p->n_nodes.load(); ++i) {
+                if (p->nodes[i].name == name) {
+                    p->nodes[i].draining = drain;
+                    p->event(drain ? "drain" : "undrain", "", i, "");
+                    p->cv.notify_all();
+                    found = true;
+                }
             }
         }
-        return pool_error(400, "no node " + name);
-    });
-    // what the other routers read: this router, its model under every name, and its links to the other nodes
-    ctx_http.get("/pool/router", [p](const server_http_req &) {
+        if (!found) {
+            return pool_error(400, "no node " + name);
+        }
         auto res = std::make_unique<server_http_res>();
-        res->data = safe_json_to_str(p->router_json());
+        res->data = safe_json_to_str({{"node", name}, {"draining", drain}});
         return res;
     });
-    ctx_http.post("/pool/pull", [p](const server_http_req & req) {
+    // what the other routers read (?model=): this router, the model under every name, and its links to the other nodes
+    ctx_http.get("/pool/router", [this, pool_by_param](const server_http_req & req) {
+        impl * p = pool_by_param(req);
+        if (p == nullptr) {
+            return pool_error(400, "no pool of the model " + req.get_param("model"));
+        }
+        json j = p->router_json();
+        j["all_names"] = std::vector<std::string>(disc->names.begin(), disc->names.end()); // the models of every pool
+        auto res = std::make_unique<server_http_res>();
+        res->data = safe_json_to_str(j);
+        return res;
+    });
+    // the pull goes to the pool of the model it names (its name on this router)
+    ctx_http.post("/pool/pull", [pool_of](const server_http_req & req) {
+        const json body = json::parse_no_throw(req.body);
+        impl * p = body.is_object() ? pool_of(json_value(body, "model", std::string())) : nullptr;
+        if (p == nullptr) {
+            return pool_error(400, "no pool of the model in the request");
+        }
         return p->pull(req);
     });
     // ?size=<bytes>: the probe of a link by another router of the pool, that many bytes from here (one chunk of a move)
@@ -2643,6 +2872,10 @@ void server_pool_xfer_clean_fork(const std::string & spill_dir, int idle_s) {
             std::filesystem::remove(it->path(), ec_file);
         }
     }
+}
+
+bool server_pool_quiet_fork(const server_http_req & req) {
+    return !pool_header(req.headers, "x-llama-pool-poll").empty();
 }
 
 server_http_context::handler_t server_pool_router_post_fork(server_models_routes & routes) {

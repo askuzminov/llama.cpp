@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_WRN(fmt, ...) LOG_WRN("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 
@@ -512,6 +513,7 @@ void common_speculative_auto::cycle_end(int64_t now) {
     fflush(trace);
 }
 
+// at the end of every request: one line, the tables of the gate at the debug level (-lv 4)
 void common_speculative_auto::print() const {
     SPC_INF("auto: %s, cycles %" PRId64 " (%" PRId64 " valid), rate %.2f t/s, verify %.2f ms + %.3f ms/token%s, draft step %.3f ms, keep > %.3f, step > %.3f\n",
             enabled ? "on" : "trace only", n_cycle, n_valid, rate() * 1e6, t0 / 1e3, t1 / 1e3, fit_ok ? "" : " (no fit)",
@@ -524,7 +526,7 @@ void common_speculative_auto::print() const {
         }
     }
     if (!str.empty()) {
-        SPC_INF("auto: gated draft lengths:%s\n", str.c_str());
+        SPC_DBG("auto: gated draft lengths:%s\n", str.c_str());
     }
 
     for (int t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
@@ -532,13 +534,13 @@ void common_speculative_auto::print() const {
             continue;
         }
         const std::string name = common_speculative_type_to_str((common_speculative_type) t);
-        SPC_INF("auto: %s: mean acc %.3f\n", name.c_str(), acc_mean((common_speculative_type) t));
+        SPC_DBG("auto: %s: mean acc %.3f\n", name.c_str(), acc_mean((common_speculative_type) t));
         for (int d = 0; d < n_depth; ++d) {
             str.clear();
             for (int b = 0; b < n_bins; ++b) {
                 str += string_format(" %.2f", cal_acc[t][d][b] / cal_n[t][d][b]);
             }
-            SPC_INF("auto: %s: acceptance by draft p (0.0..1.0 in steps of 0.1), pos %d%s:%s\n", name.c_str(), d,
+            SPC_DBG("auto: %s: acceptance by draft p (0.0..1.0 in steps of 0.1), pos %d%s:%s\n", name.c_str(), d,
                     d == n_depth - 1 ? "+" : "", str.c_str());
         }
     }
@@ -551,7 +553,7 @@ void common_speculative_auto::print() const {
         for (size_t j = 0; j < pos_n[t].size(); ++j) {
             str += string_format(" %.2f", acc_pos((common_speculative_type) t, (int) j));
         }
-        SPC_INF("auto: acceptance by position (0, 1, 2, 3+), %s:%s\n", common_speculative_type_to_str((common_speculative_type) t).c_str(), str.c_str());
+        SPC_DBG("auto: acceptance by position (0, 1, 2, 3+), %s:%s\n", common_speculative_type_to_str((common_speculative_type) t).c_str(), str.c_str());
     }
 }
 

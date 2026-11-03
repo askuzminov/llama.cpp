@@ -2025,16 +2025,16 @@ private:
                 return it_best;
             };
             auto it = best();
-            // a conversation shorter than --cache-min-tokens moves too: that minimum is for disk writes, and the state
-            // of a move is in RAM. it does not reach the disk from there either (write_state keeps to the minimum)
-            const size_t min_tokens = prompt_cache->min_tokens;
-            prompt_cache->min_tokens = 0;
+            // a conversation shorter than --cache-ram-min-tokens moves too: the state of a move goes straight to the
+            // other node. it does not reach the disk from there either (write_state keeps to --cache-min-tokens)
+            const size_t ram_min_tokens = prompt_cache->ram_min_tokens;
+            prompt_cache->ram_min_tokens = 0;
             for (auto & slot : slots) {
                 if (!slot.is_processing() && slot.prompt.tokens.get_common_prefix(task.tokens) > n_match && prompt_save_fork(slot)) {
                     it = best();
                 }
             }
-            prompt_cache->min_tokens = min_tokens;
+            prompt_cache->ram_min_tokens = ram_min_tokens;
             const size_t min_reuse = std::max<size_t>(1, task.pool_action.min_match);
             if (it == prompt_cache->states.end() || n_match < min_reuse) {
                 send_error(task, "no cached state holds this conversation", ERROR_TYPE_NOT_FOUND);

@@ -10,20 +10,22 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 struct common_params;
 struct server_routes;
 struct server_models_routes;
 
 struct server_pool_fork {
-    // the pool of the model with pool = on in the presets of the router, nullptr when there is none
+    // a pool for each model with pool = on in the presets of the router, nullptr when there is none
     static std::unique_ptr<server_pool_fork> create(const common_params & params, server_models_routes & models_routes);
 
-    server_pool_fork(const common_params & params, server_models_routes & models_routes, const std::string & model);
+    server_pool_fork(const common_params & params, server_models_routes & models_routes, const std::vector<std::string> & models);
     ~server_pool_fork();
 
-    // the requests for the model go through the pool; /pool (the dashboard), /pool/status, /pool/drain and the routes
-    // of the other routers of the pool (/pool/router, /pool/pull, /pool/probe) are added
+    // the requests for a model of a pool go through it; /pool (the dashboard, ?model= for one of several pools),
+    // /pool/status, /pool/drain and the routes of the other routers of the pools (/pool/router, /pool/pull, /pool/probe)
+    // are added
     void attach(server_http_context & ctx_http, server_routes & routes);
 
     // the discovery of the other routers and the polling of the nodes
@@ -31,7 +33,10 @@ struct server_pool_fork {
     void stop();
 
     struct impl;
-    std::unique_ptr<impl> pimpl;
+    std::vector<std::unique_ptr<impl>> pools; // one per model
+
+    struct discovery_t;
+    std::unique_ptr<discovery_t> disc; // one for all the pools; after them, so that it goes first
 };
 
 // the node side; server_routes in server-context.cpp has the handlers (*_pool_*_fork)
@@ -57,6 +62,10 @@ bool server_pool_inbox_write_fork(const std::string & id, uint64_t offset, const
 std::shared_ptr<server_pool_inbox_fork> server_pool_inbox_take_fork(const std::string & id);
 // what a pool that stopped midway left: exports and imports untouched for `idle_s`, and the links older than that
 void server_pool_xfer_clean_fork(const std::string & spill_dir, int idle_s);
+
+// a request a pool makes itself (the polls of the nodes, the probes, the chunks of a move): the router logs it at the
+// debug level only. a request of a client the pool sends on is logged as any other
+bool server_pool_quiet_fork(const server_http_req & req);
 
 // a router as a node: POST /pool/import/data goes to the instance of ?model=, the chunks are not JSON
 server_http_context::handler_t server_pool_router_post_fork(server_models_routes & routes);

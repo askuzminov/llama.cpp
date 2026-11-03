@@ -793,7 +793,8 @@ struct common_params {
     int32_t cache_ram_reserve_mib = -1;  // keep at least this much host RAM free by evicting checkpoints; -1 = auto (fraction of total RAM), 0 = disabled
     std::string cache_spill_dir   = "";  // [experimental] spill cold prompt-cache states to this dir (on disk) instead of dropping them ("" = disabled)
     int32_t cache_disk_mib        = 0;   // disk budget (MiB) for spilled prompt-cache states; least-recently-used dropped over this (0 = unlimited)
-    int32_t cache_min_tokens      = 0;   // do not cache prompts shorter than this many tokens (0 = no minimum)
+    int32_t cache_min_tokens      = 0;   // do not write prompts shorter than this many tokens to disk, the rewrite step (0 = no minimum)
+    int32_t cache_ram_min_tokens  = 0;   // do not keep prompts shorter than this many tokens in the RAM cache (0 = no minimum)
     bool    cache_idle_write      = false; // --cache-idle-write: copy every changed state to disk while idle (write-behind)
 };
 

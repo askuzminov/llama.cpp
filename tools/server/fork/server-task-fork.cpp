@@ -1513,11 +1513,11 @@ bool server_prompt_cache::pool_import(server_pool_inbox_fork & inbox, uint64_t s
         return false;
     }
 
-    // the request it came for takes it, whatever --cache-min-tokens says (a minimum for disk writes, see write_state)
-    const size_t min_tokens_disk = min_tokens;
-    min_tokens = 0;
+    // the request it came for takes it, whatever --cache-ram-min-tokens says
+    const size_t ram_min = ram_min_tokens;
+    ram_min_tokens = 0;
     server_prompt_cache_state * st = alloc(prompt, 0, 0);
-    min_tokens = min_tokens_disk;
+    ram_min_tokens = ram_min;
     if (st == nullptr) {
         error = "the prompt cache cannot take the state";
         return false;

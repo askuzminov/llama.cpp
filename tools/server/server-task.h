@@ -796,10 +796,12 @@ struct server_prompt_cache {
     // fork: host-RAM reserve and disk spill, defined in fork/server-task-fork.cpp
     ~server_prompt_cache();
 
-    // the smallest piece of work worth a disk write: prompts shorter than this are not cached at
-    // all, and a state whose front is already on disk is not written again until it grows this much
-    // past it (0 = no minimum)
+    // the smallest piece of work worth a disk write: a shorter state stays in RAM only, and a state
+    // whose front is already on disk is not written again until it grows this much past it (0 = no
+    // minimum)
     size_t min_tokens = 0;
+    // prompts shorter than this are not kept in RAM at all (--cache-ram-min-tokens, 0 = no minimum)
+    size_t ram_min_tokens = 0;
 
     // keep at least this much host RAM free by evicting cached prompts, in bytes (0 = disabled)
     size_t reserve_size = 0;

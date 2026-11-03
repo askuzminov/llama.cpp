@@ -140,11 +140,15 @@ void server_prompt_cache_init(
     prompt_cache = std::make_unique<server_prompt_cache>(
             (size_t) cache_ram_mib_eff, n_ctx, reserve_bytes, params.cache_spill_dir, spill_limit,
             server_prompt_cache_signature(params, model_tgt, ctx_tgt, ctx_dft), (uint64_t) std::hash<std::string>{}(params.model.path), has_mtmd);
-    prompt_cache->min_tokens = (size_t) std::max(0, params.cache_min_tokens);
+    prompt_cache->min_tokens     = (size_t) std::max(0, params.cache_min_tokens);
+    prompt_cache->ram_min_tokens = (size_t) std::max(0, params.cache_ram_min_tokens);
     prompt_cache->signature_portable = server_prompt_cache_signature_portable(params, model_tgt, ctx_tgt, ctx_dft); // fork: --pool
 
     if (params.cache_min_tokens > 0) {
-        SRV_INF("prompt cache minimum prompt length: %d tokens\n", params.cache_min_tokens);
+        SRV_INF("prompt cache minimum for a disk write: %d tokens\n", params.cache_min_tokens);
+    }
+    if (params.cache_ram_min_tokens > 0) {
+        SRV_INF("prompt cache minimum prompt length in RAM: %d tokens\n", params.cache_ram_min_tokens);
     }
 
     if (!params.cache_spill_dir.empty()) {
