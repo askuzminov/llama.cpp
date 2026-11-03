@@ -3653,7 +3653,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.models_preset = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_PRESET"));
-    common_fork_add_args(COMMON_ARG_FORK_AT_MODELS_PRESET, params, add_opt);
     add_opt(common_arg(
         {"--models-max"}, "N",
         string_format("for router server, maximum number of models to load simultaneously (default: %d, 0 = unlimited)", params.models_max),
@@ -4803,6 +4802,8 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, hide a cached model from the model list when this preset resolves to the same model file",
         [](common_params &, const std::string &) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_DEDUP_CACHE_MODELS).set_preset_only());
+
+    common_fork_add_preset_options(args); // fork: pool
 
     // args.push_back(common_arg(
     //     {"pin"},

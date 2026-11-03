@@ -3,6 +3,10 @@ rem starts llama-server in router mode on a models preset: the daily launcher, n
 rem standalone - copy it anywhere, it needs no other file from this folder. run-all.bat skips it.
 rem it takes llama-server.exe of the build next to it (..\..\build-win), else the path below.
 rem
+rem the pool: pool = on in the section of the model in models.ini shares it with the routers of the network that
+rem have it under the same name or alias (POOL.md). the agents may use any of the machines, the dashboard is
+rem http://this-machine:12345/pool
+rem
 rem how to stop it so the prompt cache reaches the disk:
 rem   Ctrl+C, Ctrl+Break, closing the window, logging off and shutting the pc down all run the
 rem   graceful path. The router asks every child instance to exit, the child hands its slots to the

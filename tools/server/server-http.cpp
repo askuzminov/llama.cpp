@@ -253,6 +253,7 @@ bool server_http_context::init_listener(const common_params & params) {
         std::unordered_set<std::string> endpoints {
             "/health",
             "/v1/health",
+            "/pool", // fork: the page of the pool dashboard, its data needs the key (/pool?key=...)
         };
         endpoints.insert(frontend_paths.begin(), frontend_paths.end());
         return endpoints;

@@ -1,6 +1,6 @@
 #pragma once
 
-// fork: --pool, llama-server as a router over remote instances of one model (server-pool-fork.cpp)
+// fork: a pool, the routers of a local network that share a model (pool = on in models.ini) (server-pool-fork.cpp)
 
 #include "server-common.h" // json
 #include "server-http.h"
@@ -16,14 +16,17 @@ struct server_routes;
 struct server_models_routes;
 
 struct server_pool_fork {
-    // reads the nodes and the options from params.pool_file, throws on a bad file
-    explicit server_pool_fork(const common_params & params);
+    // the pool of the model with pool = on in the presets of the router, nullptr when there is none
+    static std::unique_ptr<server_pool_fork> create(const common_params & params, server_models_routes & models_routes);
+
+    server_pool_fork(const common_params & params, server_models_routes & models_routes, const std::string & model);
     ~server_pool_fork();
 
-    // the API routes go to the nodes; /pool (the dashboard), /pool/status and /pool/drain are added
+    // the requests for the model go through the pool; /pool (the dashboard), /pool/status, /pool/drain and the routes
+    // of the other routers of the pool (/pool/router, /pool/pull, /pool/probe) are added
     void attach(server_http_context & ctx_http, server_routes & routes);
 
-    // the polling of the nodes: health, slots, device memory
+    // the discovery of the other routers and the polling of the nodes
     void start();
     void stop();
 
@@ -55,5 +58,5 @@ std::shared_ptr<server_pool_inbox_fork> server_pool_inbox_take_fork(const std::s
 // what a pool that stopped midway left: exports and imports untouched for `idle_s`, and the links older than that
 void server_pool_xfer_clean_fork(const std::string & spill_dir, int idle_s);
 
-// a router (serve.bat) as a node: POST /pool/import/data goes to the instance of ?model=, the chunks are not JSON
+// a router as a node: POST /pool/import/data goes to the instance of ?model=, the chunks are not JSON
 server_http_context::handler_t server_pool_router_post_fork(server_models_routes & routes);

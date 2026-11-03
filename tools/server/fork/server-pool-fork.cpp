@@ -1,39 +1,57 @@
-// fork: --pool, llama-server as a router over remote llama-server instances of one model. every node serves the same
-// model with the same context, other flags may differ; the agents use the address of the pool:
+// fork: a pool, the routers of a local network that share a model. a model with pool = on in models.ini (serve.bat) is
+// shared with the routers that share it under the same name or alias: each of them takes the requests for it and sends
+// each to one of the machines of the pool (a node, this one too):
+// - the routers find each other with UDP broadcasts on every local network (port 12345). a router seen on two networks
+//   (a direct cable and the WiFi) gets a link on each, the faster one measured serves, the other is the fallback. with
+//   --api-key (the same on every router) a link counts once the other side answered a challenge with a hash of the key,
+//   and only then the key goes to it
 // - a request goes to a node with a free slot (fewer requests in flight than its slots); a new conversation to the node
-//   with the most free slots by weight
+//   with the most free slots by its measured speed
 // - a conversation keeps to the node that holds its prompt cache: the pool hashes the prompt message by message (first
 //   the tools and the system prompt) and remembers which node served each prefix, and a request goes to the node with
 //   the longest prefix of it. there the cache is reused, anywhere else the whole context is computed again (100K
 //   tokens are about 2.4 minutes of prefill on the 395). X-Conversation-Id or X-Session-Id, when a client sends one,
 //   names the conversation instead
 // - when that node has no free slot, a conversation of at least move_tokens waits for it as long as a recompute
-//   elsewhere would take (its tokens at the prefill speed of that node, measured from the timings of the answers, the
-//   ini prefill_tps until then), up to wait_max seconds; a shorter one goes to a free node at once
+//   elsewhere would take (its tokens at the prefill speed of that node, measured from the timings of the answers),
+//   up to wait_max seconds; a shorter one goes to a free node at once
 // - with no free slot anywhere the requests wait in the pool, the oldest first; a client that goes away leaves
-// - a conversation that goes to another node takes its cached state along when both nodes can (the fork with the prompt
-//   cache, the same model and configuration) and the transfer is shorter than computing it again: the pool asks the
-//   node that holds it for the state, reads it in chunks and writes them to the other node, from RAM or the file of a
-//   state on disk to RAM, with nothing written to disk. --api-key on the nodes guards it (api_key in the pool ini)
-// - a node can have several urls in the order of preference (a direct cable, then the WiFi): the pool uses the first
-//   that answers and tries the ones before it every probe_s seconds
+// - a conversation that goes to another node takes its cached state along when both nodes can (the same model and
+//   configuration) and the transfer is shorter than computing it again: the router that took the request asks the node
+//   that holds it for the state (POST /pool/export), and the other node reads it from there itself (POST /pool/pull),
+//   from RAM or the file of a state on disk to RAM, with nothing written to disk
+// - every router of the pool takes requests, the agents may use any of them; on a node the requests that came through
+//   another router count as busy slots
 // - /pool is a dashboard of the nodes (slots, speed, memory), the queue, the conversations and the decisions
-// the nodes run llama-server; the one of the fork also gives the memory of its devices, its model and the signature of
-// its prompt cache (GET /pool/node), and moves conversations (POST /pool/export, /pool/import/...)
+// the options, all optional, are preset-only keys next to pool = on (or in [*]): pool-name (this node, default the host
+// name), pool-peers (host:port,... of routers to add without discovery), pool-port (UDP, 12345), pool-discover (0: no
+// broadcasts), pool-move-tokens, pool-wait-max, pool-migrate, pool-link-mbps, pool-prefill-tps, pool-poll-ms,
+// pool-probe-s, pool-same-model (common/fork/arg-fork.cpp)
 
 #include "server-pool-fork.h"
 
 #include "server-common.h"
 #include "server-context.h"
-#include "server-models.h" // server_http_proxy
+#include "server-models.h" // server_http_proxy, server_models_routes
 
+#include "arg.h"
 #include "common.h"
+#include "fork/arg-fork.h"    // COMMON_ARG_PRESET_POOL_FORK
 #include "fork/common-fork.h" // common_host_mem_available
 #include "log.h"
 
 #include "ggml-backend.h"
 
 #include <cpp-httplib/httplib.h>
+#include "hash/hash.h"
+
+#if defined(_WIN32)
+#include <iphlpapi.h>
+#include <mstcpip.h> // SIO_UDP_CONNRESET
+#if defined(_MSC_VER)
+#pragma comment(lib, "iphlpapi.lib")
+#endif
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -43,9 +61,11 @@
 #include <cstdio>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -102,57 +122,35 @@ static server_http_res_ptr pool_error(int status, const std::string & message) {
     return res;
 }
 
-// [section] then key = value lines; ; or # starts a comment
-using pool_ini = std::vector<std::pair<std::string, std::map<std::string, std::string>>>;
-
-static pool_ini pool_read_ini(const std::string & path) {
-    std::ifstream f(path);
-    if (!f) {
-        throw std::runtime_error("cannot open " + path);
-    }
-    pool_ini ini;
-    std::string line;
-    int n_line = 0;
-    while (std::getline(f, line)) {
-        n_line++;
-        std::string t = pool_trim(line);
-        if (t.empty() || t[0] == ';' || t[0] == '#') {
-            continue;
-        }
-        if (t[0] == '[') {
-            if (t.back() != ']') {
-                throw std::runtime_error(path + ":" + std::to_string(n_line) + ": a section ends with ]");
-            }
-            ini.push_back({pool_trim(t.substr(1, t.size() - 2)), {}});
-            continue;
-        }
-        const size_t eq = t.find('=');
-        if (eq == std::string::npos || ini.empty()) {
-            throw std::runtime_error(path + ":" + std::to_string(n_line) + ": expected key = value inside a section");
-        }
-        std::string val = pool_trim(t.substr(eq + 1));
-        for (const char * c : {" ;", " #", "\t;", "\t#"}) {
-            const size_t at = val.find(c);
-            if (at != std::string::npos) {
-                val = pool_trim(val.substr(0, at));
-            }
-        }
-        ini.back().second[pool_lower(pool_trim(t.substr(0, eq)))] = val;
-    }
-    return ini;
+// v[i], 0 past its end: the vectors of a request have a value per node it saw, a node may join later
+static int64_t pool_at(const std::vector<int64_t> & v, int i) {
+    return i >= 0 && i < (int) v.size() ? v[i] : 0;
 }
 
-// http://host:port, https://host:port, [ipv6]:port; the path is ignored
-static void pool_parse_url(const std::string & url, std::string & scheme, std::string & host, int & port) {
-    const size_t p = url.find("://");
-    scheme = p == std::string::npos ? "http" : pool_lower(url.substr(0, p));
-    std::string rest = p == std::string::npos ? url : url.substr(p + 3);
+// a random hex string of 16 digits
+static std::string pool_random_hex() {
+    static std::mutex mu;
+    static std::mt19937_64 rng(((uint64_t) std::random_device{}() << 32) ^ (uint64_t) std::random_device{}() ^
+                               (uint64_t) ggml_time_us());
+    std::lock_guard<std::mutex> lk(mu);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) rng());
+    return buf;
+}
+
+// host:port or http://host:port, [ipv6]:port; the path is ignored
+static void pool_parse_host_port(const std::string & s, std::string & host, int & port) {
+    const size_t p = s.find("://");
+    if (p != std::string::npos && pool_lower(s.substr(0, p)) != "http") {
+        throw std::runtime_error("a peer of the pool takes http only: " + s);
+    }
+    std::string rest = p == std::string::npos ? s : s.substr(p + 3);
     rest = rest.substr(0, rest.find('/'));
-    port = scheme == "https" ? 443 : 80;
+    port = 0;
     if (!rest.empty() && rest[0] == '[') {
         const size_t rb = rest.find(']');
         if (rb == std::string::npos) {
-            throw std::runtime_error("bad url " + url);
+            throw std::runtime_error("bad address " + s);
         }
         host = rest.substr(1, rb - 1);
         rest = rest.substr(rb + 1);
@@ -166,8 +164,8 @@ static void pool_parse_url(const std::string & url, std::string & scheme, std::s
             port = std::stoi(rest.substr(colon + 1));
         }
     }
-    if (host.empty() || port <= 0 || (scheme != "http" && scheme != "https")) {
-        throw std::runtime_error("bad url " + url);
+    if (host.empty() || port <= 0) {
+        throw std::runtime_error("bad address " + s + ", expected host:port");
     }
 }
 
@@ -255,47 +253,193 @@ static pool_key pool_key_of(const std::string & path, const json & body, const s
 }
 
 //
+// the discovery: UDP datagrams of JSON on the local networks
+//
+
+// the IPv4 broadcast addresses of the interfaces that are up, and the limited broadcast (network byte order)
+static std::vector<uint32_t> pool_broadcast_addrs() {
+    std::vector<uint32_t> out;
+#if defined(_WIN32)
+    ULONG size = 16*1024;
+    std::vector<unsigned char> buf;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int i = 0; i < 4 && rc == ERROR_BUFFER_OVERFLOW; ++i) {
+        buf.resize(size);
+        rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                  nullptr, (IP_ADAPTER_ADDRESSES *) buf.data(), &size);
+    }
+    if (rc == NO_ERROR) {
+        for (auto * a = (IP_ADAPTER_ADDRESSES *) buf.data(); a != nullptr; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
+                continue;
+            }
+            for (auto * u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
+                if (u->Address.lpSockaddr == nullptr || u->Address.lpSockaddr->sa_family != AF_INET) {
+                    continue;
+                }
+                const uint32_t ip = ((sockaddr_in *) u->Address.lpSockaddr)->sin_addr.s_addr;
+                const int prefix = u->OnLinkPrefixLength;
+                const uint32_t mask = prefix <= 0 ? 0u : prefix >= 32 ? 0xffffffffu : htonl(0xffffffffu << (32 - prefix));
+                out.push_back(ip | ~mask);
+            }
+        }
+    }
+#else
+    ifaddrs * ifs = nullptr;
+    if (getifaddrs(&ifs) == 0) {
+        for (ifaddrs * i = ifs; i != nullptr; i = i->ifa_next) {
+            if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP) ||
+                (i->ifa_flags & IFF_LOOPBACK) || !(i->ifa_flags & IFF_BROADCAST) || i->ifa_broadaddr == nullptr) {
+                continue;
+            }
+            out.push_back(((sockaddr_in *) i->ifa_broadaddr)->sin_addr.s_addr);
+        }
+        freeifaddrs(ifs);
+    }
+#endif
+    out.push_back(htonl(INADDR_BROADCAST));
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static void pool_sock_close(socket_t & s) {
+    if (s != INVALID_SOCKET) {
+#if defined(_WIN32)
+        closesocket(s);
+#else
+        close(s);
+#endif
+        s = INVALID_SOCKET;
+    }
+}
+
+// a UDP socket that may broadcast, on `port` (0 = any). shared: other routers of this machine bind the same port (the
+// tests run several), every one of them gets the broadcasts
+static socket_t pool_udp_socket(int port, bool shared) {
+    socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+        return s;
+    }
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *) &one, (socklen_t) sizeof(one));
+#if defined(_WIN32)
+    // a datagram to a port nobody listens on would fail the next recvfrom with WSAECONNRESET
+    BOOL report = FALSE;
+    DWORD got = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &report, (DWORD) sizeof(report), nullptr, 0, &got, nullptr, nullptr);
+#endif
+    if (shared) {
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, (socklen_t) sizeof(one));
+#ifdef SO_REUSEPORT
+        setsockopt(s, SOL_SOCKET, SO_REUSEPORT, (const char *) &one, (socklen_t) sizeof(one));
+#endif
+    }
+    sockaddr_in a = {};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port        = htons((uint16_t) port);
+    if (bind(s, (const sockaddr *) &a, (socklen_t) sizeof(a)) != 0) {
+        pool_sock_close(s);
+    }
+    return s;
+}
+
+static void pool_udp_send(socket_t s, uint32_t addr, int port, const std::string & msg) {
+    sockaddr_in a = {};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = addr;
+    a.sin_port        = htons((uint16_t) port);
+    sendto(s, msg.data(), (int) msg.size(), 0, (const sockaddr *) &a, (socklen_t) sizeof(a));
+}
+
+//
 // the pool
 //
 
 struct pool_config {
-    std::string name;            // the name the dashboard shows
+    std::string name;            // this router in the pool, the others show it so; "" = the host name
+    int     port        = 12345; // the UDP port of the discovery
+    bool    discover    = true;  // the broadcasts; false = only the peers below
+    std::vector<std::string> peers; // host:port of routers of the pool, added without discovery
     int     poll_ms     = 1000;  // how often each node is asked for its health and slots
-    int64_t move_tokens = 2048;  // a conversation this long waits for its node, a shorter one moves at once
+    int64_t move_tokens = 4096;  // a conversation this long waits for its node, a shorter one moves at once
     int     wait_max_s  = 300;   // the longest wait for the node of a conversation
-    double  prefill_tps = 700.0; // the prefill speed a wait is weighed against (tokens/s)
+    double  prefill_tps = 700.0; // the prefill speed a wait is weighed against until a node has measured its own
     double  chars_tok   = 3.5;   // characters per token, for the estimates
     int     ttl_s       = 6*3600; // how long the pool remembers which node holds a prefix
-    std::string api_key;         // sent to the nodes that have none of their own
-    std::string model;           // the name of the model in /v1/models, the same from any node; "" = as a node names it
-    bool    migrate    = true;   // a conversation moves with its cached state when the nodes can
-    double  link_mbps  = 500.0;  // the speed of a link not measured yet and not given after its url (Mbit/s)
-    int     probe_s    = 10;     // how often a node on a fallback link tries the links before it (s)
-    bool    same_model = true;   // a node of another model than the most of the others takes no request
+    bool    migrate     = true;  // a conversation moves with its cached state when the nodes can
+    double  link_mbps   = 500.0; // the speed of a link not measured yet (Mbit/s)
+    int     probe_s     = 10;    // how often a node on a slower link tries the faster ones again (s)
+    bool    same_model  = true;  // a node of another model than the most of the others takes no request
 };
+
+// the options of the pool next to pool = on in models.ini (pool-<key>, common/fork/arg-fork.cpp); a bad value stops
+// the start of the router with the name of the key
+static void pool_read_options(pool_config & cfg, const common_preset & preset) {
+    auto get = [&](const char * suffix, const char * key, const std::function<void(const std::string &)> & set) {
+        std::string v;
+        if (!preset.get_option(std::string(COMMON_ARG_PRESET_POOL_FORK) + suffix, v)) {
+            return;
+        }
+        try {
+            set(pool_trim(v));
+        } catch (const std::exception &) {
+            throw std::runtime_error(std::string(key) + " = " + v + ": not a number");
+        }
+    };
+    get("_NAME",        "pool-name",        [&](const std::string & v) { cfg.name        = v; });
+    get("_PORT",        "pool-port",        [&](const std::string & v) { cfg.port        = std::stoi(v); });
+    get("_DISCOVER",    "pool-discover",    [&](const std::string & v) { cfg.discover    = common_arg_utils::is_truthy(v); });
+    get("_POLL_MS",     "pool-poll-ms",     [&](const std::string & v) { cfg.poll_ms     = std::max(100, std::stoi(v)); });
+    get("_MOVE_TOKENS", "pool-move-tokens", [&](const std::string & v) { cfg.move_tokens = std::stoll(v); });
+    get("_WAIT_MAX",    "pool-wait-max",    [&](const std::string & v) { cfg.wait_max_s  = std::stoi(v); });
+    get("_PREFILL_TPS", "pool-prefill-tps", [&](const std::string & v) { cfg.prefill_tps = std::max(1.0, std::stod(v)); });
+    get("_MIGRATE",     "pool-migrate",     [&](const std::string & v) { cfg.migrate     = common_arg_utils::is_truthy(v); });
+    get("_LINK_MBPS",   "pool-link-mbps",   [&](const std::string & v) { cfg.link_mbps   = std::max(1.0, std::stod(v)); });
+    get("_PROBE_S",     "pool-probe-s",     [&](const std::string & v) { cfg.probe_s     = std::max(1, std::stoi(v)); });
+    get("_SAME_MODEL",  "pool-same-model",  [&](const std::string & v) { cfg.same_model  = common_arg_utils::is_truthy(v); });
+    get("_PEERS",       "pool-peers",       [&](const std::string & v) {
+        size_t p = 0;
+        while (p < v.size()) {
+            const size_t comma = v.find(',', p);
+            const std::string peer = pool_trim(v.substr(p, comma == std::string::npos ? std::string::npos : comma - p));
+            p = comma == std::string::npos ? v.size() : comma + 1;
+            if (!peer.empty()) {
+                cfg.peers.push_back(peer);
+            }
+        }
+    });
+}
 
 // a chunk of the move of a conversation, and of the probe of a link
 static constexpr uint64_t POOL_CHUNK = 16ull << 20;
 // the end of an answer the pool keeps for its timings (the last event of a stream, the end of a JSON body). at file
 // scope: MSVC does not let a lambda use a constexpr local it does not capture (C3493)
 static constexpr size_t POOL_TAIL = 16*1024;
+// the most nodes a pool takes: the nodes live in a vector of this size, so that a node joins without moving the others
+static constexpr int POOL_MAX_NODES = 64;
+// the header of a request the pool sends to a node: the router there serves it itself
+static constexpr const char * POOL_HOP_HEADER = "X-Llama-Pool";
 
 // one way to a node: a direct cable, the WiFi
 struct pool_link {
-    std::string url;
-    std::string scheme;
     std::string host;
-    int         port     = 0;
-    double      mbps_cfg = 0.0;  // the speed given after the url (Mbit/s), 0 = none
-    // under impl::mu. measured (bytes/s, 0 = not yet): a probe when the link starts to serve, then the moves
-    double      bps_read  = 0.0; // from the node to the pool
-    double      bps_write = 0.0; // from the pool to the node
+    int         port      = 0;
+    // under impl::mu. measured (bytes/s, 0 = not yet): a probe when the link first answers, then the moves
+    double      bps_read  = 0.0; // from the node to this router
+    double      bps_write = 0.0; // from this router to the node
     bool        probed    = false; // the probe was tried since the link last answered
     std::string error;           // why it failed the last time it was tried, "" = it answered
 };
 
 static std::string pool_base(const pool_link & l) {
-    return l.scheme + "://" + (l.host.find(':') != std::string::npos ? "[" + l.host + "]" : l.host) + ":" + std::to_string(l.port);
+    return "http://" + (l.host.find(':') != std::string::npos ? "[" + l.host + "]" : l.host) + ":" + std::to_string(l.port);
+}
+
+// the speed a link is ranked by: the slower way, 0 = not measured
+static double pool_link_rank(const pool_link & l) {
+    return l.probed ? std::min(l.bps_read, l.bps_write) : 0.0;
 }
 
 // what a request is for a move: the kind POST /pool/export reads, "" = no move (the prompt is not a conversation)
@@ -327,8 +471,8 @@ static std::string pool_error_text(const httplib::Result & res) {
     return "HTTP " + std::to_string(res->status);
 }
 
-// a model of the list of a router node (GET /models) under `name`: the name of its preset or an alias of it, as the
-// router takes it in a request
+// a model of the list of a router (GET /models) under `name`: the name of its preset or an alias of it, as the router
+// takes it in a request
 static bool pool_model_named(const json & m, const std::string & name) {
     if (json_value(m, "id", std::string()) == name) {
         return true;
@@ -344,18 +488,16 @@ static bool pool_model_named(const json & m, const std::string & name) {
 }
 
 struct pool_node {
-    // config, fixed after the start
+    // fixed once the node joined, read without the lock
+    std::string id;              // the router: <host>:<port>
     std::string name;
-    std::vector<pool_link> links; // in the order of preference: a direct cable first, the WiFi after it
-    int         slots_cfg   = 0;   // 0 = what the node reports
-    double      weight      = 1.0;
-    double      prefill_cfg = 0.0; // its prefill speed (tokens/s), 0 = the one of the pool
-    std::string api_key;
-    std::string model;           // a node in router mode (serve.bat): the model on it, set in every request
+    std::string model;           // the name the router there takes the model under, set in every request to it
+    bool        self = false;    // this router
 
-    // state, under impl::mu (the bps and error of the links too)
-    int         link    = 0;     // the link in use
-    int64_t     t_probe = 0;     // the last try of the links before it, while on a fallback
+    // state, under impl::mu (the links too: another one may join)
+    std::vector<pool_link> links; // the first found first; the one in use is `link`
+    int         link    = 0;
+    int64_t     t_probe = 0;     // the last try of the faster links, while on a slower one
     std::string status = "down"; // up, down, loading, unloaded
     bool        draining = false;
     bool        mismatch = false; // another model than the most of the nodes (same_model): it takes no request
@@ -363,16 +505,18 @@ struct pool_node {
     bool        migrate = false; // it moves conversations: the fork with a prompt cache
     uint64_t    cache_ram = 0;   // the RAM limit of its prompt cache, the largest state it takes; 0 = none
     json        model_info = json::object(); // its model (GET /pool/node): parameters, size, type, vocabulary
+    json        peers = json::array(); // its links to the other nodes (GET /pool/router), for the speed of a move
     std::string error;
     int64_t     t_ok      = 0;   // the last good poll (ms, ggml_time_ms)
     int         slots     = 0;   // capacity
-    int         inflight  = 0;   // requests proxied and not finished
+    int         inflight  = 0;   // requests proxied by this router and not finished
     int         busy      = 0;   // slots processing, at the last poll
-    int         external  = 0;   // of them, requests that did not come through the pool
+    int         external  = 0;   // of them, requests that did not come through this router
     uint64_t    n_requests = 0;
     double      gen_tps    = 0.0;
     double      prompt_tps = 0.0;
     double      prefill_tps = 0.0; // measured: the timings of the prompts of move_tokens and more it read, 0 = none yet
+    double      decode_tps  = 0.0; // measured: the timings of the answers of 16 tokens and more, 0 = none yet
     // measured: the part of a prefix of other conversations it reused for a prompt (cache_n of the answers), -1 = none
     // yet. a transformer takes all of it, a hybrid model (qwen4exp: gated delta net) or SWA only up to a checkpoint
     // within it, which a node often does not have
@@ -419,8 +563,19 @@ struct pool_req {
 
 struct server_pool_fork::impl {
     const common_params & params;
+    server_models_routes & models_routes;
     pool_config cfg;
-    std::vector<pool_node> nodes; // fixed size after the start
+    std::string model;           // the model of this router: the name of its preset
+    std::set<std::string> names; // its name and aliases: a request for any of them goes through the pool
+    std::string id;              // this router in the pool: <name or host>:<port>
+    std::string instance = pool_random_hex(); // this process: another router with the same id is another machine
+    std::string self_host;       // how this router reaches itself
+    int         http_port = 0;
+    std::string api_key;         // --api-key of this router: the other routers of the pool have it too
+
+    // [0] this router, the others as they are found; a node never leaves (a router that stops is down)
+    std::vector<pool_node> nodes = std::vector<pool_node>(POOL_MAX_NODES);
+    std::atomic<int>       n_nodes{0};
 
     std::mutex mu;
     std::condition_variable cv;
@@ -459,77 +614,150 @@ struct server_pool_fork::impl {
     int64_t t_trim = 0;
 
     std::atomic<bool>        stopping{false};
-    std::vector<std::thread> pollers;
+    std::atomic<bool>        started{false};
     std::mutex               mu_stop;
     std::condition_variable  cv_stop;
+    std::mutex               mu_threads;
+    std::vector<std::thread> pollers; // under mu_threads
+    std::thread              discovery;
 
-    explicit impl(const common_params & params) : params(params) {}
+    // the discovery: broadcasts come to sock_bcast (the port of the pool), the answers to sock_reply (a port of its own,
+    // as the broadcasts go out from it)
+    socket_t sock_bcast = INVALID_SOCKET;
+    socket_t sock_reply = INVALID_SOCKET;
+    std::map<std::string, int64_t> challenges; // the challenges of this router -> when sent, discovery thread only
+    int64_t t_conflict = 0;                    // the last warning about a router with the same id, discovery thread only
 
-    void load(const std::string & path) {
-        for (const auto & sec : pool_read_ini(path)) {
-            const std::string & section = sec.first;
-            const auto & kv = sec.second;
-            auto get = [&](const char * key, const std::string & def) {
-                auto it = kv.find(key);
-                return it == kv.end() ? def : it->second;
-            };
-            if (section == "pool") {
-                cfg.name        = get("name", cfg.name);
-                cfg.poll_ms     = std::max(100, std::stoi(get("poll_ms", std::to_string(cfg.poll_ms))));
-                cfg.move_tokens = std::stoll(get("move_tokens", std::to_string(cfg.move_tokens)));
-                cfg.wait_max_s  = std::stoi(get("wait_max", std::to_string(cfg.wait_max_s)));
-                cfg.prefill_tps = std::max(1.0, std::stod(get("prefill_tps", std::to_string(cfg.prefill_tps))));
-                cfg.chars_tok   = std::max(0.5, std::stod(get("chars_per_token", std::to_string(cfg.chars_tok))));
-                cfg.ttl_s       = std::stoi(get("affinity_ttl", std::to_string(cfg.ttl_s)));
-                cfg.api_key     = get("api_key", cfg.api_key);
-                cfg.model       = get("model", cfg.model);
-                cfg.migrate     = std::stoi(get("migrate", cfg.migrate ? "1" : "0")) != 0;
-                cfg.link_mbps   = std::max(1.0, std::stod(get("link_mbps", std::to_string(cfg.link_mbps))));
-                cfg.probe_s     = std::max(1, std::stoi(get("probe_s", std::to_string(cfg.probe_s))));
-                cfg.same_model  = std::stoi(get("same_model", cfg.same_model ? "1" : "0")) != 0;
-            } else if (section.rfind("node.", 0) == 0 || section.rfind("node ", 0) == 0) {
-                pool_node n;
-                n.name = pool_trim(section.substr(5));
-                // url = <url> [Mbit/s], <url> [Mbit/s], ...: the first that answers serves
-                const std::string urls = get("url", "");
-                size_t at = 0;
-                while (at < urls.size()) {
-                    size_t comma = urls.find(',', at);
-                    const std::string item = pool_trim(urls.substr(at, comma == std::string::npos ? std::string::npos : comma - at));
-                    at = comma == std::string::npos ? urls.size() : comma + 1;
-                    if (item.empty()) {
-                        continue;
-                    }
-                    pool_link l;
-                    const size_t sp = item.find_first_of(" \t");
-                    l.url = item.substr(0, sp);
-                    if (sp != std::string::npos) {
-                        l.mbps_cfg = std::stod(pool_trim(item.substr(sp)));
-                    }
-                    pool_parse_url(l.url, l.scheme, l.host, l.port);
-                    n.links.push_back(l);
-                }
-                if (n.name.empty() || n.links.empty()) {
-                    throw std::runtime_error(path + ": [" + section + "] needs a name and url = http://host:port");
-                }
-                n.slots_cfg   = std::stoi(get("slots", "0"));
-                n.weight      = std::max(0.01, std::stod(get("weight", "1")));
-                n.prefill_cfg = std::max(0.0, std::stod(get("prefill_tps", "0")));
-                n.api_key     = get("api_key", "");
-                n.model       = get("model", "");
-                nodes.push_back(std::move(n));
-            } else {
-                throw std::runtime_error(path + ": unknown section [" + section + "], expected [pool] or [node.<name>]");
+    impl(const common_params & params, server_models_routes & models_routes) : params(params), models_routes(models_routes) {}
+
+    void init(const std::string & name_of_model) {
+        model = name_of_model;
+        names.insert(model);
+        if (auto meta = models_routes.models.get_meta(model)) {
+            names.insert(meta->aliases.begin(), meta->aliases.end());
+            pool_read_options(cfg, meta->preset);
+        }
+        if (!params.api_keys.empty()) {
+            api_key = params.api_keys.front();
+        }
+        http_port = params.port;
+        char host[256] = {};
+        if (gethostname(host, (int) sizeof(host) - 1) != 0 || host[0] == '\0') {
+            snprintf(host, sizeof(host), "%s", "localhost");
+        }
+        // the id of the router in the pool: pool-name, else the host name; with the port, so that the routers of one
+        // machine (the tests) differ
+        id = (cfg.name.empty() ? std::string(host) : cfg.name) + ":" + std::to_string(http_port);
+        if (cfg.name.empty()) {
+            cfg.name = host;
+        }
+        // the address this router listens on, unless it is every address
+        self_host = "127.0.0.1";
+        if (!params.hostnames.empty()) {
+            const std::string & h = params.hostnames.front();
+            if (!h.empty() && h != "0.0.0.0" && h != "::" && h != "localhost") {
+                self_host = h;
             }
         }
-        if (nodes.empty()) {
-            throw std::runtime_error(path + ": no [node.<name>] section");
+        pool_node & self = nodes[0];
+        self.id    = id;
+        self.name  = cfg.name;
+        self.model = model;
+        self.self  = true;
+        pool_link l;
+        l.host = self_host;
+        l.port = http_port;
+        self.links.push_back(l);
+        n_nodes = 1;
+    }
+
+    httplib::Headers auth_headers() const {
+        httplib::Headers h;
+        if (!api_key.empty()) {
+            h.emplace("Authorization", "Bearer " + api_key);
         }
-        for (auto & n : nodes) {
-            if (n.api_key.empty()) {
-                n.api_key = cfg.api_key;
+        return h;
+    }
+
+    //
+    // the nodes
+    //
+
+    // the node of router `node_id`, joined if new; -1 when the pool is full. under mu
+    int node_of(const std::string & node_id, const std::string & name, const std::vector<std::string> & peer_names) {
+        const int n = n_nodes.load();
+        for (int i = 0; i < n; ++i) {
+            if (nodes[i].id == node_id) {
+                return i;
             }
         }
+        if (n >= POOL_MAX_NODES) {
+            return -1;
+        }
+        pool_node & node = nodes[n];
+        node.id   = node_id;
+        node.name = name.empty() ? node_id : name;
+        for (int i = 0; i < n; ++i) {
+            if (nodes[i].name == node.name) {
+                node.name = node_id; // two routers of one name (one host): the port tells them apart
+                break;
+            }
+        }
+        // the name it takes the model under: this router's own, else an alias both have
+        node.model = model;
+        if (std::find(peer_names.begin(), peer_names.end(), model) == peer_names.end()) {
+            for (const auto & nm : names) {
+                if (std::find(peer_names.begin(), peer_names.end(), nm) != peer_names.end()) {
+                    node.model = nm;
+                    break;
+                }
+            }
+        }
+        n_nodes = n + 1;
+        return n;
+    }
+
+    // a router of the pool reached at host:port: its node, and the link if new
+    void found(const std::string & node_id, const std::string & name, const std::string & host, int port,
+               const std::vector<std::string> & peer_names, const char * how) {
+        int  n;
+        bool joined = false;
+        bool linked = false;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            const int before = n_nodes.load();
+            n = node_of(node_id, name, peer_names);
+            if (n < 0) {
+                return;
+            }
+            joined = n >= before;
+            pool_node & node = nodes[n];
+            bool have = false;
+            for (const auto & l : node.links) {
+                have = have || (l.host == host && l.port == port);
+            }
+            if (!have) {
+                pool_link l;
+                l.host = host;
+                l.port = port;
+                node.links.push_back(l);
+                linked = true;
+                event(joined ? "found" : "link+", "", n, string_format("%s at %s:%d (%s)", node.id.c_str(), host.c_str(), port, how));
+                SRV_INF("pool: %s %s at %s:%d (%s)\n", joined ? "found" : "another link to", node.name.c_str(), host.c_str(), port, how);
+            }
+            cv.notify_all();
+        }
+        if (joined && linked) {
+            start_poller(n);
+        }
+    }
+
+    void start_poller(int n) {
+        std::lock_guard<std::mutex> lk(mu_threads);
+        if (stopping.load()) {
+            return;
+        }
+        pollers.emplace_back([this, n]() { poll_node(n); });
     }
 
     //
@@ -540,20 +768,40 @@ struct server_pool_fork::impl {
         return n.status == "up" && !n.draining && !n.mismatch;
     }
 
-    // the prefill speed of a node: measured (note_timings), else its prefill_tps, else the one of [pool]
+    // the prefill speed of a node: measured (note_timings), else the one of the pool
     double prefill_of(int n) const {
-        if (nodes[n].prefill_tps > 0) {
-            return nodes[n].prefill_tps;
-        }
-        return nodes[n].prefill_cfg > 0 ? nodes[n].prefill_cfg : cfg.prefill_tps;
+        return nodes[n].prefill_tps > 0 ? nodes[n].prefill_tps : cfg.prefill_tps;
     }
 
-    // the speed of the link a node is on, from the node or to it (bytes/s): measured, or given after its url, or the
-    // default
-    double link_bps(const pool_node & n, bool write) const {
-        const pool_link & l = n.links[n.link];
-        const double m = write ? l.bps_write : l.bps_read;
-        return m > 0 ? m : (l.mbps_cfg > 0 ? l.mbps_cfg : cfg.link_mbps) * 1e6 / 8;
+    // the share of the new conversations a node takes: its decode speed against the fastest node, 1 until measured
+    double weight_of(int n) const {
+        double best = 0.0;
+        for (int i = 0; i < n_nodes.load(); ++i) {
+            best = std::max(best, nodes[i].decode_tps);
+        }
+        return best > 0 && nodes[n].decode_tps > 0 ? nodes[n].decode_tps / best : 1.0;
+    }
+
+    // the speed (bytes/s) a state moves at from `from` to `to`, which reads it from there itself: the link of `to` to
+    // `from` as `to` measured it (this router's own, or the one the node reports in GET /pool/router), else the default
+    double pair_bps(int from, int to) const {
+        const pool_node & t = nodes[to];
+        if (t.self) {
+            const pool_node & f = nodes[from];
+            const double m = f.links.empty() ? 0.0 : f.links[f.link].bps_read;
+            return m > 0 ? m : cfg.link_mbps * 1e6 / 8;
+        }
+        for (const auto & p : t.peers) {
+            if (!p.is_object() || json_value(p, "id", std::string()) != nodes[from].id || !p.contains("links")) {
+                continue;
+            }
+            for (const auto & l : p.at("links")) {
+                if (l.is_object() && json_value(l, "active", false) && json_value(l, "mbps_in", 0.0) > 0) {
+                    return json_value(l, "mbps_in", 0.0) * 1e6 / 8;
+                }
+            }
+        }
+        return cfg.link_mbps * 1e6 / 8;
     }
 
     // a conversation can move from `from` to `to` with its state: both nodes of the fork with the prompt cache, of the
@@ -565,19 +813,19 @@ struct server_pool_fork::impl {
                a.signature == b.signature;
     }
 
-    // a move of `bytes` over a link of `bps` bytes/s: the requests, the transfer, and the copies on the two nodes at
-    // 2 GB/s (the export reads the file of a state on disk or copies one in RAM, the target restores it into a slot)
+    // a move of `bytes` at `bps` bytes/s: the requests, the transfer, and the copies on the two nodes at 2 GB/s (the
+    // export reads the file of a state on disk or copies one in RAM, the target restores it into a slot)
     static double move_s(double bytes, double bps) {
         return 0.2 + bytes / bps + bytes / 2e9;
     }
 
-    // how long a move of a state of `tokens` takes through the pool: the slower of the two links, with the bytes per
-    // token of the moves so far. 0 before the first move: unknown, a conversation then moves rather than waits
+    // how long a move of a state of `tokens` takes, with the bytes per token of the moves so far. 0 before the first
+    // move: unknown, a conversation then moves rather than waits
     double transfer_s(int from, int to, int64_t tokens) const {
         if (state_bpt <= 0) {
             return 0.0;
         }
-        return move_s(tokens * state_bpt, std::min(link_bps(nodes[from], false), link_bps(nodes[to], true)));
+        return move_s(tokens * state_bpt, pair_bps(from, to));
     }
 
     static int free_slots(const pool_node & n) {
@@ -587,7 +835,7 @@ struct server_pool_fork::impl {
     // the free node with the most of the prompt cached, then the most free slots by weight, then the fewest requests
     int best_free(const std::vector<int64_t> & cached) const {
         int best = -1;
-        for (int i = 0; i < (int) nodes.size(); ++i) {
+        for (int i = 0; i < n_nodes.load(); ++i) {
             const int f = free_slots(nodes[i]);
             if (f <= 0) {
                 continue;
@@ -596,14 +844,14 @@ struct server_pool_fork::impl {
                 best = i;
                 continue;
             }
-            const int64_t ci = cached.empty() ? 0 : cached[i];
-            const int64_t cb = cached.empty() ? 0 : cached[best];
+            const int64_t ci = pool_at(cached, i);
+            const int64_t cb = pool_at(cached, best);
             if (ci != cb) {
                 best = ci > cb ? i : best;
                 continue;
             }
-            const double si = nodes[i].weight * f / std::max(1, nodes[i].slots);
-            const double sb = nodes[best].weight * free_slots(nodes[best]) / std::max(1, nodes[best].slots);
+            const double si = weight_of(i) * f / std::max(1, nodes[i].slots);
+            const double sb = weight_of(best) * free_slots(nodes[best]) / std::max(1, nodes[best].slots);
             if (si > sb + 1e-9 || (si > sb - 1e-9 && nodes[i].n_requests < nodes[best].n_requests)) {
                 best = i;
             }
@@ -614,7 +862,7 @@ struct server_pool_fork::impl {
     // the usable node with the most of the prompt cached, -1 = none holds any of it
     int holder(const pool_req & r) const {
         int best = -1;
-        for (int i = 0; i < (int) nodes.size() && i < (int) r.cached.size(); ++i) {
+        for (int i = 0; i < n_nodes.load() && i < (int) r.cached.size(); ++i) {
             if (usable(nodes[i]) && r.cached[i] > 0 && (best < 0 || r.cached[i] > r.cached[best])) {
                 best = i;
             }
@@ -633,12 +881,12 @@ struct server_pool_fork::impl {
         if (alt < 0 || hold < 0 || r.conv_new) {
             return alt;
         }
-        const int64_t gain = r.cached[hold] - r.cached[alt];
+        const int64_t gain = pool_at(r.cached, hold) - pool_at(r.cached, alt);
         if (gain >= cfg.move_tokens) {
             // waiting is worth at most what going elsewhere costs: computing the difference, or moving the state
             double limit_s = std::min<double>(cfg.wait_max_s, gain / prefill_of(alt));
             if (can_migrate(hold, alt)) {
-                limit_s = std::min(limit_s, transfer_s(hold, alt, r.cached[hold]));
+                limit_s = std::min(limit_s, transfer_s(hold, alt, pool_at(r.cached, hold)));
             }
             if ((now - r.t_arrive) / 1000.0 < limit_s) {
                 return -1;
@@ -649,15 +897,16 @@ struct server_pool_fork::impl {
 
     // what each node holds of the prompt, and the conversation the request continues
     void lookup(const pool_key & k, pool_req & r) const {
+        const int n = n_nodes.load();
         r.prompt_tokens = k.chars.empty() ? 0 : (int64_t) (k.chars.back() / cfg.chars_tok);
-        r.cached.assign(nodes.size(), 0);
-        r.shared_max.assign(nodes.size(), 0);
-        std::vector<int> depth(nodes.size(), 0);
+        r.cached.assign(n, 0);
+        r.shared_max.assign(n, 0);
+        std::vector<int> depth(n, 0);
         if (!k.id.empty()) {
             auto it = affinity.find(pool_hash(POOL_ID_SEED, k.id));
             if (it != affinity.end()) {
                 for (const auto & e : it->second) {
-                    if (nodes[e.first].status != "down") {
+                    if (e.first < n && nodes[e.first].status != "down") {
                         depth[e.first] = (int) k.chain.size() - 1;
                         r.cached[e.first] = r.prompt_tokens;
                     }
@@ -671,7 +920,7 @@ struct server_pool_fork::impl {
                 continue;
             }
             for (const auto & e : it->second) {
-                if (nodes[e.first].status != "down" && depth[e.first] == 0) {
+                if (e.first < n && nodes[e.first].status != "down" && depth[e.first] == 0) {
                     depth[e.first] = i;
                     r.cached[e.first] = (int64_t) (k.chars[i] / cfg.chars_tok);
                     r.shared_max[e.first] = (int64_t) (k.chars[std::min(i + 1, (int) k.chars.size() - 1)] / cfg.chars_tok);
@@ -779,44 +1028,50 @@ struct server_pool_fork::impl {
         }
     }
 
-    // a node for a request: waits for a free slot, -1 when the client went away, -2 when no node is up
+    // a node for a request: waits for a free slot, -1 when the client went away, -2 when no node is up. while no node
+    // takes requests and this router answers (its model loading, or unloaded), the requests go to it in turn as without
+    // a pool: the router waits for the model there
     int acquire(pool_req & r, const std::function<bool()> & should_stop) {
         std::unique_lock<std::mutex> lk(mu);
         queue.push_back(&r);
         int64_t t_none = 0;
         while (true) {
             const int64_t now = ggml_time_ms();
-            if (should_stop()) {
+            if (should_stop() || stopping.load()) {
                 queue.erase(std::find(queue.begin(), queue.end(), &r));
-                event("gone", r.conv, -1, "the client left while it waited");
+                event("gone", r.conv, -1, stopping.load() ? "the router stops" : "the client left while it waited");
                 return -1;
             }
-            const int n = choose(r, now);
+            int n = choose(r, now);
             if (n >= 0) {
                 // an older request that would take the same node goes first
-                bool older = false;
                 for (pool_req * q : queue) {
                     if (q == &r) {
                         break;
                     }
                     if (choose(*q, now) == n) {
-                        older = true;
+                        n = -1;
                         break;
                     }
                 }
-                if (!older) {
-                    queue.erase(std::find(queue.begin(), queue.end(), &r));
-                    nodes[n].inflight++;
-                    nodes[n].n_requests++;
-                    r.node = n;
-                    r.t_start = now;
-                    running[r.id] = r;
-                    return n;
-                }
             }
             bool any = false;
-            for (const auto & node : nodes) {
-                any = any || usable(node);
+            for (int i = 0; i < n_nodes.load(); ++i) {
+                any = any || usable(nodes[i]);
+            }
+            const pool_node & self = nodes[0];
+            if (n < 0 && !any && (self.status == "loading" || self.status == "unloaded") && !self.draining &&
+                queue.front() == &r) {
+                n = 0;
+            }
+            if (n >= 0) {
+                queue.erase(std::find(queue.begin(), queue.end(), &r));
+                nodes[n].inflight++;
+                nodes[n].n_requests++;
+                r.node = n;
+                r.t_start = now;
+                running[r.id] = r;
+                return n;
             }
             if (!any) {
                 t_none = t_none == 0 ? now : t_none;
@@ -832,9 +1087,9 @@ struct server_pool_fork::impl {
         }
     }
 
-    void release(uint64_t id, int status) {
+    void release(uint64_t req_id, int status) {
         std::lock_guard<std::mutex> lk(mu);
-        auto it = running.find(id);
+        auto it = running.find(req_id);
         if (it == running.end()) {
             return;
         }
@@ -851,6 +1106,7 @@ struct server_pool_fork::impl {
     // nested object):
     // - the prompt it read, when that was at least move_tokens - the size of the prefills the speed is weighed for, where
     //   a short prompt shows the overhead of a request more than the speed
+    // - the answer, when it was 16 tokens or more: the decode speed the new conversations are shared out by
     // - with `shared` (the fraction of the prompt the node held from other conversations, estimated from the
     //   characters; at least move_tokens of it) the share of it the node took from its cache (cache_n). a node that took
     //   more than reaches to the end of the next message (`shared_max`), where the prompt differs from the others, held
@@ -869,10 +1125,15 @@ struct server_pool_fork::impl {
         const double n_prompt = json_value(t, "prompt_n", 0.0);
         const double n_cache  = json_value(t, "cache_n", 0.0);
         const double t_ms     = json_value(t, "prompt_ms", 0.0);
+        const double n_gen    = json_value(t, "predicted_n", 0.0);
+        const double t_gen    = json_value(t, "predicted_ms", 0.0);
         auto avg = [](double old, double x, double none) { return old > none ? 0.5*old + 0.5*x : x; };
         std::lock_guard<std::mutex> lk(mu);
         if (n_prompt >= cfg.move_tokens && t_ms > 0) {
             nodes[n].prefill_tps = avg(nodes[n].prefill_tps, n_prompt*1000.0/t_ms, 0.0);
+        }
+        if (n_gen >= 16 && t_gen > 0) {
+            nodes[n].decode_tps = avg(nodes[n].decode_tps, n_gen*1000.0/t_gen, 0.0);
         }
         const double total = n_prompt + n_cache;
         if (shared > 0 && total > 0 && n_cache <= shared_max * total) {
@@ -880,81 +1141,46 @@ struct server_pool_fork::impl {
         }
     }
 
-    // the least busy node that is up, for the requests that take no slot (tokenize, models, props)
-    int any_node() const {
-        int best = -1;
-        for (int i = 0; i < (int) nodes.size(); ++i) {
-            if (nodes[i].status == "up" && (best < 0 || nodes[i].inflight < nodes[best].inflight)) {
-                best = i;
-            }
-        }
-        return best;
+    // the link a node is on, a copy
+    pool_link link_of(int n) {
+        std::lock_guard<std::mutex> lk(mu);
+        const pool_node & node = nodes[n];
+        return node.links[node.link];
     }
 
-    std::map<std::string, std::string> headers_for(const pool_node & node, const std::map<std::string, std::string> & in) const {
+    std::map<std::string, std::string> headers_for(const std::map<std::string, std::string> & in) const {
         std::map<std::string, std::string> out = in;
-        if (!node.api_key.empty()) {
-            for (auto it = out.begin(); it != out.end(); ) {
-                it = pool_lower(it->first) == "authorization" ? out.erase(it) : std::next(it);
-            }
-            out["Authorization"] = "Bearer " + node.api_key;
+        for (auto it = out.begin(); it != out.end(); ) {
+            const std::string k = pool_lower(it->first);
+            it = (k == "authorization" && !api_key.empty()) || k == pool_lower(POOL_HOP_HEADER) ? out.erase(it) : std::next(it);
         }
+        if (!api_key.empty()) {
+            out["Authorization"] = "Bearer " + api_key;
+        }
+        out[POOL_HOP_HEADER] = id;
         return out;
     }
 
-    std::unique_ptr<server_http_proxy> proxy_to(int n, const server_http_req & req, const std::string & method) {
-        const pool_node & node = nodes[n];
-        pool_link l;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            l = node.links[node.link];
+    // the request to node `n`: the router there picks the instance by the model in the body
+    std::unique_ptr<server_http_proxy> proxy_to(int n, const server_http_req & req, const std::string & method, json body) {
+        const pool_link l = link_of(n);
+        std::string path = req.path;
+        if (!req.query_string.empty()) {
+            path += '?' + req.query_string;
         }
-        std::string path  = req.path;
-        std::string query = req.query_string;
-        std::string body  = req.body;
-        if (!node.model.empty()) {
-            // a node in router mode picks the instance by the model: in the body of a POST, in ?model= of a GET
-            if (method == "POST") {
-                json j = json::parse_no_throw(body);
-                if (!j.is_discarded() && j.is_object()) {
-                    j["model"] = node.model;
-                    body = j.dump();
-                }
-            } else {
-                std::string kept;
-                size_t at = 0;
-                while (at <= query.size() && !query.empty()) {
-                    const size_t amp = query.find('&', at);
-                    const std::string part = query.substr(at, amp == std::string::npos ? std::string::npos : amp - at);
-                    if (!part.empty() && part.rfind("model=", 0) != 0) {
-                        kept += (kept.empty() ? "" : "&") + part;
-                    }
-                    if (amp == std::string::npos) {
-                        break;
-                    }
-                    at = amp + 1;
-                }
-                query = kept + (kept.empty() ? "" : "&") + "model=" + node.model;
-            }
-        }
-        if (!query.empty()) {
-            path += '?' + query;
-        }
-        return std::make_unique<server_http_proxy>(method, l.scheme, l.host, l.port, path,
-            headers_for(node, req.headers), body, req.files, req.should_stop,
+        body["model"] = nodes[n].model;
+        return std::make_unique<server_http_proxy>(method, "http", l.host, l.port, path,
+            headers_for(req.headers), body.dump(), req.files, req.should_stop,
             params.timeout_read, params.timeout_write);
     }
 
     // the conversation of `r` moves from `from` to `to` with its state: `from` gives the cached state of the prompt
-    // (POST /pool/export), the pool reads it in chunks and writes them to `to` (a thread each way, so that both links run
-    // at once), `to` takes it into its prompt cache in RAM (POST /pool/import/done). false with `why` when it did not
-    // move: `to` then computes the conversation from the start, as without a move
+    // (POST /pool/export), `to` reads it from `from` itself and takes it into its prompt cache in RAM (POST /pool/pull).
+    // false with `why` when it did not move: `to` then computes the conversation from the start, as without a move
     bool migrate(const pool_req & r, int from, int to, const char * kind, const json & body,
                  const std::function<bool()> & should_stop, std::string & why, std::string & detail) {
-        const pool_node & nf = nodes[from]; // the config fields only, the state is under mu
+        const pool_node & nf = nodes[from]; // the fixed fields only, the state is under mu
         const pool_node & nt = nodes[to];
-        int lf_i;
-        int lt_i;
         pool_link lf;
         pool_link lt;
         double bps;
@@ -962,57 +1188,35 @@ struct server_pool_fork::impl {
         uint64_t cache_ram_to;
         {
             std::lock_guard<std::mutex> lk(mu);
-            lf_i = nf.link;
-            lt_i = nt.link;
-            lf   = nf.links[lf_i];
-            lt   = nt.links[lt_i];
-            bps  = std::min(link_bps(nf, false), link_bps(nt, true));
+            lf = nf.links[nf.link];
+            lt = nt.links[nt.link];
+            bps          = pair_bps(from, to);
             prefill_to   = prefill_of(to);
             cache_ram_to = nt.cache_ram;
         }
-        auto hdrs_of = [](const pool_node & n) {
-            httplib::Headers h;
-            if (!n.api_key.empty()) {
-                h.emplace("Authorization", "Bearer " + n.api_key);
-            }
-            return h;
-        };
-        // a router node takes the model in ?model= and in the body of a POST; autoload=0: a move never loads a model
-        auto path_of = [](const pool_node & n, const std::string & path, std::string q) {
-            if (!n.model.empty()) {
-                q += (q.empty() ? "" : "&") + std::string("model=") + n.model + "&autoload=0";
-            }
-            return q.empty() ? path : path + "?" + q;
-        };
-        auto body_of = [](const pool_node & n, json j) {
-            if (!n.model.empty()) {
-                j["model"] = n.model;
-            }
-            return j.dump();
-        };
-        const httplib::Headers hf = hdrs_of(nf);
-        const httplib::Headers ht = hdrs_of(nt);
+        const httplib::Headers hdrs = auth_headers();
         httplib::Client cf(pool_base(lf));
         httplib::Client ct(pool_base(lt));
         cf.set_connection_timeout(3, 0);
         ct.set_connection_timeout(3, 0);
-        // the export copies a state only in RAM, behind the batch the node is computing
+        // the export copies a state only in RAM, behind the batch the node is computing; the pull moves it
         cf.set_read_timeout(params.timeout_read, 0);
-        ct.set_read_timeout(60, 0);
+        ct.set_read_timeout(params.timeout_read, 0);
         cf.set_write_timeout(60, 0);
         ct.set_write_timeout(60, 0);
+        // a router takes the model in ?model= and in the body of a POST; autoload=0: a move never loads a model
+        const std::string q_from = "?model=" + nf.model + "&autoload=0";
 
         const int64_t t0 = ggml_time_ms();
-        auto rx = cf.Post(path_of(nf, "/pool/export", ""), hf,
-            body_of(nf, {{"kind", kind}, {"body", body}, {"min_match", cfg.move_tokens}}),
-            "application/json");
+        json req_ex = {{"kind", kind}, {"body", body}, {"min_match", cfg.move_tokens}, {"model", nf.model}};
+        req_ex["body"]["model"] = nf.model;
+        auto rx = cf.Post("/pool/export" + q_from, hdrs, req_ex.dump(), "application/json");
         if (!rx || rx->status != 200) {
             why = "no state: " + pool_error_text(rx);
             return false;
         }
-        cf.set_read_timeout(60, 0);
         const json ex = json::parse_no_throw(rx->body);
-        const std::string id  = ex.is_object() ? json_value(ex, "id", std::string()) : std::string();
+        const std::string xid = ex.is_object() ? json_value(ex, "id", std::string()) : std::string();
         const std::string sig = ex.is_object() ? json_value(ex, "signature", std::string()) : std::string();
         const uint64_t size   = ex.is_object() ? json_value(ex, "size", (uint64_t) 0) : 0;
         const int64_t n_tok   = ex.is_object() ? json_value(ex, "n_tokens", (int64_t) 0) : 0;
@@ -1021,9 +1225,10 @@ struct server_pool_fork::impl {
         const int64_t n_ckpt_all = ex.is_object() ? json_value(ex, "n_ckpt_all", (int64_t) 0) : 0;
         const bool from_disk  = ex.is_object() && json_value(ex, "from_disk", false);
         auto drop_export = [&]() {
-            cf.Post(path_of(nf, "/pool/export/done", ""), hf, body_of(nf, {{"id", id}}), "application/json");
+            cf.set_read_timeout(10, 0);
+            cf.Post("/pool/export/done" + q_from, hdrs, json{{"id", xid}, {"model", nf.model}}.dump(), "application/json");
         };
-        if (id.empty() || size == 0) {
+        if (xid.empty() || size == 0) {
             why = "a bad answer to the export";
             drop_export();
             return false;
@@ -1038,17 +1243,92 @@ struct server_pool_fork::impl {
         }
         // worth it only when the transfer is shorter than computing what it brings
         const double t_xfer = move_s((double) size, bps);
-        const double t_comp = std::max<int64_t>(0, n_reuse - r.cached[to]) / prefill_to;
+        const double t_comp = std::max<int64_t>(0, n_reuse - pool_at(r.cached, to)) / prefill_to;
         if (t_xfer >= t_comp) {
             why = string_format("the move of %.0f MB would take ~%.0f s, computing ~%lld tok ~%.0f s", size / 1e6, t_xfer,
                                 (long long) n_reuse, t_comp);
             drop_export();
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                state_bpt = state_bpt > 0 ? 0.5*state_bpt + 0.5*size / std::max<int64_t>(1, n_tok) : (double) size / std::max<int64_t>(1, n_tok);
-            }
+            std::lock_guard<std::mutex> lk(mu);
+            state_bpt = state_bpt > 0 ? 0.5*state_bpt + 0.5*size / std::max<int64_t>(1, n_tok) : (double) size / std::max<int64_t>(1, n_tok);
             return false;
         }
+
+        // the pull, on the other node; a client that leaves stops it
+        std::atomic<bool> pulled{false};
+        std::thread watch([&]() {
+            while (!pulled.load()) {
+                if (should_stop()) {
+                    ct.stop();
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        const json req_pull = {{"from", nf.id}, {"id", xid}, {"size", size}, {"signature", sig},
+                               {"source_model", nf.model}, {"model", nt.model}};
+        auto rp = ct.Post("/pool/pull", hdrs, req_pull.dump(), "application/json");
+        pulled = true;
+        watch.join();
+        drop_export();
+        if (!rp || rp->status != 200) {
+            why = should_stop() ? "the client left" : "pull: " + pool_error_text(rp);
+            return false;
+        }
+        const json res = json::parse_no_throw(rp->body);
+        const double dt = std::max<int64_t>(1, ggml_time_ms() - t0) / 1000.0;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            state_bpt = state_bpt > 0 ? 0.5*state_bpt + 0.5*size / std::max<int64_t>(1, n_tok) : (double) size / std::max<int64_t>(1, n_tok);
+        }
+        const double t_read = res.is_object() ? json_value(res, "read_s", 0.0) : 0.0;
+        detail = string_format("~%lld tok from %s (%s): %.0f MB in %.1f s (read %.0f MB/s), %lld of %lld checkpoints",
+                               (long long) n_tok, nf.name.c_str(), from_disk ? "its file" : "RAM", size / 1e6, dt,
+                               t_read > 0 ? size / 1e6 / t_read : 0.0, (long long) n_ckpt, (long long) n_ckpt_all);
+        return true;
+    }
+
+    // POST /pool/pull, on the node a conversation moves to: the state of export `id` from node `from`, read from there
+    // in chunks (GET /pool/export/data) and written to the instance of this router (POST /pool/import/data, a thread
+    // each way, so that the network and the import run at once), which takes it into its prompt cache in RAM
+    server_http_res_ptr pull(const server_http_req & req) {
+        const json body = json::parse_no_throw(req.body);
+        if (body.is_discarded() || !body.is_object()) {
+            return pool_error(400, "expected {\"from\": <node>, \"id\": <export>, \"size\": <bytes>, ...}");
+        }
+        const std::string from_id = json_value(body, "from", std::string());
+        const std::string xid     = json_value(body, "id", std::string());
+        const std::string sig     = json_value(body, "signature", std::string());
+        const std::string src_model = json_value(body, "source_model", std::string());
+        const std::string dst_model = json_value(body, "model", model);
+        const uint64_t size       = json_value(body, "size", (uint64_t) 0);
+        int src = -1;
+        int src_link = 0;
+        pool_link lf;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            for (int i = 1; i < n_nodes.load(); ++i) {
+                if (nodes[i].id == from_id && !nodes[i].links.empty()) {
+                    src      = i;
+                    src_link = nodes[i].link;
+                    lf       = nodes[i].links[src_link];
+                }
+            }
+        }
+        if (src < 0 || size == 0 || xid.empty()) {
+            // 400, not 404: the HTTP server puts its own body into every 404
+            return pool_error(400, "no node " + from_id + " in the pool of " + id);
+        }
+        const httplib::Headers hdrs = auth_headers();
+        httplib::Client cf(pool_base(lf));
+        httplib::Client ct(self_host, http_port);
+        cf.set_connection_timeout(3, 0);
+        ct.set_connection_timeout(3, 0);
+        cf.set_read_timeout(60, 0);
+        ct.set_read_timeout(60, 0);
+        cf.set_write_timeout(60, 0);
+        ct.set_write_timeout(60, 0);
+        const std::string q_src = "&model=" + src_model + "&autoload=0";
+        const std::string q_dst = "model=" + dst_model + "&autoload=0";
 
         // the reader keeps up to two chunks ahead of the writer
         std::mutex              m;
@@ -1068,12 +1348,12 @@ struct server_pool_fork::impl {
                     }
                 }
                 const int64_t ts = ggml_time_us();
-                auto rd = cf.Get(path_of(nf, "/pool/export/data", "id=" + id + "&offset=" + std::to_string(off) +
-                                                                  "&size=" + std::to_string(POOL_CHUNK)), hf);
+                auto rd = cf.Get("/pool/export/data?id=" + xid + "&offset=" + std::to_string(off) + "&size=" +
+                                 std::to_string(POOL_CHUNK) + q_src, hdrs);
                 std::lock_guard<std::mutex> lk(m);
                 if (!rd || rd->status != 200 || rd->body.empty()) {
                     failed = true;
-                    err = "read from " + nf.name + ": " + (rd && rd->body.empty() ? "no data" : pool_error_text(rd));
+                    err = "read from " + from_id + ": " + (rd && rd->body.empty() ? "no data" : pool_error_text(rd));
                     break;
                 }
                 t_read += (ggml_time_us() - ts) / 1e6;
@@ -1086,6 +1366,7 @@ struct server_pool_fork::impl {
             cq.notify_all();
         });
 
+        const int64_t t0 = ggml_time_ms();
         uint64_t off = 0;
         double t_write = 0.0;
         while (true) {
@@ -1093,9 +1374,9 @@ struct server_pool_fork::impl {
             {
                 std::unique_lock<std::mutex> lk(m);
                 cq.wait_for(lk, std::chrono::milliseconds(200), [&] { return !q.empty() || read_done || failed; });
-                if (!failed && should_stop()) {
+                if (!failed && req.should_stop && req.should_stop()) {
                     failed = true;
-                    err = "the client left";
+                    err = "the router that asked for it left";
                 }
                 if (failed || (q.empty() && read_done)) {
                     cq.notify_all();
@@ -1109,12 +1390,12 @@ struct server_pool_fork::impl {
                 cq.notify_all();
             }
             const int64_t ts = ggml_time_us();
-            auto rw = ct.Post(path_of(nt, "/pool/import/data", "id=" + id + "&offset=" + std::to_string(off)), ht, chunk,
+            auto rw = ct.Post("/pool/import/data?" + q_dst + "&id=" + xid + "&offset=" + std::to_string(off), hdrs, chunk,
                               "application/octet-stream");
             if (!rw || rw->status != 200) {
                 std::lock_guard<std::mutex> lk(m);
                 failed = true;
-                err = "write to " + nt.name + ": " + pool_error_text(rw);
+                err = "import: " + pool_error_text(rw);
                 cq.notify_all();
                 break;
             }
@@ -1124,44 +1405,34 @@ struct server_pool_fork::impl {
         reader.join();
 
         auto abort_import = [&]() {
-            ct.Post(path_of(nt, "/pool/import/done", ""), ht, body_of(nt, {{"id", id}, {"abort", true}}), "application/json");
+            ct.Post("/pool/import/done?" + q_dst, hdrs, json{{"id", xid}, {"abort", true}, {"model", dst_model}}.dump(), "application/json");
         };
         if (failed || off != size) {
-            why = failed ? err : "the state came short";
             abort_import();
-            drop_export();
-            return false;
+            return pool_error(502, failed ? err : "the state came short");
         }
-        auto ri = ct.Post(path_of(nt, "/pool/import/done", ""), ht, body_of(nt, {{"id", id}, {"signature", sig}}), "application/json");
-        drop_export();
+        auto ri = ct.Post("/pool/import/done?" + q_dst, hdrs, json{{"id", xid}, {"signature", sig}, {"model", dst_model}}.dump(),
+                          "application/json");
         if (!ri || ri->status != 200) {
-            why = "import: " + pool_error_text(ri);
             abort_import();
-            return false;
+            return pool_error(502, "import: " + pool_error_text(ri));
         }
-
-        const double dt = std::max<int64_t>(1, ggml_time_ms() - t0) / 1000.0;
         {
             std::lock_guard<std::mutex> lk(mu);
-            auto avg = [](double old, double x) { return old > 0 ? 0.5*old + 0.5*x : x; };
+            pool_link & l = nodes[src].links[src_link];
             if (t_read > 0) {
-                nodes[from].links[lf_i].bps_read = avg(nodes[from].links[lf_i].bps_read, size / t_read);
+                l.bps_read = l.bps_read > 0 ? 0.5*l.bps_read + 0.5*size / t_read : size / t_read;
             }
-            if (t_write > 0) {
-                nodes[to].links[lt_i].bps_write = avg(nodes[to].links[lt_i].bps_write, size / t_write);
-            }
-            state_bpt = avg(state_bpt, (double) size / std::max<int64_t>(1, n_tok));
         }
-        detail = string_format("~%lld tok from %s (%s): %.0f MB in %.1f s (%.0f MB/s), %lld of %lld checkpoints", (long long) n_tok,
-                               nf.name.c_str(), from_disk ? "its file" : "RAM", size / 1e6, dt, size / 1e6 / dt,
-                               (long long) n_ckpt, (long long) n_ckpt_all);
-        return true;
+        auto res = std::make_unique<server_http_res>();
+        res->data = safe_json_to_str({{"size", size}, {"seconds", (ggml_time_ms() - t0) / 1000.0}, {"read_s", t_read},
+                                      {"write_s", t_write}});
+        return res;
     }
 
-    // a request that takes a slot: the node by the conversation and the free slots, waiting in the queue if need be
-    server_http_res_ptr forward_slot(const server_http_req & req, const std::string & method) {
-        const json body = json::parse_no_throw(req.body);
-        const pool_key key = pool_key_of(req.path, body.is_discarded() ? json() : body, req.headers);
+    // a request for the model: the node by the conversation and the free slots, waiting in the queue if need be
+    server_http_res_ptr forward_slot(const server_http_req & req, const std::string & method, const json & body) {
+        const pool_key key = pool_key_of(req.path, body, req.headers);
 
         pool_req r;
         r.path = req.path;
@@ -1190,11 +1461,12 @@ struct server_pool_fork::impl {
             trim(now);
             const double  waited = (now - r.t_arrive) / 1000.0;
             const int64_t best   = r.cached_max();
-            const int64_t got    = r.cached[n];
+            const int64_t got    = pool_at(r.cached, n);
             const std::string w  = waited >= 0.5 ? string_format(", waited %.1f s", waited) : "";
             if (r.conv_new) {
-                event("new", r.conv, n, r.shared[n] > 0
-                    ? string_format("~%lld of ~%lld tok shared with others cached here%s", (long long) r.shared[n], (long long) r.prompt_tokens, w.c_str())
+                event("new", r.conv, n, pool_at(r.shared, n) > 0
+                    ? string_format("~%lld of ~%lld tok shared with others cached here%s", (long long) pool_at(r.shared, n),
+                                    (long long) r.prompt_tokens, w.c_str())
                     : string_format("~%lld tok%s", (long long) r.prompt_tokens, w.c_str()));
             } else if (best == 0) {
                 event("cold", r.conv, n, string_format("no node holds it, ~%lld tok%s", (long long) r.prompt_tokens, w.c_str()));
@@ -1203,7 +1475,7 @@ struct server_pool_fork::impl {
                     (long long) r.prompt_tokens, w.c_str()));
             } else {
                 int from = 0;
-                for (int i = 0; i < (int) nodes.size(); ++i) {
+                for (int i = 0; i < (int) r.cached.size(); ++i) {
                     from = r.cached[i] > r.cached[from] ? i : from;
                 }
                 move_why = string_format("~%lld tok cached on %s (%s), ~%lld here, ~%lld tok to compute%s",
@@ -1225,7 +1497,7 @@ struct server_pool_fork::impl {
                 c.prompt_tokens = r.prompt_tokens;
                 c.t_last = pool_wall_ms();
                 c.n++;
-                c.held.resize(nodes.size(), 0);
+                c.held.resize(n_nodes.load(), 0);
                 c.held[n] = r.prompt_tokens;
             }
         }
@@ -1252,14 +1524,14 @@ struct server_pool_fork::impl {
         }
 
         try {
-            auto proxy = proxy_to(n, req, method);
+            auto proxy = proxy_to(n, req, method, body);
             server_http_proxy * p = proxy.get();
-            const uint64_t id = r.id;
-            // the end of the answer, for its timings: the prefill speed, and the share of what the node held of the prompt
-            // from other conversations that it reused (not when the state of the conversation came along)
-            const bool   sample     = !moved && r.shared[n] >= cfg.move_tokens && r.prompt_tokens > 0;
-            const double shared     = sample ? (double) r.shared[n] / r.prompt_tokens : 0.0;
-            const double shared_max = sample ? (double) r.shared_max[n] / r.prompt_tokens : 0.0;
+            const uint64_t req_id = r.id;
+            // the end of the answer, for its timings: the prefill and decode speeds, and the share of what the node held
+            // of the prompt from other conversations that it reused (not when the state of the conversation came along)
+            const bool   sample     = !moved && pool_at(r.shared, n) >= cfg.move_tokens && r.prompt_tokens > 0;
+            const double shared     = sample ? (double) pool_at(r.shared, n) / r.prompt_tokens : 0.0;
+            const double shared_max = sample ? (double) pool_at(r.shared_max, n) / r.prompt_tokens : 0.0;
             auto tail = std::make_shared<std::string>();
             auto next = proxy->next;
             proxy->next = [next, tail](std::string & out) -> bool {
@@ -1270,28 +1542,15 @@ struct server_pool_fork::impl {
                 }
                 return more;
             };
-            proxy->cleanup = [this, id, p, n, tail, shared, shared_max]() {
+            proxy->cleanup = [this, req_id, p, n, tail, shared, shared_max]() {
                 note_timings(n, *tail, shared, shared_max);
-                release(id, p->status);
+                release(req_id, p->status);
             };
             return std::unique_ptr<server_http_res>(std::move(proxy));
         } catch (...) {
             release(r.id, 500);
             throw;
         }
-    }
-
-    // a request that takes no slot goes to any node that is up
-    server_http_res_ptr forward_any(const server_http_req & req, const std::string & method) {
-        int n;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            n = any_node();
-        }
-        if (n < 0) {
-            return pool_error(503, "no node of the pool is up");
-        }
-        return std::unique_ptr<server_http_res>(proxy_to(n, req, method));
     }
 
     //
@@ -1343,8 +1602,8 @@ struct server_pool_fork::impl {
         n.prompt_tps = pp;
     }
 
-    // the state of a model on a node in router mode: up when its instance is loaded
-    static std::string model_state(httplib::Client & cli, const httplib::Headers & hdrs, const std::string & model, std::string & error) {
+    // the state of the model on a router: up when its instance is loaded
+    static std::string model_state(httplib::Client & cli, const httplib::Headers & hdrs, const std::string & name, std::string & error) {
         auto rm = cli.Get("/models", hdrs);
         if (!rm || rm->status != 200) {
             error = rm ? "models: HTTP " + std::to_string(rm->status) : httplib::to_string(rm.error());
@@ -1359,7 +1618,7 @@ struct server_pool_fork::impl {
         }
         if (list) {
             for (const auto & m : *list) {
-                if (!m.is_object() || !pool_model_named(m, model)) {
+                if (!m.is_object() || !pool_model_named(m, name)) {
                     continue;
                 }
                 const std::string v = m.contains("status") && m.at("status").is_object()
@@ -1370,37 +1629,36 @@ struct server_pool_fork::impl {
                 if (v == "loading" || v == "downloading") {
                     return "loading";
                 }
-                error = "model " + model + " is " + (v.empty() ? "unknown" : v);
+                error = "model " + name + " is " + (v.empty() ? "unknown" : v);
                 return "unloaded";
             }
         }
-        error = "no model " + model + " on the node";
+        error = "no model " + name + " on the node";
         return "down";
     }
 
-    // a node of another model than the most of the others takes no request (same_model). the first in the config
-    // decides a tie
+    // a node of another model than the most of the others takes no request (same_model). the first node decides a tie
     void update_mismatch() {
         std::map<std::string, int> count;
-        for (const auto & n : nodes) {
-            if (!n.model_info.empty()) {
-                count[n.model_info.dump()]++;
+        for (int i = 0; i < n_nodes.load(); ++i) {
+            if (!nodes[i].model_info.empty()) {
+                count[nodes[i].model_info.dump()]++;
             }
         }
         std::string ref;
         int n_ref = 0;
-        for (const auto & n : nodes) {
-            if (!n.model_info.empty() && count[n.model_info.dump()] > n_ref) {
-                ref   = n.model_info.dump();
+        for (int i = 0; i < n_nodes.load(); ++i) {
+            if (!nodes[i].model_info.empty() && count[nodes[i].model_info.dump()] > n_ref) {
+                ref   = nodes[i].model_info.dump();
                 n_ref = count[ref];
             }
         }
-        for (int i = 0; i < (int) nodes.size(); ++i) {
+        for (int i = 0; i < n_nodes.load(); ++i) {
             pool_node & n = nodes[i];
             const bool mismatch = cfg.same_model && !n.model_info.empty() && n.model_info.dump() != ref;
             if (mismatch != n.mismatch) {
                 event(mismatch ? "mismatch" : "match", "", i, mismatch
-                    ? "another model than the other nodes (" + n.model_info.dump() + "): it takes no request, same_model = 0 lets it"
+                    ? "another model than the other nodes (" + n.model_info.dump() + "): it takes no request, pool-same-model = 0 lets it"
                     : "the same model as the other nodes again");
                 n.mismatch = mismatch;
                 cv.notify_all();
@@ -1415,10 +1673,12 @@ struct server_pool_fork::impl {
         json        props;
         json        slots;
         json        info;
+        json        router;
     };
 
     // one poll of a node over one link
-    poll_result poll_link(const pool_node & node, const pool_link & l, const httplib::Headers & hdrs, bool want_props) const {
+    poll_result poll_link(const pool_node & node, const pool_link & l, const httplib::Headers & hdrs, bool want_props,
+                          bool want_router) const {
         poll_result pr;
         try {
             httplib::Client cli(pool_base(l));
@@ -1431,16 +1691,20 @@ struct server_pool_fork::impl {
                 return pr;
             }
             pr.reached = true;
-            if (res->status == 503) {
-                pr.status = "loading";
-            } else if (res->status != 200) {
+            if (res->status != 200) {
                 pr.error = "health: HTTP " + std::to_string(res->status);
-            } else {
-                pr.status = node.model.empty() ? "up" : model_state(cli, hdrs, node.model, pr.error);
+                return pr;
             }
+            if (want_router) {
+                auto rr = cli.Get("/pool/router", hdrs);
+                if (rr && rr->status == 200) {
+                    pr.router = json::parse_no_throw(rr->body);
+                }
+            }
+            pr.status = model_state(cli, hdrs, node.model, pr.error);
             if (pr.status == "up") {
-                // a router node passes these to the instance of the model; autoload=0: a poll never loads it
-                const std::string q = node.model.empty() ? "" : "?model=" + node.model + "&autoload=0";
+                // the router passes these to the instance of the model; autoload=0: a poll never loads it
+                const std::string q = "?model=" + node.model + "&autoload=0";
                 if (want_props) {
                     auto rp = cli.Get("/props" + q, hdrs);
                     if (rp && rp->status == 200) {
@@ -1462,73 +1726,98 @@ struct server_pool_fork::impl {
         return pr;
     }
 
-    // the speed of a link both ways (bytes/s, 0 = no answer): one chunk of a move read from the node, one written to it
-    static void probe_link(const pool_node & node, const pool_link & l, const httplib::Headers & hdrs, double & rd, double & wr) {
+    // the speed of a link both ways (bytes/s, 0 = no answer): one chunk of a move read from the router, one written to it
+    static void probe_link(const pool_link & l, const httplib::Headers & hdrs, double & rd, double & wr) {
         httplib::Client cli(pool_base(l));
         cli.set_keep_alive(true);
-        cli.set_connection_timeout(2, 0);
-        cli.set_read_timeout(60, 0);
-        cli.set_write_timeout(60, 0);
-        // a router node passes it to the instance of the model; autoload=0: a probe never loads it
-        const std::string q = node.model.empty() ? "" : "model=" + node.model + "&autoload=0";
+        cli.set_connection_timeout(1, 0);
+        // 16 MiB: 0.2 s over the WiFi; a stop of the router waits for a probe that runs
+        cli.set_read_timeout(15, 0);
+        cli.set_write_timeout(15, 0);
         if (!cli.Get("/health", hdrs)) { // the connection, before the clock starts
             return;
         }
         int64_t t0 = ggml_time_us();
-        auto r = cli.Get("/pool/probe?size=" + std::to_string(POOL_CHUNK) + (q.empty() ? "" : "&" + q), hdrs);
+        auto r = cli.Get("/pool/probe?size=" + std::to_string(POOL_CHUNK), hdrs);
         if (r && r->status == 200 && r->body.size() == POOL_CHUNK) {
             rd = POOL_CHUNK / std::max(1e-6, (ggml_time_us() - t0) / 1e6);
         }
         t0 = ggml_time_us();
-        auto w = cli.Post("/pool/probe" + (q.empty() ? "" : "?" + q), hdrs, std::string(POOL_CHUNK, '\0'), "application/octet-stream");
+        auto w = cli.Post("/pool/probe", hdrs, std::string(POOL_CHUNK, '\0'), "application/octet-stream");
         if (w && w->status == 200 && json_value(json::parse_no_throw(w->body), "size", (uint64_t) 0) == POOL_CHUNK) {
             wr = POOL_CHUNK / std::max(1e-6, (ggml_time_us() - t0) / 1e6);
         }
     }
 
+    // the links of a node in the order a poll tries them: the one in use, then the faster measured ones (the ones not
+    // measured last); every probe_s seconds the faster ones first, so that a node goes back to a faster link that
+    // answers again. under mu
+    std::vector<int> link_order(const pool_node & node, bool retry) const {
+        std::vector<int> rest;
+        for (int k = 0; k < (int) node.links.size(); ++k) {
+            if (k != node.link) {
+                rest.push_back(k);
+            }
+        }
+        std::stable_sort(rest.begin(), rest.end(), [&](int a, int b) {
+            return pool_link_rank(node.links[a]) > pool_link_rank(node.links[b]);
+        });
+        std::vector<int> order;
+        const double cur = pool_link_rank(node.links[node.link]);
+        if (retry) {
+            for (int k : rest) {
+                if (pool_link_rank(node.links[k]) > cur) {
+                    order.push_back(k);
+                }
+            }
+        }
+        order.push_back(node.link);
+        for (int k : rest) {
+            if (std::find(order.begin(), order.end(), k) == order.end()) {
+                order.push_back(k);
+            }
+        }
+        return order;
+    }
+
     void poll_node(int i) {
         pool_node & node = nodes[i];
-        httplib::Headers hdrs;
-        if (!node.api_key.empty()) {
-            hdrs.emplace("Authorization", "Bearer " + node.api_key);
-        }
+        const httplib::Headers hdrs = auth_headers();
+        int64_t t_router = 0;
 
         while (!stopping.load()) {
             const int64_t t0 = ggml_time_ms();
+            std::vector<int> order;
+            std::vector<pool_link> links;
             int  active;
             bool want_props;
-            bool probe;
+            bool want_router;
+            bool retry;
             {
                 std::lock_guard<std::mutex> lk(mu);
-                active     = node.link;
-                want_props = node.status != "up" || t0 - node.t_props > 30000;
-                probe      = active > 0 && t0 - node.t_probe >= (int64_t) cfg.probe_s * 1000;
-                if (probe) {
+                want_props  = node.status != "up" || t0 - node.t_props > 30000;
+                want_router = !node.self && t0 - t_router >= 5000;
+                retry = t0 - node.t_probe >= (int64_t) cfg.probe_s * 1000;
+                if (retry) {
                     node.t_probe = t0;
                 }
-            }
-            // the links in the order they are tried, the first that answers serves: on a fallback the ones before it
-            // now and then, the one in use, then the others in the order of the config
-            std::vector<int> order;
-            for (int k = 0; probe && k < active; ++k) {
-                order.push_back(k);
-            }
-            order.push_back(active);
-            for (int k = 0; k < (int) node.links.size(); ++k) {
-                if (k != active && !(probe && k < active)) {
-                    order.push_back(k);
-                }
+                order  = link_order(node, retry);
+                links  = node.links;
+                active = node.link;
             }
             poll_result pr;
             int used = -1;
             std::vector<std::pair<int, std::string>> failed;
             for (int k : order) {
-                pr = poll_link(node, node.links[k], hdrs, want_props || k != active);
+                pr = poll_link(node, links[k], hdrs, want_props || k != active, want_router);
                 if (pr.reached) {
                     used = k;
                     break;
                 }
                 failed.push_back({k, pr.error});
+            }
+            if (used >= 0 && want_router) {
+                t_router = t0;
             }
 
             {
@@ -1542,7 +1831,7 @@ struct server_pool_fork::impl {
                     node.links[used].error.clear();
                     if (used != node.link) {
                         const pool_link & was = node.links[node.link];
-                        const std::string why = used < node.link ? "back to a preferred link" : pool_base(was) + ": " + was.error;
+                        const std::string why = was.error.empty() ? "a faster link" : pool_base(was) + ": " + was.error;
                         event("link", "", i, pool_base(node.links[used]) + " (" + why + ")");
                         SRV_INF("pool: node %s now on %s (%s)\n", node.name.c_str(), pool_base(node.links[used]).c_str(), why.c_str());
                         node.link = used;
@@ -1578,35 +1867,52 @@ struct server_pool_fork::impl {
                     node.model_info = pr.info.contains("model") && pr.info.at("model").is_object() ? pr.info.at("model") : json::object();
                     update_mismatch();
                 }
+                if (!pr.router.is_discarded() && pr.router.is_object() && pr.router.contains("peers")) {
+                    node.peers = pr.router.at("peers");
+                }
                 int reported = json_value(node.props, "total_slots", 0);
                 if (reported <= 0) {
                     reported = (int) node.slot_state.size();
                 }
-                node.slots    = node.slots_cfg > 0 ? node.slots_cfg : reported;
+                node.slots    = reported;
                 node.external = std::max(0, node.busy - node.inflight);
                 cv.notify_all();
             }
 
-            // a link of a node that moves conversations is measured when it starts to serve, until then a move is
-            // weighed at the speed of the config. the moves measure it from then on
+            // a link is measured when it first answers (one that did not answer, every probe_s seconds), the moves
+            // measure it from then on; a node goes to a link that measured faster than the one in use (a quarter more)
             if (used >= 0) {
-                bool need;
-                {
-                    std::lock_guard<std::mutex> lk(mu);
-                    pool_link & l = node.links[used];
-                    need = cfg.migrate && node.migrate && node.status == "up" && !l.probed;
-                    l.probed = l.probed || need;
-                }
-                if (need) {
+                for (int k = 0; k < (int) links.size() && !stopping.load(); ++k) {
+                    bool need;
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        pool_link & l = node.links[k];
+                        need = !l.probed && (k == used || l.error.empty() || retry);
+                        l.probed = l.probed || need;
+                    }
+                    if (!need) {
+                        continue;
+                    }
                     double rd = 0.0;
                     double wr = 0.0;
-                    probe_link(node, node.links[used], hdrs, rd, wr);
+                    probe_link(links[k], hdrs, rd, wr);
                     std::lock_guard<std::mutex> lk(mu);
-                    pool_link & l = node.links[used];
+                    pool_link & l = node.links[k];
+                    if (rd <= 0 && wr <= 0) {
+                        l.probed = false;
+                        l.error  = l.error.empty() ? "no answer to the probe" : l.error;
+                        continue;
+                    }
+                    l.error.clear();
                     l.bps_read  = l.bps_read  > 0 ? l.bps_read  : rd;
                     l.bps_write = l.bps_write > 0 ? l.bps_write : wr;
                     SRV_INF("pool: link %s of node %s: %.0f MB/s from it, %.0f MB/s to it\n", pool_base(l).c_str(),
                             node.name.c_str(), rd / 1e6, wr / 1e6);
+                    if (k != node.link && pool_link_rank(l) > 1.25 * pool_link_rank(node.links[node.link])) {
+                        event("link", "", i, string_format("%s (a faster link: %.0f MB/s)", pool_base(l).c_str(), pool_link_rank(l) / 1e6));
+                        SRV_INF("pool: node %s now on %s (a faster link)\n", node.name.c_str(), pool_base(l).c_str());
+                        node.link = k;
+                    }
                 }
             }
 
@@ -1616,68 +1922,209 @@ struct server_pool_fork::impl {
         }
     }
 
-    // [pool] model: the pool names the model, the same whichever node answers; of the list of a router node only the
-    // model of the node
-    server_http_res_ptr models_alias() {
-        int n;
-        pool_link l;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            n = any_node();
-            if (n >= 0) {
-                l = nodes[n].links[nodes[n].link];
+    //
+    // the discovery
+    //
+
+    std::string proof_of(const std::string & challenge, const std::string & prover) const {
+        if (api_key.empty()) {
+            return "";
+        }
+        const std::string s = api_key + "|" + challenge + "|" + prover;
+        return hash_sha256_hex(s.data(), s.size());
+    }
+
+    json hello_of(const char * type) const {
+        return {{"llama_pool", 1}, {"t", type}, {"id", id}, {"i", instance}, {"name", cfg.name}, {"port", http_port},
+                {"names", std::vector<std::string>(names.begin(), names.end())}};
+    }
+
+    std::string challenge() {
+        const std::string c = pool_random_hex();
+        const int64_t now = ggml_time_ms();
+        for (auto it = challenges.begin(); it != challenges.end(); ) {
+            it = now - it->second > 60000 ? challenges.erase(it) : std::next(it);
+        }
+        challenges[c] = now;
+        return c;
+    }
+
+    // a datagram from addr:port. hello (a broadcast): answer with a proof of the key for its challenge and a challenge
+    // of our own; proof: the other router answered our challenge, the link counts, and it gets a proof back if it asks
+    void on_datagram(const std::string & data, uint32_t addr, int port) {
+        const json m = json::parse_no_throw(data);
+        if (m.is_discarded() || !m.is_object() || json_value(m, "llama_pool", 0) != 1) {
+            return;
+        }
+        const std::string peer = json_value(m, "id", std::string());
+        const int peer_port    = json_value(m, "port", 0);
+        if (peer == id && json_value(m, "i", instance) != instance) {
+            // a router of another machine with the same host name and port: they cannot tell each other apart
+            const int64_t now = ggml_time_ms();
+            if (now - t_conflict > 60000) {
+                t_conflict = now;
+                char host[INET_ADDRSTRLEN] = {};
+                in_addr ia = {};
+                ia.s_addr = addr;
+                inet_ntop(AF_INET, &ia, host, sizeof(host));
+                SRV_WRN("pool: the router at %s has the same id %s: give one of them a name (pool-name in models.ini)\n", host, id.c_str());
+                std::lock_guard<std::mutex> lk(mu);
+                event("conflict", "", 0, std::string("the router at ") + host + " has the same id " + id + ": pool-name in models.ini on one of them");
+            }
+            return;
+        }
+        if (peer.empty() || peer == id || peer_port <= 0 || !m.contains("names") || !m.at("names").is_array()) {
+            return;
+        }
+        std::vector<std::string> peer_names;
+        bool shared = false;
+        for (const auto & nm : m.at("names")) {
+            if (nm.is_string()) {
+                peer_names.push_back(nm.get<std::string>());
+                shared = shared || names.count(peer_names.back()) > 0;
             }
         }
-        if (n < 0) {
-            return pool_error(503, "no node of the pool is up");
+        if (!shared) {
+            return; // another model, another pool
         }
-        const pool_node & node = nodes[n];
-        httplib::Client cli(pool_base(l));
-        cli.set_connection_timeout(2, 0);
-        cli.set_read_timeout(10, 0);
-        httplib::Headers h;
-        if (!node.api_key.empty()) {
-            h.emplace("Authorization", "Bearer " + node.api_key);
+        const std::string type = json_value(m, "t", std::string());
+        const std::string c    = json_value(m, "c", std::string());
+        if (type == "hello" || (type == "proof" && !c.empty())) {
+            json ans = hello_of("proof");
+            ans["a"] = c;
+            ans["p"] = proof_of(c, id);
+            if (type == "hello") {
+                ans["c"] = challenge();
+            }
+            pool_udp_send(sock_reply, addr, port, ans.dump());
         }
-        auto res = cli.Get("/v1/models", h);
-        json j = res && res->status == 200 ? json::parse_no_throw(res->body) : json();
-        if (j.is_discarded() || !j.is_object()) {
-            return pool_error(502, "node " + node.name + ": " + pool_error_text(res));
+        if (type != "proof") {
+            return;
         }
-        for (const char * key : {"data", "models"}) {
-            if (!j.contains(key) || !j.at(key).is_array()) {
+        const std::string a = json_value(m, "a", std::string());
+        const std::string p = json_value(m, "p", std::string());
+        if (challenges.count(a) == 0 || p != proof_of(a, peer)) {
+            SRV_DBG("pool: %s did not answer the challenge (another key)\n", peer.c_str());
+            return;
+        }
+        char host[INET_ADDRSTRLEN] = {};
+        in_addr ia = {};
+        ia.s_addr = addr;
+        inet_ntop(AF_INET, &ia, host, sizeof(host));
+        found(peer, json_value(m, "name", std::string()), host, peer_port, peer_names, "broadcast");
+    }
+
+    // a router given in peers: GET /pool/router with the key, which the config trusts it with
+    void try_peer(const std::string & peer) {
+        std::string host;
+        int port = 0;
+        try {
+            pool_parse_host_port(peer, host, port);
+        } catch (const std::exception & e) {
+            SRV_WRN("pool: %s\n", e.what());
+            return;
+        }
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(1, 0);
+        cli.set_read_timeout(3, 0);
+        auto r = cli.Get("/pool/router", auth_headers());
+        const json j = r && r->status == 200 ? json::parse_no_throw(r->body) : json();
+        if (!j.is_object() || !j.contains("names") || !j.at("names").is_array()) {
+            return;
+        }
+        std::vector<std::string> peer_names;
+        bool shared = false;
+        for (const auto & nm : j.at("names")) {
+            if (nm.is_string()) {
+                peer_names.push_back(nm.get<std::string>());
+                shared = shared || names.count(peer_names.back()) > 0;
+            }
+        }
+        const std::string peer_id = json_value(j, "id", std::string());
+        if (shared && !peer_id.empty() && peer_id != id) {
+            found(peer_id, json_value(j, "name", std::string()), host, port, peer_names, "peers");
+        }
+    }
+
+    void discovery_loop() {
+        int64_t t_hello = 0;
+        int64_t t_peers = 0;
+        const int64_t t_start = ggml_time_ms();
+        std::vector<char> buf(4096);
+        while (!stopping.load()) {
+            const int64_t now = ggml_time_ms();
+            // a hello every 2 s for the first 30 s, then every 15 s: a router that starts is found within a round trip
+            const int64_t every = now - t_start < 30000 ? 2000 : 15000;
+            if (cfg.discover && sock_reply != INVALID_SOCKET && now - t_hello >= every) {
+                t_hello = now;
+                json h = hello_of("hello");
+                h["c"] = challenge();
+                const std::string msg = h.dump();
+                for (uint32_t a : pool_broadcast_addrs()) {
+                    pool_udp_send(sock_reply, a, cfg.port, msg);
+                }
+            }
+            if (!cfg.peers.empty() && now - t_peers >= every) {
+                t_peers = now;
+                for (const auto & peer : cfg.peers) {
+                    try_peer(peer);
+                }
+            }
+            if (sock_reply == INVALID_SOCKET && sock_bcast == INVALID_SOCKET) {
+                std::unique_lock<std::mutex> lk(mu_stop);
+                cv_stop.wait_for(lk, std::chrono::milliseconds(250), [&] { return stopping.load(); });
                 continue;
             }
-            json kept = json::array();
-            for (json m : j.at(key)) {
-                if (!m.is_object()) {
-                    continue;
+            fd_set rd;
+            FD_ZERO(&rd);
+            socket_t hi = 0;
+            for (socket_t s : {sock_bcast, sock_reply}) {
+                if (s != INVALID_SOCKET) {
+                    FD_SET(s, &rd);
+                    hi = std::max(hi, s);
                 }
-                const std::string id = json_value(m, "id", json_value(m, "model", json_value(m, "name", std::string())));
-                if (!node.model.empty() && id != node.model && !pool_model_named(m, node.model)) {
-                    continue;
-                }
-                for (const char * f : {"id", "model", "name"}) {
-                    if (m.contains(f)) {
-                        m[f] = cfg.model;
-                    }
-                }
-                if (m.contains("aliases")) {
-                    m["aliases"] = json::array({cfg.model});
-                }
-                kept.push_back(m);
-                break;
             }
-            j[key] = kept;
+            timeval tv = {0, 250000};
+            if (select((int) hi + 1, &rd, nullptr, nullptr, &tv) <= 0) {
+                continue;
+            }
+            for (socket_t s : {sock_bcast, sock_reply}) {
+                if (s == INVALID_SOCKET || !FD_ISSET(s, &rd)) {
+                    continue;
+                }
+                sockaddr_in from = {};
+                socklen_t len = sizeof(from);
+                const int n = (int) recvfrom(s, buf.data(), (int) buf.size(), 0, (sockaddr *) &from, &len);
+                if (n > 0) {
+                    on_datagram(std::string(buf.data(), n), from.sin_addr.s_addr, ntohs(from.sin_port));
+                }
+            }
         }
-        auto out = std::make_unique<server_http_res>();
-        out->data = safe_json_to_str(j);
-        return out;
     }
 
     //
-    // the dashboard
+    // the dashboard, and what the other routers read
     //
+
+    json router_json() {
+        std::lock_guard<std::mutex> lk(mu);
+        json peers = json::array();
+        for (int i = 0; i < n_nodes.load(); ++i) {
+            const pool_node & n = nodes[i];
+            if (n.self) {
+                continue;
+            }
+            json links = json::array();
+            for (int k = 0; k < (int) n.links.size(); ++k) {
+                const pool_link & l = n.links[k];
+                links.push_back({{"url", pool_base(l)}, {"active", k == n.link}, {"error", l.error},
+                                 {"mbps_in", l.bps_read * 8 / 1e6}, {"mbps_out", l.bps_write * 8 / 1e6}});
+            }
+            peers.push_back({{"id", n.id}, {"name", n.name}, {"status", n.status}, {"links", links}});
+        }
+        return {{"id", id}, {"name", cfg.name}, {"port", http_port}, {"model", model},
+                {"names", std::vector<std::string>(names.begin(), names.end())}, {"peers", peers}};
+    }
 
     json status_json() {
         std::lock_guard<std::mutex> lk(mu);
@@ -1687,7 +2134,7 @@ struct server_pool_fork::impl {
         json jnodes = json::array();
         int up = 0, slots_total = 0, slots_busy = 0, inflight = 0;
         double gen = 0.0, pp = 0.0;
-        for (int i = 0; i < (int) nodes.size(); ++i) {
+        for (int i = 0; i < n_nodes.load(); ++i) {
             const pool_node & n = nodes[i];
             json jslots = json::array();
             for (const auto & s : n.slot_state) {
@@ -1698,21 +2145,21 @@ struct server_pool_fork::impl {
                 });
             }
             json jrun = json::array();
-            for (const auto & [id, r] : running) {
+            for (const auto & [rid, r] : running) {
                 if (r.node == i) {
-                    jrun.push_back({{"id", id}, {"conv", r.conv}, {"age_ms", now - r.t_start}, {"path", r.path}, {"stage", r.stage}});
+                    jrun.push_back({{"id", rid}, {"conv", r.conv}, {"age_ms", now - r.t_start}, {"path", r.path}, {"stage", r.stage}});
                 }
             }
             int queued_for = 0;
             for (const pool_req * q : queue) {
                 queued_for += holder(*q) == i ? 1 : 0;
             }
-            std::string model = json_value(n.props, "model_alias", std::string());
-            if (model.empty()) {
-                model = json_value(n.props, "model_path", std::string());
+            std::string model_name = json_value(n.props, "model_alias", std::string());
+            if (model_name.empty()) {
+                model_name = json_value(n.props, "model_path", std::string());
             }
-            if (model.find_last_of("/\\") != std::string::npos) {
-                model = model.substr(model.find_last_of("/\\") + 1);
+            if (model_name.find_last_of("/\\") != std::string::npos) {
+                model_name = model_name.substr(model_name.find_last_of("/\\") + 1);
             }
             int n_ctx = 0;
             if (n.props.contains("default_generation_settings") && n.props.at("default_generation_settings").is_object()) {
@@ -1723,17 +2170,23 @@ struct server_pool_fork::impl {
                 const pool_link & l = n.links[k];
                 jlinks.push_back({
                     {"url", pool_base(l)}, {"active", k == n.link}, {"error", l.error},
-                    {"mbps_read", l.bps_read * 8 / 1e6}, {"mbps_write", l.bps_write * 8 / 1e6}, {"mbps_cfg", l.mbps_cfg},
+                    {"mbps_read", l.bps_read * 8 / 1e6}, {"mbps_write", l.bps_write * 8 / 1e6}, {"mbps_cfg", 0},
                 });
             }
+            // on a fallback: a link that answered measured faster than the one in use
+            bool fallback = false;
+            for (const auto & l : n.links) {
+                fallback = fallback || (l.error.empty() && pool_link_rank(l) > pool_link_rank(n.links[n.link]));
+            }
             jnodes.push_back({
-                {"name", n.name}, {"url", pool_base(n.links[n.link])}, {"fallback", n.link > 0}, {"links", jlinks},
+                {"name", n.name}, {"id", n.id}, {"self", n.self}, {"url", pool_base(n.links[n.link])},
+                {"fallback", fallback}, {"links", jlinks},
                 {"status", n.status}, {"draining", n.draining}, {"mismatch", n.mismatch}, {"error", n.error},
-                {"model", model}, {"model_info", n.model_info}, {"migrate", n.migrate}, {"signature", n.signature},
+                {"model", model_name}, {"model_info", n.model_info}, {"migrate", n.migrate}, {"signature", n.signature},
                 {"n_ctx", n_ctx}, {"slots", n.slots}, {"inflight", n.inflight}, {"busy", n.busy},
-                {"external", n.external}, {"weight", n.weight}, {"requests", n.n_requests},
+                {"external", n.external}, {"weight", weight_of(i)}, {"requests", n.n_requests},
                 {"gen_tps", n.gen_tps}, {"prompt_tps", n.prompt_tps}, {"queued_for", queued_for},
-                {"prefill_tps", n.prefill_tps}, {"prefill_cfg", n.prefill_cfg > 0 ? n.prefill_cfg : cfg.prefill_tps},
+                {"prefill_tps", n.prefill_tps}, {"prefill_cfg", cfg.prefill_tps}, {"decode_tps", n.decode_tps},
                 {"share", n.share},
                 {"seen_ms", n.t_ok > 0 ? now - n.t_ok : -1}, {"devices", n.devices}, {"slot_list", jslots}, {"running", jrun},
             });
@@ -1753,7 +2206,7 @@ struct server_pool_fork::impl {
         for (const pool_req * q : queue) {
             const int64_t best = q->cached_max();
             std::string want;
-            for (int i = 0; i < (int) nodes.size() && best > 0; ++i) {
+            for (int i = 0; i < (int) q->cached.size() && best > 0; ++i) {
                 if (q->cached[i] == best) {
                     want += (want.empty() ? "" : ", ") + nodes[i].name;
                 }
@@ -1768,13 +2221,13 @@ struct server_pool_fork::impl {
         std::sort(cs.begin(), cs.end(), [](const auto & a, const auto & b) { return a.second.t_last > b.second.t_last; });
         json jconvs = json::array();
         for (size_t i = 0; i < cs.size() && i < 60; ++i) {
-            const auto & [id, c] = cs[i];
+            const auto & [cid, c] = cs[i];
             bool active = false;
             for (const auto & [rid, r] : running) {
-                active = active || r.conv == id;
+                active = active || r.conv == cid;
             }
             jconvs.push_back({
-                {"conv", id}, {"node", c.node >= 0 ? nodes[c.node].name : ""}, {"messages", c.depth},
+                {"conv", cid}, {"node", c.node >= 0 ? nodes[c.node].name : ""}, {"messages", c.depth},
                 {"cached_tokens", c.est_tokens}, {"prompt_tokens", c.prompt_tokens}, {"age_ms", wall - c.t_last},
                 {"requests", c.n}, {"active", active},
             });
@@ -1786,16 +2239,17 @@ struct server_pool_fork::impl {
         }
 
         return {
-            {"name", cfg.name}, {"time", wall},
+            {"name", cfg.name}, {"id", id}, {"time", wall},
             {"pool", {
-                {"nodes_up", up}, {"nodes", (int) nodes.size()}, {"slots", slots_total}, {"slots_busy", slots_busy},
+                {"nodes_up", up}, {"nodes", n_nodes.load()}, {"slots", slots_total}, {"slots_busy", slots_busy},
                 {"inflight", inflight}, {"queued", (int) queue.size()}, {"gen_tps", gen}, {"prompt_tps", pp},
                 {"conversations", (int) convs.size()}, {"prefixes", (int) affinity.size()},
             }},
             {"config", {
+                {"model", model}, {"names", std::vector<std::string>(names.begin(), names.end())},
                 {"move_tokens", cfg.move_tokens}, {"wait_max", cfg.wait_max_s}, {"prefill_tps", cfg.prefill_tps},
-                {"poll_ms", cfg.poll_ms}, {"model", cfg.model}, {"migrate", cfg.migrate}, {"link_mbps", cfg.link_mbps},
-                {"same_model", cfg.same_model},
+                {"poll_ms", cfg.poll_ms}, {"migrate", cfg.migrate}, {"link_mbps", cfg.link_mbps},
+                {"same_model", cfg.same_model}, {"port", cfg.port}, {"discover", cfg.discover}, {"peers", cfg.peers},
             }},
             {"state_kib_per_token", state_bpt / 1024},
             {"nodes", jnodes}, {"queue", jqueue}, {"conversations", jconvs}, {"events", jevents},
@@ -1807,16 +2261,32 @@ struct server_pool_fork::impl {
 // server_pool_fork
 //
 
-server_pool_fork::server_pool_fork(const common_params & params) : pimpl(std::make_unique<impl>(params)) {
-    pimpl->load(params.pool_file);
-    for (const auto & n : pimpl->nodes) {
-        std::string urls;
-        for (const auto & l : n.links) {
-            urls += (urls.empty() ? "" : ", then ") + pool_base(l);
+std::unique_ptr<server_pool_fork> server_pool_fork::create(const common_params & params, server_models_routes & models_routes) {
+    std::vector<std::string> pooled;
+    for (const auto & meta : models_routes.models.get_all_meta()) {
+        std::string val;
+        if (meta.preset.get_option(COMMON_ARG_PRESET_POOL_FORK, val) && common_arg_utils::is_truthy(val)) {
+            pooled.push_back(meta.name);
         }
-        SRV_INF("pool: node %s at %s%s\n", n.name.c_str(), urls.c_str(),
-                n.slots_cfg > 0 ? string_format(", %d slots", n.slots_cfg).c_str() : "");
     }
+    if (pooled.empty()) {
+        return nullptr;
+    }
+    if (pooled.size() > 1) {
+        SRV_WRN("pool: %zu models have pool = on, the pool takes %s only\n", pooled.size(), pooled.front().c_str());
+    }
+    return std::make_unique<server_pool_fork>(params, models_routes, pooled.front());
+}
+
+server_pool_fork::server_pool_fork(const common_params & params, server_models_routes & models_routes, const std::string & model)
+        : pimpl(std::make_unique<impl>(params, models_routes)) {
+    pimpl->init(model);
+    std::string list;
+    for (const auto & nm : pimpl->names) {
+        list += (list.empty() ? "" : ", ") + nm;
+    }
+    SRV_INF("pool: %s shares %s (%s) as %s%s\n", pimpl->id.c_str(), model.c_str(), list.c_str(), pimpl->cfg.name.c_str(),
+            pimpl->api_key.empty() ? "" : ", its links need the key");
 }
 
 server_pool_fork::~server_pool_fork() {
@@ -1824,21 +2294,46 @@ server_pool_fork::~server_pool_fork() {
 }
 
 void server_pool_fork::start() {
-    for (int i = 0; i < (int) pimpl->nodes.size(); ++i) {
-        pimpl->pollers.emplace_back([this, i]() { pimpl->poll_node(i); });
+    impl * p = pimpl.get();
+    if (p->started.exchange(true)) {
+        return;
     }
+    p->start_poller(0);
+    p->sock_reply = pool_udp_socket(0, false);
+    if (p->cfg.discover) {
+        p->sock_bcast = pool_udp_socket(p->cfg.port, true);
+        if (p->sock_bcast == INVALID_SOCKET) {
+            // the answers to its own broadcasts still come: it finds the others, they find it only by their answers
+            SRV_WRN("pool: cannot listen on UDP port %d, the other routers find this one only when it asks\n", p->cfg.port);
+        }
+    }
+    if (p->sock_reply == INVALID_SOCKET) {
+        SRV_WRN("%s", "pool: no UDP socket, the routers of the pool are found only from pool-peers\n");
+    }
+    p->discovery = std::thread([p]() { p->discovery_loop(); });
 }
 
 void server_pool_fork::stop() {
-    if (pimpl->stopping.exchange(true)) {
+    impl * p = pimpl.get();
+    if (p->stopping.exchange(true)) {
         return;
     }
     {
-        std::lock_guard<std::mutex> lk(pimpl->mu_stop);
+        std::lock_guard<std::mutex> lk(p->mu_stop);
     }
-    pimpl->cv_stop.notify_all();
-    pimpl->cv.notify_all();
-    for (auto & t : pimpl->pollers) {
+    p->cv_stop.notify_all();
+    p->cv.notify_all();
+    if (p->discovery.joinable()) {
+        p->discovery.join();
+    }
+    pool_sock_close(p->sock_bcast);
+    pool_sock_close(p->sock_reply);
+    std::vector<std::thread> threads;
+    {
+        std::lock_guard<std::mutex> lk(p->mu_threads);
+        threads.swap(p->pollers);
+    }
+    for (auto & t : threads) {
         if (t.joinable()) {
             t.join();
         }
@@ -1848,77 +2343,31 @@ void server_pool_fork::stop() {
 void server_pool_fork::attach(server_http_context & ctx_http, server_routes & routes) {
     impl * p = pimpl.get();
 
-    auto slot_post = [p](const server_http_req & req) { return p->forward_slot(req, "POST"); };
-    auto any_post  = [p](const server_http_req & req) { return p->forward_any(req, "POST"); };
-    auto any_get   = [p](const server_http_req & req) { return p->forward_any(req, "GET"); };
-    auto node_only = [](const server_http_req &) {
-        return pool_error(400, "a pool does not route this request: send it to a node directly");
-    };
-
-    routes.get_health = [p](const server_http_req &) {
-        int up = 0;
-        {
-            std::lock_guard<std::mutex> lk(p->mu);
-            for (const auto & n : p->nodes) {
-                up += n.status == "up" ? 1 : 0;
-            }
-        }
-        auto res = std::make_unique<server_http_res>();
-        res->status = up > 0 ? 200 : 503;
-        res->data = safe_json_to_str({{"status", up > 0 ? "ok" : "no node is up"}, {"nodes_up", up}});
-        return res;
-    };
-    routes.get_slots = [p](const server_http_req &) {
-        json out = json::array();
-        {
-            std::lock_guard<std::mutex> lk(p->mu);
-            for (const auto & n : p->nodes) {
-                for (const auto & s : n.slot_state) {
-                    out.push_back({{"node", n.name}, {"id", s.id}, {"is_processing", s.processing}, {"n_ctx", s.n_ctx},
-                                   {"n_prompt_tokens", s.n_prompt}, {"n_decoded", s.n_decoded}});
+    // a request for the model goes through the pool, unless another router of the pool sent it here; any other request
+    // stays with this router
+    auto wrap = [p](server_http_context::handler_t own) -> server_http_context::handler_t {
+        return [p, own](const server_http_req & req) -> server_http_res_ptr {
+            if (pool_header(req.headers, "x-llama-pool").empty()) {
+                const json body = json::parse_no_throw(req.body);
+                if (body.is_object() && p->names.count(json_value(body, "model", std::string())) > 0) {
+                    return p->forward_slot(req, "POST", body);
                 }
             }
-        }
-        auto res = std::make_unique<server_http_res>();
-        res->data = safe_json_to_str(out);
-        return res;
+            return own(req);
+        };
     };
-
-    routes.get_props                   = any_get;
-    routes.get_models                  = any_get;
-    if (!p->cfg.model.empty()) {
-        routes.get_models = [p](const server_http_req &) { return p->models_alias(); };
-    }
-    routes.get_lora_adapters           = any_get;
-    routes.get_metrics                 = node_only;
-    routes.post_props                  = node_only;
-    routes.post_slots                  = node_only;
-    routes.post_control                = node_only;
-    routes.post_lora_adapters          = node_only;
-
-    routes.post_completions            = slot_post;
-    routes.post_completions_oai        = slot_post;
-    routes.post_chat_completions       = slot_post;
-    routes.post_responses_oai          = slot_post;
-    routes.post_anthropic_messages     = slot_post;
-    routes.post_infill                 = slot_post;
-    routes.post_embeddings             = slot_post;
-    routes.post_embeddings_oai         = slot_post;
-    routes.post_rerank                 = slot_post;
-    routes.post_transcriptions_oai     = slot_post;
-    routes.post_tts                    = slot_post;
-    routes.post_systemone              = slot_post;
-
-    routes.post_chat_completions_tok   = any_post;
-    routes.post_responses_tok_oai      = any_post;
-    routes.post_anthropic_count_tokens = any_post;
-    routes.post_tokenize               = any_post;
-    routes.post_detokenize             = any_post;
-    routes.post_apply_template         = any_post;
-
-    routes.ws_realtime = [](const server_http_req &, server_http_context::ws_conn & conn) {
-        conn.close();
-    };
+    routes.post_completions            = wrap(routes.post_completions);
+    routes.post_completions_oai        = wrap(routes.post_completions_oai);
+    routes.post_chat_completions       = wrap(routes.post_chat_completions);
+    routes.post_responses_oai          = wrap(routes.post_responses_oai);
+    routes.post_anthropic_messages     = wrap(routes.post_anthropic_messages);
+    routes.post_infill                 = wrap(routes.post_infill);
+    routes.post_embeddings             = wrap(routes.post_embeddings);
+    routes.post_embeddings_oai         = wrap(routes.post_embeddings_oai);
+    routes.post_rerank                 = wrap(routes.post_rerank);
+    routes.post_transcriptions_oai     = wrap(routes.post_transcriptions_oai);
+    routes.post_tts                    = wrap(routes.post_tts);
+    routes.post_systemone              = wrap(routes.post_systemone);
 
     ctx_http.get("/pool", [](const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
@@ -1937,7 +2386,7 @@ void server_pool_fork::attach(server_http_context & ctx_http, server_routes & ro
         }
         return res;
     });
-    // {"node": "<name>", "drain": true}: no new request goes to the node, the running ones finish
+    // {"node": "<name>", "drain": true}: this router sends no new request to the node, the running ones finish
     ctx_http.post("/pool/drain", [p](const server_http_req & req) {
         const json body = json::parse_no_throw(req.body);
         if (body.is_discarded() || !body.is_object() || !body.contains("node")) {
@@ -1946,7 +2395,7 @@ void server_pool_fork::attach(server_http_context & ctx_http, server_routes & ro
         const std::string name = json_value(body, "node", std::string());
         const bool drain = json_value(body, "drain", true);
         std::lock_guard<std::mutex> lk(p->mu);
-        for (int i = 0; i < (int) p->nodes.size(); ++i) {
+        for (int i = 0; i < p->n_nodes.load(); ++i) {
             if (p->nodes[i].name == name) {
                 p->nodes[i].draining = drain;
                 p->event(drain ? "drain" : "undrain", "", i, "");
@@ -1956,7 +2405,35 @@ void server_pool_fork::attach(server_http_context & ctx_http, server_routes & ro
                 return res;
             }
         }
-        return pool_error(404, "no node " + name);
+        return pool_error(400, "no node " + name);
+    });
+    // what the other routers read: this router, its model under every name, and its links to the other nodes
+    ctx_http.get("/pool/router", [p](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res->data = safe_json_to_str(p->router_json());
+        return res;
+    });
+    ctx_http.post("/pool/pull", [p](const server_http_req & req) {
+        return p->pull(req);
+    });
+    // ?size=<bytes>: the probe of a link by another router of the pool, that many bytes from here (one chunk of a move)
+    ctx_http.get("/pool/probe", [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        uint64_t size = 0;
+        try {
+            size = std::min<uint64_t>(std::stoull(req.get_param("size", "16777216")), 64ull << 20);
+        } catch (const std::exception &) {
+            return pool_error(400, "bad size");
+        }
+        res->data.assign(size, '\0');
+        res->content_type = "application/octet-stream";
+        return res;
+    });
+    // the probe of a link the other way: the bytes in the body go nowhere
+    ctx_http.post("/pool/probe", [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        res->data = safe_json_to_str({{"size", req.body.size()}});
+        return res;
     });
 }
 
@@ -1992,13 +2469,7 @@ json server_pool_node_devices_fork() {
 }
 
 std::string server_pool_xfer_id_fork() {
-    static std::mutex mu;
-    static std::mt19937_64 rng(((uint64_t) std::random_device{}() << 32) ^ (uint64_t) std::random_device{}() ^
-                               (uint64_t) ggml_time_us());
-    std::lock_guard<std::mutex> lk(mu);
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) rng());
-    return buf;
+    return pool_random_hex();
 }
 
 std::filesystem::path server_pool_xfer_path_fork(const std::string & spill_dir, const char * kind, const std::string & id) {

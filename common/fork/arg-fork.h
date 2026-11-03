@@ -17,10 +17,15 @@ enum common_arg_fork_at {
     COMMON_ARG_FORK_AT_CACHE_RAM,        // after --cache-ram: --cache-spill-dir, --cache-disk, --cache-min-tokens
     COMMON_ARG_FORK_AT_N_CPU_MOE,        // after --n-cpu-moe: --moe-cache, --phase-mem
     COMMON_ARG_FORK_AT_SPEC_SYNTH_RATES, // after --spec-synth-rates: --spec-auto
-    COMMON_ARG_FORK_AT_MODELS_PRESET,    // after --models-preset: --pool
 };
 
 void common_fork_add_args(common_arg_fork_at at, const common_params & params, const std::function<void(common_arg)> & add_opt);
+
+// the fork's preset-only options of a model in models.ini, after those of common_params_add_preset_options: pool, and the
+// options of the pool (pool-<key>) under COMMON_ARG_PRESET_POOL_FORK "_<KEY>"
+#define COMMON_ARG_PRESET_POOL_FORK "__PRESET_POOL"
+
+void common_fork_add_preset_options(std::vector<common_arg> & args);
 
 // --spec-auto in common_models_handler_apply, after the speculative type is inferred:
 // spec_types_given - a type was requested, spec_types_default - no type is set (none requested, none inferred)

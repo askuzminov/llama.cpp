@@ -577,20 +577,31 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.get_models                  = models_routes->get_router_models;
 
     ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
-    // fork: a pool (--pool) with this router as a node: the device memory, the move of a conversation and the probe of
-    // a link go to the instance (?model= or "model" in the body; the chunks of an import and a probe are not JSON)
+    // fork: this router as a node of a pool (pool = on in models.ini): the device memory and the move of a conversation
+    // go to the instance (?model= or "model" in the body; the chunks of an import are not JSON)
     ctx_http.get ("/pool/node",            ex_wrapper(models_routes->proxy_get));
     ctx_http.post("/pool/export",          ex_wrapper(models_routes->proxy_post));
     ctx_http.get ("/pool/export/data",     ex_wrapper(models_routes->proxy_get));
     ctx_http.post("/pool/export/done",     ex_wrapper(models_routes->proxy_post));
     ctx_http.post("/pool/import/data",     ex_wrapper(server_pool_router_post_fork(*models_routes)));
     ctx_http.post("/pool/import/done",     ex_wrapper(models_routes->proxy_post));
-    ctx_http.get ("/pool/probe",           ex_wrapper(models_routes->proxy_get));
-    ctx_http.post("/pool/probe",           ex_wrapper(server_pool_router_post_fork(*models_routes)));
     ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
     ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
     ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+
+    // fork: a model with pool = on in models.ini: this router shares it with the routers of the local network that
+    // share it under the same name (tools/server/fork/server-pool-fork.cpp)
+    std::unique_ptr<server_pool_fork> pool;
+    try {
+        pool = server_pool_fork::create(params, *models_routes);
+    } catch (const std::exception & e) {
+        SRV_ERR("failed to start the pool: %s\n", e.what());
+        return 1;
+    }
+    if (pool) {
+        pool->attach(ctx_http, routes);
+    }
 
     server_register_routes(ctx_http, routes);
     server_register_stream_routes(ctx_http,
@@ -602,8 +613,11 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
         return 1;
     }
 
-    auto clean_up = [&models_routes, &mcp_mgr]() {
+    auto clean_up = [&models_routes, &mcp_mgr, &pool]() {
         SRV_INF("%s: cleaning up before exit...\n", __func__);
+        if (pool) {
+            pool->stop();
+        }
         // stop the session GC first, it finalizes live sessions and wakes pending readers
         server_stream_session_manager_stop();
         if (models_routes.has_value()) {
@@ -620,11 +634,17 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
         return 1;
     }
     ctx_http.is_ready.store(true);
+    if (pool) {
+        pool->start(); // fork: the discovery and the polling of the nodes, routing starts before the model loads
+    }
 
     shutdown_handler = [&](int) {
         if (models_routes.has_value()) {
             // important to disconnect any SSE clients
             models_routes->stopping.store(true);
+        }
+        if (pool) {
+            pool->stop(); // fork: the requests waiting in the pool give up
         }
         mcp_mgr.shutdown();
         ctx_http.stop();
@@ -661,76 +681,6 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
 
     // when the HTTP server stops, clean up and exit
     clean_up();
-
-    return 0;
-}
-
-//
-// pool (fork)
-//
-
-// fork: --pool, a router over remote instances of one model: the agents use one address, a conversation keeps to the
-// node that holds its prompt cache (tools/server/fork/server-pool-fork.cpp)
-static int server_run_pool(common_params & params, const server_run_opts & opts) {
-    SRV_INF("starting server in pool mode, the nodes from %s\n", params.pool_file.c_str());
-
-#if defined(_WIN32)
-    // the console handler waits for the end of this function, see exit_notifier
-    exit_notifier notify_exit;
-#endif
-
-    // a request waiting in the pool for a free slot holds an HTTP thread
-    if (params.n_threads_http < 1) {
-        params.n_threads_http = 128;
-    }
-
-    std::unique_ptr<server_pool_fork> pool;
-    try {
-        pool = std::make_unique<server_pool_fork>(params);
-    } catch (const std::exception & e) {
-        SRV_ERR("failed to read the pool: %s\n", e.what());
-        return 1;
-    }
-
-    // the pool loads no model, its context stays empty; the routes it does not proxy still need one
-    server_context ctx_server;
-    server_routes  routes(params, ctx_server);
-
-    server_http_context ctx_http;
-    if (!ctx_http.init(params)) {
-        SRV_ERR("%s", "failed to initialize HTTP server\n");
-        return 1;
-    }
-
-    pool->attach(ctx_http, routes);
-    server_register_routes(ctx_http, routes);
-
-    if (!ctx_http.start()) {
-        SRV_ERR("%s", "exiting due to HTTP server error\n");
-        return 1;
-    }
-    pool->start();
-    ctx_http.is_ready.store(true);
-
-    shutdown_handler = [&](int) {
-        pool->stop();
-        ctx_http.stop();
-    };
-
-    if (opts.install_signal_handlers) {
-        server_install_signal_handlers();
-    }
-
-    server_connect connect_proc;
-    if (!server_on_listening(ctx_http, params, connect_proc)) {
-        ctx_http.stop();
-        ctx_http.join();
-        pool->stop();
-        return 1;
-    }
-
-    ctx_http.join(); // keep the main thread alive
-    pool->stop();
 
     return 0;
 }
@@ -912,12 +862,6 @@ static int server_run(common_params & params, int argc, char ** argv, server_rol
             SRV_ERR("failed to fetch model metadata: %s\n", e.what());
             return 1;
         }
-    }
-
-    // fork: --pool, a router over remote instances, loads no model (tools/server/fork/server-pool-fork.cpp)
-    if (!params.pool_file.empty() && !role.is_managed_by_router()) {
-        common_params_print_info(params, false);
-        return server_run_pool(params, opts);
     }
 
     const server_role_type role_type = server_role_detect(params, role);

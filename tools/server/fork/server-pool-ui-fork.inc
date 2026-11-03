@@ -41,6 +41,7 @@ main { padding: 16px 20px 40px; max-width: 1560px; margin: 0 auto; }
 .node.off { opacity: .72; }
 .nh { display: flex; align-items: center; gap: 8px; }
 .nh .name { font-weight: 600; font-size: 15px; }
+.nh .name small { font-weight: 500; font-size: 11px; color: var(--muted); margin-left: 4px; }
 .nh .act { margin-left: auto; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--soft); color: var(--muted); white-space: nowrap; }
 .badge.up { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
@@ -210,7 +211,7 @@ R"POOLUI(
 function linkRow(l) {
   const mb = x => x > 0 ? (x / 8).toFixed(0) : "-";
   const sp = l.mbps_read > 0 || l.mbps_write > 0 ? "from " + mb(l.mbps_read) + " / to " + mb(l.mbps_write) + " MB/s measured" :
-    (l.mbps_cfg > 0 ? l.mbps_cfg + " Mbit/s given" : "");
+    "not measured yet";
   return '<div class="lnk"><span class="ld' + (l.error ? " err" : (l.active ? " on" : "")) + '"></span>' +
     '<span class="u">' + esc(l.url) + (l.active ? " \u00b7 in use" : "") + '</span><span class="t">' + esc(sp) + '</span>' +
     (l.error ? '<span class="e">' + esc(l.error) + '</span>' : "") + '</div>';
@@ -222,10 +223,10 @@ function nodeCard(n) {
   const mi = n.model_info || {};
   const meta = [n.url + (n.fallback ? " (fallback)" : ""), n.model || "", mi.ftype || "",
     n.n_ctx ? "ctx " + tok(n.n_ctx) : "", n.slots ? n.slots + " slots" : "",
-    n.weight !== 1 ? "weight " + n.weight : "", n.signature ? "cache " + n.signature.slice(0, 8) : ""
+    n.weight !== 1 ? "weight " + n.weight.toFixed(2) : "", n.signature ? "cache " + n.signature.slice(0, 8) : ""
   ].filter(Boolean).join(" \u00b7 ");
   let html = '<div class="node' + (off ? " off" : "") + '">' +
-    '<div class="nh"><span class="name">' + esc(n.name) + '</span><span class="badge ' + esc(state) + '">' + esc(state) + '</span>' +
+    '<div class="nh"><span class="name">' + esc(n.name) + (n.self ? ' <small>this router</small>' : '') + '</span><span class="badge ' + esc(state) + '">' + esc(state) + '</span>' +
     '<span class="act"><button data-node="' + esc(n.name) + '" data-drain="' + (n.draining ? "0" : "1") + '">' +
     (n.draining ? "Resume" : "Drain") + '</button></span></div>' +
     '<div class="meta">' + esc(meta) + '</div>';
@@ -237,12 +238,14 @@ function nodeCard(n) {
   if (devs) html += '<div class="sec">Memory</div>' + devs;
   html += '<div class="nf">' +
     '<span>in flight <b>' + n.inflight + " / " + n.slots + '</b></span>' +
-    (n.external ? '<span>other clients <b>' + n.external + '</b></span>' : "") +
+    (n.external ? '<span title="requests of other routers of the pool and of clients that went to the node itself">other routers <b>' + n.external + '</b></span>' : "") +
     '<span>waiting for it <b>' + n.queued_for + '</b></span>' +
     '<span>gen <b>' + tps(n.gen_tps) + '</b> t/s</span>' +
     '<span>prompt <b>' + tps(n.prompt_tps) + '</b> t/s</span>' +
-    '<span title="the prefill speed the decisions use: measured from the prompts of move_tokens and more, else the ini value">' +
-    'prefill <b>' + tps(n.prefill_tps > 0 ? n.prefill_tps : n.prefill_cfg) + '</b> t/s' + (n.prefill_tps > 0 ? "" : " (ini)") + '</span>' +
+    '<span title="the prefill speed the decisions use: measured from the prompts of move_tokens and more, else a default">' +
+    'prefill <b>' + tps(n.prefill_tps > 0 ? n.prefill_tps : n.prefill_cfg) + '</b> t/s' + (n.prefill_tps > 0 ? "" : " (default)") + '</span>' +
+    '<span title="the decode speed of its answers of 16 tokens and more: the new conversations are shared out by it">' +
+    'decode <b>' + (n.decode_tps > 0 ? tps(n.decode_tps) : "-") + '</b> t/s</span>' +
     '<span title="the share of a prefix of other conversations (the system prompt of an agent) it reused: measured from the answers, 0 until then">' +
     'shared prefix <b>' + (n.share >= 0 ? Math.round(n.share * 100) + "%" : "-") + '</b></span>' +
     '<span>served <b>' + n.requests + '</b></span>' +
@@ -265,7 +268,7 @@ function table(head, rows, empty) {
 function render(s) {
   const p = s.pool;
   const c = s.config;
-  document.getElementById("sub").textContent = [s.name, c.model ? "model " + c.model : "",
+  document.getElementById("sub").textContent = [s.name, c.names && c.names.length ? "model " + c.names.join(", ") : "",
     "a conversation with ~" + tok(c.move_tokens) + " tok of its own on a busy node waits for it, up to " + c.wait_max + " s" +
     (c.migrate ? ", or moves with its state" : ""),
     s.state_kib_per_token > 0 ? "state ~" + s.state_kib_per_token.toFixed(0) + " KiB/tok" : ""].filter(Boolean).join(" \u00b7 ");

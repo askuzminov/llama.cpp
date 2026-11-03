@@ -121,26 +121,65 @@ static void common_params_add_args_spec_synth_rates(const common_params & params
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_AUTO"));
 }
 
-static void common_params_add_args_models_preset(const common_params & /*params*/, const std::function<void(common_arg)> & add_opt) {
-    add_opt(common_arg(
-        {"--pool"}, "PATH",
-        "[experimental] run as a router over remote llama-server instances of one model, listed in the INI file PATH "
-        "([pool] options, a [node.<name>] section with url = http://host:port per node): the agents use one address, a "
-        "conversation keeps to the node that holds its prompt cache, a new one goes to the node with free slots; "
-        "a dashboard at /pool (default: disabled)",
-        [](common_params & params, const std::string & value) {
-            params.pool_file = value;
-        }
-    ).set_env("LLAMA_ARG_POOL").set_examples({LLAMA_EXAMPLE_SERVER}));
-}
-
 void common_fork_add_args(common_arg_fork_at at, const common_params & params, const std::function<void(common_arg)> & add_opt) {
     switch (at) {
         case COMMON_ARG_FORK_AT_CTX_CHECKPOINTS:  common_params_add_args_ctx_checkpoints (params, add_opt); break;
         case COMMON_ARG_FORK_AT_CACHE_RAM:        common_params_add_args_cache_ram       (params, add_opt); break;
         case COMMON_ARG_FORK_AT_N_CPU_MOE:        common_params_add_args_n_cpu_moe       (params, add_opt); break;
         case COMMON_ARG_FORK_AT_SPEC_SYNTH_RATES: common_params_add_args_spec_synth_rates(params, add_opt); break;
-        case COMMON_ARG_FORK_AT_MODELS_PRESET:    common_params_add_args_models_preset   (params, add_opt); break;
+    }
+}
+
+void common_fork_add_preset_options(std::vector<common_arg> & args) {
+    args.push_back(common_arg(
+        {"pool"}, "on|off",
+        "in server router mode, share this model with the routers of the local network that share it under the same "
+        "name or alias: each takes the requests for it and sends them to the machine that holds the conversation or has "
+        "a free slot (tools/server/fork/server-pool-fork.cpp, a dashboard at /pool)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_POOL_FORK).set_preset_only());
+
+    // the options of the pool, in the section of the model with pool = on or in [*]; server-pool-fork.cpp reads them by
+    // the env name (COMMON_ARG_PRESET_POOL_FORK "_<KEY>") and keeps its defaults for the ones not given
+    static const struct {
+        const char * key;
+        const char * env;
+        const char * hint;
+        const char * help;
+    } pool_options[] = {
+        {"pool-name",        COMMON_ARG_PRESET_POOL_FORK "_NAME",        "NAME",
+         "this machine in the pool (default: the host name); with the port it is the id of the node, which the machines "
+         "must not share"},
+        {"pool-peers",       COMMON_ARG_PRESET_POOL_FORK "_PEERS",       "HOST:PORT,...",
+         "routers of the pool added without the broadcasts, for networks without them"},
+        {"pool-port",        COMMON_ARG_PRESET_POOL_FORK "_PORT",        "N",
+         "the UDP port the routers of the pool find each other on (default: 12345)"},
+        {"pool-discover",    COMMON_ARG_PRESET_POOL_FORK "_DISCOVER",    "0|1",
+         "find the routers of the pool by broadcasts (default: 1); 0 = only pool-peers"},
+        {"pool-move-tokens", COMMON_ARG_PRESET_POOL_FORK "_MOVE_TOKENS", "N",
+         "a conversation with this many tokens of its own on a busy node waits for it, a shorter one goes to a free node "
+         "at once; a state moves from this many tokens on (default: 4096)"},
+        {"pool-wait-max",    COMMON_ARG_PRESET_POOL_FORK "_WAIT_MAX",    "SECONDS",
+         "the longest wait for the node of a conversation (default: 300)"},
+        {"pool-migrate",     COMMON_ARG_PRESET_POOL_FORK "_MIGRATE",     "0|1",
+         "a conversation that goes to another node takes its cached state along when that is faster than computing it "
+         "again (default: 1)"},
+        {"pool-link-mbps",   COMMON_ARG_PRESET_POOL_FORK "_LINK_MBPS",   "N",
+         "the speed of a link until it is measured, Mbit/s (default: 500)"},
+        {"pool-prefill-tps", COMMON_ARG_PRESET_POOL_FORK "_PREFILL_TPS", "N",
+         "the prefill speed of a node until it is measured, tokens/s (default: 700)"},
+        {"pool-poll-ms",     COMMON_ARG_PRESET_POOL_FORK "_POLL_MS",     "N",
+         "how often each node is polled, ms (default: 1000)"},
+        {"pool-probe-s",     COMMON_ARG_PRESET_POOL_FORK "_PROBE_S",     "N",
+         "how often a node on a slower link tries the faster ones, seconds (default: 10)"},
+        {"pool-same-model",  COMMON_ARG_PRESET_POOL_FORK "_SAME_MODEL",  "0|1",
+         "a node of another model than the most of the others takes no request (default: 1)"},
+    };
+    for (const auto & o : pool_options) {
+        args.push_back(common_arg(
+            {o.key}, o.hint, o.help,
+            [](common_params &, const std::string &) { /* unused */ }
+        ).set_env(o.env).set_preset_only());
     }
 }
 

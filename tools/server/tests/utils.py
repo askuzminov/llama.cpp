@@ -315,6 +315,7 @@ class ServerProcess(ServerProcessFork):
             env["AIP_MODE"] = "PREDICTION"
             env["AIP_HTTP_PORT"] = str(self.server_port)
         server_args.extend(self.fork_server_args())
+        self.fork_env(env)  # fork: env_fork
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")

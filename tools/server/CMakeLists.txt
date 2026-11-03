@@ -83,6 +83,11 @@ target_sources(${TARGET} PRIVATE
     fork/server-trace-fork.cpp
     fork/server-trace-fork.h
 )
+# fork: the pool discovery, the hash of the key a router proves and the network interfaces it broadcasts on
+target_link_libraries(${TARGET} PRIVATE vendor::hash)
+if (WIN32)
+    target_link_libraries(${TARGET} PRIVATE iphlpapi)
+endif()
 
 # llama-server executable
 

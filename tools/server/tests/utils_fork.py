@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# fork: ServerProcess options for the context checkpoints and the prompt cache spill, see utils.py
+# fork: ServerProcess options for the context checkpoints and the prompt cache spill, and the environment of the pool
+# tests, see utils.py
 
 
 class ServerProcessFork:
@@ -12,7 +13,9 @@ class ServerProcessFork:
     cache_disk: int | None = None
     cache_min_tokens: int | None = None
     cache_idle_write: bool | None = None
-    pool_file: str | None = None
+    # variables set in the environment of the server, None removes one (the pool tests take out
+    # LLAMA_SERVER_DEBUG_FAKE_TIMING: a router sleeps 2 s in every request it proxies, the polls of a pool among them)
+    env_fork: dict | None = None
 
     def fork_server_args(self) -> list:
         server_args = []
@@ -30,6 +33,11 @@ class ServerProcessFork:
             server_args.extend(["--cache-min-tokens", self.cache_min_tokens])
         if self.cache_idle_write:
             server_args.append("--cache-idle-write")
-        if self.pool_file is not None:
-            server_args.extend(["--pool", self.pool_file])
         return server_args
+
+    def fork_env(self, env: dict):
+        for k, v in (self.env_fork or {}).items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
