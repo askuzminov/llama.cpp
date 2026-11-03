@@ -12,6 +12,8 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <future>
 #include <regex>
 #include <unordered_set>
@@ -1829,21 +1831,47 @@ bool llama_model_loader::load_all_data(
         std::vector<ggml_backend_buffer_t> & host_buffers;
         ggml_backend_t                     & backend;
 
-        void release() {
+        // every step runs, a step that throws does not stop the rest; then the first error is thrown (rethrow) or logged
+        void release(bool rethrow) {
+            std::exception_ptr first;
+            auto run = [&](const std::function<void()> & f) {
+                try {
+                    f();
+                } catch (...) {
+                    if (!first) {
+                        first = std::current_exception();
+                    }
+                }
+            };
             for (auto * event : events) {
-                ggml_backend_event_synchronize(event);
-                ggml_backend_event_free(event);
+                run([&] { ggml_backend_event_synchronize(event); });
+                run([&] { ggml_backend_event_free(event); });
             }
             events.clear();
             for (auto * buf : host_buffers) {
-                ggml_backend_buffer_free(buf);
+                run([&] { ggml_backend_buffer_free(buf); });
             }
             host_buffers.clear();
-            ggml_backend_free(backend);
+            run([&] { ggml_backend_free(backend); });
             backend = nullptr;
+            if (first && rethrow) {
+                std::rethrow_exception(first);
+            }
+            if (first) {
+                try {
+                    std::rethrow_exception(first);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_WARN("%s: freeing the async uploads failed too: %s\n", __func__, e.what());
+                } catch (...) {
+                    LLAMA_LOG_WARN("%s: freeing the async uploads failed too\n", __func__);
+                }
+            }
         }
 
-        ~upload_guard() { release(); }
+        // runs while another error unwinds (a failed upload): a second exception here would end the process with no
+        // message (std::terminate). on the 395 (03.11) a weight upload ran out of device memory, and the event
+        // synchronize here threw ErrorOutOfDeviceMemory again
+        ~upload_guard() { release(false); }
     } uploads { events, host_buffers, upload_backend };
 
     if (upload_backend) {
@@ -2057,7 +2085,7 @@ bool llama_model_loader::load_all_data(
 
     // free temporary resources used for async uploads
     watch.step("upload release");
-    uploads.release();
+    uploads.release(true);
     watch.step("validation");
 
     // check validation results

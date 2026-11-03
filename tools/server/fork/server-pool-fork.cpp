@@ -1039,11 +1039,12 @@ struct server_pool_fork::impl {
     // the requests for the model wait or come: the routers that have it unloaded load it, so that every node takes a
     // part - those with room for it (fewer other models running than their models_max), each once a minute at most; and
     // when no node has it or loads it and none has room, one more that unloads another model for it, this router
-    // first, as a router without a pool would. a failed load is not asked again. under mu
+    // first, as a router without a pool would. a failed load is asked again after 5 minutes: on the 395 a load runs out
+    // of device memory now and then, and the next one goes through. under mu
     void wake(int64_t now) {
         auto loadable = [&](const pool_node & n) {
-            return n.status == "unloaded" && !n.failed && !n.draining && !n.mismatch && !n.want_load &&
-                   now - n.t_load > 60000;
+            return n.status == "unloaded" && !n.draining && !n.mismatch && !n.want_load &&
+                   now - n.t_load > (n.failed ? 300000 : 60000);
         };
         bool have = false;
         for (int i = 0; i < n_nodes.load(); ++i) {
