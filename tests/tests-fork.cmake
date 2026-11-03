@@ -35,6 +35,14 @@ target_link_libraries(test-prompt-cache-spill PRIVATE server-context)
 llama_test(test-prompt-cache-spill NAME test-prompt-cache-compat LABEL "model behavior" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-prompt-cache-compat PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# the checkpoint at the end of a long system prompt (LLAMA_CKPT_SYSTEM_BREAK): where the system block ends and the
+# eviction that keeps its checkpoint; no model
+llama_build_and_test(test-ckpt-system-fork.cpp)
+target_include_directories(test-ckpt-system-fork PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/server
+    ${PROJECT_SOURCE_DIR}/tools/mtmd)
+target_link_libraries(test-ckpt-system-fork PRIVATE server-context)
+
 # the row cache test calls internal functions of libllama. a Windows DLL exports LLAMA_API only, so there the test is
 # built from the sources of the row cache and llama_file, with the two helpers of llama-impl.cpp that they use
 # (test-row-cache-impl-fork.cpp). LLAMA_FORK_ROW_CACHE_STANDALONE=ON builds it that way on any platform
@@ -68,6 +76,9 @@ endif()
 llama_build(test-qsa-multi-fork.cpp)
 target_include_directories(test-qsa-multi-fork PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# the state of one sequence into a context of another KV stream count (registered below where the matrix models exist)
+llama_build(test-state-streams-fork.cpp)
+
 # the device cache of the host experts with --phase-mem (keep, fill, kv) against the release of all slots at every
 # phase switch: built everywhere (llama.h, gguf.h), registered where the matrix models exist, skips without a GPU
 llama_build(test-moe-cache-fork.cpp)
@@ -94,6 +105,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # against the same sequence alone, on the qwen4exp model of the matrix. the mask from positions must give the logits
     # of the dense mask bit for bit, and LLAMA_QSA_MASK_POS is read once per process: a run with the dense mask writes
     # its logits first. the binary is built on every platform (below), it needs only llama.h
+    llama_test(test-state-streams-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-state-streams-fork PROPERTIES FIXTURES_REQUIRED generate-models)
+
     set(QSA_MULTI_DENSE "${CMAKE_CURRENT_BINARY_DIR}/test-qsa-multi-fork-dense.bin")
     llama_test(test-qsa-multi-fork NAME test-ple-read-error-fork LABEL "model behavior" ARGS --ple-read-error -m "${MODEL_DIR}/qwen4exp-moe.gguf")
     set_tests_properties(test-ple-read-error-fork PROPERTIES FIXTURES_REQUIRED generate-models)

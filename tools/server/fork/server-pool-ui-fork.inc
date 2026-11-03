@@ -239,17 +239,31 @@ function nodeCard(n) {
   if (n.links && n.links.length) html += '<div class="sec">Links</div>' + n.links.map(linkRow).join("");
   const devs = (n.devices || []).map(memRow).join("");
   if (devs) html += '<div class="sec">Memory</div>' + devs;
+  const gpus = (n.gpus || []).map(g => '<span>' + esc(g.name) + ' <b>' + (g.temp_c != null ? g.temp_c.toFixed(0) + " \u00b0C" : "-") + '</b>' +
+    (g.power_pct != null ? " \u00b7 power " + g.power_pct.toFixed(0) + "%" : "") + (g.power_w != null ? " \u00b7 " + g.power_w.toFixed(0) + " W" : "") +
+    (g.fan_rpm != null ? " \u00b7 fan " + g.fan_rpm + " rpm" : "") + '</span>').join("");
+  if (gpus) html += '<div class="sec">GPU</div><div class="nf">' + gpus + '</div>';
+  const st = n.stats || {};
+  if (st.uptime_s > 0) {
+    const avg = (k, s) => st[s] > 0 ? " (" + tps(st[k] / st[s]) + " t/s)" : "";
+    html += '<div class="sec">Work since the model loaded, ' + age(st.uptime_s * 1000) + ' ago</div><div class="nf">' +
+      '<span title="prompt tokens it computed, with their average speed">prompt <b>' + tok(st.prompt_tokens) + '</b> tok' + avg("prompt_tokens", "prompt_s") + '</span>' +
+      '<span title="tokens it generated, with the average speed of a slot">generated <b>' + tok(st.gen_tokens) + '</b> tok' + avg("gen_tokens", "gen_s") + '</span>' +
+      '<span title="prompt tokens it took from its cache instead of computing them">from cache <b>' + tok(st.cached_tokens) + '</b> tok</span></div>';
+  }
   html += '<div class="nf">' +
     '<span>in flight <b>' + n.inflight + " / " + n.slots + '</b></span>' +
     (n.external ? '<span title="requests of other routers of the pool and of clients that went to the node itself">other routers <b>' + n.external + '</b></span>' : "") +
     '<span>waiting for it <b>' + n.queued_for + '</b></span>' +
-    '<span>gen <b>' + tps(n.gen_tps) + '</b> t/s</span>' +
-    '<span>prompt <b>' + tps(n.prompt_tps) + '</b> t/s</span>' +
-    '<span title="the prefill speed the decisions use: measured from the prompts of move_tokens and more, else a default">' +
+    (n.room ? '<span title="the cells of its unified KV cache that the running and paused slots hold with their answer reserve: a prompt that does not fit next to them waits in the pool for a node with room">' +
+      'KV held <b>' + tok(n.room.held) + " / " + tok(n.room.n_ctx) + '</b>' + (n.room.deferred ? " (" + n.room.deferred + " waiting inside)" : "") + '</span>' : "") +
+    '<span title="tokens its slots generate per second now (all of them, between two polls)">gen now <b>' + tps(n.gen_tps) + '</b> t/s</span>' +
+    '<span title="prompt tokens its slots compute per second now (all of them, between two polls)">prompt now <b>' + tps(n.prompt_tps) + '</b> t/s</span>' +
+    '<span title="the prefill speed of one request the decisions use (what computing a conversation there costs): the average of its prompts of move_tokens and more, else a default">' +
     'prefill <b>' + tps(n.prefill_tps > 0 ? n.prefill_tps : n.prefill_cfg) + '</b> t/s' + (n.prefill_tps > 0 ? "" : " (default)") + '</span>' +
-    '<span title="the decode speed of its answers of 16 tokens and more: the new conversations are shared out by it">' +
+    '<span title="the decode speed of one request: the average of its answers of 16 tokens and more, with the others it ran beside them. the new conversations are shared out by it">' +
     'decode <b>' + (n.decode_tps > 0 ? tps(n.decode_tps) : "-") + '</b> t/s</span>' +
-    '<span title="the share of a prefix of other conversations (the system prompt of an agent) it reused: measured from the answers, 0 until then">' +
+    '<span title="of the prefix a new conversation shares with others it holds (the system prompt and tools of an agent), the part it took from its cache: the average of such requests. a hybrid model (gated delta net) reuses only up to a checkpoint inside that prefix">' +
     'shared prefix <b>' + (n.share >= 0 ? Math.round(n.share * 100) + "%" : "-") + '</b></span>' +
     '<span>served <b>' + n.requests + '</b></span>' +
     '<span>moves state <b>' + (n.migrate ? "yes" : "no") + '</b></span></div>';
@@ -297,7 +311,7 @@ function render(s) {
 
   document.getElementById("queue").innerHTML = table(
     [{ t: "conversation" }, { t: "waits for" }, { t: "waiting", n: 1 }, { t: "cached there", n: 1 }, { t: "prompt", n: 1 }],
-    s.queue.map(q => '<tr><td class="mono">' + esc(q.conv || "#" + q.id) + '</td><td>' + esc(q.want || "any node") +
+    s.queue.map(q => '<tr><td class="mono">' + esc(q.conv || "#" + q.id) + (q.short ? ' <small>short</small>' : '') + '</td><td>' + esc(q.want || "any node") +
       '</td><td class="n">' + age(q.age_ms) + '</td><td class="n">' + (q.want ? "~" + tok(q.est_tokens) : "-") +
       '</td><td class="n">~' + tok(q.prompt_tokens) + '</td></tr>'),
     "nothing waits");

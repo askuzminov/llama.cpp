@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <filesystem>
 #include <iomanip>
 #include <locale>
@@ -124,13 +125,11 @@ void server_prompt_cache_init(
         bool has_mtmd) {
     int32_t cache_ram_mib_eff = params.cache_ram_mib;
     if (cache_ram_mib_eff < 0) {
-        // auto: cap the prompt-cache archive at ~1/4 of total host RAM (floor 1 GiB).
-        // The host-RAM reserve (see server_ckpt_limits::reserve_bytes) is the real anti-swap backstop.
-        const size_t total = common_host_mem_total();
-        cache_ram_mib_eff = total > 0
-            ? (int32_t) std::min<size_t>(std::max<size_t>((total / 4) >> 20, 1024), (size_t) INT32_MAX)
-            : 8192;
-        SRV_TRC("prompt cache size limit: auto = %d MiB (total host RAM = %zu MiB)\n", cache_ram_mib_eff, total >> 20);
+        // -1: no size limit - the cache takes the free host RAM down to the reserve (server_ckpt_limits::reserve_bytes,
+        // --cache-ram-reserve), so the prompts that fit are not computed again. until 03.11 it was 1/4 of the host RAM,
+        // which left most of the RAM free while the conversations were evicted
+        cache_ram_mib_eff = 0;
+        SRV_INF("prompt cache size limit: none, it keeps %zu MiB of host RAM free\n", reserve_bytes >> 20);
     } else {
         SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", cache_ram_mib_eff);
     }
@@ -199,10 +198,11 @@ static std::string server_cache_file_identity(const std::string & name, const ll
     return out.str();
 }
 
-// portable (fork: --pool): only what the format of a saved state depends on, so that another node of the same model has
-// the same and a cached state can move to it: no path of the model or times of its files, and the number of KV streams
-// in place of the slots and the context sizes (a state larger than the context of the node fails to restore and is
-// recomputed there). the text holds hexfloats, so it matches between builds of one standard library only
+// portable (fork: the pool): only what the format of a saved state depends on, so that another node of the same model has
+// the same and a cached state can move to it: no path of the model or times of its files, no slots, KV streams or context
+// sizes (the state of one sequence restores into a cache of any stream count since 03.11; a state larger than the context
+// of the node fails to restore and is recomputed there). the text holds hexfloats, so it matches between builds of one
+// standard library only
 static uint64_t server_prompt_cache_signature_impl(
         const common_params & params,
         const llama_model * model_tgt,
@@ -231,8 +231,6 @@ static uint64_t server_prompt_cache_signature_impl(
     s += "|" + std::to_string((int) params.swa_full);
     if (!portable) {
         s += "|" + std::to_string((int) params.kv_unified);
-    } else {
-        s += "|streams " + std::to_string(params.kv_unified ? 1 : params.n_parallel);
     }
     s += "|" + std::to_string(ctx_dft != nullptr);
     s += "|" + std::to_string(LLAMA_STATE_SEQ_VERSION);
@@ -319,23 +317,40 @@ bool server_ckpt_has_dependent_delta(const server_ckpt_list & ckpts, server_ckpt
     return std::next(it) != ckpts.end() && std::next(it)->is_delta();
 }
 
-size_t server_ckpt_evict_front_chain(server_ckpt_list & ckpts) {
-    if (ckpts.empty()) {
+// the chain eviction takes: the front one, or the one after it when the front one is the checkpoint at `keep` (the end of
+// a long system prompt) and another chain follows
+static server_ckpt_list::iterator server_ckpt_evictable(server_ckpt_list & ckpts, int64_t keep) {
+    auto it = ckpts.begin();
+    if (keep >= 0 && it != ckpts.end() && !it->is_delta() && it->n_tokens == keep) {
+        auto next = std::next(it);
+        while (next != ckpts.end() && next->is_delta()) {
+            ++next;
+        }
+        if (next != ckpts.end()) {
+            return next;
+        }
+    }
+    return it;
+}
+
+size_t server_ckpt_evict_front_chain(server_ckpt_list & ckpts, int64_t keep) {
+    auto it = server_ckpt_evictable(ckpts, keep);
+    if (it == ckpts.end()) {
         return 0;
     }
-    size_t freed = ckpts.front().size();
-    const bool erased_base = !ckpts.front().is_delta();
-    ckpts.erase(ckpts.begin());
+    size_t freed = it->size();
+    const bool erased_base = !it->is_delta();
+    it = ckpts.erase(it);
     if (erased_base) {
-        while (!ckpts.empty() && ckpts.front().is_delta()) {
-            freed += ckpts.front().size();
-            ckpts.erase(ckpts.begin());
+        while (it != ckpts.end() && it->is_delta()) {
+            freed += it->size();
+            it = ckpts.erase(it);
         }
     }
     return freed;
 }
 
-llama_pos server_ckpt_next_base_pos(const server_ckpt_list & ckpts, const llama_model * model) {
+llama_pos server_ckpt_next_base_pos(const server_ckpt_list & ckpts, const llama_model * model, int64_t keep) {
     // Walk back over the last chain: the deltas, then the base they hang off.
     bool   has_base          = false;
     size_t chain_base_bytes  = 0;
@@ -346,6 +361,11 @@ llama_pos server_ckpt_next_base_pos(const server_ckpt_list & ckpts, const llama_
         if (!it->is_delta() && !it->data_tgt.empty()) {
             has_base         = true;
             chain_base_bytes = it->size();
+            // fork: no delta hangs off the checkpoint at the end of a long system prompt, so that it stays a chain of
+            // its own, which eviction keeps (server_ckpt_evict_front_chain)
+            if (keep >= 0 && it->n_tokens == keep) {
+                return -1;
+            }
             break;
         }
 
@@ -371,7 +391,7 @@ llama_pos server_ckpt_next_base_pos(const server_ckpt_list & ckpts, const llama_
     return ckpts.back().pos_max;
 }
 
-size_t server_ckpt_evict_over_budget(server_ckpt_list & ckpts, size_t budget) {
+size_t server_ckpt_evict_over_budget(server_ckpt_list & ckpts, size_t budget, int64_t keep) {
     size_t total = 0;
     for (const common_prompt_checkpoint & cp : ckpts) {
         total += cp.size();
@@ -379,18 +399,21 @@ size_t server_ckpt_evict_over_budget(server_ckpt_list & ckpts, size_t budget) {
 
     size_t freed = 0;
     while (total > budget && ckpts.size() > 1) {
-        // the front chain is a base plus its trailing deltas; if that is the whole list,
+        // the chain to evict is a base plus its trailing deltas; if it reaches the end of the list,
         // evicting it would take the checkpoint just created with it
-        size_t n_chain = 1;
-        for (auto it = std::next(ckpts.begin());
-                it != ckpts.end() && it->is_delta(); ++it) {
-            ++n_chain;
+        auto it = server_ckpt_evictable(ckpts, keep);
+        if (it == ckpts.end()) {
+            break;
         }
-        if (n_chain >= ckpts.size()) {
+        auto end = std::next(it);
+        while (end != ckpts.end() && end->is_delta()) {
+            ++end;
+        }
+        if (end == ckpts.end()) {
             break;
         }
 
-        const size_t n = server_ckpt_evict_front_chain(ckpts);
+        const size_t n = server_ckpt_evict_front_chain(ckpts, keep);
         if (n == 0) {
             break;
         }
@@ -452,13 +475,33 @@ static int32_t server_env_int_fork(const char * name, int32_t def) {
     return (int32_t) std::clamp<int64_t>(common_fork_env_int(name, def), INT32_MIN, INT32_MAX);
 }
 
+int32_t server_ckpt_system_break_fork() {
+    static const int32_t value = std::max(0, server_env_int_fork("LLAMA_CKPT_SYSTEM_BREAK", 1024));
+    return value;
+}
+
+int32_t server_ckpt_system_end_fork(const common_chat_msg_spans & spans) {
+    const int32_t min_tokens = server_ckpt_system_break_fork();
+    if (min_tokens <= 0 || spans.spans.empty()) {
+        return -1;
+    }
+    // a template with a delimiter of the system role (Qwen3.5 and the like): the message after it. else the system
+    // block stands before the first message the delimiters find (the autoparser has only user and assistant ones); a
+    // template that puts the system prompt into the first user message leaves only its start there, below the minimum
+    int32_t end = (int32_t) spans.spans[0].pos;
+    if (spans.spans[0].role == COMMON_CHAT_ROLE_SYSTEM) {
+        end = spans.spans.size() > 1 ? (int32_t) spans.spans[1].pos : -1;
+    }
+    return end >= min_tokens ? end : -1;
+}
+
 int32_t server_prefill_budget_fork() {
     static const int32_t value = server_env_int_fork("LLAMA_PREFILL_BUDGET", 2048);
     return value;
 }
 
 bool server_prefill_exclusive_fork() {
-    static const bool value = server_env_int_fork("LLAMA_PREFILL_EXCLUSIVE", 0) != 0;
+    static const bool value = server_env_int_fork("LLAMA_PREFILL_EXCLUSIVE", 1) != 0;
     return value;
 }
 
@@ -470,6 +513,32 @@ bool server_slot_continue_fork() {
 int32_t server_answer_room_fork() {
     static const int32_t value = std::max(0, server_env_int_fork("LLAMA_SLOT_ANSWER_ROOM", 8192));
     return value;
+}
+
+// one model per server process: the loop writes, the HTTP thread of GET /pool/node reads
+static std::mutex       g_room_mutex_fork;
+static server_room_fork g_room_fork;
+
+void server_room_report_fork(const server_room_fork & room) {
+    std::lock_guard<std::mutex> lk(g_room_mutex_fork);
+    g_room_fork = room;
+}
+
+server_room_fork server_room_get_fork() {
+    std::lock_guard<std::mutex> lk(g_room_mutex_fork);
+    return g_room_fork;
+}
+
+static server_stats_fork g_stats_fork;
+
+void server_stats_report_fork(const server_stats_fork & stats) {
+    std::lock_guard<std::mutex> lk(g_room_mutex_fork);
+    g_stats_fork = stats;
+}
+
+server_stats_fork server_stats_get_fork() {
+    std::lock_guard<std::mutex> lk(g_room_mutex_fork);
+    return g_stats_fork;
 }
 
 bool server_slot_room_fork() {

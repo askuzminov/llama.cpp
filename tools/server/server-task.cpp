@@ -2014,8 +2014,14 @@ void server_prompt_cache::update(bool may_write) {
     size_t n_tokens_cur = 0;
     size_t size_off     = 0;
 
+    // fork: with no size limit (--cache-ram -1) the host RAM reserve bounds what is resident, and the token limit only the
+    // states that are on disk alone, the directory, when no disk budget does
+    const auto counted = [&](const server_prompt_cache_state & state) {
+        return limit_size == 0 ? !disk_bounded && off_disk(state) : !(disk_bounded && off_disk(state));
+    };
+
     for (const auto & state : states) {
-        if (disk_bounded && off_disk(state)) {
+        if (!counted(state)) {
             continue;
         }
 
@@ -2032,8 +2038,8 @@ void server_prompt_cache::update(bool may_write) {
         while (n_tokens_cur > limit_tokens_cur) {
             auto it = states.begin();
 
-            while (disk_bounded && it != states.end() && off_disk(*it)) {
-                ++it; // the disk budget owns this one
+            while (it != states.end() && !counted(*it)) {
+                ++it; // the disk budget owns this one, or with no size limit the reserve
             }
             if (it == states.end()) {
                 break;

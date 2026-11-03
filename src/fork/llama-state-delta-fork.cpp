@@ -124,13 +124,11 @@ bool llama_kv_cache::state_read_delta(
         return false;
     }
 
+    // the delta of one sequence holds the cells of the one stream it lived in: it goes to the stream of the sequence here
+    // whatever the stream count of the cache it came from (state_read_sinfo does the same for the whole state)
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-
-    if (n_stream_cur != n_stream) {
-        LLAMA_LOG_ERROR("%s: stream count mismatch\n", __func__);
-        return false;
-    }
+    uint32_t n_filled = 0;
 
     // must match the write side, which refuses to produce a whole-context delta
     if (seq_id < 0) {
@@ -142,12 +140,16 @@ bool llama_kv_cache::state_read_delta(
 
     const uint32_t strm = seq_to_stream[seq_id];
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
         if (cell_count == 0) {
             continue;
+        }
+        if (n_stream_cur != n_stream && ++n_filled > 1) {
+            LLAMA_LOG_ERROR("%s: the delta of one sequence holds cells of several streams\n", __func__);
+            return false;
         }
 
         slot_info sinfo;

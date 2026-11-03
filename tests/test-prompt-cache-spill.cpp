@@ -415,6 +415,32 @@ static void test_min_tokens(const std::string & dir) {
     }
 }
 
+// --cache-ram -1 (no size limit): the host RAM reserve bounds the states in RAM, the token limit (n_ctx) does not; it
+// still bounds the states that are on disk alone when no disk budget does
+static void test_no_size_limit(const std::string & /*dir*/) {
+    // no spill dir: the destructor writes nothing, the states on disk alone are only flagged so
+    {
+        server_prompt_cache cache(0, 100, 0, "", 0, SIG);
+        for (int i = 0; i < 3; ++i) {
+            cache.states.push_back(make_state(100, 1000*(i + 1), 4096, 0));
+        }
+        cache.update(true);
+        assert(cache.states.size() == 3);
+    }
+    {
+        server_prompt_cache cache(0, 100, 0, "", 0, SIG);
+        for (int i = 0; i < 3; ++i) {
+            auto st = make_state(100, 1000*(i + 1), 0, 0);
+            st.on_disk    = true;
+            st.disk_bytes = 4096;
+            cache.states.push_back(std::move(st));
+        }
+        cache.update(true);
+        assert(cache.states.size() == 1);
+        cache.states.clear();
+    }
+}
+
 // fork: the RAM limit counts the RAM the server holds outside the cache (ram_outside: the states of slots paused for
 // room). the cache gives way: with no disk write while one may not happen (a decode would wait for it), the dirty
 // states then wait above the limit; with one when it may; and with none for the states write_behind put on disk
@@ -888,6 +914,7 @@ int main(int argc, char ** argv) {
         { "write-behind",       test_write_behind       },
         { "write-behind-cancel", test_write_behind_cancel },
         { "min-tokens",         test_min_tokens         },
+        { "no-size-limit",      test_no_size_limit      },
         { "ram-outside",        test_ram_outside        },
         { "ram-outside-alloc",  test_ram_outside_alloc  },
         { "reserve-no-write",   test_reserve_no_write   },

@@ -2278,9 +2278,14 @@ const slot_info_vec_t *   sinfos_in) {
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+    // fork: the state of one sequence holds the cells of the one stream it lived in, and they go to the stream of the
+    // sequence here (seq_to_stream), so it restores into a cache of another stream count too (another -np or
+    // --kv-unified: the pool moves conversations between such nodes); a whole-context state needs the same count
+    const bool other_streams = n_stream_cur != n_stream;
+    if (other_streams && seq_id < 0) {
         throw std::runtime_error("n_stream mismatch");
     }
+    uint32_t n_filled = 0;
 
     // a whole-context restore replaces every stream, so the cache is emptied once here
     // clear() resets all streams at once, so doing it per stream below would keep only the last one
@@ -2288,16 +2293,22 @@ const slot_info_vec_t *   sinfos_in) {
         clear(true);
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
+        // fork: with another stream count the layout of a mirrored cache is that of the stream of the sequence here
+        const uint32_t si = other_streams ? seq_to_stream[seq_id] : s;
+
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
-            if (sinfos_in && !(*sinfos_in)[s].empty()) {
+            if (!other_streams && sinfos_in && !(*sinfos_in)[s].empty()) {
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
             continue;
+        }
+        if (other_streams && ++n_filled > 1) {
+            throw std::runtime_error("failed to restore kv cache: the state of one sequence holds cells of several streams");
         }
 
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
@@ -2305,7 +2316,7 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[si] : nullptr);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2319,8 +2330,13 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (sinfos_out) {
-            (*sinfos_out)[s] = sinfo;
+            (*sinfos_out)[si] = sinfo;
         }
+    }
+
+    // fork: the mirrored cache holds cells where this one has none
+    if (other_streams && n_filled == 0 && sinfos_in && !(*sinfos_in)[seq_to_stream[seq_id]].empty()) {
+        throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
     }
 }
 

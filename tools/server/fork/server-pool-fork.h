@@ -44,6 +44,10 @@ struct server_pool_fork {
 // GET /pool/node: the devices with their memory, for the dashboard of a pool
 json server_pool_node_devices_fork();
 
+// GET /pool/node: the temperature, power and fan of the GPUs as the system reports them, [] where it does not
+// (server-gpu-sensors-fork.cpp)
+json server_gpu_sensors_fork();
+
 // a conversation moves to another node with its cached state, read and written in chunks by the HTTP threads, with
 // nothing written to disk: the export sends the file of a state on disk (a hard link pool-export-<id>.bin next to it in
 // the --cache-spill-dir) or a copy of a state in RAM, the import parses the chunks into RAM

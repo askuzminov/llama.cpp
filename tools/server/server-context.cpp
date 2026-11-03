@@ -2200,6 +2200,25 @@ private:
         return held;
     }
 
+    // a reserve for each answer: up to server_answer_room_fork tokens, less when the request allows less (Rulith
+    // Inference's pool guard holds 8192). with it a task that would make the running ones pause soon waits instead
+    static int64_t room_answer_fork(const server_task & t, int64_t n_done) {
+        const int64_t room = server_answer_room_fork();
+        const int64_t n_predict = t.params.n_predict > 0 ? (int64_t) t.params.n_predict : room;
+        return std::max<int64_t>(0, std::min(room, n_predict) - n_done);
+    }
+
+    // the cells the slots that run or wait paused take for themselves, other than `skip`: their tokens and answer reserve
+    int64_t room_reserved_fork(const server_slot * skip) const {
+        int64_t held = 0;
+        for (const auto & slot : slots) {
+            if (&slot != skip && slot.is_processing() && slot.task) {
+                held += std::max<int64_t>(slot.prompt.n_tokens(), slot.task->n_tokens()) + room_answer_fork(*slot.task, slot.stats.n_gen);
+            }
+        }
+        return held;
+    }
+
     // whether the prompt of a new task fits next to the slots that run or wait paused, the idle ones giving way. the
     // caller defers a task that does not, and the queue brings it back when a slot is released. a prompt longer than
     // the cache goes on, to the error of the upstream path
@@ -2207,25 +2226,12 @@ private:
         if (!room_on_fork()) {
             return true;
         }
-        // a reserve for each answer: up to server_answer_room_fork tokens, less when the request allows less (Rulith
-        // Inference's pool guard holds 8192). with it a task that would make the running ones pause soon waits instead
-        auto answer_room = [](const server_task & t, int64_t n_done) {
-            const int64_t room = server_answer_room_fork();
-            const int64_t n_predict = t.params.n_predict > 0 ? (int64_t) t.params.n_predict : room;
-            return std::max<int64_t>(0, std::min(room, n_predict) - n_done);
-        };
-
         const int64_t n_ctx = llama_n_ctx(ctx_tgt);
-        const int64_t need  = (int64_t) task.n_tokens() + answer_room(task, 0) + room_margin_fork();
+        const int64_t need  = (int64_t) task.n_tokens() + room_answer_fork(task, 0) + room_margin_fork();
         if ((int64_t) task.n_tokens() + room_margin_fork() > n_ctx) {
             return true;
         }
-        int64_t held = 0;
-        for (const auto & slot : slots) {
-            if (&slot != &dst && slot.is_processing() && slot.task) {
-                held += std::max<int64_t>(slot.prompt.n_tokens(), slot.task->n_tokens()) + answer_room(*slot.task, slot.stats.n_gen);
-            }
-        }
+        const int64_t held = room_reserved_fork(&dst);
         // The margin must not block the only task. Its context limit is checked by the decode path.
         if (held == 0 || held + need <= n_ctx) {
             return true;
@@ -3238,6 +3244,9 @@ private:
         const int id_task = slot.task->id;
         const int64_t t_start_us = ggml_time_us();
 
+        // fork: the checkpoint at the end of a long system prompt is evicted last (server_ckpt_system_break_fork)
+        const int64_t keep = server_ckpt_system_end_fork(slot.task->params.message_spans);
+
         // Optional cap on chain length (--ctx-checkpoints, or the fallback when the host-RAM probe
         // failed). A count does not help when the memory is short, so what normally bounds the
         // footprint is ckpt_budget(), enforced after the checkpoint is built and its size is known.
@@ -3272,7 +3281,7 @@ private:
 
         while (count_cap_active &&
                 slot.prompt.checkpoints.size() >= (size_t) ckpt_limits.count_cap) {
-            server_ckpt_evict_front_chain(slot.prompt.checkpoints);
+            server_ckpt_evict_front_chain(slot.prompt.checkpoints, keep);
         }
 
         // memory guard: keep the configured amount of host RAM free. Checked here, on every
@@ -3283,7 +3292,7 @@ private:
                 const size_t need = ckpt_limits.reserve_bytes - avail;
                 size_t freed = 0;
                 while (freed < need && !slot.prompt.checkpoints.empty()) {
-                    freed += server_ckpt_evict_front_chain(slot.prompt.checkpoints);
+                    freed += server_ckpt_evict_front_chain(slot.prompt.checkpoints, keep);
                 }
                 if (freed > 0) {
                     SLT_WRN(slot, "evicted %zu MiB of context checkpoints under host memory pressure (available %zu MiB < reserve %zu MiB)\n",
@@ -3308,7 +3317,7 @@ private:
             }
         }
 
-        const llama_pos base_pos = server_ckpt_next_base_pos(slot.prompt.checkpoints, model_tgt);
+        const llama_pos base_pos = server_ckpt_next_base_pos(slot.prompt.checkpoints, model_tgt, keep);
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
@@ -3339,7 +3348,7 @@ private:
         // Never drop the newest chain - it would just be rebuilt on the next call.
         const size_t budget = ckpt_budget();
         if (budget > 0) {
-            const size_t freed = server_ckpt_evict_over_budget(slot.prompt.checkpoints, budget);
+            const size_t freed = server_ckpt_evict_over_budget(slot.prompt.checkpoints, budget, keep);
 
             if (freed > 0) {
                 SLT_TRC(slot, "evicted %.3f MiB of context checkpoints over the budget (%zu MiB per slot)\n",
@@ -4123,6 +4132,18 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // fork: the room of a unified cache and the work done for the pool (server_room_report_fork,
+        // server_stats_report_fork), also when every slot is idle
+        {
+            int64_t n_held = 0;
+            for (const auto & slot : slots) {
+                n_held += slot.is_processing() && slot.task ? 1 : 0;
+            }
+            server_room_report_fork({room_on_fork() ? room_reserved_fork(nullptr) : -1, n_held, llama_n_ctx(ctx_tgt), room_margin_fork()});
+            server_stats_report_fork({metrics.prompt.count, metrics.prompt.time, metrics.predict.count, metrics.predict.time,
+                                      metrics.n_prompt_cached, metrics.t_start});
+        }
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
@@ -5119,6 +5140,13 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // fork: the end of a long system prompt, a checkpoint goes there (server_ckpt_system_break_fork),
+                    // unless the slot holds one there already (restored from it)
+                    int32_t sys_end = do_checkpoint ? server_ckpt_system_end_fork(spans) : -1;
+                    for (const auto & cp : slot.prompt.checkpoints) {
+                        sys_end = cp.n_tokens == sys_end ? -1 : sys_end;
+                    }
+
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
@@ -5170,6 +5198,12 @@ private:
                             }
                         }
 
+                        // fork: stop at the end of a long system prompt, the checkpoint made at the start of the next
+                        // batch holds it (server_ckpt_system_break_fork)
+                        if (slot.prompt.n_tokens() == sys_end) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -5201,6 +5235,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_system_end = sys_end >= 0 && n_tokens_start == sys_end; // fork
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -5218,7 +5253,8 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // fork: or the batch starts after a long system prompt
+                        if (!is_user_start && !near_prompt_end && !is_system_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -5238,7 +5274,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_system_end || // fork: is_system_end
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -7558,6 +7594,8 @@ void server_routes::init_routes() {
         auto res = create_response(true);
         // the pool polls this: the RAM a pool that stopped midway left goes even when no other move comes
         server_pool_xfer_clean_fork(std::string(), POOL_XFER_IDLE_S_FORK);
+        const server_room_fork  room  = server_room_get_fork();
+        const server_stats_fork stats = server_stats_get_fork();
         res->ok({
             {"devices",    server_pool_node_devices_fork()},
             {"n_parallel", params.n_parallel},
@@ -7572,6 +7610,20 @@ void server_routes::init_routes() {
                 ? string_format("%016llx", (unsigned long long) meta->pool_signature_fork) : std::string()},
             {"cache_ram", meta->pool_cache_ram_fork},
             {"migrate", pool_migrate_fork()},
+            {"kv_unified", params.kv_unified},
+            // the room of a unified cache (server_room_report_fork) and the tasks waiting in the queue for a slot or
+            // for room: the pool sends no request that would wait there
+            {"room", {
+                {"held", room.held}, {"slots", room.n_slots}, {"n_ctx", room.n_ctx}, {"margin", room.margin},
+                {"answer", server_answer_room_fork()}, {"deferred", queue_tasks.queue_tasks_deferred_size()},
+            }},
+            // what the model instance computed since it started (its metrics)
+            {"stats", {
+                {"prompt_tokens", stats.n_prompt}, {"prompt_s", stats.t_prompt_us / 1e6},
+                {"gen_tokens", stats.n_gen}, {"gen_s", stats.t_gen_us / 1e6}, {"cached_tokens", stats.n_cached},
+                {"uptime_s", stats.t_start_us > 0 ? (ggml_time_us() - stats.t_start_us) / 1e6 : 0.0},
+            }},
+            {"gpus", server_gpu_sensors_fork()},
         });
         return res;
     };

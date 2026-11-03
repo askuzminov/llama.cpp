@@ -77,6 +77,7 @@ endif()
 # fork: sources kept apart from the upstream list above
 target_sources(${TARGET} PRIVATE
     fork/server-models-fork.cpp
+    fork/server-gpu-sensors-fork.cpp
     fork/server-pool-fork.cpp
     fork/server-pool-fork.h
     fork/server-pool-ui-fork.inc

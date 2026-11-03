@@ -649,7 +649,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = -1;    // explicit count cap on context checkpoints per slot; -1 = no count limit (bounded by available host RAM), 0 = disabled
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = -1;    // -1 = auto (fraction of total RAM), 0 = disable, 1 = 1 MiB, etc.
+    int32_t cache_ram_mib       = -1;    // -1 = no limit (the free host RAM down to cache_ram_reserve_mib), 0 = disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
     // llama-connect params

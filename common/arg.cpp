@@ -1673,7 +1673,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum prompt cache size in MiB (default: %d, -1 - auto (fraction of total RAM), 0 - disable; decision models disable it unless it is given)"
+        string_format("set the maximum prompt cache size in MiB (default: %d, -1 - no limit: the free host RAM down to --cache-ram-reserve, 0 - disable; decision models disable it unless it is given)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;

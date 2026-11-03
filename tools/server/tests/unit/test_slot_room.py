@@ -199,7 +199,7 @@ def test_no_pause_below_ram_reserve(monkeypatch):
 
 def test_generation_progress_during_another_prompt(monkeypatch):
     global server
-    monkeypatch.delenv("LLAMA_PREFILL_EXCLUSIVE", raising=False)
+    monkeypatch.setenv("LLAMA_PREFILL_EXCLUSIVE", "0")  # the interleaved mode this test is about
     monkeypatch.setenv("LLAMA_PREFILL_BUDGET", "64")
     monkeypatch.setenv("LLAMA_SLOT_ANSWER_ROOM", "0")
     server.n_ctx = 8192

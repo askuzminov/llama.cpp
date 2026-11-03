@@ -1,4 +1,5 @@
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -258,6 +259,18 @@ def test_pool_keeps_a_conversation_on_its_node():
     assert len(keep) == 2
     assert all(e["node"] == new[0]["node"] for e in keep)
     assert all(e["conv"] == new[0]["conv"] for e in keep)
+    # a done event tells the prompt and the answer of the request from its timings
+    done = events("done")
+    assert len(done) == 3 and all(re.match(r"HTTP 200, [\d.]+ s: prompt \d+ tok [\d.]+ s, answer 8 tok [\d.]+ s \([\d.]+ t/s\)",
+                                           e["detail"]) for e in done), done
+    # the node reports what its model instance computed (its metrics) and the sensors of its GPUs (none here)
+    deadline = time.time() + 5
+    while (node_of(new[0]["node"])["stats"] or {}).get("gen_tokens", 0) < 24:
+        assert time.time() < deadline, node_of(new[0]["node"])["stats"]
+        time.sleep(0.05)
+    st = node_of(new[0]["node"])["stats"]
+    assert st["prompt_tokens"] > 0 and st["uptime_s"] > 0 and st["gen_s"] > 0, st
+    assert isinstance(node_of(new[0]["node"])["gpus"], list)
 
 
 def test_pool_spreads_new_conversations():
@@ -270,6 +283,249 @@ def test_pool_spreads_new_conversations():
         t.join()
     assert {e["node"] for e in events("new")} == {"n0", "n1"}
 
+
+def test_pool_spreads_new_conversations_before_the_cache():
+    # a new conversation goes to the node with the most free slots by weight; the shared prefix another node has cached
+    # (the system prompt of an agent) decides only between nodes as free. n0: 2 slots, the system prompt cached, one
+    # slot busy; n1: 1 slot, free - the new conversation goes to n1 (with the cache first it went to n0)
+    routers[0].n_slots = 2
+    routers[0].n_ctx = 2048
+    start_pool("move_tokens=64", slots=3)
+    drain("n1")
+
+    def on_slot_0(messages: list) -> str:  # both in the slot that holds the system prompt, so that n0 measures its share
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": messages, "max_tokens": 8, "temperature": 0, "id_slot": 0,
+        })
+        assert res.status_code == 200, res.body
+        return res.body["choices"][0]["message"]["content"]
+
+    a = [LIBRARY, {"role": "user", "content": "question one about the books"}]
+    a.append({"role": "assistant", "content": on_slot_0(a)})
+    on_slot_0([LIBRARY, {"role": "user", "content": "question two about the opening hours"}])
+    assert wait_share("n0") > 0.9  # n0 holds the system prompt and takes all of it
+    drain("n1", False)
+    a.append({"role": "user", "content": "tell a very long story about it"})
+
+    def long_answer():  # goes on on n0, the node of its conversation, and keeps one of its slots busy
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": a, "max_tokens": 700, "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+
+    t = threading.Thread(target=long_answer)
+    t.start()
+    deadline = time.time() + 10
+    while node_of("n0")["inflight"] < 1:
+        assert time.time() < deadline
+        time.sleep(0.005)
+    chat([LIBRARY, {"role": "user", "content": "question three about the newspapers"}])
+    t.join()
+    assert events("new")[0]["node"] == "n1", events("new")
+
+
+@pytest.mark.parametrize("rebalance", [True, False])
+def test_pool_rebalances_a_crowded_node(rebalance: bool):
+    # a conversation leaves its node when that node runs clearly more requests than a free one and the move is cheap:
+    # n0 (3 slots) runs 2 long answers, n1 stands - the next turn of a conversation of n0 goes to n1 with its state.
+    # pool-rebalance-s = 0 keeps it on n0
+    routers[0].n_slots = 3
+    routers[0].n_ctx = 3072
+    for r in routers:
+        r.kv_unified = True  # one KV stream on both: the same cache signature, the state can move
+    start_pool("move_tokens=16 prefill_tps=1" + ("" if rebalance else " rebalance_s=0"), slots=4)
+    drain("n1")
+    conv = [{"role": "user", "content": "once upon a time there was a little girl who " * 6}]
+    conv.append({"role": "assistant", "content": chat(conv)})
+    conv.append({"role": "user", "content": "and then?"})
+
+    def long_answer(i: int):
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": [{"role": "user", "content": f"a long story number {i}"}], "max_tokens": 1000,
+            "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+
+    ths = [threading.Thread(target=long_answer, args=(i,)) for i in range(2)]
+    for t in ths:
+        t.start()
+    deadline = time.time() + 10
+    while node_of("n0")["inflight"] < 2:
+        assert time.time() < deadline
+        time.sleep(0.005)
+    drain("n1", False)
+    chat(conv)
+    for t in ths:
+        t.join()
+    if rebalance:
+        moved = events("migrate")
+        assert len(moved) == 1 and moved[0]["node"] == "n1", (moved, events("move"), events("keep"))
+    else:
+        assert events("migrate") == [] and events("keep")[0]["node"] == "n0", (events("keep"), events("move"))
+
+
+@pytest.mark.parametrize("long_message", [True, False])
+def test_pool_moves_a_long_prompt_to_a_quiet_node(long_message: bool):
+    # a turn with a long new part to read (pool-move-tokens and more) leaves a node where another request runs for one
+    # where nothing runs: there its prompt pauses nobody (LLAMA_PREFILL_EXCLUSIVE). n0 (2 slots) runs one long answer,
+    # which is not crowded (2 streams with it against 1); a long next turn goes to n1 with its state, a short one stays
+    routers[0].n_slots = 2
+    routers[0].n_ctx = 4096
+    for r in routers:
+        r.kv_unified = True  # one KV stream on both: the same cache signature, the state can move
+    start_pool("move_tokens=16 prefill_tps=1", slots=3)
+    drain("n1")
+    conv = [{"role": "user", "content": "once upon a time there was a little girl who " * 6}]
+    conv.append({"role": "assistant", "content": chat(conv)})
+    conv.append({"role": "user", "content": "and then she went into the dark forest to find " * 6 if long_message else "and then?"})
+
+    def long_answer():
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": [{"role": "user", "content": "a long story"}], "max_tokens": 1500,
+            "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+
+    t = threading.Thread(target=long_answer)
+    t.start()
+    deadline = time.time() + 10
+    while node_of("n0")["inflight"] < 1:
+        assert time.time() < deadline
+        time.sleep(0.005)
+    drain("n1", False)
+    chat(conv)
+    t.join()
+    if long_message:
+        moved = events("migrate")
+        assert len(moved) == 1 and moved[0]["node"] == "n1", (moved, events("move"), events("keep"))
+    else:
+        assert events("migrate") == [] and events("keep")[0]["node"] == "n0", (events("keep"), events("move"))
+
+
+@pytest.mark.parametrize("quiet_wait,max_tokens", [(30, 1000), (0, 1000), (30, 8)])
+def test_pool_waits_with_a_long_prompt_for_a_quiet_node(quiet_wait: int, max_tokens: int):
+    # a long prompt for a node where a request runs waits until that request ends (at most pool-quiet-wait-s), instead
+    # of pausing its answer: n0 (2 slots, n1 out) runs one long answer, a new conversation with a long prompt comes. it
+    # asks for a long answer: one for a short answer (pool-short-tokens) does not wait
+    routers[0].n_slots = 2
+    routers[0].n_ctx = 4096
+    start_pool(f"move_tokens=16 prefill_tps=1 quiet_wait_s={quiet_wait}", slots=3)
+    drain("n1")
+    done = {}
+
+    def long_answer():
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": [{"role": "user", "content": "a long story"}], "max_tokens": 1500,
+            "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+        done["long"] = time.time()
+
+    t = threading.Thread(target=long_answer)
+    t.start()
+    deadline = time.time() + 10
+    while node_of("n0")["inflight"] < 1:
+        assert time.time() < deadline
+        time.sleep(0.005)
+    res = routers[0].make_request("POST", "/v1/chat/completions", data={
+        "model": "tiny", "messages": [{"role": "user", "content": "once upon a time there was a little girl who " * 6}],
+        "max_tokens": max_tokens, "temperature": 0,
+    })
+    assert res.status_code == 200, res.body
+    done["new"] = time.time()
+    t.join()
+    if quiet_wait and max_tokens > 512:
+        assert done["new"] > done["long"], done
+    else:
+        assert done["new"] < done["long"], done
+
+
+
+@pytest.mark.parametrize("repeat", [60, 3])
+def test_pool_sends_no_prompt_that_has_no_room_in_the_kv(repeat: int):
+    # a node with a unified KV cache takes a task only when its prompt fits next to what the running slots hold with
+    # their answer reserve, else the task waits inside the node. the node reports that room (GET /pool/node) and the pool
+    # sends such a prompt to a node with room instead. n0: 2 slots in a unified cache of 4096 cells, an answer reserve
+    # of 1500 (LLAMA_SLOT_ANSWER_ROOM); a long answer there (a prompt of ~1760 tokens) holds ~3260 cells, so the next
+    # turn of a conversation of n0 (~920 tokens, its answer of 8 tokens reserves 8, as on the node) has a free slot there
+    # but no room: it goes to n1. a short one (~60 tokens) fits and stays
+    routers[0].n_slots = 2
+    routers[0].kv_unified = True
+    routers[0].env_fork = {"LLAMA_SERVER_DEBUG_FAKE_TIMING": None, "LLAMA_SLOT_ANSWER_ROOM": "1500"}
+    for r in routers:
+        r.n_ctx = 4096
+        r.n_batch = 512
+    start_pool("move_tokens=16 wait_max=0", slots=3)
+    drain("n1")
+    conv = [{"role": "user", "content": "once upon a time there was a little girl who " * repeat}]
+    conv.append({"role": "assistant", "content": chat(conv)})
+    conv.append({"role": "user", "content": "and then?"})
+
+    def long_answer():
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": [{"role": "user", "content": "a long story " * 250}], "max_tokens": 2000,
+            "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+
+    t = threading.Thread(target=long_answer)
+    t.start()
+    deadline = time.time() + 10
+    while (node_of("n0")["room"] or {}).get("held", 0) < 3000:
+        assert time.time() < deadline, node_of("n0")["room"]
+        time.sleep(0.01)
+    drain("n1", False)
+    chat(conv)
+    t.join()
+    went = [e for e in events("move") + events("migrate") + events("keep") if e["conv"] == events("new")[-1]["conv"]]
+    assert len(went) == 1 and went[0]["node"] == ("n1" if repeat == 60 else "n0"), (went, node_of("n0")["room"])
+    assert node_of("n1")["room"] is None  # one slot, no unified cache: no room logic
+
+
+
+@pytest.mark.parametrize("short_tokens", [100, 0])
+def test_pool_puts_a_short_answer_first(short_tokens: int):
+    # a request for a short answer (max_tokens up to pool-short-tokens: the permission check an agent waits for) goes
+    # ahead of an older one for a long answer: n0 alone (n1 out, one slot) runs a long answer, a request for 300 tokens
+    # queues, then one for 8; the second runs first. with pool-short-tokens = 0 the older one goes first
+    routers[0].n_ctx = 2048
+    start_pool(f"short_tokens={short_tokens}")
+    drain("n1")
+    done = {}
+
+    def ask(name: str, content: str, max_tokens: int):
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens,
+            "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+        done[name] = time.time()
+
+    def queued(n: int):
+        deadline = time.time() + 10
+        while status()["pool"]["queued"] < n:
+            assert time.time() < deadline, status()["pool"]
+            time.sleep(0.005)
+
+    a = threading.Thread(target=ask, args=("a", "a long story", 1500))
+    a.start()
+    deadline = time.time() + 10
+    while node_of("n0")["inflight"] < 1:
+        assert time.time() < deadline
+        time.sleep(0.005)
+    b = threading.Thread(target=ask, args=("b", "another long story", 300))
+    b.start()
+    queued(1)
+    c = threading.Thread(target=ask, args=("c", "is this allowed?", 8))
+    c.start()
+    queued(2)
+    for t in (a, b, c):
+        t.join()
+    assert done["a"] < min(done["b"], done["c"]), done
+    if short_tokens:
+        assert done["c"] < done["b"], done
+    else:
+        assert done["b"] < done["c"], done
 
 def test_pool_queues_when_every_slot_is_busy():
     start_pool()
@@ -399,6 +655,52 @@ def test_pool_moves_the_state_of_a_conversation(spill: bool, min_tokens: int | N
     assert len(moved) == 1 and moved[0]["node"] != first, events("move")
     assert spill or "(RAM)" in moved[0]["detail"], moved[0]["detail"]
     # the state holds the first prompt and its answer
+    assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
+
+
+def test_pool_exports_no_state_the_estimate_rejects():
+    # the export copies the whole state on its node, so the pool asks for none when the moves so far say computing the
+    # difference is shorter: the first move of n0 exports and drops the state (prefill_tps so high that computing is
+    # always shorter), which gives the bytes per token; the second does not export
+    start_pool("move_tokens=16 wait_max=0 prefill_tps=100000000")
+    drain("n1")
+    convs = []
+    for i in range(2):
+        msgs = [{"role": "user", "content": f"story {i}: once upon a time there was a little girl who " * 12}]
+        msgs.append({"role": "assistant", "content": chat(msgs)})
+        msgs.append({"role": "user", "content": "and then?"})
+        convs.append(msgs)
+    drain("n1", False)
+    drain("n0")
+    for msgs in convs:
+        chat(msgs)
+    move = events("move")
+    move.reverse()
+    assert len(move) == 2 and all(e["node"] == "n1" for e in move), move
+    assert "no state moved: the move of" in move[0]["detail"] and "(estimate)" not in move[0]["detail"], move
+    assert "no state moved: the move of" in move[1]["detail"] and "(estimate)" in move[1]["detail"], move
+
+
+@pytest.mark.parametrize("first", [0, 1])
+def test_pool_moves_between_stream_counts(first: int):
+    # the state of a conversation moves between nodes of other KV stream counts: n0 runs 2 slots in 2 streams (no
+    # --kv-unified), n1 one slot in one. the signatures are the same, and a state restores into the stream of its slot
+    routers[0].n_slots = 2
+    routers[0].n_ctx = 1024
+    st = start_pool("move_tokens=16 wait_max=0 prefill_tps=1", slots=3)
+    assert st["nodes"][0]["signature"] == st["nodes"][1]["signature"] != ""
+    other = f"n{1 - first}"
+    drain(other)  # the conversation starts on n<first>
+    msgs = [{"role": "user", "content": "once upon a time there was a little girl who " * 12}]
+    t1 = {}
+    msgs.append({"role": "assistant", "content": chat(msgs, timings=t1)})
+    msgs.append({"role": "user", "content": "and then?"})
+    drain(other, False)
+    drain(f"n{first}")
+    t2 = {}
+    chat(msgs, timings=t2)
+    moved = events("migrate")
+    assert len(moved) == 1 and moved[0]["node"] == other, (events("move"), moved)
     assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
 
 

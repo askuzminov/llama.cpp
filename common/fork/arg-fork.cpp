@@ -187,6 +187,15 @@ void common_fork_add_preset_options(std::vector<common_arg> & args) {
          "how often a node on a slower link tries the faster ones, seconds (default: 10)"},
         {"pool-same-model",  COMMON_ARG_PRESET_POOL_FORK "_SAME_MODEL",  "0|1",
          "a node of another model than the most of the others takes no request (default: 1)"},
+        {"pool-rebalance-s", COMMON_ARG_PRESET_POOL_FORK "_REBALANCE_S", "SECONDS",
+         "a conversation leaves a node that runs clearly more requests than a free one when its move costs at most this "
+         "(default: 15, 0 = never)"},
+        {"pool-quiet-wait-s", COMMON_ARG_PRESET_POOL_FORK "_QUIET_WAIT_S", "SECONDS",
+         "a long prompt waits at most this long for a node where nothing runs, instead of pausing the answers of a busy "
+         "one (default: 60, 0 = no wait)"},
+        {"pool-short-tokens", COMMON_ARG_PRESET_POOL_FORK "_SHORT_TOKENS", "N",
+         "a request for at most N answer tokens (max_tokens) goes ahead of longer ones in the queue, as an agent waits for "
+         "its permission check (default: 512, 0 = none does)"},
     };
     for (const auto & o : pool_options) {
         args.push_back(common_arg(
