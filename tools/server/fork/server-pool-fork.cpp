@@ -47,7 +47,9 @@
 
 #if defined(_WIN32)
 #include <iphlpapi.h>
-#include <mstcpip.h> // SIO_UDP_CONNRESET
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12) // in mswsock.h of some SDKs only
+#endif
 #if defined(_MSC_VER)
 #pragma comment(lib, "iphlpapi.lib")
 #endif
