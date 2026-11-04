@@ -10,13 +10,18 @@
 //   A) restoring a partial checkpoint and rolling the rest of the memory back with seq_rm, then
 //      replaying the remaining tokens, reproduces the logits of an uninterrupted run;
 //   B) if the memory can produce a partial delta, base + delta reproduces the full partial state.
+//
+// --tokens N: a prompt of N tokens, the first N of -p / -f, else N synthetic ones (long enough for the sparse attention
+// of QSA in the replay); the context and the batch grow to hold it
 
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -54,39 +59,59 @@ static int argmax(const std::vector<float> & v) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    // --tokens is not a common argument
+    int n_tokens = 0;
+    std::vector<char *> args;
+    for (int i = 0; i < argc; ++i) {
+        if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
+            n_tokens = atoi(argv[++i]);
+        } else {
+            args.push_back(argv[i]);
+        }
+    }
+
     common_params params;
     params.n_ctx = 2048;
 
     common_init();
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
+    params.n_ctx   = std::max(params.n_ctx,   n_tokens);
+    params.n_batch = std::max(params.n_batch, n_tokens);
 
     ggml_backend_load_all();
 
+    // one context: a second one would take the device memory twice (-c, --moe-cache auto of the machines)
     auto init = common_init_from_params(params);
-    llama_model * model = init->model();
-    if (!model) {
-        return 1;
-    }
-
-    llama_context_ptr ctx(llama_init_from_model(model, common_context_params_to_llama(params)));
-    if (!ctx) {
+    llama_model   * model = init->model();
+    llama_context * ctx   = init->context();
+    if (!model || !ctx) {
         return 1;
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
+    const bool has_tokenizer = llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE;
+
     std::vector<llama_token> tokens;
-    if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
-        // synthetic test models carry no tokenizer
+    if (has_tokenizer && !params.prompt.empty()) {
+        tokens = common_tokenize(vocab, params.prompt, true);
+        if ((int) tokens.size() < n_tokens) {
+            fprintf(stderr, "the prompt has %zu tokens, fewer than --tokens %d: give a longer text with -f\n", tokens.size(), n_tokens);
+            return 1;
+        }
+        if (n_tokens > 0) {
+            tokens.resize(n_tokens);
+        }
+    } else if (has_tokenizer && n_tokens == 0) {
+        tokens = common_tokenize(vocab, "The quick brown fox jumps over the lazy dog and keeps running across the field.", true);
+    } else {
+        // synthetic test models carry no tokenizer; --tokens without a text gives synthetic tokens too
         const int n_vocab = llama_vocab_n_tokens(vocab);
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < (n_tokens > 0 ? n_tokens : 16); ++i) {
             tokens.push_back((llama_token) ((7*i + 1) % n_vocab));
         }
-    } else {
-        tokens = common_tokenize(
-                vocab, "The quick brown fox jumps over the lazy dog and keeps running across the field.", true);
     }
 
     if (tokens.size() < 6) {
@@ -97,7 +122,13 @@ int main(int argc, char ** argv) {
     const llama_seq_id seq_id = 0;
     const int n_base = (int) tokens.size() / 2;
 
-    llama_memory_t mem = llama_get_memory(ctx.get());
+    if (tokens.size() > llama_n_ctx(ctx) || tokens.size() - n_base > llama_n_batch(ctx)) {
+        fprintf(stderr, "the prompt of %zu tokens does not fit the context (%u) or the batch (%u)\n",
+                tokens.size(), llama_n_ctx(ctx), llama_n_batch(ctx));
+        return 1;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx);
     if (!mem) {
         printf("model has no memory - nothing to checkpoint\n");
         return 0;
@@ -108,49 +139,51 @@ int main(int argc, char ** argv) {
     const int  n_swa        = llama_model_n_swa(model);
 
     printf("model family: hybrid = %d, recurrent = %d, n_swa = %d\n", is_hybrid, is_recurrent, n_swa);
+    printf("prompt: %zu tokens, the checkpoint after %d\n", tokens.size(), n_base);
 
     // reference run: decode the whole prompt in two batches
     int n_past = 0;
-    if (!common_prompt_batch_decode(ctx.get(), tokens, n_base, n_past, params.n_batch, {}, false)) {
+    const std::vector<llama_token> head(tokens.begin(), tokens.begin() + n_base);
+    if (!common_prompt_batch_decode(ctx, head, n_base, n_past, params.n_batch, {}, false)) {
         return 1;
     }
 
     const llama_pos base_pos = n_past - 1;
-    const std::vector<uint8_t> snapshot = get_state(ctx.get(), seq_id);
+    const std::vector<uint8_t> snapshot = get_state(ctx, seq_id);
     if (snapshot.empty()) {
         fprintf(stderr, "partial checkpoint is empty\n");
         return 1;
     }
 
     if (!common_prompt_batch_decode(
-                ctx.get(), tokens, (int) tokens.size() - n_base, n_past, params.n_batch, {}, false)) {
+                ctx, tokens, (int) tokens.size() - n_base, n_past, params.n_batch, {}, false)) {
         return 1;
     }
 
-    const std::vector<uint8_t> expected  = get_state (ctx.get(), seq_id);
-    const std::vector<float>   logits_ref = get_logits(ctx.get(), model);
+    const std::vector<uint8_t> expected  = get_state (ctx, seq_id);
+    const std::vector<float>   logits_ref = get_logits(ctx, model);
 
     // --- B) partial delta round-trip, when the memory supports it -----------------------------
 
-    const size_t delta_size = llama_state_seq_get_delta_ext(ctx.get(), nullptr, 0, seq_id, FLAGS, base_pos);
+    const size_t delta_size = llama_state_seq_get_delta_ext(ctx, nullptr, 0, seq_id, FLAGS, base_pos);
     if (delta_size > 0) {
         std::vector<uint8_t> delta(delta_size);
-        if (llama_state_seq_get_delta_ext(ctx.get(), delta.data(), delta.size(), seq_id, FLAGS, base_pos) != delta.size()) {
+        if (llama_state_seq_get_delta_ext(ctx, delta.data(), delta.size(), seq_id, FLAGS, base_pos) != delta.size()) {
             fprintf(stderr, "failed to save the partial delta state\n");
             return 1;
         }
 
-        if (!set_state(ctx.get(), snapshot, seq_id)) {
+        if (!set_state(ctx, snapshot, seq_id)) {
             fprintf(stderr, "failed to restore the partial checkpoint\n");
             return 1;
         }
-        if (llama_state_seq_apply_delta(ctx.get(), delta.data(), delta.size(), seq_id, FLAGS, base_pos) != 0) {
+        if (llama_state_seq_apply_delta(ctx, delta.data(), delta.size(), seq_id, FLAGS, base_pos) != 0) {
             fprintf(stderr, "failed to apply the partial delta state\n");
             return 1;
         }
 
-        if (get_state(ctx.get(), seq_id) != expected) {
-            fprintf(stderr, "partial delta round-trip mismatch\n");
+        if (get_state(ctx, seq_id) != expected) {
+            fprintf(stderr, "partial delta round-trip failed: the state differs\n");
             return 1;
         }
 
@@ -164,7 +197,7 @@ int main(int argc, char ** argv) {
 
     // the checkpoint goes back first: it puts the recurrent state (if any) back at base_pos, which
     // is what makes the seq_rm below legal for hybrid and recurrent memory
-    if (!set_state(ctx.get(), snapshot, seq_id)) {
+    if (!set_state(ctx, snapshot, seq_id)) {
         fprintf(stderr, "failed to restore the partial checkpoint\n");
         return 1;
     }
@@ -175,11 +208,11 @@ int main(int argc, char ** argv) {
 
     n_past = n_base;
     if (!common_prompt_batch_decode(
-                ctx.get(), tokens, (int) tokens.size() - n_base, n_past, params.n_batch, {}, false)) {
+                ctx, tokens, (int) tokens.size() - n_base, n_past, params.n_batch, {}, false)) {
         return 1;
     }
 
-    const std::vector<float> logits_new = get_logits(ctx.get(), model);
+    const std::vector<float> logits_new = get_logits(ctx, model);
     if (logits_new.size() != logits_ref.size()) {
         fprintf(stderr, "logits size mismatch\n");
         return 1;
@@ -191,12 +224,12 @@ int main(int argc, char ** argv) {
     }
 
     if (argmax(logits_ref) != argmax(logits_new) || max_diff > 1e-2f) {
-        fprintf(stderr, "replay after a partial checkpoint diverged: argmax %d vs %d, max diff = %f\n",
+        fprintf(stderr, "partial checkpoint replay failed: argmax %d vs %d, max logit diff = %g\n",
                 argmax(logits_ref), argmax(logits_new), max_diff);
         return 1;
     }
 
-    printf("partial checkpoint replay passed: checkpoint = %zu bytes, max logit diff = %f\n",
+    printf("partial checkpoint replay passed: checkpoint = %zu bytes, max logit diff = %g\n",
             snapshot.size(), max_diff);
 
     return 0;

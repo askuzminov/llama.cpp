@@ -607,11 +607,11 @@ uint32_t common_speculative_fork_mtp_ubatch(uint32_t n_ubatch) {
     return cap > 0 ? (uint32_t) std::min<int64_t>(n_ubatch, cap) : n_ubatch;
 }
 
-bool common_speculative_fork_even_drafts() {
+bool common_speculative_fork_even_drafts(const common_params_speculative & params) {
     static const bool even = [] {
         return common_fork_env_int("LLAMA_SPEC_EVEN", 1) != 0;
     }();
-    return even;
+    return even && params.tgt_split_equal;
 }
 
 int32_t common_speculative_fork_draft_by_slots(int n_gen) {

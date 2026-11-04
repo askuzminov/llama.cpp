@@ -63,10 +63,11 @@ public:
 
     // the elastic KV cache: the attention cache searches its capacity, the indexer cache maps memory for the same cells
     bool     kv_elastic_init_fork(bool emulate) override;
-    uint32_t kv_capacity_fork() const override;
-    uint32_t kv_set_capacity_fork(uint32_t n_cells) override;
+    uint32_t kv_capacity_fork(int32_t strm) const override;
+    uint32_t kv_set_capacity_fork(uint32_t n_cells, int32_t strm) override;
+    size_t   kv_mapped_cells_fork() const override;
     size_t   kv_cell_bytes_fork() const override;
-    void     kv_set_grow_fork(std::function<bool(uint32_t)> grow) override;
+    void     kv_set_grow_fork(std::function<bool(uint32_t, uint32_t)> grow) override;
     void     kv_alloc_deferred_fork() override;
 
     // the pool rows of a failed pass may be half written

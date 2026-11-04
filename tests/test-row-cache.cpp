@@ -184,6 +184,24 @@ int main() {
         test_type(GGML_TYPE_Q8_0, 4096, 400, 0);
     }
 
+    // a table that does not fit in its file is refused at once: its last rows would read as zeros. the exact fit is fine
+    {
+        const std::string path = write_table("test-row-cache.bin", GGML_TYPE_F32, 128, 100);
+        for (const int64_t n_rows : { (int64_t) 101, (int64_t) 100 }) {
+            bool refused = false;
+            try {
+                llama_row_cache cache(path, HEADER, GGML_TYPE_F32, 128, n_rows, 1);
+            } catch (const std::exception &) {
+                refused = true;
+            }
+            if (refused != (n_rows > 100)) {
+                fprintf(stderr, "FAIL: a table of %d rows in a file of 100 was %s\n", (int) n_rows, refused ? "refused" : "accepted");
+                n_fail++;
+            }
+        }
+        remove(path.c_str());
+    }
+
     if (n_fail > 0) {
         fprintf(stderr, "%d checks failed\n", n_fail);
         return 1;

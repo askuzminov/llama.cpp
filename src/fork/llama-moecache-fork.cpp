@@ -1118,6 +1118,7 @@ void llama_moe_cache_fork::init(ggml_backend_sched_t sched) {
     }
     hot.resize(sel.size());
     layers = std::move(sel);
+    state_file = state_path();
     state_load();
 
     if (n_skip > 0) {
@@ -1327,6 +1328,10 @@ void llama_moe_cache_fork::alloc() {
         const auto & h = hot[idx];
         for (int32_t i = std::min<int32_t>(c.n_slots, (int32_t) h.size()) - 1; i >= 0; --i) {
             const int32_t e = h[i];
+            // an expert twice would enter the LRU list twice and make it a loop (state_load drops such a file)
+            if (c.slot[e] >= 0) {
+                continue;
+            }
             const int32_t s = c.n_fill++;
 
             c.expert[s] = e;
@@ -1677,25 +1682,74 @@ std::vector<std::vector<int32_t>> llama_moe_cache_fork::hot_now() const {
     return h;
 }
 
-// file: "LMC1", the layer count, n_expert, then per layer its index in the model, the count and the experts. it is
-// written next to itself and renamed, so a process that dies while saving leaves the last complete one
+uint64_t llama_moe_cache_fork::state_id() const {
+    // FNV-1a over the model (architecture, name, file size, parameters) and the cached layers (index, the type and the
+    // shape of each expert weight): two models of one shape, as two quants or two fine-tunes, get different files
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void * p, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            h = (h ^ ((const uint8_t *) p)[i]) * 1099511628211ull;
+        }
+    };
+    const std::string arch = model.arch_name();
+    mix(arch.data(), arch.size() + 1);
+    mix(model.name.data(), model.name.size() + 1);
+    const uint64_t n_bytes  = model.size();
+    const uint64_t n_params = model.n_elements();
+    mix(&n_bytes,  sizeof(n_bytes));
+    mix(&n_params, sizeof(n_params));
+    mix(&n_expert, sizeof(n_expert));
+    for (const auto & l : layers) {
+        mix(&l.il, sizeof(l.il));
+        for (const ggml_tensor * w : { l.w_up, l.w_gate, l.w_down }) {
+            const int32_t type = w != nullptr ? (int32_t) w->type : -1;
+            mix(&type, sizeof(type));
+            if (w != nullptr) {
+                mix(w->ne, sizeof(w->ne));
+            }
+        }
+    }
+    return h;
+}
+
+std::string llama_moe_cache_fork::state_path() const {
+    const char * env = getenv("LLAMA_MOE_CACHE_STATE");
+    if (env == nullptr || *env == '\0' || layers.empty()) {
+        return "";
+    }
+    char id[24];
+    snprintf(id, sizeof(id), "-%016" PRIx64, state_id());
+    std::string path = env;
+    const size_t sep = path.find_last_of("/\\");
+    const size_t dot = path.find_last_of('.');
+    path.insert(dot != std::string::npos && (sep == std::string::npos || dot > sep) ? dot : path.size(), id);
+    return path;
+}
+
+// file: "LMC2", the id of the model and its cache (state_id), the layer count, n_expert, then per layer its index in the
+// model, the count and the experts. it is written next to itself and renamed, so a process that dies while saving
+// leaves the last complete one. "LMC1" (until 04.11) had no id: a model of the same shape took the state of another
+static constexpr int32_t MOE_CACHE_STATE_MAGIC = 0x32434d4c;
+
 void llama_moe_cache_fork::state_save() const {
-    static const char * path = getenv("LLAMA_MOE_CACHE_STATE");
-    if (path == nullptr || *path == '\0' || layers.empty()) {
+    if (state_file.empty() || layers.empty()) {
         return;
     }
     const auto h = hot_now();
     if (std::all_of(h.begin(), h.end(), [](const std::vector<int32_t> & v) { return v.empty(); })) {
         return;
     }
-    const std::string tmp = std::string(path) + ".tmp";
+    const std::string & path = state_file;
+    const std::string tmp = path + ".tmp";
     FILE * f = fopen(tmp.c_str(), "wb");
     if (f == nullptr) {
         LLAMA_LOG_WARN("%s: cannot write %s\n", MOE_CACHE_LOG, tmp.c_str());
         return;
     }
-    const int32_t head[3] = { 0x31434d4c, (int32_t) layers.size(), (int32_t) n_expert };
-    bool ok = fwrite(head, sizeof(head), 1, f) == 1;
+    const int32_t  magic   = MOE_CACHE_STATE_MAGIC;
+    const uint64_t id      = state_id();
+    const int32_t  dims[2] = { (int32_t) layers.size(), (int32_t) n_expert };
+    bool ok = fwrite(&magic, sizeof(magic), 1, f) == 1 && fwrite(&id, sizeof(id), 1, f) == 1 && fwrite(dims, sizeof(dims), 1, f) == 1;
     for (size_t idx = 0; idx < layers.size() && ok; ++idx) {
         const int32_t rec[2] = { (int32_t) layers[idx].il, (int32_t) h[idx].size() };
         ok = fwrite(rec, sizeof(rec), 1, f) == 1 && (h[idx].empty() || fwrite(h[idx].data(), sizeof(int32_t), h[idx].size(), f) == h[idx].size());
@@ -1706,24 +1760,27 @@ void llama_moe_cache_fork::state_save() const {
         std::remove(tmp.c_str());
         return;
     }
-    std::remove(path); // rename does not replace a file on windows
-    if (std::rename(tmp.c_str(), path) != 0) {
-        LLAMA_LOG_WARN("%s: cannot rename %s to %s\n", MOE_CACHE_LOG, tmp.c_str(), path);
+    std::remove(path.c_str()); // rename does not replace a file on windows
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        LLAMA_LOG_WARN("%s: cannot rename %s to %s\n", MOE_CACHE_LOG, tmp.c_str(), path.c_str());
     }
 }
 
 void llama_moe_cache_fork::state_load() {
-    const char * path = getenv("LLAMA_MOE_CACHE_STATE");
-    if (path == nullptr || *path == '\0') {
+    if (state_file.empty()) {
         return;
     }
+    const char * path = state_file.c_str();
     FILE * f = fopen(path, "rb");
     if (f == nullptr) {
         return;
     }
     std::vector<std::vector<int32_t>> h(layers.size());
-    int32_t head[3] = { 0, 0, 0 };
-    bool ok = fread(head, sizeof(head), 1, f) == 1 && head[0] == 0x31434d4c && head[1] == (int32_t) layers.size() && head[2] == (int32_t) n_expert;
+    int32_t  magic   = 0;
+    uint64_t id      = 0;
+    int32_t  dims[2] = { 0, 0 };
+    bool ok = fread(&magic, sizeof(magic), 1, f) == 1 && fread(&id, sizeof(id), 1, f) == 1 && fread(dims, sizeof(dims), 1, f) == 1 &&
+              magic == MOE_CACHE_STATE_MAGIC && id == state_id() && dims[0] == (int32_t) layers.size() && dims[1] == (int32_t) n_expert;
     size_t n_total = 0;
     for (size_t idx = 0; idx < layers.size() && ok; ++idx) {
         int32_t rec[2] = { 0, 0 };
@@ -1732,8 +1789,13 @@ void llama_moe_cache_fork::state_load() {
             h[idx].resize(rec[1]);
             ok = rec[1] == 0 || fread(h[idx].data(), sizeof(int32_t), rec[1], f) == (size_t) rec[1];
         }
+        // each expert once: state_save writes no repeat, a damaged or edited file can
+        std::vector<uint8_t> seen(n_expert, 0);
         for (int32_t e : h[idx]) {
-            ok = ok && e >= 0 && e < n_expert;
+            ok = ok && e >= 0 && e < n_expert && seen[e] == 0;
+            if (ok) {
+                seen[e] = 1;
+            }
         }
         n_total += h[idx].size();
     }

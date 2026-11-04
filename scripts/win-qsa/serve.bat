@@ -40,9 +40,9 @@ rem the console goes away with the window at shutdown, so keep a copy of the log
 rem this is where to look after a reboot to see whether the cache was written
 if not defined LOGDIR        set "LOGDIR=%~dp0logs"
 
-rem the experts the VRAM cache held (--moe-cache, the 3090) are saved here and loaded at the next start, so the first
-rem requests after a restart do not start from an empty cache. a file of another model is ignored and overwritten.
-rem set it to an empty value to start empty every time
+rem the experts the VRAM cache held (--moe-cache, the 3090) are saved next to this path and loaded at the next start,
+rem so the first requests after a restart do not start from an empty cache. each model keeps its own file: its name
+rem gets a hash of the model (moe-cache-state-HASH.bin). set it to an empty value to start empty every time
 if not defined LLAMA_MOE_CACHE_STATE set "LLAMA_MOE_CACHE_STATE=%CACHEDIR%\moe-cache-state.bin"
 
 rem ---------------------------------------------------------------------------

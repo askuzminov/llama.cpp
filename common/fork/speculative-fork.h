@@ -56,8 +56,10 @@ void common_speculative_fork_dflash_fit(const llama_model * model_dft, int32_t n
 // decoding together cannot share (Rulith, four: 37.9 -> 47.4 tok/s with the cap).
 // even: the MTP drafter keeps a sequence whose confident run ended drafting while another one is still confident and
 // cuts all of them to the longest confident run; common_speculative_draft cuts what is left uneven to the shortest.
-// LLAMA_SPEC_EVEN=0: per sequence, as upstream
-bool    common_speculative_fork_even_drafts();
+// only for a target that splits such a batch equally (params.tgt_split_equal): a KV cache of attention alone in one
+// stream verifies drafts of any lengths in one pass, and there the cut only loses drafts. LLAMA_SPEC_EVEN=0: per
+// sequence, as upstream
+bool    common_speculative_fork_even_drafts(const common_params_speculative & params);
 // the draft cap of a step with n_gen generating slots, -1 for none. LLAMA_SPEC_DRAFT_BY_SLOTS: the caps for 1, 2, ...
 // slots, the last one for more (default "3,3,2,2,2,1": what Rulith's measured adaptation picked on real tasks - two
 // conversations three drafts, four two, eight one), "0" or "" = no cap. one slot keeps --spec-auto as it is

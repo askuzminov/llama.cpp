@@ -131,6 +131,11 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
         ggml_nbytes(src0) > range || ggml_nbytes(src1) > range) {
         return nullptr;
     }
+    // the shader reads b as vec4 from element offsets divided by 4: the rows are contiguous (y_f32_kernel) and K is a
+    // multiple of 64, the strides of the batch dimensions must keep the 16-byte steps too
+    if (src1->nb[2] % 16 != 0 || src1->nb[3] % 16 != 0) {
+        return nullptr;
+    }
     if (glu_up != nullptr && (glu_up->type != src0->type || !ggml_are_same_shape(glu_up, src0) || ggml_nbytes(glu_up) > range)) {
         return nullptr;
     }

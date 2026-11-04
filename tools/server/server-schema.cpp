@@ -228,6 +228,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
 #endif
 
+    // fork: a cap on the drafts of this request (upstream keeps its speculative fields off above). 0 drafts nothing, so
+    // one server answers with and without speculation: the spec probe of the QA harness (scripts/win-qsa/_qa.py)
+    add((new field_num("speculative.n_max", params.spec_n_max_fork))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Draft at most this many tokens per step for this request, 0 to not draft (-1: as the server)"));
+
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

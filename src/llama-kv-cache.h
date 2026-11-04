@@ -190,24 +190,28 @@ public:
     // head only (llama_model::create_memory); the other SWA caches keep the upstream rule
     bool swa_reuse_shared_fork = false;
 
-    // fork: an elastic cache (src/fork/llama-kv-elastic-fork.cpp, LLAMA_KV_ELASTIC): only its first cells - the
-    // capacity - are used, and the device maps memory to them as the context grows; the rest of the cache costs no
-    // memory. elastic_init_fork moves the tensors to buffers the device maps on demand (emulate: ordinary buffers, for
-    // tests where the backend has none), elastic_commit_fork maps memory to n_cap cells (false if the device has none
-    // left), elastic_set_capacity_fork sets the capacity (not below the cells in use, mapping what it lacks, unmapping
-    // the rest) and returns it - the old one when the device cannot map the new
+    // fork: an elastic cache (src/fork/llama-kv-elastic-fork.cpp, LLAMA_KV_ELASTIC): only the first cells of each
+    // stream - its capacity - are used, and the device maps memory to them as the context grows; the rest of the cache
+    // costs no memory. elastic_init_fork moves the tensors to buffers the device maps on demand (emulate: ordinary
+    // buffers, for tests where the backend has none), elastic_commit_fork maps memory to n_cap cells of a stream (false
+    // if the device has none left), elastic_set_capacity_fork sets the capacity of a stream (not below its cells in use,
+    // mapping what it lacks, unmapping the rest) and returns it - the old one when the device cannot map the new.
+    // elastic_zero_reads_fork: the device reads memory it has not mapped as zeros, so a stream may be read past its
+    // capacity (the streams of a ubatch read the same n_kv cells); else find_slot maps those cells (elastic_cover_fork)
     bool     elastic_init_fork(bool emulate);
-    bool     elastic_commit_fork(uint32_t n_cap);
-    uint32_t elastic_set_capacity_fork(uint32_t n_cap);
-    uint32_t elastic_capacity_fork() const { return n_cap_fork; }
+    bool     elastic_commit_fork(uint32_t strm, uint32_t n_cap);
+    uint32_t elastic_set_capacity_fork(uint32_t strm, uint32_t n_cap);
+    uint32_t elastic_capacity_fork(uint32_t strm) const { return strm < v_cap_fork.size() ? v_cap_fork[strm] : 0; }
     size_t   elastic_cell_bytes_fork() const;
+    bool     elastic_zero_reads_fork() const;
 
     // fork: the buffers of a cache built without memory (llama_kv_defer_scope_fork) that elastic_init_fork did not
     // replace, allocated and cleared as the constructor does; nothing for the others
     void     alloc_deferred_fork();
 
-    // fork: find_slot calls it with the cells the cache needs when the free cells within the capacity do not hold a ubatch
-    std::function<bool(uint32_t)> elastic_grow_fork;
+    // fork: find_slot calls it with a stream and the cells it needs when the free cells within its capacity do not hold
+    // a ubatch
+    std::function<bool(uint32_t, uint32_t)> elastic_grow_fork;
 
     // n_kv of the full contexts, see set_n_kv_full()
     uint32_t get_n_kv_full() const;
@@ -356,9 +360,21 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
 
-    // fork: the capacity of an elastic cache, 0: all cells (see elastic_init_fork)
-    uint32_t n_cap_fork = 0;
+    // fork: the capacity of each stream of an elastic cache, 0 or none: all cells (see elastic_init_fork)
+    std::vector<uint32_t> v_cap_fork;
     std::shared_ptr<llama_kv_elastic_fork> elastic_fork;
+
+    // fork: the cells of a stream an elastic cache maps (all of them when it is not elastic), and where they start in the
+    // input of the K-shift, which takes the streams one after the other (build_graph_shift)
+    uint32_t elastic_cells_fork(uint32_t strm) const;
+    uint32_t elastic_shift_base_fork(uint32_t strm) const;
+
+    // fork: the streams of a ubatch read the same n_kv cells; where the device does not read unmapped memory as zeros,
+    // each of them gets its memory first (false when the device has none)
+    bool elastic_cover_fork(const slot_info & sinfo) const;
+
+    // fork: the cross-stream copy of an elastic cache takes the cells in use only, the rest has no memory
+    void elastic_copy_stream_fork(uint32_t ssrc, uint32_t sdst) const;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

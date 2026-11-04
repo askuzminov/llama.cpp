@@ -13,6 +13,10 @@
 #include "fork/qwen4exp-fork.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-dsa.h"
+#include "llama-kv-cache-dsa-iswa.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-msa.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
@@ -126,10 +130,10 @@ void llama_context::kv_elastic_try_fork() {
 
     kv_elastic = true;
 
-    // a cell search that runs out of capacity (a restored state, a batch past the plan) grows it, giving up the moe-cache
-    // slots if it has to
-    memory->kv_set_grow_fork([this](uint32_t n_cells) {
-        return kv_elastic_set_fork(n_cells + kv_elastic_step, true);
+    // a cell search that runs out of capacity of a stream (a restored state, a batch past the plan) grows it, giving up
+    // the moe-cache slots if it has to
+    memory->kv_set_grow_fork([this](uint32_t strm, uint32_t n_cells) {
+        return kv_elastic_set_fork(n_cells + kv_elastic_step, true, (int32_t) strm);
     });
 
     const uint32_t cap = kv_elastic_capacity_fork(kv_elastic_step);
@@ -140,7 +144,8 @@ void llama_context::kv_elastic_try_fork() {
         throw std::runtime_error("kv_elastic: the device has no memory for the first cells of the KV cache");
     }
 
-    LLAMA_LOG_INFO("%s: kv_elastic: %u of %u cells mapped, step %u, %.1f MiB per 1024 cells%s\n", __func__, cap, cparams.n_ctx,
+    LLAMA_LOG_INFO("%s: kv_elastic: %u of %u cells mapped%s, step %u, %.1f MiB per 1024 cells%s\n", __func__, cap, cparams.n_ctx_seq,
+            kv_n_stream_fork() > 1 ? format(" in each of %u streams", kv_n_stream_fork()).c_str() : "",
             kv_elastic_step, memory->kv_cell_bytes_fork()*1024/1024.0/1024.0,
             mode > 0 ? " (on request)" : no_cache ? " (by default: no expert cache, LLAMA_KV_ELASTIC=0 for a static one)" : "");
 }
@@ -148,50 +153,92 @@ void llama_context::kv_elastic_try_fork() {
 // LLAMA_KV_ELASTIC_TEST_MIB (tests): the device memory of the KV capacity and of the moe-cache slots together stops at this
 // many MiB, so that a growth past it makes the cache give up layers as on a full device. the emulation of
 // LLAMA_KV_ELASTIC=1 maps any capacity, and a host with free memory never gets there. 0 (default): no limit
-uint32_t llama_context::kv_elastic_capacity_fork(uint32_t n_cells) {
+uint32_t llama_context::kv_n_stream_fork() const {
+    return cparams.kv_unified ? 1 : std::max(1u, cparams.n_seq_max);
+}
+
+uint32_t llama_context::kv_elastic_capacity_fork(uint32_t n_cells, int32_t strm) {
     static const int64_t test_mib = llama_fork_env_int("LLAMA_KV_ELASTIC_TEST_MIB", 0);
     const size_t cell = memory->kv_cell_bytes_fork();
     if (test_mib > 0 && cell > 0) {
-        const size_t   held  = moe_cache_fork && moe_cache_fork->ready() ? moe_cache_fork->size_slots() : 0;
-        const size_t   limit = (size_t) test_mib*1024*1024;
-        const uint32_t fit   = limit > held ? (uint32_t) std::min<size_t>((limit - held)/cell/kv_elastic_step*kv_elastic_step, UINT32_MAX) : 0;
-        n_cells = std::min(n_cells, std::max(memory->kv_capacity_fork(), fit));
+        // all streams: one after the other, each within what the others left
+        if (strm < 0 && kv_n_stream_fork() > 1) {
+            uint32_t res = 0;
+            for (uint32_t s = 0; s < kv_n_stream_fork(); ++s) {
+                const uint32_t cap = kv_elastic_capacity_fork(n_cells, (int32_t) s);
+                res = s == 0 ? cap : std::min(res, cap);
+            }
+            return res;
+        }
+        // the cells all streams may map together, the ones this stream maps now among them
+        const size_t   held   = moe_cache_fork && moe_cache_fork->ready() ? moe_cache_fork->size_slots() : 0;
+        const size_t   limit  = (size_t) test_mib*1024*1024;
+        const size_t   fit    = limit > held ? (limit - held)/cell : 0;
+        const size_t   mapped = memory->kv_mapped_cells_fork();
+        const uint32_t cur    = memory->kv_capacity_fork(strm);
+        const size_t   room   = fit > mapped ? (fit - mapped)/kv_elastic_step*kv_elastic_step : 0;
+        n_cells = std::min<size_t>(n_cells, std::max<size_t>(cur, std::min<size_t>(cur + room, UINT32_MAX)));
     }
-    return memory->kv_set_capacity_fork(n_cells);
+    return memory->kv_set_capacity_fork(n_cells, strm);
 }
 
-bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release) {
+bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t strm) {
     if (!kv_elastic) {
         return false;
     }
 
-    const uint32_t old  = memory->kv_capacity_fork();
+    // the cells of one stream (all of them with one)
+    const uint32_t full = cparams.n_ctx_seq;
+    const uint32_t old  = memory->kv_capacity_fork(strm);
     const uint32_t want = GGML_PAD(n_cells, kv_elastic_step);
 
-    uint32_t cap = kv_elastic_capacity_fork(want);
+    uint32_t cap = kv_elastic_capacity_fork(want, strm);
 
     // the moe-cache holds the memory: it gives up layers of slots until the cells fit (all of them with
     // LLAMA_MOE_CACHE_KEEP=0), the next generation phase gives those layers slots from what is left
-    if (cap < std::min(want, cparams.n_ctx) && release && moe_cache_fork && moe_cache_fork->ready()) {
+    if (cap < std::min(want, full) && release && moe_cache_fork && moe_cache_fork->ready()) {
         if (moe_cache_keep_mib() == 0) {
             moe_cache_fork->release();
-            cap = kv_elastic_capacity_fork(want);
+            cap = kv_elastic_capacity_fork(want, strm);
         }
-        while (cap < std::min(want, cparams.n_ctx) && moe_cache_fork->ready()) {
+        while (cap < std::min(want, full) && moe_cache_fork->ready()) {
             // whole layers, at least one per try: the mapping rounds every tensor of the cache up to its granule
-            moe_cache_fork->release_bytes(std::max<size_t>(1, (size_t) (std::min(want, cparams.n_ctx) - cap)*memory->kv_cell_bytes_fork()));
-            cap = kv_elastic_capacity_fork(want);
+            moe_cache_fork->release_bytes(std::max<size_t>(1, (size_t) (std::min(want, full) - cap)*memory->kv_cell_bytes_fork()));
+            cap = kv_elastic_capacity_fork(want, strm);
         }
         phase_cache = false;
         gf_res_prev_reset();
         gf_res_prev_active = nullptr;
     }
 
-    if (cap != old) {
-        LLAMA_LOG_INFO("%s: kv_elastic: %u -> %u cells (%u in use)\n", __func__, old, cap, memory->get_n_kv_used());
+    // several streams: a stream that cannot grow takes the memory the others map past their cells in use (the capacity
+    // only grows without --phase-mem, so a slot that once held a long conversation keeps its memory until then); each
+    // of them takes a step again on its next cell search
+    if (cap < std::min(want, full) && strm >= 0 && kv_n_stream_fork() > 1) {
+        const size_t before = memory->kv_mapped_cells_fork();
+        for (uint32_t s = 0; s < kv_n_stream_fork(); ++s) {
+            if ((int32_t) s != strm) {
+                memory->kv_set_capacity_fork(0, (int32_t) s);
+            }
+        }
+        if (memory->kv_mapped_cells_fork() < before) {
+            LLAMA_LOG_INFO("%s: kv_elastic: stream %d needs %u cells, the other streams give back %zu cells\n", __func__,
+                    strm, want, before - memory->kv_mapped_cells_fork());
+            cap = kv_elastic_capacity_fork(want, strm);
+        }
     }
 
-    return cap >= std::min(n_cells, cparams.n_ctx);
+    if (cap != old) {
+        if (kv_n_stream_fork() > 1) {
+            LLAMA_LOG_INFO("%s: kv_elastic: %s %u -> %u cells (%u in use, %zu cells mapped in all)\n", __func__,
+                    strm >= 0 ? format("stream %d", strm).c_str() : "every stream", old, cap,
+                    memory->get_n_kv_used(), memory->kv_mapped_cells_fork());
+        } else {
+            LLAMA_LOG_INFO("%s: kv_elastic: %u -> %u cells (%u in use)\n", __func__, old, cap, memory->get_n_kv_used());
+        }
+    }
+
+    return cap >= std::min(n_cells, full);
 }
 
 bool llama_context::sched_upload_experts_fork(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -246,7 +293,7 @@ void llama_context::phase_update(uint32_t n_tokens) {
 
     // elastic KV: the cells of this batch within the capacity before the slot search, and before a generation phase
     // gives the free memory to the moe-cache
-    if (kv_elastic && memory->get_n_kv_used() + n_tokens > memory->kv_capacity_fork()) {
+    if (kv_elastic && memory->get_n_kv_used() + n_tokens > memory->kv_capacity_fork(-1)) {
         kv_elastic_set_fork(memory->get_n_kv_used() + n_tokens + kv_elastic_step, true);
     }
 
@@ -254,7 +301,7 @@ void llama_context::phase_update(uint32_t n_tokens) {
     // after it) goes back to the device, and the moe-cache takes its slots again below
     if (kv_elastic && gen) {
         const uint32_t want = memory->get_n_kv_used() + n_tokens + kv_elastic_step;
-        if (memory->kv_capacity_fork() > GGML_PAD(want, kv_elastic_step) + std::max(2*kv_elastic_step, cparams.n_ctx/8)) {
+        if (memory->kv_capacity_fork(-1) > GGML_PAD(want, kv_elastic_step) + std::max(2*kv_elastic_step, cparams.n_ctx/8)) {
             if (moe_cache_fork && moe_cache_fork->ready()) {
                 moe_cache_fork->release();
                 gf_res_prev_reset();
@@ -291,7 +338,7 @@ void llama_context::phase_gen() {
     // elastic KV: the cells in use and a step; more than two steps over that go back to the device for the moe-cache
     if (kv_elastic) {
         const uint32_t want = memory->get_n_kv_used() + kv_elastic_step;
-        const uint32_t cap  = memory->kv_capacity_fork();
+        const uint32_t cap  = memory->kv_capacity_fork(-1);
         if (cap < want || cap > GGML_PAD(want, kv_elastic_step) + 2*kv_elastic_step) {
             kv_elastic_set_fork(want, false);
         }
@@ -638,6 +685,19 @@ uint32_t llama_mtp_window_kv(const llama_context * ctx, uint32_t * n_window) {
         *n_window = n_swa;
     }
     return n_swa > 0 ? kv->get_size() : 0;
+}
+
+bool llama_split_equal(const llama_context * ctx) {
+    // the caches of attention alone try split_simple first when they keep one stream (init_batch); all other memories,
+    // also ones not listed here, split a batch of several sequences equally
+    const llama_memory_i * mem = ctx->get_memory();
+    const bool attn_only =
+        dynamic_cast<const llama_kv_cache          *>(mem) != nullptr ||
+        dynamic_cast<const llama_kv_cache_iswa     *>(mem) != nullptr ||
+        dynamic_cast<const llama_kv_cache_dsa      *>(mem) != nullptr ||
+        dynamic_cast<const llama_kv_cache_dsa_iswa *>(mem) != nullptr ||
+        dynamic_cast<const llama_kv_cache_msa      *>(mem) != nullptr;
+    return !(attn_only && ctx->get_cparams().kv_unified);
 }
 
 // a ubatch of tokens of one sequence at consecutive positions, for the fork's reads ahead (the PLE rows need the tokens,

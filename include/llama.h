@@ -595,6 +595,12 @@ extern "C" {
     // does not fit a window one: a server keys the states it keeps across runs with these
     LLAMA_API uint32_t llama_mtp_window_kv(const struct llama_context * ctx, uint32_t * n_window);
 
+    // fork: true when the memory of the context splits a batch of several sequences into ubatches of the same number of
+    // tokens per sequence (a recurrent state, or a KV cache with a stream per sequence): drafts of different lengths
+    // then verify in more than one pass. false for a KV cache of attention alone in one stream (kv_unified), which takes
+    // such a batch in one pass
+    LLAMA_API bool llama_split_equal(const struct llama_context * ctx);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

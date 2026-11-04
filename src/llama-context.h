@@ -539,8 +539,10 @@ private:
     // memory left and release is set; false when the capacity stays below n_cells
     void kv_elastic_init_fork();
     void kv_elastic_try_fork(); // kv_elastic_init_fork without the full allocation of the caches it did not place
-    bool kv_elastic_set_fork(uint32_t n_cells, bool release);
-    uint32_t kv_elastic_capacity_fork(uint32_t n_cells); // memory->kv_set_capacity_fork within LLAMA_KV_ELASTIC_TEST_MIB
+    // strm: a stream of the cache, -1: all of them
+    uint32_t kv_n_stream_fork() const; // the streams of the KV cache: one with --kv-unified, else one per sequence
+    bool kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t strm = -1);
+    uint32_t kv_elastic_capacity_fork(uint32_t n_cells, int32_t strm = -1); // memory->kv_set_capacity_fork within LLAMA_KV_ELASTIC_TEST_MIB
 
     bool     kv_elastic      = false;
     uint32_t kv_elastic_step = 8192;

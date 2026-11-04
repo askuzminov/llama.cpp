@@ -9,12 +9,15 @@
 //   makes it full), the next step gives them back
 // - upload: as keep, and the uploads ahead of whole weights (GGML_SCHED_PREFETCH, every prompt here with
 //   GGML_SCHED_PREFETCH_LOAD=0) take the experts the slots hold from device memory too (LLAMA_MOE_CACHE_COPY=2)
+// - state: the hot experts across runs (LLAMA_MOE_CACHE_STATE): a run saves them in a file of its model, the next run
+//   of the same model reads it, the same model under another name (a model of the same shape) reads none of it and
+//   keeps a file of its own; a file with an expert twice in a layer (a damaged or edited one) is ignored
 // the reference run (--out) releases all slots at every phase switch and uploads every expert of a prompt copy from the
 // host. the knobs are read once per process, so each mode is a run of its own (ctest runs them after the reference).
 // the model is the qwen4exp of test-llama-archs with 32 experts instead of 2 and without the per-expert scales, which
 // the cache does not take; its memory takes the elastic KV. each run checks in the log that its path ran
 //
-// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf (--out <file> | --ref <file> --mode keep|fill|kv|upload)
+// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)
 
 #include "llama.h"
 
@@ -27,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <random>
 #include <string>
@@ -162,9 +166,18 @@ struct record {
     float   logprob[8];
 };
 
-// six turns of 180 new tokens and 32 greedy ones, as a server conversation; the top 8 of every generated token
-static bool run(const std::string & path, ggml_backend_dev_t gpu, std::vector<record> & recs) {
+// six turns of 180 new tokens and 32 greedy ones, as a server conversation; the top 8 of every generated token. name:
+// general.name of the model instead of the one of the file
+static bool run(const std::string & path, ggml_backend_dev_t gpu, std::vector<record> & recs, const char * name = nullptr) {
     llama_model_params mp = llama_model_default_params();
+    llama_model_kv_override kvo[2];
+    memset(kvo, 0, sizeof(kvo));
+    if (name != nullptr) {
+        kvo[0].tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+        snprintf(kvo[0].key, sizeof(kvo[0].key), "general.name");
+        snprintf(kvo[0].val_str, sizeof(kvo[0].val_str), "%s", name);
+        mp.kv_overrides = kvo;
+    }
     ggml_backend_dev_t devs[2] = { gpu, nullptr };
     const llama_model_tensor_buft_override overrides[] = {
         { "exps", ggml_backend_cpu_buffer_type() },
@@ -264,6 +277,85 @@ static bool run(const std::string & path, ggml_backend_dev_t gpu, std::vector<re
     return ok;
 }
 
+// the state files of the runs next to base: <base>.state-<id of the model>.bin
+static std::vector<std::string> state_files(const std::string & base) {
+    namespace fs = std::filesystem;
+    const fs::path b(base);
+    const std::string prefix = b.filename().string() + ".state-";
+    std::vector<std::string> res;
+    for (const auto & e : fs::directory_iterator(b.has_parent_path() ? b.parent_path() : fs::path("."))) {
+        const std::string n = e.path().filename().string();
+        if (n.rfind(prefix, 0) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, ".bin") == 0) {
+            res.push_back(e.path().string());
+        }
+    }
+    return res;
+}
+
+static int state_test(const std::string & model, ggml_backend_dev_t gpu, const std::string & base) {
+    for (const auto & f : state_files(base)) {
+        std::remove(f.c_str());
+    }
+    std::vector<record> recs;
+    auto run_once = [&](const char * name) {
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            g_log.clear();
+        }
+        recs.clear();
+        CHECK(run(model, gpu, recs, name));
+    };
+
+    run_once(nullptr);
+    const auto first = state_files(base);
+    CHECK(first.size() == 1);
+    CHECK(!log_has("experts of")); // nothing to read yet
+
+    run_once(nullptr);
+    CHECK(!first.empty() && log_has(("layers from " + first[0]).c_str()));
+
+    // the second expert of the first layer with two made the first one: "LMC2", the id, the layer count and n_expert,
+    // then per layer its index, the count and the experts
+    bool edited = false;
+    if (!first.empty()) {
+        std::vector<char> bytes;
+        if (FILE * f = fopen(first[0].c_str(), "rb")) {
+            char buf[4096];
+            for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0; ) {
+                bytes.insert(bytes.end(), buf, buf + n);
+            }
+            fclose(f);
+        }
+        for (size_t at = 20; !edited && at + 8 <= bytes.size(); ) {
+            int32_t n;
+            memcpy(&n, bytes.data() + at + 4, sizeof(n));
+            if (n >= 2 && at + 8 + 8 <= bytes.size()) {
+                memcpy(bytes.data() + at + 12, bytes.data() + at + 8, 4);
+                edited = true;
+            }
+            at += 8 + 4*(size_t) std::max(n, 0);
+        }
+        if (FILE * f = edited ? fopen(first[0].c_str(), "wb") : nullptr) {
+            edited = fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+            fclose(f);
+        }
+    }
+    CHECK(edited);
+    run_once(nullptr);
+    CHECK(log_has("is not a state of this model and its cache, ignored"));
+
+    run_once("another model of the same shape");
+    CHECK(!log_has("experts of"));
+    CHECK(state_files(base).size() == 2);
+
+    printf("state: %zu files%s\n", state_files(base).size(), n_fail == 0 ? "" : ", FAILED");
+    for (const auto & f : state_files(base)) {
+        std::remove(f.c_str());
+    }
+    llama_backend_free();
+    return n_fail == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     const char * model_in = nullptr;
     const char * out      = nullptr;
@@ -281,8 +373,8 @@ int main(int argc, char ** argv) {
         }
     }
     if (model_in == nullptr || (out == nullptr) == (ref == nullptr) ||
-            (ref != nullptr && mode != "keep" && mode != "fill" && mode != "kv" && mode != "upload")) {
-        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> (--out <file> | --ref <file> --mode keep|fill|kv|upload)\n", argv[0]);
+            (ref != nullptr && mode != "keep" && mode != "fill" && mode != "kv" && mode != "upload" && mode != "state")) {
+        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)\n", argv[0]);
         return 1;
     }
 
@@ -292,9 +384,12 @@ int main(int argc, char ** argv) {
     set_env("LLAMA_MOE_CACHE_POLICY", "lru");
     set_env("LLAMA_KV_ELASTIC", "1");
     set_env("LLAMA_KV_ELASTIC_STEP", "256");
-    if (out != nullptr) {
+    if (out != nullptr || mode == "state") {
         set_env("LLAMA_MOE_CACHE_KEEP", "0");
         set_env("LLAMA_MOE_CACHE_COPY", "0");
+        if (mode == "state") {
+            set_env("LLAMA_MOE_CACHE_STATE", (std::string(ref) + ".state.bin").c_str());
+        }
     } else if (mode == "keep" || mode == "fill" || mode == "upload") {
         // one of the two layers of 37.1 MiB stays (the last one goes first: the counts are even), so the 1-token MoE of
         // the last layer in a prompt graph (its output row) has no slots, as in the reference
@@ -341,6 +436,17 @@ int main(int argc, char ** argv) {
     if (out != nullptr && !make_model(model_in, model)) {
         llama_backend_free();
         return 1;
+    }
+
+    if (mode == "state") {
+        FILE * mf = fopen(model.c_str(), "rb");
+        if (mf == nullptr) {
+            printf("the reference ran without a GPU: skipped\n");
+            llama_backend_free();
+            return 0;
+        }
+        fclose(mf);
+        return state_test(model, gpu, base);
     }
 
     std::vector<record> recs;

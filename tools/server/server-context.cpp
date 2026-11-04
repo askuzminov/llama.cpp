@@ -611,6 +611,11 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
+        // fork: the cap of the request ("speculative.n_max", 0: no drafts)
+        if (task->params.spec_n_max_fork >= 0) {
+            n_draft_max = std::min(n_draft_max, task->params.spec_n_max_fork);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
@@ -1526,6 +1531,9 @@ private:
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            // fork: even drafts only for a target that verifies drafts of different lengths in more than one pass
+            params_base.speculative.tgt_split_equal = llama_split_equal(ctx_tgt);
+
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
@@ -4546,7 +4554,7 @@ private:
         if (spec && !drafting.empty() && generating.size() > 1) {
             int32_t n_cap = common_speculative_fork_draft_by_slots((int) generating.size());
 
-            if (common_speculative_fork_even_drafts()) {
+            if (common_speculative_fork_even_drafts(params_base.speculative)) {
                 bool replay = false;
                 int32_t n_other = -1;
                 for (auto * other : generating) {
@@ -5669,7 +5677,7 @@ private:
                     // with the batch (e.g. MoE routing), and the replay then does not end; on_pos also sees each position once
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q, false, on_pos);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, false, on_pos);
                 }

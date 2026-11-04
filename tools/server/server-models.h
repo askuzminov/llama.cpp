@@ -171,6 +171,7 @@ private:
         std::shared_ptr<server_subproc> subproc; // shared with the monitor thread
         server_model_meta meta;
         int req_count = 0; // number of active proxy requests
+        int64_t t_idle_fork = 0; // fork: when its last proxy request ended (meta.last_used is when one started)
 
         // ask the child to exit (it handles the command on its stdin, see server_role::setup)
         void request_exit() const;
@@ -331,6 +332,8 @@ public:
         // the partial files the download plan writes
         std::vector<std::string>             sidecars;
         std::vector<common_download_partial> partials;
+        // fork: room for the model only from models idle this long (a load a pool asked for), 0 = any idle model
+        int64_t evict_idle_ms = 0;
     };
 
     // load and unload model instances

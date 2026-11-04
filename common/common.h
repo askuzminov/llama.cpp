@@ -415,6 +415,7 @@ struct common_params_speculative {
 
     // fork:
     bool auto_n = false; // pick the draft length per cycle from the measured cost and acceptance, n_max is the cap
+    bool tgt_split_equal = true; // the target splits a batch of several sequences equally (llama_split_equal), the server sets it: drafts are made even only then
 };
 
 struct common_params_diffusion {

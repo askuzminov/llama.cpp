@@ -1052,7 +1052,11 @@ def probe_flags(rows, ref_p90):
     """per depth: DECODE DIFFERS where the decode path of a variant strays from its prompt path more than the decode
     path of the reference build strays from its own on the same machine (ref_p90, per depth; none without the decode
     run of the reference, QA_REF_DECODE=0): the 90th percentile of the KL above QA_DECODE_RATIO (2) times that of the
-    reference. How far the two paths part by rounding depends on the machine and the model: the test model on the Mac
+    reference. PROMPT DIFFERS (04.11) where the prompt path of a variant strays from the reference build more than
+    QA_PROMPT_RATIO (2) times the same noise: until then the prompt path had LOW TOP1 alone, and a shift of the
+    distribution that kept the argmax on 85% of the probes passed with code 0. On the 3090 (02.11) the prompt path of the
+    default build was 0.75 - 1.26 times the decode noise of the reference at the same depths (0.011 - 0.046 against
+    0.014 - 0.052). How far the two paths part by rounding depends on the machine and the model: the test model on the Mac
     Vulkan0 (top-k 16, 31.10) 0.001 - 0.004 with up to 4 tokens above 0.5 of 128, the CPU 0; the real model 0.012 -
     0.074 on the 3090 and the 395 (02.11), where a fixed bar of 0.02 from the Mac fired at every depth. The decode fault
     of 13.10 gave 4-5; a variant run twice, 1.4 times apart at one depth (the 3090, 02.11, before the stable radix-select
@@ -1062,14 +1066,17 @@ def probe_flags(rows, ref_p90):
     (395, 32768)"""
     flags = {}
     ratio = float(env("QA_DECODE_RATIO", "2"))
+    pratio = float(env("QA_PROMPT_RATIO", "2"))
     for r in rows:
-        f = ""
+        f = []
         if r["path"] == "decode" and r["depth"] in ref_p90 and r["kl_p90"] > ratio * ref_p90[r["depth"]]:
-            f = "DECODE DIFFERS"
+            f.append("DECODE DIFFERS")
+        if r["path"] == "prompt" and r["depth"] in ref_p90 and r["kl_p90"] > pratio * ref_p90[r["depth"]]:
+            f.append("PROMPT DIFFERS")
         if r["path"] == "prompt" and r["top1"] < 0.85:
-            f = "LOW TOP1"
+            f.append("LOW TOP1")
         if f:
-            flags[(r["depth"], r["path"])] = f
+            flags[(r["depth"], r["path"])] = ", ".join(f)
     return flags
 
 
@@ -1112,7 +1119,8 @@ def quality(run, label, ctx, depths, qargs=None):
     run.add(f"{label}: logits at {len(positions)} positions before the depths {' '.join(map(str, depths))} of one "
             f"context of {ctx} tokens: prompt - the prompt batch against the reference ({env('QA_REF_ENV', REF_ENV)}); "
             f"decode - the same positions in batches of {dbatch} (the decode path) against the prompt path of the "
-            f"same variant; p90/ref - its 90th percentile over that of the decode path of the reference")
+            f"same variant; p90/ref - its 90th percentile over that of the decode path of the reference (the rounding "
+            f"between two paths on this machine)")
     clean = True
     header = ["depth", "path", "n", "KL median", "KL p90", "KL max", ">0.01", ">0.5", "top-1", "dNLL"]
 
@@ -1149,7 +1157,7 @@ def quality(run, label, ctx, depths, qargs=None):
             run.add("", f"{label} reference decode: FAIL {e}")
 
     def vs_ref(r):
-        p = ref_p90.get(r["depth"]) if r["path"] == "decode" else None
+        p = ref_p90.get(r["depth"])
         if p is None:
             return ""
         return f"{r['kl_p90'] / p:.2f}" if p > 0 else ("-" if r["kl_p90"] == 0 else "inf")
@@ -1226,7 +1234,280 @@ def cmd_check():
         except (Fail, Skip) as e:
             run.failed = True
             run.add("", f"quality: FAIL {e}")
+    if env("QA_CHECK_CKPT", "1") != "0":
+        try:
+            ckpt_probe(run, model_path())
+        except Skip as e:
+            run.add("", f"ckpt: skipped, {e}")
+        except Fail as e:
+            run.failed = True
+            run.add("", f"ckpt: FAIL {e}")
+    if env("QA_CHECK_SPEC", "1") != "0":
+        try:
+            spec_probe(run, model_path(), env_int("QA_PORT", 8097))
+        except Skip as e:
+            run.add("", f"spec: skipped, {e}")
+        except Fail as e:
+            run.failed = True
+            run.add("", f"spec: FAIL {e}")
     return run.finish()
+
+
+# ---------------------------------------------------------------- context checkpoints
+#
+# between the turns of a conversation the server restores a partial checkpoint (the recurrent state, the attention goes
+# back with seq_rm) and reads on from it. test-checkpoint-partial (tests/) reads a prompt in two halves with a checkpoint
+# after the first, restores it, reads the second half again and compares the logits of the last token with the
+# uninterrupted run; ctest runs it on generated models only, here it runs on the GPU of the machine (04.11, a review)
+
+def ckpt_probe(run, model):
+    """test-checkpoint-partial with the model as the server loads it (EXTRA, LOADMODE, DECARGS) on QA_CKPT_TOKENS tokens
+    of the corpus: the second half is past the QSA budget (513 blocks of 4 tokens), so the replay takes the sparse path"""
+    exe = binary("test-checkpoint-partial")
+    corpus = Path(env("QA_CORPUS", env("PPLFILE")))
+    if not corpus.is_file():
+        raise Fail(f"no corpus {corpus}: set QA_CORPUS to a long text file (or run get-wikitext.bat for PPLFILE)")
+    n = env_int("QA_CKPT_TOKENS", 8192)
+    # the test parses the common arguments (LLAMA_EXAMPLE_COMMON), which have no --no-warmup: it warms up with one empty run
+    args = [str(a) for a in [*model_args(model), *split_args(env("DECARGS")), "-f", corpus, "--tokens", n]
+            if a != "--no-warmup"]
+    identity = {"v": VERSION, "kind": "ckpt", "build": build_id(exe.parent), "args": args, "model": model_identity(model),
+                "corpus": digest(corpus), "env": env_identity(os.environ), "machine": machine()}
+
+    def go(log):
+        # a replay that differs exits with 1 and its line, execute() raises it
+        _, text = execute([exe, *args], log, os.environ.copy(), timed=False)
+        m = re.search(r"partial checkpoint replay passed: checkpoint = (\d+) bytes, max logit diff = (\S+)", text)
+        if not m:
+            raise Fail(f"no result line ({log.name})")
+        return {"bytes": int(m.group(1)), "diff": float(m.group(2))}
+
+    r, kept = run.measure("ckpt", identity, go)
+    same = "bit for bit" if r["diff"] == 0 else f"max diff {r['diff']:g} (the test allows 1e-2)"
+    run.add("", f"ckpt: {n} tokens of the corpus, a partial checkpoint ({r['bytes'] / 2**20:.1f} MiB) after the first "
+                f"half, the second half again after its restore: the logits of the last token {same} with the "
+                f"uninterrupted run" + (" k" if kept else ""))
+    run.record("check", "ckpt", {"diff": r["diff"], "mib": r["bytes"] / 2**20}, kept, exe.parent)
+
+
+# ---------------------------------------------------------------- speculative decoding
+#
+# the probes of quality() compare the logits of the target alone (llama-quality-fork drafts nothing): the drafts of the MTP
+# head, the rejection sampling of the verify and the rollbacks are not in them (04.11, a review). spec_probe runs the server
+# as serve.bat does and asks it with and without drafts ("speculative.n_max": 0, a field of the fork)
+
+def chi2_sf(x, df):
+    """P(X > x) of a chi-square of df degrees of freedom: the regularized upper incomplete gamma Q(df/2, x/2)"""
+    if x <= 0:
+        return 1.0
+    a, z = df / 2.0, x / 2.0
+    gln = math.lgamma(a)
+    if z < a + 1:
+        # the series of P
+        term = total = 1.0 / a
+        n = a
+        for _ in range(100000):
+            n += 1
+            term *= z / n
+            total += term
+            if abs(term) < abs(total) * 1e-15:
+                break
+        return max(0.0, 1.0 - total * math.exp(-z + a * math.log(z) - gln))
+    # the continued fraction of Q (Lentz)
+    tiny = 1e-300
+    b = z + 1 - a
+    c = 1 / tiny
+    d = 1 / b
+    h = d
+    for i in range(1, 100000):
+        an = -i * (i - a)
+        b += 2
+        d = an * d + b
+        d = tiny if abs(d) < tiny else d
+        c = b + an / c
+        c = tiny if abs(c) < tiny else c
+        d = 1 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1) < 1e-15:
+            break
+    return math.exp(-z + a * math.log(z) - gln) * h
+
+
+def pit_values(tokens, probs, rng):
+    """the randomized probability integral transform of each emitted token under the distribution it was drawn from (the
+    top n_probs of it in their order, the rest one bucket): uniform on [0, 1) when the tokens follow that distribution.
+    Returns the values and the count of tokens outside it (missing from a top that holds all of it)"""
+    out, outside = [], 0
+    for tok, top in zip(tokens, probs):
+        lo, p_tok = 0.0, None
+        for e in top:
+            p = math.exp(e["logprob"])
+            if e["id"] == tok:
+                p_tok = p
+                break
+            lo += p
+        if p_tok is None:
+            p_tok = max(0.0, 1.0 - lo)
+            if p_tok < 1e-6:
+                outside += 1
+                continue
+        out.append(min(1.0 - 1e-12, lo + rng.random() * p_tok))
+    return out, outside
+
+
+def uniform_test(values, bins=20):
+    """values in [0, 1) against the uniform distribution: the chi-square over equal bins (its statistic and p-value) for the
+    shape, and the p-value of their mean against 1/2 (a z-test, the variance of a uniform 1/12) for a shift, which a
+    leaning of the output to the tokens the draft favours makes and the bins see later"""
+    n = len(values)
+    if n < 5 * bins:
+        return None, None, None
+    counts = [0] * bins
+    for v in values:
+        counts[min(bins - 1, int(v * bins))] += 1
+    e = n / bins
+    stat = sum((c - e) ** 2 / e for c in counts)
+    z = (statistics.mean(values) - 0.5) / math.sqrt(1.0 / (12.0 * n))
+    return stat, chi2_sf(stat, bins - 1), math.erfc(abs(z) / math.sqrt(2.0))
+
+
+def spec_prompts(n, chars):
+    """n parts of the corpus of about `chars` characters, spread over it"""
+    text = corpus_text()
+    step = max(1, (len(text) - chars) // max(1, n))
+    return [text[i * step: i * step + chars] for i in range(n)]
+
+
+def spec_completion(url, body):
+    try:
+        _, raw = http(url + "/completion", body, env_int("QA_TIMEOUT", 3600))
+    except urllib.error.HTTPError as e:
+        raise Fail(f"spec: HTTP {e.code} {e.read()[:300]!r}")
+    r = json.loads(raw)
+    if "tokens" not in r or "completion_probabilities" not in r or "timings" not in r:
+        raise Fail(f"spec: no tokens, probabilities or timings in the answer {raw[:300]!r}")
+    return r
+
+
+def spec_greedy(url, prompts, n_predict):
+    """temperature 0 with and without drafts on one server: the tokens agree up to the first one where the two paths of
+    the model round apart, where the margin of the top token over the second (nats, without drafts) is small. A fault of
+    the drafts, the verify or a rollback parts them also where the model is sure of the next token"""
+    rows = []
+    for i, text in enumerate(prompts):
+        body = {"prompt": text, "n_predict": n_predict, "temperature": 0, "n_probs": 2, "return_tokens": True,
+                "cache_prompt": True}
+        base = spec_completion(url, dict(body, **{"speculative.n_max": 0}))
+        spec = spec_completion(url, body)
+        a, b = base["tokens"], spec["tokens"]
+        first = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), None)
+        if first is None and len(a) != len(b):
+            first = min(len(a), len(b))
+        margin = None
+        if first is not None and first < len(base["completion_probabilities"]):
+            top = base["completion_probabilities"][first]["top_logprobs"]
+            margin = top[0]["logprob"] - top[1]["logprob"] if len(top) > 1 else float("inf")
+        t = spec["timings"]
+        rows.append({"prompt": i, "n": len(a), "same": len(a) if first is None else first, "margin": margin,
+                     "draft_n": t.get("draft_n", 0), "draft_acc": t.get("draft_n_accepted", 0)})
+    return rows
+
+
+def spec_pit(url, prompts, n_predict, n_probs, seed):
+    """temperature 1 with the temperature alone in the chain: the probabilities the server gives for every token (before
+    sampling, the only ones it gives for a drafted token) are then the distribution it was drawn from, and the transform
+    of pit_values is uniform. With drafts every token after the first goes through the verify of the MTP head, its
+    rejection sampling (common_sampler_sample_and_accept_n_rejection) on the q of the head; without them, the control"""
+    arms = {}
+    for name, extra in (("spec", {}), ("nospec", {"speculative.n_max": 0})):
+        rng = random.Random(seed)
+        values, outside, draft_n, draft_acc, n_tok = [], 0, 0, 0, 0
+        for i, text in enumerate(prompts):
+            r = spec_completion(url, {"prompt": text, "n_predict": n_predict, "temperature": 1.0, "samplers": ["temperature"],
+                                      "n_probs": n_probs, "return_tokens": True, "cache_prompt": True, "seed": seed + i,
+                                      **extra})
+            v, o = pit_values(r["tokens"], [x["top_logprobs"] for x in r["completion_probabilities"]], rng)
+            values += v
+            outside += o
+            n_tok += len(r["tokens"])
+            draft_n += r["timings"].get("draft_n", 0)
+            draft_acc += r["timings"].get("draft_n_accepted", 0)
+        stat, p, p_mean = uniform_test(values)
+        arms[name] = {"tokens": n_tok, "outside": outside, "chi2": stat, "p": p, "p_mean": p_mean,
+                      "mean": statistics.mean(values) if values else None, "draft_n": draft_n, "draft_acc": draft_acc}
+    return arms
+
+
+def spec_flags(greedy, pit):
+    """SPEC GREEDY DIFFERS: temperature 0 parts with and without drafts where the model without them was sure of the
+    token, a margin above QA_SPEC_MARGIN (1.0) nats. SPEC SAMPLING DIFFERS: the tokens with drafts do not follow the
+    distribution they were drawn from (the shape or the mean of uniform_test below QA_SPEC_ALPHA, 1e-4, each) or one came
+    out that it does not have. SPEC PROBE DIFFERS: the same without drafts, so the probe itself does not hold. NO DRAFTS: nothing drafted"""
+    margin, alpha = float(env("QA_SPEC_MARGIN", "1.0")), float(env("QA_SPEC_ALPHA", "1e-4"))
+    flags = []
+    for r in greedy:
+        if r["margin"] is not None and r["margin"] > margin:
+            flags.append(f"SPEC GREEDY DIFFERS (prompt {r['prompt']}, token {r['same']}, margin {r['margin']:.2f})")
+    if not any(r["draft_n"] for r in greedy) or not pit["spec"]["draft_n"]:
+        flags.append("NO DRAFTS")
+    def off(a):
+        return a["outside"] or any(a.get(k) is not None and a[k] < alpha for k in ("p", "p_mean"))
+
+    if off(pit["spec"]):
+        flags.append("SPEC SAMPLING DIFFERS")
+    if off(pit["nospec"]):
+        flags.append("SPEC PROBE DIFFERS")
+    return flags
+
+
+def spec_probe(run, model, port):
+    """the speculative decoding of the server as serve.bat runs it (SPECDRAFT, QA_SPEC): greedy tokens with and without
+    drafts, and the calibration of sampled tokens with and without them (spec_greedy, spec_pit, spec_flags)"""
+    if not env("SPECDRAFT") or env("QA_SPEC", "--spec-auto") == "none":
+        raise Skip("no MTP head (SPECDRAFT) or QA_SPEC=none")
+    exe = binary("llama-server")
+    ctx = env_int("QA_SPEC_CTX", 8192)
+    args = server_args(model, ctx, 1, port)
+    n_greedy, n_tokens, n_probs = env_int("QA_SPEC_GREEDY", 64), env_int("QA_SPEC_TOKENS", 2048), env_int("QA_SPEC_PROBS", 20)
+    prompts = spec_prompts(env_int("QA_SPEC_PROMPTS", 4), env_int("QA_SPEC_CHARS", 4000))
+    identity = {"v": VERSION, "kind": "spec", "build": build_id(exe.parent), "args": args, "model": model_identity(model),
+                "draft": model_identity(Path(env("SPECDRAFT"))), "env": env_identity(os.environ),
+                "prompts": text_digest("\n".join(prompts)), "greedy": n_greedy, "tokens": n_tokens, "probs": n_probs,
+                "machine": machine()}
+
+    def go(log):
+        proc, log = start_server(exe, args, os.environ.copy(), log)
+        try:
+            url = f"http://127.0.0.1:{port}"
+            return {"greedy": spec_greedy(url, prompts, n_greedy), "pit": spec_pit(url, prompts, n_tokens, n_probs, 1000)}
+        finally:
+            proc.kill()
+            proc.wait()
+            mark_end()
+
+    r, kept = run.measure("spec", identity, go)
+    k = " k" if kept else ""
+    flags = spec_flags(r["greedy"], r["pit"])
+    run.add("", f"spec: temperature 0, {n_greedy} tokens of {len(prompts)} prompts with and without drafts: the same "
+                f"tokens up to the first other one, the margin of the top token there without drafts (nats)" + k,
+            *table(["prompt", "same", "margin", "drafted", "accepted"],
+                   [[g["prompt"], f"{g['same']}/{g['n']}", "-" if g["margin"] is None else f"{g['margin']:.2f}",
+                     g["draft_n"], g["draft_acc"]] for g in r["greedy"]]))
+    run.add("", f"spec: temperature 1 (the temperature alone), {n_tokens} tokens of each prompt: the probability integral "
+                f"transform of every token under the distribution it was drawn from, uniform when they follow it" + k,
+            *table(["", "tokens", "chi2 (19)", "p", "mean (0.5)", "p", "outside", "drafted", "accepted"],
+                   [[name, a["tokens"], "-" if a["chi2"] is None else f"{a['chi2']:.1f}",
+                     "-" if a["p"] is None else f"{a['p']:.2g}", "-" if a["mean"] is None else f"{a['mean']:.3f}",
+                     "-" if a.get("p_mean") is None else f"{a['p_mean']:.2g}",
+                     a["outside"], a["draft_n"], a["draft_acc"]] for name, a in r["pit"].items()]))
+    if flags:
+        run.failed = True
+        run.add("spec: " + "; ".join(flags))
+    run.record("check", "spec", {"greedy_same": sum(g["same"] for g in r["greedy"]) / max(1, sum(g["n"] for g in r["greedy"])),
+               "pit_p_spec": r["pit"]["spec"]["p"], "pit_p_nospec": r["pit"]["nospec"]["p"],
+               "pit_mean_spec": r["pit"]["spec"]["mean"],
+               "accept": r["pit"]["spec"]["draft_acc"] / max(1, r["pit"]["spec"]["draft_n"])}, kept, exe.parent)
 
 
 # ---------------------------------------------------------------- the server

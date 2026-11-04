@@ -233,6 +233,61 @@ def test_pool_shares_two_models():
     assert res.status_code == 400
 
 
+@pytest.mark.parametrize("evict_idle", [0, 300])
+def test_pool_unloads_only_an_idle_model_for_another(evict_idle: int):
+    # two models with pool = on, the routers run one model at a time (models_max 1) and both run the tiny one. a request
+    # for the other finds no node and no room, so its pool asks a router to unload a model (wake). pool-evict-idle-s:
+    # the router gives up only a model idle that long, here the tiny one has just answered or come up: the load is
+    # refused and the request fails after 30 s, as when no node can take the model. 0: the tiny model goes on one
+    # router at most; the pool asks no other one while that load waits for the unload
+    two = (TINY + "alias = tiny-alias\n" + "\n[moe]\nhf-repo = ggml-org/stories15M_MOE\nhf-file = stories15M_MOE-F16.gguf\n"
+           "pool = on\n")
+    ports = [r.server_port for r in routers]
+    for i, r in enumerate(routers):
+        r.models_preset = preset(f"r{i}", body=two)
+        r.models_max = 1
+        r.log_path = os.path.join(TMP_DIR, f"test_pool_evict_idle_r{i}.log")
+        with_pool(r, f"name=n{i} discover=0 peers=127.0.0.1:{ports[1 - i]} poll_ms=200 evict_idle_s={evict_idle}")
+        r.start()
+
+    def pool(model: str) -> dict:
+        return routers[0].make_request("GET", f"/pool/status?model={model}").body
+
+    deadline = time.time() + 30
+    while pool("tiny")["pool"]["nodes_up"] != 2:
+        assert time.time() < deadline, pool("tiny")["nodes"]
+        time.sleep(0.1)
+    chat([{"role": "user", "content": "the tiny model answers"}])
+
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=routers[0].make_request("POST", "/v1/chat/completions", data={
+        "model": "moe", "messages": [{"role": "user", "content": "a moe question"}], "max_tokens": 8, "temperature": 0,
+    }, timeout=120)))
+    t.start()
+    deadline = time.time() + 30
+    while not [e for e in pool("moe")["events"] if e["kind"] == "load"]:
+        assert time.time() < deadline, "the pool of the moe model asked no load"
+        time.sleep(0.1)
+    t.join(90)
+    assert not t.is_alive()
+    loads = [e for e in pool("moe")["events"] if e["kind"] == "load"]
+    asked = [e for e in loads if "asked to load" in e["detail"]]
+    tiny_nodes = {n["name"]: n["status"] for n in pool("tiny")["nodes"]}
+    if evict_idle == 0:
+        # one request unloads the tiny model on one router at most: the next router is asked only after a refusal (a
+        # poll of the pool in flight makes a model busy for its router now and then, so a router may refuse)
+        assert len(asked) <= 1, loads
+        assert "up" in tiny_nodes.values(), tiny_nodes
+    else:
+        assert asked == [] and res["r"].status_code != 200, loads
+        assert tiny_nodes == {"n0": "up", "n1": "up"}, tiny_nodes  # the tiny model stays on both
+        logs = ""
+        for r in routers:
+            with open(r.log_path) as f:
+                logs += f.read()
+        assert "no model idle for 300 s to unload for name=moe" in logs
+
+
 def test_pool_takes_the_model_under_every_name():
     # a request for the model under its name or an alias goes through the pool, a request for any other model stays
     # with the router

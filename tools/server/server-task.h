@@ -104,6 +104,8 @@ struct task_params {
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
 
+    int32_t spec_n_max_fork = -1; // fork: the drafts of a step at most for this request, 0 none, -1 as the server
+
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 

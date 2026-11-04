@@ -595,6 +595,13 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers");
 
+    // fork: an elastic cache maps the cells of the source in the destination stream before the copy (update)
+    if (elastic_capacity_fork(s1) > 0 && elastic_capacity_fork(s1) < v_cells[s0].used_max_p1() &&
+            !(elastic_grow_fork && elastic_grow_fork(s1, v_cells[s0].used_max_p1()))) {
+        LLAMA_LOG_ERROR("%s: kv_elastic: stream %u maps %u cells, the copy of stream %u needs %u\n", __func__, s1,
+                elastic_capacity_fork(s1), s0, v_cells[s0].used_max_p1());
+    }
+
     // enqueue the copy operation - the buffer copy will be performed during the next update
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
@@ -923,6 +930,12 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             assert(ssrc != sdst);
 
+            // fork: an elastic cache copies the cells in use, the rest of a stream has no memory
+            if (elastic_fork) {
+                elastic_copy_stream_fork(ssrc, sdst);
+                continue;
+            }
+
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
 
@@ -1082,11 +1095,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-        // fork: an elastic cache searches its capacity, grown first where its free cells do not hold the ubatch
-        if (n_cap_fork > 0 && n_cap_fork < cells.get_used() + n_tokens && elastic_grow_fork) {
-            elastic_grow_fork(cells.get_used() + n_tokens);
+        // fork: an elastic cache searches the capacity of the stream, grown first where its free cells do not hold the
+        // ubatch
+        if (elastic_capacity_fork(seq_to_stream[seq_id]) > 0 && elastic_grow_fork &&
+                elastic_capacity_fork(seq_to_stream[seq_id]) < cells.get_used() + n_tokens) {
+            elastic_grow_fork(seq_to_stream[seq_id], cells.get_used() + n_tokens);
         }
-        const uint32_t n_cells = n_cap_fork > 0 ? std::min(n_cap_fork, cells.size()) : cells.size();
+        const uint32_t n_cells = std::min(elastic_cells_fork(seq_to_stream[seq_id]), cells.size());
 
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
@@ -1189,6 +1204,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     assert(res.s1 >= res.s0);
+
+    // fork: the streams of the ubatch read the same n_kv cells, mapped where the device needs it (elastic_cover_fork)
+    if (!elastic_cover_fork(res)) {
+        return { };
+    }
 
     return res;
 }
@@ -1652,11 +1672,13 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
-        // fork: an elastic cache shifts the cells of its capacity, see build_graph_shift
-        const uint32_t n = n_cap_fork > 0 ? std::min(n_cap_fork, cells.size()) : cells.size();
+        // fork: an elastic cache shifts the cells of the capacity of each stream, the streams one after the other (see
+        // build_graph_shift); the others start each stream at s*size as upstream
+        const uint32_t n    = std::min(elastic_cells_fork(s), cells.size());
+        const uint32_t base = elastic_shift_base_fork(s);
 
         for (uint32_t i = 0; i < n; ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+            data[base + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
     }
 }
@@ -2119,8 +2141,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    // fork: an elastic cache has memory only for the cells of its capacity (one stream)
-    const int64_t n_shift = n_cap_fork > 0 ? (int64_t) n_cap_fork : (int64_t) get_size()*n_stream;
+    // fork: an elastic cache has memory only for the cells of the capacity of each stream
+    const int64_t n_shift = elastic_fork ? (int64_t) elastic_shift_base_fork(n_stream) : (int64_t) get_size()*n_stream;
 
     inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_shift);
     ggml_set_input(inp->k_shift);
@@ -2145,6 +2167,25 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+
+        // fork: an elastic cache of several streams shifts the cells of each stream's capacity apart
+        if (elastic_fork && n_stream > 1) {
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                const uint32_t n = elastic_cells_fork(s);
+
+                ggml_tensor * k_s =
+                    ggml_view_3d(ctx, layer.k,
+                        n_rot, n_head_kv, n,
+                        ggml_row_size(layer.k->type, n_embd_head_k),
+                        ggml_row_size(layer.k->type, n_embd_k_gqa),
+                        s*layer.k->nb[2] + ggml_row_size(layer.k->type, n_embd_nope));
+
+                ggml_tensor * shift_s = ggml_view_1d(ctx, inp->k_shift, n, (size_t) elastic_shift_base_fork(s)*ggml_element_size(inp->k_shift));
+
+                ggml_build_forward_expand(gf, build_rope_shift(cparams, ctx, k_s, shift_s, layer.k_rot, rope_factors, freq_base_l, freq_scale_l, il));
+            }
+            continue;
+        }
 
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
@@ -2605,12 +2646,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // fork: an elastic cache maps memory to the cells of the state first. the attention cache grows itself and the
         // indexer with it (llama_memory_hybrid_idx_fork), the indexer restores after it into the cells it shares
-        if (elastic_fork && cell_count > n_cap_fork) {
+        if (elastic_fork && cell_count > elastic_capacity_fork(strm)) {
             if (elastic_grow_fork) {
-                elastic_grow_fork(cell_count);
+                elastic_grow_fork(strm, cell_count);
             }
-            if (cell_count > n_cap_fork) {
-                LLAMA_LOG_ERROR("%s: the elastic cache maps %u cells, the state holds %u\n", __func__, n_cap_fork, cell_count);
+            if (cell_count > elastic_capacity_fork(strm)) {
+                LLAMA_LOG_ERROR("%s: the elastic cache maps %u cells of stream %u, the state holds %u\n", __func__,
+                        elastic_capacity_fork(strm), strm, cell_count);
                 return false;
             }
         }

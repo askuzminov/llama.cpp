@@ -264,8 +264,9 @@ void ggml_vk_fork_log_sparse(const vk_device & device) {
     for (const auto & f : families) {
         n_sparse += (f.queueFlags & vk::QueueFlagBits::eSparseBinding) ? 1 : 0;
     }
-    GGML_LOG_INFO("ggml_vulkan: sparse buffers: binding %d, residency %d, %zu of %zu queue families, max allocations %u\n",
-        (int) features.sparseBinding, (int) features.sparseResidencyBuffer, n_sparse, families.size(),
+    GGML_LOG_INFO("ggml_vulkan: sparse buffers: binding %d, residency %d (unbound reads zero %d), %zu of %zu queue families, max allocations %u\n",
+        (int) features.sparseBinding, (int) features.sparseResidencyBuffer,
+        (int) device->properties.sparseProperties.residencyNonResidentStrict, n_sparse, families.size(),
         device->properties.limits.maxMemoryAllocationCount);
 }
 
@@ -1087,6 +1088,17 @@ static void ggml_backend_vk_buffer_decommit_fork(ggml_backend_buffer_t buffer, s
     el->free_empty();
 }
 
+// the granules an elastic buffer has not bound read as zeros and take no writes: a sparse residency buffer on a device
+// with residencyNonResidentStrict. llama lets a stream of a KV cache read past its capacity then (the streams of a
+// ubatch read the same n_kv cells, the ones past a stream's own masked), so each stream maps only its own cells
+static bool ggml_backend_vk_buffer_elastic_zero_reads_fork(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_vk(buffer)) {
+        return false;
+    }
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    return ctx->elastic != nullptr && ctx->elastic->device->properties.sparseProperties.residencyNonResidentStrict;
+}
+
 bool ggml_vk_fork_elastic_clear(ggml_backend_vk_buffer_context * ctx, uint8_t value) {
     ggml_vk_elastic_fork * el = ctx->elastic.get();
     if (el == nullptr) {
@@ -1125,6 +1137,9 @@ void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char *
     }
     if (strcmp(name, "ggml_backend_buffer_decommit_fork") == 0) {
         return (void *) ggml_backend_vk_buffer_decommit_fork;
+    }
+    if (strcmp(name, "ggml_backend_buffer_elastic_zero_reads_fork") == 0) {
+        return (void *) ggml_backend_vk_buffer_elastic_zero_reads_fork;
     }
     return nullptr;
 }

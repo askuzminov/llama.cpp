@@ -196,6 +196,10 @@ void common_fork_add_preset_options(std::vector<common_arg> & args) {
         {"pool-short-tokens", COMMON_ARG_PRESET_POOL_FORK "_SHORT_TOKENS", "N",
          "a request for at most N answer tokens (max_tokens) goes ahead of longer ones in the queue, as an agent waits for "
          "its permission check (default: 512, 0 = none does)"},
+        {"pool-evict-idle-s", COMMON_ARG_PRESET_POOL_FORK "_EVICT_IDLE_S", "SECONDS",
+         "a load the pool asks of a router takes room there only by unloading a model idle at least this long, so the "
+         "pools of two models that share a machine do not unload each other's model again and again (default: 300, "
+         "0 = any idle model)"},
     };
     for (const auto & o : pool_options) {
         args.push_back(common_arg(

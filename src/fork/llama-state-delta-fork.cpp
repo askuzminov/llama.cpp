@@ -63,7 +63,10 @@ size_t llama_kv_cache::state_write_delta(
         return 0;
     }
 
-    GGML_UNUSED(flags);
+    // must mirror state_write(): a partial state of a plain cache is empty, so there is no partial delta either
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
+        return 0;
+    }
 
     GGML_ASSERT((size_t) seq_id < seq_to_stream.size());
 
@@ -105,7 +108,10 @@ bool llama_kv_cache::state_read_delta(
         return true;
     }
 
-    GGML_UNUSED(flags);
+    // must mirror state_read(): nothing to read for a partial state of a plain cache
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
+        return true;
+    }
 
     uint32_t delta_magic;
     io.read(&delta_magic, sizeof(delta_magic));

@@ -82,8 +82,8 @@ struct server_models_sched {
 
     bool has_capacity(std::unique_lock<std::mutex> & lk);
 
-    // returns "" if no model can be given up
-    std::string pick_victim(std::unique_lock<std::mutex> & lk);
+    // returns "" if no model can be given up. fork: min_idle_ms > 0 takes only a model idle that long
+    std::string pick_victim(std::unique_lock<std::mutex> & lk, int64_t min_idle_ms = 0);
 
     // requests wanting the same model share one entry, so they all need only one slot
     // and all get unblocked by the single load that entry performs
@@ -110,7 +110,8 @@ struct server_models_sched {
     bool limits_exceeded(std::unique_lock<std::mutex> & lk, const std::string & name, bool verbose = true);
 
     // wait for the measure of name, then unload idle LRU models until it fits; call without models.mutex
-    void make_room(const std::string & name);
+    // fork: min_idle_ms > 0 unloads only models idle that long (a load a pool asked for, load_options::evict_idle_ms)
+    void make_room(const std::string & name, int64_t min_idle_ms = 0);
 
     //
     // memory accounting (--models-memory-margin), the router never touches a GPU

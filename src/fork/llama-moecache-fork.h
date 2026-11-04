@@ -271,6 +271,12 @@ private:
     void   state_save() const;
     std::vector<std::vector<int32_t>> hot_now() const;
 
+    // what a state belongs to: the model and the expert weights of the cached layers. each model has its own file
+    // <stem>-<id>.<ext> next to that path (a router passes one path to every model it runs), the id is in it too
+    uint64_t    state_id() const;
+    std::string state_path() const;
+    std::string state_file; // set by init(), "" without LLAMA_MOE_CACHE_STATE
+
     const llama_model & model;
 
     const int32_t n_slots_req;

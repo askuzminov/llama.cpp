@@ -6,7 +6,7 @@ from utils import *
 # fork: router tests of the fork. The helpers of test_router use its module-level `server`,
 # so the fixture below points that one at the server of this module too
 import test_router
-from test_router import MODEL_A, _Bg, _load_model_and_wait, _tokenize, _wait_for_model_status
+from test_router import MODEL_A, MODEL_B, _Bg, _get_model_status, _load_model_and_wait, _tokenize, _wait_for_model_status
 
 server: ServerProcess
 
@@ -130,3 +130,27 @@ def test_router_killed_after_exit_command_child_exits():
             sock.close()
         os.remove(preset_path)
         os.remove(server.log_path)
+
+
+def test_router_load_takes_room_only_from_an_idle_model():
+    """a load with evict_idle_s (a pool asks it, server-pool-fork.cpp) unloads only a model idle that long, counted from
+    the end of its last request: two pools that share a router do not swap their models every minute"""
+    global server
+    server.models_max = 1
+    server.start()
+
+    _load_model_and_wait(MODEL_A, timeout=120)
+    assert _tokenize(MODEL_A).status_code == 200
+
+    # MODEL_A served a request just now: it stays, the load is refused
+    res = server.make_request("POST", "/models/load", data={"model": MODEL_B, "evict_idle_s": 300})
+    assert res.status_code != 200
+    assert _get_model_status(MODEL_A) == "loaded"
+    assert _get_model_status(MODEL_B) == "unloaded"
+
+    # idle longer than the threshold: the load unloads it
+    time.sleep(1.5)
+    res = server.make_request("POST", "/models/load", data={"model": MODEL_B, "evict_idle_s": 1})
+    assert res.status_code == 200
+    _wait_for_model_status(MODEL_B, {"loaded"}, timeout=120)
+    assert _get_model_status(MODEL_A) == "unloaded"

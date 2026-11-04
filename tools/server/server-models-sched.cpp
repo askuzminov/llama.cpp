@@ -88,13 +88,19 @@ bool server_models_sched::has_capacity(std::unique_lock<std::mutex> & lk) {
         || count_running() < (size_t) models.base_params.models_max;
 }
 
-std::string server_models_sched::pick_victim(std::unique_lock<std::mutex> & lk) {
+std::string server_models_sched::pick_victim(std::unique_lock<std::mutex> & lk, int64_t min_idle_ms) {
     check_lock(lk);
     std::string victim;
     int64_t victim_last_used = 0;
+    const int64_t now = ggml_time_ms();
     for (const auto & m : models.mapping) {
         // a busy model is mid-request, one still coming up has no request to finish
         if (m.second.req_count != 0 || !m.second.meta.is_ready_or_sleep()) {
+            continue;
+        }
+        // fork: idle since the end of its last request or since its load: two pools that share this router cannot
+        // unload each other's model every minute (server-pool-fork.cpp)
+        if (min_idle_ms > 0 && now - std::max(m.second.meta.last_used, m.second.t_idle_fork) < min_idle_ms) {
             continue;
         }
         // already on its way out, or a queued request wants it
@@ -266,7 +272,7 @@ bool server_models_sched::limits_exceeded(std::unique_lock<std::mutex> & lk, con
     return any_running;
 }
 
-void server_models_sched::make_room(const std::string & name) {
+void server_models_sched::make_room(const std::string & name, int64_t min_idle_ms) {
     if (memory_enabled()) {
         // the measure result decides what to unload
         std::unique_lock<std::mutex> lk(models.mutex);
@@ -288,9 +294,12 @@ void server_models_sched::make_room(const std::string & name) {
             if (!limits_exceeded(lk, name)) {
                 return;
             }
-            lru_model_name = pick_victim(lk);
+            lru_model_name = pick_victim(lk, min_idle_ms);
         }
         if (lru_model_name.empty()) {
+            if (min_idle_ms > 0) {
+                SRV_INF("no model idle for %" PRId64 " s to unload for name=%s\n", min_idle_ms / 1000, name.c_str());
+            }
             return; // every running model is busy, load() reports the limit
         }
         SRV_INF("limits reached, removing LRU name=%s\n", lru_model_name.c_str());

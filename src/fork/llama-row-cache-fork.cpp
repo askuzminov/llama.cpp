@@ -164,6 +164,13 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
     files.emplace_back(new llama_file(path.c_str(), "rb", false));
     file_size = files[0]->size();
 
+    // the loader checks that a tensor lies in its file; a table past the end would read zeros there (the tail of the last
+    // block is zero filled), so it is refused here too
+    if (n_rows < 0 || (row_size > 0 && (offs > file_size || (uint64_t) n_rows > (file_size - offs)/row_size))) {
+        throw std::runtime_error(format("row cache: %" PRId64 " rows of %zu bytes at offset %zu do not fit in %s (%zu bytes)",
+                                        n_rows, row_size, offs, path.c_str(), file_size));
+    }
+
     // one block is one row: the rows a gather asks for are scattered, so a bigger block reads
     // bytes nothing wants. 4 KiB used to read 4.47 GiB where the rows themselves are 0.25 GiB
     blk_size = row_size;

@@ -616,6 +616,8 @@ These words will not be included in the completion, so make sure to add them to 
 
 `post_sampling_probs`: Returns the probabilities of top `n_probs` tokens after applying sampling chain.
 
+`speculative.n_max`: Draft at most this many tokens per step for this request when the server runs speculative decoding, `0` to not draft at all. Default: `-1`, the server setting
+
 `response_fields`: A list of response fields, for example: `"response_fields": ["content", "generation_settings/n_predict"]`. If the specified field is missing, it will simply be omitted from the response without triggering an error. Note that fields with a slash will be unnested; for example, `generation_settings/n_predict` will move the field `n_predict` from the `generation_settings` object to the root of the response and give it a new name.
 
 `lora`: A list of LoRA adapters to be applied to this specific request. Each object in the list must contain `id` and `scale` fields. For example: `[{"id": 0, "scale": 0.5}, {"id": 1, "scale": 1.1}]`. If a LoRA adapter is not specified in the list, its scale will default to `0.0`. Please note that requests with different LoRA configurations will not be batched together, which may result in performance degradation.
@@ -2350,6 +2352,7 @@ Load a model
 
 Payload:
 - `model`: name of the model to be loaded.
+- `evict_idle_s` (fork, optional): when the router has no room, unload only a model idle for at least this many seconds (since the end of its last request or since its load); otherwise the load fails with `model limit reached`. The pool sends `pool-evict-idle-s` here. Default 0: any idle model, as before.
 
 ```json
 {

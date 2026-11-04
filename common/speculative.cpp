@@ -472,6 +472,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                // fork: the candidates go with their tokens (the rejection check asserts the same length)
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }
@@ -1553,9 +1557,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // fork: the drafts of a step padded to one length (common_speculative_fork_even_drafts)
+    bool even_drafts = false;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
+        , even_drafts(common_speculative_fork_even_drafts(params))
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1866,7 +1874,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // fork: the drafts of this step the same length (common_speculative_fork_even_drafts): a sequence whose
         // confident run ended drafts on while another one is still confident, and all are cut to the longest run.
         // conf_len: the confident run of a sequence, -1 while it lasts
-        const bool even = common_speculative_fork_even_drafts() && n_drafting > 1;
+        const bool even = even_drafts && n_drafting > 1;
         std::vector<uint8_t> confident(n_seq, 0);
         std::vector<int32_t> conf_len (n_seq, -1);
         int n_confident = 0;
@@ -2070,6 +2078,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                // fork: the candidates go with their tokens (the rejection check asserts the same length)
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
 
@@ -2587,6 +2599,9 @@ struct common_speculative {
     std::vector<double> synth_probs;
 
     common_speculative_auto ctl;
+
+    // fork: the drafts of a call cut to one length (common_speculative_fork_even_drafts)
+    bool even_drafts;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3147,6 +3162,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
         /* .ctl         = */ {},
+        /* .even_drafts = */ common_speculative_fork_even_drafts(params),
     });
 
     result->ctl.init(params.auto_n, n_seq, params.draft.n_max, std::getenv("LLAMA_SPEC_TRACE"));
@@ -3269,7 +3285,8 @@ void common_speculative_draft(common_speculative * spec) {
         // the auto mode caps the draft of each implementation, 0 skips it for this cycle
         const int32_t cap = ctl.cap_begin(impl->type, dparams);
 
-        {
+        // fork: a skipped implementation has no sequence to draft for (draft-simple would decode an empty batch)
+        if (cap != 0) {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
@@ -3339,7 +3356,7 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     // fork: the sequences that drafted in this call, all to the shortest draft (common_speculative_fork_even_drafts)
-    if (common_speculative_fork_even_drafts() && was_drafting.size() > 1) {
+    if (spec->even_drafts && was_drafting.size() > 1) {
         size_t n_even = SIZE_MAX;
         for (llama_seq_id seq_id : was_drafting) {
             n_even = std::min(n_even, dparams[seq_id].result->size());

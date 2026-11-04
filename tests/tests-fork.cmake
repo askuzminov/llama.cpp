@@ -82,13 +82,18 @@ llama_build(test-state-streams-fork.cpp)
 # the device cache of the host experts with --phase-mem (keep, fill, kv) against the release of all slots at every
 # phase switch: built everywhere (llama.h, gguf.h), registered where the matrix models exist, skips without a GPU
 llama_build(test-moe-cache-fork.cpp)
+llama_build(test-kv-elastic-streams-fork.cpp)
+
+# llama_split_equal against the graphs of a batch of drafts of different lengths (registered below where the matrix
+# models exist): only llama.h
+llama_build(test-split-equal-fork.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # the models of this matrix come from test-llama-archs (the generate-models fixture), which upstream builds under
     # the same condition: on a Windows DLL build there are none
     # partial (PARTIAL_ONLY) context checkpoints, one test per memory family:
-    # plain attention, iSWA, hybrid (attention + recurrent) and pure recurrent
-    foreach(CKPT_MODEL llama-dense gemma2-dense phi3-dense granitehybrid-dense nemotron_h-dense falcon-h1-dense mamba2-dense)
+    # plain attention, iSWA, hybrid (attention + recurrent), pure recurrent and the hybrid of qwen4exp (QSA + GDN)
+    foreach(CKPT_MODEL llama-dense gemma2-dense phi3-dense granitehybrid-dense nemotron_h-dense falcon-h1-dense mamba2-dense qwen4exp-moe)
         llama_test(
             test-checkpoint-partial
             NAME test-checkpoint-partial-${CKPT_MODEL}
@@ -99,6 +104,21 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             FIXTURES_REQUIRED generate-models
         )
     endforeach()
+
+    # the same with sparse QSA in the replay: top-k 16 instead of the 131072 of the file, which selects every cell
+    llama_test(
+        test-checkpoint-partial
+        NAME test-checkpoint-partial-qwen4exp-moe-qsa
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --tokens 256 --override-kv qwen4exp.attention.indexer.top_k=int:16
+    )
+    set_tests_properties(test-checkpoint-partial-qwen4exp-moe-qsa PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # which memories verify drafts of different lengths in one pass: the even drafts of the server depend on it
+    llama_test(test-split-equal-fork LABEL main ARGS --models "${MODEL_DIR}")
+    set_tests_properties(test-split-equal-fork PROPERTIES FIXTURES_REQUIRED generate-models)
 
     # QSA with several sequences in one unified cache (the server's slots): the groupings carried across the rollbacks
     # of drafts, checked by LLAMA_QSA_CHECK, the mask from positions per sequence, and the logits of every sequence
@@ -130,6 +150,38 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED "generate-models;qsa-multi-dense"
     )
 
+    # the elastic KV cache with a stream per slot (no --kv-unified): the static cache writes the logits of the scenario,
+    # an elastic one gives them bit for bit with reads past a capacity as zeros (Vulkan) and with them mapped (CUDA)
+    set(KV_ELASTIC_STREAMS_REF "${CMAKE_CURRENT_BINARY_DIR}/test-kv-elastic-streams-fork-ref.bin")
+    llama_test(
+        test-kv-elastic-streams-fork
+        NAME test-kv-elastic-streams-fork-ref
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --out "${KV_ELASTIC_STREAMS_REF}"
+    )
+    set_tests_properties(test-kv-elastic-streams-fork-ref PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        FIXTURES_SETUP kv-elastic-streams-ref
+    )
+    foreach(KV_ELASTIC_MODE zero map)
+        llama_test(
+            test-kv-elastic-streams-fork
+            NAME test-kv-elastic-streams-fork-${KV_ELASTIC_MODE}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --ref "${KV_ELASTIC_STREAMS_REF}" --mode ${KV_ELASTIC_MODE}
+        )
+        set_tests_properties(test-kv-elastic-streams-fork-${KV_ELASTIC_MODE} PROPERTIES
+            FIXTURES_REQUIRED "generate-models;kv-elastic-streams-ref"
+        )
+    endforeach()
+    llama_test(
+        test-kv-elastic-streams-fork
+        NAME test-kv-elastic-streams-fork-reclaim
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --mode reclaim
+    )
+    set_tests_properties(test-kv-elastic-streams-fork-reclaim PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the moe-cache through the phase switches: the reference run writes the model it builds from the qwen4exp of the
     # matrix (32 experts, no per-expert scales) and its logprobs, each mode compares with them in a run of its own
     set(MOE_CACHE_REF "${CMAKE_CURRENT_BINARY_DIR}/test-moe-cache-fork-ref.bin")
@@ -143,7 +195,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
         FIXTURES_SETUP moe-cache-ref
     )
-    foreach(MOE_CACHE_MODE keep fill kv upload)
+    foreach(MOE_CACHE_MODE keep fill kv upload state)
         llama_test(
             test-moe-cache-fork
             NAME test-moe-cache-fork-${MOE_CACHE_MODE}
@@ -155,6 +207,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         )
     endforeach()
 endif()
+
+# rejection sampling of speculative drafts against a sharp target, one chi-square over all tokens (the upstream test,
+# on the flat distribution of its tiny model, misses a residual from p and swapped p_x / q_x)
+llama_build_and_test(test-spec-rejection-fork.cpp ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-spec-rejection-fork PROPERTIES FIXTURES_REQUIRED speculative-model)
+
+# a sampling drafter reports q, the distribution its drafted tokens are drawn from: their counts against it (draft-simple,
+# the llama of the speculative fixture as target and draft)
+llama_build_and_test(test-spec-draft-q-fork.cpp ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-spec-draft-q-fork PROPERTIES FIXTURES_REQUIRED speculative-model)
 
 # Test checkpoint delta encoding/decoding
 llama_build_and_test(test-checkpoint-delta.cpp LABEL "model" ARGS -m "${MODEL_DEST}")

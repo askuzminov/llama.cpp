@@ -383,6 +383,7 @@ struct pool_config {
     int     rebalance_s = 15;    // a conversation leaves a crowded node when the move costs at most this (s), 0 = never
     int     quiet_wait_s = 60;   // the longest wait of a long prompt for a node where nothing runs (s), 0 = no wait
     int64_t short_tokens = 512;  // a request for at most this many answer tokens goes ahead in the queue, 0 = none does
+    int     evict_idle_s = 300;  // a load the pool asks for unloads on that router only a model idle this long (s), 0 = any idle
 };
 
 // the options of the pool next to pool = on in models.ini (pool-<key>, common/fork/arg-fork.cpp); a bad value stops
@@ -413,6 +414,7 @@ static void pool_read_options(pool_config & cfg, const common_preset & preset) {
     get("_REBALANCE_S", "pool-rebalance-s", [&](const std::string & v) { cfg.rebalance_s = std::max(0, std::stoi(v)); });
     get("_QUIET_WAIT_S", "pool-quiet-wait-s", [&](const std::string & v) { cfg.quiet_wait_s = std::max(0, std::stoi(v)); });
     get("_SHORT_TOKENS", "pool-short-tokens", [&](const std::string & v) { cfg.short_tokens = std::max<int64_t>(0, std::stoll(v)); });
+    get("_EVICT_IDLE_S", "pool-evict-idle-s", [&](const std::string & v) { cfg.evict_idle_s = std::max(0, std::stoi(v)); });
     get("_PEERS",       "pool-peers",       [&](const std::string & v) {
         size_t p = 0;
         while (p < v.size()) {
@@ -521,6 +523,7 @@ struct pool_node {
     int         n_running  = 0;   // the other models its router runs, loaded or loading
     int         max_models = 0;   // models_max of its router (GET /props), 0 = no limit
     bool        want_load  = false; // a load of the model to ask of its router at the next poll
+    bool        load_asked = false; // a load asked of its router and not refused, until a poll finds it on its way
     int64_t     t_load     = 0;   // the last load asked of it
     std::string signature;       // the portable signature of its prompt cache, "" = unknown (GET /pool/node)
     bool        migrate = false; // it moves conversations: the fork with a prompt cache
@@ -1195,8 +1198,10 @@ struct server_pool_fork::impl {
     // the requests for the model wait or come: the routers that have it unloaded load it, so that every node takes a
     // part - those with room for it (fewer other models running than their models_max), each once a minute at most; and
     // when no node has it or loads it and none has room, one more that unloads another model for it, this router
-    // first, as a router without a pool would. a failed load is asked again after 5 minutes: on the 395 a load runs out
-    // of device memory now and then, and the next one goes through. under mu
+    // first, as a router without a pool would - but only a model idle for evict_idle_s there (the router decides, also
+    // for the pools of other entries): two pools of models that fit there one at a time do not swap them every minute.
+    // a failed load is asked again after 5 minutes: on the 395 a load runs out of device memory now and then, and the
+    // next one goes through. under mu
     void wake(int64_t now) {
         auto loadable = [&](const pool_node & n) {
             return n.status == "unloaded" && !n.draining && !n.mismatch && !n.want_load &&
@@ -1205,7 +1210,7 @@ struct server_pool_fork::impl {
         bool have = false;
         for (int i = 0; i < n_nodes.load(); ++i) {
             const pool_node & n = nodes[i];
-            have = have || usable(n) || n.status == "loading" || n.want_load;
+            have = have || usable(n) || n.status == "loading" || n.want_load || n.load_asked;
         }
         bool room = false;
         for (int i = 0; i < n_nodes.load(); ++i) {
@@ -1267,7 +1272,7 @@ struct server_pool_fork::impl {
             bool loading = false;
             for (int i = 0; i < n_nodes.load(); ++i) {
                 any = any || usable(nodes[i]);
-                loading = loading || nodes[i].status == "loading" || nodes[i].want_load;
+                loading = loading || nodes[i].status == "loading" || nodes[i].want_load || nodes[i].load_asked;
             }
             if (!any && !loading) {
                 t_none = t_none == 0 ? now : t_none;
@@ -2111,6 +2116,10 @@ struct server_pool_fork::impl {
                     SRV_INF("pool: node %s is %s%s%s\n", node.name.c_str(), status.c_str(), error.empty() ? "" : ": ", error.c_str());
                 }
                 node.status = status;
+                // the asked load is on its way or over, or the router never took it up
+                if (status != "unloaded" || (used >= 0 && pr.failed) || now - node.t_load > 120000) {
+                    node.load_asked = false;
+                }
                 node.error  = error;
                 if (used >= 0) {
                     node.failed    = pr.failed;
@@ -2170,15 +2179,21 @@ struct server_pool_fork::impl {
                 node.want_load = false;
                 if (load) {
                     node.t_load = ggml_time_ms();
+                    // the router answers when the model it unloads for this one is gone, which can take long: until
+                    // then the node is not unloaded for wake, or it would ask the next node too and both would unload
+                    node.load_asked = true;
                 }
             }
             if (load) {
                 httplib::Client cli(pool_base(links[used]));
                 cli.set_connection_timeout(1, 0);
                 cli.set_read_timeout(10, 0);
-                auto rl = cli.Post("/models/load", hdrs, json{{"model", node.model}}.dump(), "application/json");
+                const json body = {{"model", node.model}, {"evict_idle_s", cfg.evict_idle_s}};
+                auto rl = cli.Post("/models/load", hdrs, body.dump(), "application/json");
                 std::lock_guard<std::mutex> lk(mu);
                 const bool ok = rl && rl->status == 200;
+                // a refusal ends the wait; no answer in time (the router still waits for another model to unload) does not
+                node.load_asked = !rl || rl->status == 200;
                 event("load", "", i, ok ? "asked to load " + node.model : "cannot load " + node.model + ": " + pool_error_text(rl));
                 SRV_INF("pool: %s %s on %s%s%s\n", ok ? "loading" : "cannot load", node.model.c_str(), node.name.c_str(),
                         ok ? "" : ": ", ok ? "" : pool_error_text(rl).c_str());
@@ -2405,6 +2420,7 @@ struct server_pool_fork::impl {
                 {"poll_ms", cfg.poll_ms}, {"migrate", cfg.migrate}, {"link_mbps", cfg.link_mbps},
                 {"same_model", cfg.same_model}, {"port", cfg.port}, {"discover", cfg.discover}, {"peers", cfg.peers},
                 {"rebalance_s", cfg.rebalance_s}, {"quiet_wait_s", cfg.quiet_wait_s}, {"short_tokens", cfg.short_tokens},
+                {"evict_idle_s", cfg.evict_idle_s},
             }},
             {"state_kib_per_token", state_bpt / 1024},
             {"nodes", jnodes}, {"queue", jqueue}, {"conversations", jconvs}, {"events", jevents},

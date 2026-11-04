@@ -294,23 +294,50 @@ bool llama_memory_hybrid_idx_fork::kv_elastic_init_fork(bool emulate) {
     return true;
 }
 
-uint32_t llama_memory_hybrid_idx_fork::kv_capacity_fork() const {
-    return get_mem_attn()->elastic_capacity_fork();
+uint32_t llama_memory_hybrid_idx_fork::kv_capacity_fork(int32_t strm) const {
+    const llama_kv_cache * attn = get_mem_attn();
+    if (strm >= 0) {
+        return attn->elastic_capacity_fork((uint32_t) strm);
+    }
+    uint32_t res = 0;
+    for (uint32_t s = 0; s < attn->get_n_stream(); ++s) {
+        res = s == 0 ? attn->elastic_capacity_fork(s) : std::min(res, attn->elastic_capacity_fork(s));
+    }
+    return res;
 }
 
-uint32_t llama_memory_hybrid_idx_fork::kv_set_capacity_fork(uint32_t n_cells) {
+uint32_t llama_memory_hybrid_idx_fork::kv_set_capacity_fork(uint32_t n_cells, int32_t strm) {
     llama_kv_cache * attn = get_mem_attn();
 
-    // more cells: the indexer memory first, it must hold every cell the attention cache may place
-    if (idx_elastic && n_cells > attn->elastic_capacity_fork() && !mem_idx->elastic_commit_fork(n_cells)) {
-        return attn->elastic_capacity_fork();
+    uint32_t res = 0;
+    bool     any = false;
+    for (uint32_t s = 0; s < attn->get_n_stream(); ++s) {
+        if (strm >= 0 && (uint32_t) strm != s) {
+            continue;
+        }
+        // more cells: the indexer memory first, it must hold every cell the attention cache may place
+        uint32_t cap;
+        if (idx_elastic && n_cells > attn->elastic_capacity_fork(s) && !mem_idx->elastic_commit_fork(s, n_cells)) {
+            cap = attn->elastic_capacity_fork(s);
+        } else {
+            cap = attn->elastic_set_capacity_fork(s, n_cells);
+            if (idx_elastic) {
+                mem_idx->elastic_set_capacity_fork(s, cap);
+            }
+        }
+        res = any ? std::min(res, cap) : cap;
+        any = true;
     }
 
-    const uint32_t res = attn->elastic_set_capacity_fork(n_cells);
-    if (idx_elastic) {
-        mem_idx->elastic_set_capacity_fork(res);
-    }
+    return res;
+}
 
+size_t llama_memory_hybrid_idx_fork::kv_mapped_cells_fork() const {
+    const llama_kv_cache * attn = get_mem_attn();
+    size_t res = 0;
+    for (uint32_t s = 0; s < attn->get_n_stream(); ++s) {
+        res += attn->elastic_capacity_fork(s);
+    }
     return res;
 }
 
@@ -318,7 +345,7 @@ size_t llama_memory_hybrid_idx_fork::kv_cell_bytes_fork() const {
     return get_mem_attn()->elastic_cell_bytes_fork() + (idx_elastic ? mem_idx->elastic_cell_bytes_fork() : 0);
 }
 
-void llama_memory_hybrid_idx_fork::kv_set_grow_fork(std::function<bool(uint32_t)> grow) {
+void llama_memory_hybrid_idx_fork::kv_set_grow_fork(std::function<bool(uint32_t, uint32_t)> grow) {
     get_mem_attn()->elastic_grow_fork = std::move(grow);
 }
 

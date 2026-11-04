@@ -132,13 +132,16 @@ struct llama_memory_i {
     virtual void set_n_kv_full(uint32_t n_kv) { (void) n_kv; }
 
     // fork: the elastic KV cache (src/fork/llama-kv-elastic-fork.cpp): its tensors in buffers the device maps on demand
-    // (emulate: ordinary buffers), the capacity in cells (0: not elastic), set as close to n_cells as the cells in use
-    // and the memory allow, the device bytes of a cell, the callback a cell search uses to grow the capacity
+    // (emulate: ordinary buffers), the capacity in cells of a stream (strm -1: the smallest of them; 0: not elastic), set
+    // as close to n_cells as the cells in use and the memory allow (strm -1: every stream, the smallest result), the
+    // cells all streams map together, the device bytes of a cell of a stream, the callback a cell search uses to grow the
+    // capacity of a stream
     virtual bool     kv_elastic_init_fork(bool emulate) { (void) emulate; return false; }
-    virtual uint32_t kv_capacity_fork() const { return 0; }
-    virtual uint32_t kv_set_capacity_fork(uint32_t n_cells) { (void) n_cells; return 0; }
+    virtual uint32_t kv_capacity_fork(int32_t strm) const { (void) strm; return 0; }
+    virtual uint32_t kv_set_capacity_fork(uint32_t n_cells, int32_t strm) { (void) n_cells; (void) strm; return 0; }
+    virtual size_t   kv_mapped_cells_fork() const { return 0; }
     virtual size_t   kv_cell_bytes_fork() const { return 0; }
-    virtual void     kv_set_grow_fork(std::function<bool(uint32_t)> grow) { (void) grow; }
+    virtual void     kv_set_grow_fork(std::function<bool(uint32_t, uint32_t)> grow) { (void) grow; }
     // the caches built without memory (llama_kv_defer_scope_fork) that did not become elastic, allocated in full
     virtual void     kv_alloc_deferred_fork() {}
 

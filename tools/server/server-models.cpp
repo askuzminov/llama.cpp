@@ -1153,7 +1153,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
         if (opts.role == SERVER_ROLE_INSTANCE) {
-            sched->make_room(name);
+            sched->make_room(name, opts.evict_idle_ms);
         }
     }
 
@@ -1751,6 +1751,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
         if (it != mapping.end() && it->second.req_count > 0) {
             it->second.req_count--;
             if (it->second.req_count == 0) {
+                it->second.t_idle_fork = ggml_time_ms();
                 sched->tick(lk);
             }
         }
@@ -1829,6 +1830,7 @@ void server_models::proxy_ws(const server_http_req & req, server_http_context::w
     if (it != mapping.end() && it->second.req_count > 0) {
         it->second.req_count--;
         if (it->second.req_count == 0) {
+            it->second.t_idle_fork = ggml_time_ms();
             sched->tick(lk);
         }
     }
@@ -2161,7 +2163,10 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        models.load(meta->name);
+        // fork: a pool asks with evict_idle_s, room then comes only from a model idle that long (server-pool-fork.cpp)
+        server_models::load_options opts;
+        opts.evict_idle_ms = (int64_t) (json_value(body, "evict_idle_s", 0.0) * 1000.0);
+        models.load(meta->name, opts);
         res_ok(res, {{"success", true}});
         return res;
     };

@@ -153,6 +153,36 @@ int main() {
         }
     }
 
+    // a sampled MTP token: keep() reads the distribution (its top, data[0] of the sorted candidates), never the token the
+    // head drew (selected), or a kept draft would lean towards the draws the gate likes and rejection sampling would no
+    // longer return the target distribution (04.11)
+    {
+        common_speculative_auto ctl;
+        ctl.init(true, 1, 3, nullptr);
+        for (int i = 0; i < 300; ++i) {
+            verify(ctl, MTP, { 0.95f }, 1);
+            verify(ctl, MTP, { 0.15f }, 0);
+        }
+        ctl.mode     = common_speculative_auto::MODE_GATE;
+        ctl.drafting = MTP;
+        ctl.thr_keep = 0.5;
+        ctl.thr_step = 0.0;
+
+        for (const float top : { 0.95f, 0.15f }) {
+            int decisions = 0;
+            for (int32_t drawn = 0; drawn < 3; ++drawn) {
+                llama_token_data cand[3] = { { 7, 0.0f, top }, { 8, 0.0f, (1.0f - top)*0.7f }, { 9, 0.0f, (1.0f - top)*0.3f } };
+                llama_token_data_array cur_p = { cand, 3, drawn, true };
+                ctl.seqs[0] = {};
+                bool more = true;
+                decisions += ctl.keep(0, &cur_p, more) ? 1 : 0;
+                CHECK(ctl.seqs[0].hp.empty() || ctl.seqs[0].hp[0] == top);
+            }
+            // the same answer for every drawn token: kept for a confident head, dropped for an unsure one
+            CHECK(decisions == (top > 0.5f ? 3 : 0));
+        }
+    }
+
     // the trace: the overlap of the draft with the target (ov) needs a token distribution of the drafter. the candidates
     // of a DFlash2 lattice carry selector scores, which taken as logits at the target temperature mean nothing: -1
     {
