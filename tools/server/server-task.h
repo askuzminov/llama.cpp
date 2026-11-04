@@ -882,6 +882,26 @@ struct server_prompt_cache {
     // with a spill dir
     bool defer_writes = false;
 
+    // fork: defer_writes for a scope, the value before it back on the way out: a save or a load that throws (no host
+    // memory for a state) must not leave the cache dropping what it would write for the rest of the process
+    struct defer_scope {
+        server_prompt_cache * cache;
+        bool                  prev;
+
+        defer_scope(server_prompt_cache * cache, bool defer) : cache(cache), prev(cache ? cache->defer_writes : false) {
+            if (cache) {
+                cache->defer_writes = defer;
+            }
+        }
+        ~defer_scope() {
+            if (cache) {
+                cache->defer_writes = prev;
+            }
+        }
+        defer_scope(const defer_scope &) = delete;
+        defer_scope & operator=(const defer_scope &) = delete;
+    };
+
     // fork: host RAM the server holds outside the cache within the cache's RAM limit - the states of slots paused for
     // room (room_pause_fork): the limit counts them, the cache gives way. empty = none
     std::function<size_t()> ram_outside;

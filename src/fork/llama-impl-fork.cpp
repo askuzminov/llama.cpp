@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -30,13 +31,43 @@ void llama_parallel_for(int64_t n, int64_t work, const std::function<void(int64_
 
     const int64_t chunk = (n + n_parts - 1) / n_parts;
 
+    // what a part throws (no host memory for its bookkeeping) goes to the caller once every thread is joined: a thread
+    // that ends with an exception, or a vector of joinable threads destroyed on the way out, ends the process. a part
+    // that gets no thread runs here
+    std::vector<std::exception_ptr> errors((size_t) n_parts);
     std::vector<std::thread> threads;
     threads.reserve(n_parts - 1);
-    for (int64_t b = chunk; b < n; b += chunk) {
-        threads.emplace_back(fn, b, std::min(n, b + chunk));
+    int64_t i_part = 1;
+    for (int64_t b = chunk; b < n; b += chunk, ++i_part) {
+        const int64_t e = std::min(n, b + chunk);
+        std::exception_ptr & err = errors[(size_t) i_part];
+        try {
+            threads.emplace_back([&fn, &err, b, e] {
+                try {
+                    fn(b, e);
+                } catch (...) {
+                    err = std::current_exception();
+                }
+            });
+        } catch (...) {
+            try {
+                fn(b, e);
+            } catch (...) {
+                err = std::current_exception();
+            }
+        }
     }
-    fn(0, std::min(n, chunk));
+    try {
+        fn(0, std::min(n, chunk));
+    } catch (...) {
+        errors[0] = std::current_exception();
+    }
     for (auto & t : threads) {
         t.join();
+    }
+    for (const auto & err : errors) {
+        if (err) {
+            std::rethrow_exception(err);
+        }
     }
 }

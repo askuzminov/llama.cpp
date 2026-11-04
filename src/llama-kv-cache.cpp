@@ -595,11 +595,21 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers");
 
-    // fork: an elastic cache maps the cells of the source in the destination stream before the copy (update)
-    if (elastic_capacity_fork(s1) > 0 && elastic_capacity_fork(s1) < v_cells[s0].used_max_p1() &&
-            !(elastic_grow_fork && elastic_grow_fork(s1, v_cells[s0].used_max_p1()))) {
-        LLAMA_LOG_ERROR("%s: kv_elastic: stream %u maps %u cells, the copy of stream %u needs %u\n", __func__, s1,
-                elastic_capacity_fork(s1), s0, v_cells[s0].used_max_p1());
+    // fork: an elastic cache maps the cells of the source in the destination stream before the copy (update). where the
+    // device has no memory for them, nothing is copied and the destination stays empty: cells past the mapped ones
+    // would point at rows the copy never fills. the caller sees it in seq_pos_max (the server: seq_copied_fork)
+    if (elastic_capacity_fork(s1) > 0 && elastic_capacity_fork(s1) < v_cells[s0].used_max_p1()) {
+        if (elastic_grow_fork) {
+            elastic_grow_fork(s1, v_cells[s0].used_max_p1());
+        }
+        if (elastic_capacity_fork(s1) < v_cells[s0].used_max_p1()) {
+            LLAMA_LOG_ERROR("%s: kv_elastic: stream %u maps %u cells, the copy of stream %u needs %u: not copied, "
+                    "sequence %d left empty\n", __func__, s1, elastic_capacity_fork(s1), s0, v_cells[s0].used_max_p1(),
+                    seq_id_dst);
+            v_cells[s1].reset();
+            v_heads[s1] = 0;
+            return;
+        }
     }
 
     // enqueue the copy operation - the buffer copy will be performed during the next update
@@ -854,7 +864,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        auto sinfo_new = find_slot(ubatch, false);
+        // fork: the window cache of the MTP head gives up its oldest cells where an image left none free (swa_room_fork)
+        if (sinfo_new.empty() && swa_room_on_fork && swa_room_fork(ubatch, ubatches)) {
+            sinfo_new = find_slot(ubatch, false);
+        }
         if (sinfo_new.empty()) {
             success = false;
             break;

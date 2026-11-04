@@ -190,6 +190,14 @@ public:
     // head only (llama_model::create_memory); the other SWA caches keep the upstream rule
     bool swa_reuse_shared_fork = false;
 
+    // fork: the window cache of the MTP head again (set with swa_reuse_shared_fork). it holds the window of every
+    // sequence plus one ubatch, counting a cell per position; an image takes a cell per token at one position (M-RoPE),
+    // so its cells come on top of the window's and the window does not move while the image is read. past the spare
+    // ubatch a ubatch then finds no cell: a conversation longer than the window with an image of more tokens than
+    // LLAMA_MTP_UBATCH failed at that image every time (04.11). prepare() gives up the oldest cells of the sequences of
+    // the ubatch then and searches again (swa_room_fork, src/fork/llama-kv-window-fork.cpp)
+    bool swa_room_on_fork = false;
+
     // fork: an elastic cache (src/fork/llama-kv-elastic-fork.cpp, LLAMA_KV_ELASTIC): only the first cells of each
     // stream - its capacity - are used, and the device maps memory to them as the context grows; the rest of the cache
     // costs no memory. elastic_init_fork moves the tensors to buffers the device maps on demand (emulate: ordinary
@@ -264,6 +272,10 @@ public:
     // find places for the provided ubatches in the cache, returns the slot infos
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
+
+    // fork: with swa_room_on_fork, make room for a ubatch that find_slot could not place by giving up the oldest cells of
+    // its sequences, below the lowest position of each in `ubatches`. false when nothing was given up
+    bool swa_room_fork(const llama_ubatch & ubatch, const std::vector<llama_ubatch> & ubatches);
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 

@@ -1405,6 +1405,13 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_high = expert_bounds[zt + 1];
     const int col_diff = col_high - col_low;
 
+    // fork: a tile past the columns of its expert computed nothing (mul_mat_q_stream_k skips it), and with
+    // GGML_HINT_IDS_REPEAT the tiles reach ne_get_rows columns, so its ids would be read past the end of ids_dst.
+    // the same for the whole block, before the barrier
+    if (jt*J >= col_diff) {
+        return;
+    }
+
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
         ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
     }

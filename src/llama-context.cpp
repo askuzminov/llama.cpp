@@ -950,7 +950,7 @@ void llama_context::sched_reserve() {
     // LLAMA_REPLAN_DISABLE: off, together with that plan, for comparisons
     // pooled embeddings read every token, the graph cannot have fewer outputs than tokens
     const bool pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
-    if (n_outputs_pp > n_seqs && !pooled && getenv("LLAMA_REPLAN_DISABLE") == nullptr) {
+    if (n_outputs_pp > n_seqs && !pooled && llama_fork_env_int("LLAMA_REPLAN_DISABLE", 0) == 0) {
         const uint32_t n_seqs_pp = model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01 ? 1 : n_seqs;
         auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_seqs_pp, mctx.get(), model.no_alloc());
         if (!gf) {
@@ -1699,7 +1699,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // build the graph again. a graph that does not fit that plan either (the nodes depend on the KV size) is not
         // planned so again. only prompt ubatches: a draft check (up to 65 tokens) would drop the snapshots of the decode
         // graphs. LLAMA_REPLAN_DISABLE: off, together with the plan of the prompt graph at the start, for comparisons
-        static const bool replan_disable = getenv("LLAMA_REPLAN_DISABLE") != nullptr;
+        static const bool replan_disable = llama_fork_env_int("LLAMA_REPLAN_DISABLE", 0) != 0;
         if (!replan_disable && memory && ubatch.n_tokens >= std::max<uint32_t>(128, n_ubatch_split() / 2) &&
             gtype == ctx_type_to_graph_type(cparams.ctx_type) &&
             ggml_backend_sched_get_n_reserve(sched.get()) != n_reserve && ggml_graph_n_nodes(gf) != replan_failed_n_nodes) {

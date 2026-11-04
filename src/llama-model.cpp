@@ -3560,6 +3560,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr);
                         // fork: the cells a seq_cp leaves shared come back once masked (swa_reuse_shared_fork)
                         kv->swa_reuse_shared_fork = mtp_window;
+                        // fork: an image that does not move the window takes the oldest cells (swa_room_fork)
+                        kv->swa_room_on_fork = mtp_window;
                         res = kv;
                     }
                 }

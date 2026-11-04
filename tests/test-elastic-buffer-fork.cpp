@@ -238,6 +238,11 @@ int main() {
         n_fail++;
     }
 
+    // the marker makes ctest count it as skipped (SKIP_REGULAR_EXPRESSION in tests-fork.cmake)
+    if (n_tested == 0 && n_fail == 0) {
+        printf("test-elastic-buffer-fork: SKIPPED, no device gave an elastic buffer\n");
+        return 0;
+    }
     printf("test-elastic-buffer-fork: %d devices tested%s\n", n_tested, n_fail ? ", FAILED" : "");
     return n_fail == 0 ? 0 : 1;
 }

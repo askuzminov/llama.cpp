@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring> // fork: server_batch::remove_slot
 #include <deque>
 #include <exception>
 #include <memory>
@@ -219,6 +220,28 @@ struct server_batch {
 
     int32_t size() const {
         return (int32_t)tokens.size();
+    }
+
+    // fork: remove the entries of one slot, in place and without an allocation (the error that released the slot may
+    // be a bad_alloc). the rows of the embeddings move down with their entries
+    void remove_slot(int32_t id_slot) {
+        size_t n_kept    = 0;
+        size_t rows_kept = 0;
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (tokens[i].id_slot == id_slot) {
+                continue;
+            }
+            token t = tokens[i];
+            if (t.i_embd >= 0) {
+                if ((size_t) t.i_embd != rows_kept) {
+                    std::memmove(embd.data() + rows_kept*n_embd, embd.data() + (size_t) t.i_embd*n_embd, (size_t) n_embd*sizeof(float));
+                }
+                t.i_embd = (int32_t) rows_kept++;
+            }
+            tokens[n_kept++] = t;
+        }
+        tokens.erase(tokens.begin() + n_kept, tokens.end());
+        embd.erase(embd.begin() + rows_kept*n_embd, embd.end());
     }
 
     // remove the entries after the first n
@@ -879,6 +902,25 @@ struct server_slot {
         mem.seq_cp(id, other.id, -1, -1);
 
         other.prompt = prompt.clone();
+
+        // fork: a copy the memory could not make leaves the other sequence empty, it reads its whole prompt itself
+        if (!seq_copied_fork(other)) {
+            SLT_WRN(other, "the memory could not copy the prompt of slot %d (%zu tokens), the slot reads it itself\n", id,
+                    prompt.tokens.size());
+            other.prompt_clear();
+        }
+    }
+
+    // fork: whether mem.seq_cp gave `other` the cells of this slot. a cache that cannot make a copy (an elastic KV cache
+    // whose device has no memory for the cells of another stream) leaves the destination empty
+    bool seq_copied_fork(const server_slot & other) const {
+        for (llama_context * c : { mem.ctx_tgt, mem.ctx_dft }) {
+            if (c != nullptr && llama_memory_seq_pos_max(llama_get_memory(c), other.id) !=
+                                llama_memory_seq_pos_max(llama_get_memory(c), id)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     void copy_state_to(server_slot & other) const {
@@ -1964,17 +2006,17 @@ private:
                 // fork: while other slots run, the cache writes nothing to disk here, their next decode would wait for
                 // it: write_behind writes the states out once the server is idle (defer_writes)
                 const bool others_run = others_run_fork(ret);
-                prompt_cache->defer_writes = others_run;
+                {
+                    server_prompt_cache::defer_scope defer(prompt_cache.get(), others_run);
 
-                ret->prompt_save(*prompt_cache);
+                    ret->prompt_save(*prompt_cache);
 
-                // fork: no load whose state cannot fit: it would fail and erase its entry. the slot keeps its prompt, as
-                // with no better entry in the cache
-                if (evict_for_load_fork(*ret, task.tokens) && !ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                    // fork: no load whose state cannot fit: it would fail and erase its entry. the slot keeps its prompt,
+                    // as with no better entry in the cache
+                    if (evict_for_load_fork(*ret, task.tokens) && !ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear();
+                    }
                 }
-
-                prompt_cache->defer_writes = false;
                 prompt_cache->update(!others_run);
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
@@ -1995,9 +2037,11 @@ private:
     // other slots run (defer_writes)
     bool prompt_save_fork(server_slot & slot) {
         const bool others_run = others_run_fork(&slot);
-        prompt_cache->defer_writes = others_run;
-        const bool saved = slot.prompt_save(*prompt_cache);
-        prompt_cache->defer_writes = false;
+        bool saved = false;
+        {
+            server_prompt_cache::defer_scope defer(prompt_cache.get(), others_run);
+            saved = slot.prompt_save(*prompt_cache);
+        }
         if (saved) {
             prompt_cache->update(!others_run);
         }
@@ -2109,10 +2153,8 @@ private:
         // already (a task launch)
         bool saved = false;
         if (prompt_cache) {
-            const bool deferred = prompt_cache->defer_writes;
-            prompt_cache->defer_writes = true;
+            server_prompt_cache::defer_scope defer(prompt_cache.get(), true);
             saved = lru->prompt_save(*prompt_cache);
-            prompt_cache->defer_writes = deferred;
         }
 
         SRV_WRN("purging slot %d with %zu tokens, the least recently used idle one%s\n", lru->id, lru->prompt.tokens.size(),
@@ -3338,6 +3380,9 @@ private:
 
         cur.base_pos = base_pos;
 
+        // fork: a checkpoint that does not fit in host memory is skipped, and the prompt goes on without it. on the
+        // 395 (04.11) a bad_alloc here released the slot in the middle of its prompt and then aborted the server
+        try {
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, cur.base_pos);
 
         // The draft state is stored only if the draft context cannot roll back in place. A plain
@@ -3350,6 +3395,17 @@ private:
         }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        } catch (const std::bad_alloc &) {
+            slot.prompt.checkpoints.pop_back();
+            const bool with_dft = ctx_dft && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+            SLT_WRN(slot, "no host memory for a context checkpoint at n_tokens = %" PRId64 " (whole states: target %.1f MiB, draft %.1f MiB), skipped; "
+                    "%zu checkpoints kept, host memory available %zu MiB\n",
+                    slot.prompt.n_tokens() - n_tokens_cur,
+                    llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) / 1024.0 / 1024.0,
+                    with_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) / 1024.0 / 1024.0 : 0.0,
+                    slot.prompt.checkpoints.size(), common_host_mem_available() >> 20);
+            return;
+        }
 
         // Byte budget: the real size is known only now that the checkpoint has been built, and the
         // host is probed now too, so the budget follows the memory that is free at this moment.
@@ -4008,6 +4064,7 @@ private:
                 callback(slot);
             } catch (const std::exception & e) {
                 SLT_ERR(slot, "got exception: %s\n", e.what());
+                drop_failed_slot_fork(slot); // fork
                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot.release();
             }
@@ -4020,10 +4077,51 @@ private:
                 callback(*slot);
             } catch (const std::exception & e) {
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
+                drop_failed_slot_fork(*slot); // fork
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot->release();
             }
         }
+    }
+
+    // fork: true while pre_decode() builds the batch, from its batch.clear() until update_slots() takes the batch
+    bool batch_building_fork = false;
+
+    // fork: an error released the slot while the batch was being built. its entries leave the batch, or the batch
+    // would hold the tokens of no slot (395, 04.11: a bad_alloc in create_checkpoint, then the GGML_ASSERT on
+    // slot_batched in update_slots aborted the server). its cache is dropped too: the tokens added to the batch were
+    // already counted as cached, and they will not be decoded. after the decode the batch and the cache agree, and an
+    // error then leaves both as they are
+    void drop_failed_slot_fork(server_slot & slot) {
+        if (!batch_building_fork) {
+            return;
+        }
+        batch.remove_slot(slot.id);
+        if (batch.slot_batched == &slot) {
+            // the lora scale an alora turned off for this batch comes back, as after a decode
+            if (batch.alora_scale > 0.0f && batch.alora_disabled_id < slot.lora.size()) {
+                slot.lora[batch.alora_disabled_id].scale = batch.alora_scale;
+            }
+            batch.alora_scale       = -1.0f;
+            batch.alora_disabled_id = 0;
+            batch.slot_batched      = batch.size() > 0 ? get_slot_by_id(batch.tokens[0].id_slot) : nullptr;
+        }
+        slot.prompt_clear();
+    }
+
+    // fork: the build of the batch failed as a whole (pre_decode() threw). the slots with entries in it drop their
+    // cache for the same reason, and the batch goes
+    void drop_batch_fork() {
+        for (auto & slot : slots) {
+            const bool in_batch = std::any_of(batch.tokens.begin(), batch.tokens.end(), [&](const server_batch::token & t) {
+                return t.id_slot == slot.id;
+            });
+            if (in_batch) {
+                slot.prompt_clear();
+            }
+        }
+        batch.clear();
+        batch_building_fork = false;
     }
 
     void abort_all_slots(const std::string & reason) {
@@ -4204,8 +4302,10 @@ private:
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+            batch_building_fork = false; // fork
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
+            drop_batch_fork(); // fork
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
 
             // the batch is half-built and not rendered, skip now to avoid UB
@@ -4454,6 +4554,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        batch_building_fork = true; // fork: drop_failed_slot_fork
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4478,7 +4579,9 @@ private:
                 return;
             }
 
-            if (prompt_only) { // fork: waits for the prompts (server_prefill_exclusive_fork)
+            // fork: waits for the prompts (server_prefill_exclusive_fork). a realtime transcription does not: it would stay
+            // silent through the whole prompt of another slot, for one token per step
+            if (prompt_only && !slot.audio_stream) {
                 return;
             }
 
@@ -4641,6 +4744,14 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
+            // fork: an error in its draft above released the slot, and its cache went with it (drop_failed_slot_fork). when
+            // it was slot_batched, the first slot left takes its place: they all batch with it, so with each other
+            if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+            if (!slot_batched) {
+                slot_batched = &slot;
+            }
             slot.handle_last_sampled_token(batch);
         });
 
@@ -5505,6 +5616,14 @@ private:
                     GGML_ASSERT(slot.task->n_tokens_shared == 0);
 
                     slot.copy_state_to(*child);
+
+                    // fork: the child would generate on an empty sequence
+                    if (!slot.seq_copied_fork(*child)) {
+                        send_error(*child, "the memory could not copy the prompt state to this completion", ERROR_TYPE_SERVER);
+                        child->release();
+                        continue;
+                    }
+
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
             }

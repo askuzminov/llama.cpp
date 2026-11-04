@@ -1,4 +1,6 @@
 #include "llama-model-loader.h"
+#include "fork/llama-fork.h"
+#include "fork/llama-load-chunked-fork.h"
 #include "fork/llama-load-watch-fork.h"
 
 #include "ggml-alloc.h"
@@ -9,8 +11,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -1683,6 +1687,8 @@ bool llama_model_loader::load_all_data(
         llama_progress_callback progress_callback,
         void * progress_callback_user_data,
         llama_tensor_range_queue * ranges) {
+    const int64_t t_load_start_us = ggml_time_us();
+
     // tells the allocating thread when the tensors it handed over are no longer in use
     struct range_guard {
         llama_tensor_range_queue * q;
@@ -1771,6 +1777,23 @@ bool llama_model_loader::load_all_data(
             LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                 ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
             return nullptr;
+        }
+
+        // fork: an integrated GPU shares the system memory, and its weight buffers are host visible on Vulkan: a tensor
+        // set copies into them on the host, no queue submit. the async uploads submit GPU copies instead, which the driver
+        // of the 395 fails now and then during a load (vkQueueSubmit ErrorOutOfDeviceMemory with the memory free, 04.11).
+        // the tensors then load in chunks, the copy of one chunk while the next is read (llama_load_chunked_fork).
+        // LLAMA_LOAD_IGPU_ASYNC=1: the async uploads, as upstream
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            static const bool igpu_async = llama_fork_env_int("LLAMA_LOAD_IGPU_ASYNC", 0) != 0;
+            if (!igpu_async) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true)) {
+                    LLAMA_LOG_INFO("%s: %s is an integrated GPU: the weights are copied into its memory on the host, no async uploads (LLAMA_LOAD_IGPU_ASYNC=1 for them)\n",
+                        func, ggml_backend_dev_name(dev));
+                }
+                return nullptr;
+            }
         }
 
         ggml_backend_dev_props props;
@@ -1891,6 +1914,11 @@ bool llama_model_loader::load_all_data(
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     std::vector<no_init<uint8_t>> read_buf;
 
+    // fork: the same buffers loaded in chunks, the copy of one chunk while the next is read (LLAMA_LOAD_CHUNK_MB=0: the
+    // whole tensor at once, above). the check of the tensors needs the whole tensor in one buffer
+    const bool load_chunked = !check_tensors && llama_load_chunked_fork::chunk_size() > 0;
+    llama_load_chunked_fork chunked;
+
     for (; have_range; have_range = ranges && (watch.step("waiting for the next buffer"), ranges->pop(range))) {
         tensors.clear();
         for (struct ggml_tensor * cur = range.first; cur != range.last; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -1948,6 +1976,10 @@ bool llama_model_loader::load_all_data(
                 }
 
                 GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
+                if (load_chunked) {
+                    // the set below must not run next to a chunk copy
+                    chunked.finish(watch, t_upload_us);
+                }
                 watch.step("set from the mapping", ggml_get_name(cur));
                 if (buf_mmap && cur->data == nullptr) {
                     ggml_backend_tensor_alloc(buf_mmap, cur, data);
@@ -2041,6 +2073,8 @@ bool llama_model_loader::load_all_data(
                             ++buffer_idx;
                             buffer_idx %= n_buffers;
                         }
+                    } else if (load_chunked) {
+                        chunked.load(*file, cur, weight->offs, n_size, watch, t_read_us, n_read, t_upload_us);
                     } else {
                         // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
                         const size_t align          = file->read_alignment();
@@ -2077,10 +2111,14 @@ bool llama_model_loader::load_all_data(
         }
     }
 
+    // the last chunk copies land before the weights count as loaded
+    chunked.finish(watch, t_upload_us);
+
     if (n_read > 0 && t_read_us > 0) {
-        LLAMA_LOG_INFO("%s: read %.2f GiB in %.2f s (%.2f GiB/s), waited %.2f s for uploads\n", __func__,
+        LLAMA_LOG_INFO("%s: read %.2f GiB in %.2f s (%.2f GiB/s), waited %.2f s for uploads, %.2f s in all\n", __func__,
                        n_read/1024.0/1024.0/1024.0, t_read_us/1e6,
-                       n_read/1024.0/1024.0/1024.0/(t_read_us/1e6), t_upload_us/1e6);
+                       n_read/1024.0/1024.0/1024.0/(t_read_us/1e6), t_upload_us/1e6,
+                       (ggml_time_us() - t_load_start_us)/1e6);
     }
 
     // free temporary resources used for async uploads

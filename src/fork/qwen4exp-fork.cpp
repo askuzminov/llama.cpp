@@ -181,6 +181,16 @@ void llama_model_qwen4exp_fork::load_arch_hparams(llama_model_loader & ml) {
         hparams.dsv4_compress_ratios[il] = 0;
     }
 
+    // the KV cells come in multiples of 256 (the context and n_kv are padded to it), and the block index is built and
+    // tested for blocks that split them evenly: a ratio that does not divide 256 leaves a partial last block of n_kv,
+    // which no model has and no test covers
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        const uint32_t r = hparams.dsv4_compress_ratios[il];
+        if (r > 0 && 256 % r != 0) {
+            throw std::runtime_error(format("compress ratio %u of layer %u does not divide 256", r, il));
+        }
+    }
+
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
@@ -333,7 +343,12 @@ void llama_model_qwen4exp_fork::load_arch_tensors(llama_model_loader & ml) {
 
         if (ple_cached && !ml.no_alloc) {
             const auto * loc = ml.lazy.get_location(ple_name);
-            GGML_ASSERT(loc != nullptr && loc->idx < ml.file_paths.size());
+            GGML_ASSERT(loc != nullptr);
+            // the row cache opens the file by its path, a model loaded from a FILE * has none
+            if (loc->idx >= ml.file_paths.size()) {
+                throw std::runtime_error(format("%s: the row cache of -lzm dio needs the path of the model file, "
+                                                "load it from a path or with another lazy mode", ple_name.c_str()));
+            }
 
             ple_cache.reset(new llama_row_cache(ml.file_paths[loc->idx], loc->offs, loc->type,
                                                 loc->ne0, loc->ne1, /*n_threads =*/ 0));

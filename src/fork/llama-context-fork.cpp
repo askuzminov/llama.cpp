@@ -46,6 +46,12 @@ static int64_t moe_cache_keep_mib() {
     return keep;
 }
 
+// n rounded up to a multiple of the elastic step: a multiple of 256 that LLAMA_KV_ELASTIC_STEP may set to a value that is
+// no power of 2 (10000 -> 9984), which GGML_PAD cannot round to
+static uint32_t kv_elastic_round_up(uint32_t n, uint32_t step) {
+    return (uint32_t) std::min<uint64_t>(((uint64_t) n + step - 1)/step*step, UINT32_MAX/step*step);
+}
+
 uint32_t llama_context::n_ubatch_split() const {
     return phase_n_tokens > 0 ? std::min(phase_n_tokens, cparams.n_ubatch) : cparams.n_ubatch;
 }
@@ -190,7 +196,7 @@ bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t 
     // the cells of one stream (all of them with one)
     const uint32_t full = cparams.n_ctx_seq;
     const uint32_t old  = memory->kv_capacity_fork(strm);
-    const uint32_t want = GGML_PAD(n_cells, kv_elastic_step);
+    const uint32_t want = kv_elastic_round_up(n_cells, kv_elastic_step);
 
     uint32_t cap = kv_elastic_capacity_fork(want, strm);
 
@@ -301,7 +307,7 @@ void llama_context::phase_update(uint32_t n_tokens) {
     // after it) goes back to the device, and the moe-cache takes its slots again below
     if (kv_elastic && gen) {
         const uint32_t want = memory->get_n_kv_used() + n_tokens + kv_elastic_step;
-        if (memory->kv_capacity_fork(-1) > GGML_PAD(want, kv_elastic_step) + std::max(2*kv_elastic_step, cparams.n_ctx/8)) {
+        if (memory->kv_capacity_fork(-1) > kv_elastic_round_up(want, kv_elastic_step) + std::max(2*kv_elastic_step, cparams.n_ctx/8)) {
             if (moe_cache_fork && moe_cache_fork->ready()) {
                 moe_cache_fork->release();
                 gf_res_prev_reset();
@@ -339,7 +345,7 @@ void llama_context::phase_gen() {
     if (kv_elastic) {
         const uint32_t want = memory->get_n_kv_used() + kv_elastic_step;
         const uint32_t cap  = memory->kv_capacity_fork(-1);
-        if (cap < want || cap > GGML_PAD(want, kv_elastic_step) + 2*kv_elastic_step) {
+        if (cap < want || cap > kv_elastic_round_up(want, kv_elastic_step) + 2*kv_elastic_step) {
             kv_elastic_set_fork(want, false);
         }
     }

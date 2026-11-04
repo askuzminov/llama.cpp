@@ -149,6 +149,11 @@ struct llama_row_cache::impl {
 llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type type,
                             int64_t n_cols, int64_t n_rows, int n_threads) :
         offs(offs), type(type), n_cols(n_cols), n_rows(n_rows) {
+    // a row is one block of the pool: a row of no bytes would divide by zero below
+    if (n_cols <= 0) {
+        throw std::runtime_error(format("row cache: rows of %" PRId64 " columns", n_cols));
+    }
+
     // the reads are timed with ggml_time_us(), which needs ggml_time_init() before it on Windows.
     // llama_backend_init() calls it, so every caller that loads a model is covered
     row_size = ggml_row_size(type, n_cols);
@@ -177,7 +182,8 @@ llama_row_cache::impl::impl(const std::string & path, size_t offs, ggml_type typ
 
     // blocks that turn out to be adjacent are read in one request, which is what makes a gather
     // over real text cheap: neighbouring tokens ask for neighbouring rows
-    run_max = std::max<size_t>(row_cache_env("LLAMA_ROW_CACHE_RUN", 64), 1);
+    // the pool holds 2 runs of blocks: a run past 4096 rows asks for more memory than any gather reads at once
+    run_max = std::clamp<size_t>(row_cache_env("LLAMA_ROW_CACHE_RUN", 64), 1, 4096);
 
     bench_n = row_cache_env("LLAMA_ROW_CACHE_BENCH", 0);
 

@@ -24,6 +24,7 @@ llama_build(test-hc-round-fork.cpp)
 # the elastic buffers of the backends (CUDA VMM, Vulkan sparse buffers) on every GPU device that has them, skipped
 # elsewhere; 01-check runs it on the machines (CHECKUNITS)
 llama_build_and_test(test-elastic-buffer-fork.cpp)
+set_tests_properties(test-elastic-buffer-fork PROPERTIES SKIP_REGULAR_EXPRESSION "test-elastic-buffer-fork: SKIPPED")
 
 # prompt-cache disk spill: block-aligned unbuffered file layout, cold-start adoption, rejection of
 # foreign or truncated files. server-context is a static library, so this links on Windows too.
@@ -91,6 +92,13 @@ llama_build(test-split-equal-fork.cpp)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # the models of this matrix come from test-llama-archs (the generate-models fixture), which upstream builds under
     # the same condition: on a Windows DLL build there are none
+
+    # the window cache of the MTP head with an image that does not move the window (swa_room_on_fork): the cells of a
+    # llama_kv_cache made by the test, no graph; internal classes, so only where they link
+    llama_build(test-kv-window-fork.cpp LINK llama)
+    llama_test(test-kv-window-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-kv-window-fork PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # partial (PARTIAL_ONLY) context checkpoints, one test per memory family:
     # plain attention, iSWA, hybrid (attention + recurrent), pure recurrent and the hybrid of qwen4exp (QSA + GDN)
     foreach(CKPT_MODEL llama-dense gemma2-dense phi3-dense granitehybrid-dense nemotron_h-dense falcon-h1-dense mamba2-dense qwen4exp-moe)
@@ -194,6 +202,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-moe-cache-fork-ref PROPERTIES
         FIXTURES_REQUIRED generate-models
         FIXTURES_SETUP moe-cache-ref
+        SKIP_REGULAR_EXPRESSION "test-moe-cache-fork: SKIPPED"
     )
     foreach(MOE_CACHE_MODE keep fill kv upload state)
         llama_test(
@@ -204,6 +213,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         )
         set_tests_properties(test-moe-cache-fork-${MOE_CACHE_MODE} PROPERTIES
             FIXTURES_REQUIRED "generate-models;moe-cache-ref"
+            SKIP_REGULAR_EXPRESSION "test-moe-cache-fork: SKIPPED"
         )
     endforeach()
 endif()

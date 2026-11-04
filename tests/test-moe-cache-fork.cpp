@@ -428,7 +428,8 @@ int main(int argc, char ** argv) {
                 fclose(f);
             }
         }
-        printf("no GPU device, the moe-cache needs one: skipped\n");
+        // the marker makes ctest count it as skipped (SKIP_REGULAR_EXPRESSION in tests-fork.cmake)
+        printf("test-moe-cache-fork: SKIPPED, no GPU device, the moe-cache needs one\n");
         llama_backend_free();
         return 0;
     }
@@ -441,7 +442,7 @@ int main(int argc, char ** argv) {
     if (mode == "state") {
         FILE * mf = fopen(model.c_str(), "rb");
         if (mf == nullptr) {
-            printf("the reference ran without a GPU: skipped\n");
+            printf("test-moe-cache-fork: SKIPPED, the reference ran without a GPU\n");
             llama_backend_free();
             return 0;
         }
@@ -481,7 +482,7 @@ int main(int argc, char ** argv) {
         }
     }
     if (want.empty()) {
-        printf("the reference ran without a GPU: skipped\n");
+        printf("test-moe-cache-fork: SKIPPED, the reference ran without a GPU\n");
         llama_backend_free();
         return 0;
     }

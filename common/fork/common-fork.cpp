@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -114,7 +115,10 @@ size_t common_host_mem_available() {
 #if defined(_WIN32)
     MEMORYSTATUSEX st; st.dwLength = sizeof(st);
     if (GlobalMemoryStatusEx(&st)) {
-        return (size_t) st.ullAvailPhys;
+        // an allocation on Windows fails when the commit limit (RAM + page file) is reached, free RAM or not, and the
+        // guards that read this probe (checkpoint budget, prompt cache reserve) have to stop before that: the less of
+        // the free RAM and the commit this process can still take. with a page file the second is the larger one
+        return (size_t) std::min(st.ullAvailPhys, st.ullAvailPageFile);
     }
     return 0;
 #elif defined(__APPLE__) && defined(__MACH__)

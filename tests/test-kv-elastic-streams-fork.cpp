@@ -8,7 +8,8 @@
 //   (LLAMA_KV_ELASTIC_POISON=1), so a read of them shows in the logits
 // - reclaim: the memory stops at 3 MiB (LLAMA_KV_ELASTIC_TEST_MIB, ~2560 cells of 1.2 KiB together): stream 0 grows to
 //   ~1800 cells and is cleared, stream 1 then fits a long prompt only with the memory stream 0 still maps (no shrink
-//   without --phase-mem), which it takes back. no reference: every decode succeeds
+//   without --phase-mem), which it takes back; then a copy of 1800 cells of stream 0 to stream 1 that the memory cannot
+//   hold leaves sequence 1 empty instead of copying cells it has no rows for. no reference: every decode succeeds
 // the scenario on the qwen4exp of the matrix (attention, gated delta net, indexer cache): a long and a short prompt in two
 // streams, joint decode steps, a rollback of the drafts of both (n_rs_seq), the state of the long one restored into
 // stream 1 of another context, a copy of stream 0 to stream 1 (seq_cp across streams), a K-shift of stream 0
@@ -208,6 +209,23 @@ static void scenario_reclaim(llama_model * model) {
     CHECK(llama_memory_seq_rm(mem, 0, -1, -1));
     CHECK(decode(ctx, pb, false));
     CHECK(decode(ctx, { { 1, 1300, tk(1) } }, true));
+
+    // a copy of stream 0 that stream 1 has no memory for (1800 + 1800 cells of ~2560): nothing is copied and sequence 1
+    // stays empty, where its cells past the capacity would point at rows the copy never fills; it decodes from scratch
+    std::vector<tok> pc;
+    for (llama_pos i = 0; i < 1800; ++i) {
+        pc.push_back({ 0, i, tk(5000 + i) });
+    }
+    CHECK(llama_memory_seq_rm(mem, 1, -1, -1));
+    CHECK(decode(ctx, pc, false));
+    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+    CHECK(llama_memory_seq_pos_max(mem, 0) == 1799);
+    CHECK(llama_memory_seq_pos_max(mem, 1) == -1);
+    CHECK(decode(ctx, { { 1, 0, tk(2) } }, true));
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        CHECK(g_log.find("not copied, sequence 1 left empty") != std::string::npos);
+    }
 
     llama_free(ctx);
 }

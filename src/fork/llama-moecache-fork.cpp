@@ -1684,7 +1684,9 @@ std::vector<std::vector<int32_t>> llama_moe_cache_fork::hot_now() const {
 
 uint64_t llama_moe_cache_fork::state_id() const {
     // FNV-1a over the model (architecture, name, file size, parameters) and the cached layers (index, the type and the
-    // shape of each expert weight): two models of one shape, as two quants or two fine-tunes, get different files
+    // shape of each expert weight): two quants of one model get different files, two fine-tunes only by name or file
+    // size - the weights are not hashed (a read of the whole model). the file holds expert numbers, not weights, so a
+    // shared one only changes which experts go to the device first
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](const void * p, size_t n) {
         for (size_t i = 0; i < n; ++i) {
