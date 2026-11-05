@@ -572,6 +572,12 @@ struct pool_node {
         double  gen_tps     = 0.0;
         double  prompt_tps  = 0.0;
         int64_t t           = 0;
+        // the prompt counter of a slot moves once per batch (16384 tokens take ~18 s on the 395, the polls come every
+        // second): its last move (time, count, tokens) and the speed measured over it
+        int64_t t_pp        = 0;
+        int64_t n_pp        = 0;
+        int64_t dn_pp       = 0;
+        double  pp_rate     = 0.0;
     };
     std::vector<slot_t> slot_state;
 };
@@ -1831,11 +1837,32 @@ struct server_pool_fork::impl {
                 if (st.processing && p.id_task == st.id_task && now > p.t) {
                     const double dt = (now - p.t) / 1000.0;
                     const double g = std::max<int64_t>(0, st.n_decoded - p.n_decoded) / dt;
-                    const double q = std::max<int64_t>(0, st.n_processed - p.n_processed) / dt;
-                    st.gen_tps    = 0.5*g + 0.5*p.gen_tps;
-                    st.prompt_tps = 0.5*q + 0.5*p.prompt_tps;
+                    st.gen_tps = 0.5*g + 0.5*p.gen_tps;
+
+                    // the prompt: the tokens of the last move of the counter over the time since the move before it,
+                    // held until the next move. a poll between two moves would read 0, the poll of a move a whole batch
+                    // in one interval. past the time the last move took, the speed falls as that move over the time
+                    // since (a stalled prompt goes to 0); once the slot generates, its prompt is read
+                    st.t_pp    = p.t_pp;
+                    st.n_pp    = p.n_pp;
+                    st.dn_pp   = p.dn_pp;
+                    st.pp_rate = p.pp_rate;
+                    if (st.n_processed != p.n_pp && p.t_pp > 0) {
+                        st.dn_pp   = std::max<int64_t>(0, st.n_processed - p.n_pp);
+                        st.pp_rate = now > p.t_pp ? st.dn_pp*1000.0/(now - p.t_pp) : p.pp_rate;
+                        st.t_pp    = now;
+                        st.n_pp    = st.n_processed;
+                    }
+                    const double since = (now - st.t_pp) / 1000.0;
+                    st.prompt_tps = st.n_decoded > 0 ? 0.0 :
+                                    since > 0.0 && st.pp_rate > 0.0 ? std::min(st.pp_rate, st.dn_pp/since) : st.pp_rate;
                 }
                 break;
+            }
+            // a new task, or the first poll of one: its prompt counter starts here
+            if (st.t_pp == 0) {
+                st.t_pp = now;
+                st.n_pp = st.n_processed;
             }
             busy += st.processing ? 1 : 0;
             gen  += st.gen_tps;
