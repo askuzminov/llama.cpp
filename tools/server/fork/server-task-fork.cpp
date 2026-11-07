@@ -1819,15 +1819,18 @@ size_t server_prompt_cache::drop_resident(size_t need) {
             ++it;
             continue;
         }
-        SRV_WRN(" - releasing %.3f MiB of prompt-cache RAM after spill could not cover the deficit\n", before / (1024.0 * 1024.0));
         if (spill_exists(*it)) {
             evict_state(*it);
         }
         if (it->on_disk) {
+            SRV_WRN(" - releasing %.3f MiB of prompt-cache RAM after spill could not cover the deficit\n", before / (1024.0 * 1024.0));
             it->prompt.checkpoints.clear();
             freed += before - it->size();
             ++it;
         } else {
+            // the only copy: the conversation is computed again from the front when it comes back
+            SRV_WRN(" - dropping a prompt-cache state of %d tokens (%.3f MiB) that has no copy on disk: host memory pressure\n",
+                    it->prompt.n_tokens(), before / (1024.0 * 1024.0));
             freed += before;
             it = states.erase(it);
         }
@@ -1923,6 +1926,28 @@ size_t server_prompt_cache::disk_size() const {
     return res;
 }
 
+bool server_prompt_cache::make_room(size_t bytes) {
+    // 07.11: a state that comes from another node takes its whole size in RAM as its chunks arrive. on a 395 the RAM is
+    // what the 96 GiB of the GPU leave, and the cache holds all of it down to the reserve: the room is made before the
+    // transfer, by the writes a transfer can wait for, not after it in the pages of the system
+    const size_t avail = common_host_mem_available();
+    if (avail == 0) {
+        return true;
+    }
+    const size_t want = reserve_size + bytes;
+    if (avail >= want) {
+        return true;
+    }
+    const size_t need = want - avail;
+    SRV_INF(" - room for a state of %.3f MiB from another node: relieving %.3f MiB from the prompt cache (available %.3f MiB, reserve %.3f MiB)\n",
+            bytes / (1024.0 * 1024.0), need / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
+    size_t freed = free_ram(need, true);
+    if (freed < need) {
+        freed += drop_resident(need - freed);
+    }
+    return freed >= need;
+}
+
 bool server_prompt_cache::evict_for_reserve(size_t extra, bool may_write) {
     if (reserve_size == 0) {
         return true;
@@ -1945,6 +1970,15 @@ bool server_prompt_cache::evict_for_reserve(size_t extra, bool may_write) {
     SRV_WRN(" - host memory pressure, relieving %.3f MiB from the prompt cache (available %.3f MiB < reserve %.3f MiB)\n",
             need / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
     size_t freed = free_ram(need, may_write);
+
+    // 07.11: the writes wait while other slots run (defer_writes), and with requests in the queue they always run, so the
+    // deferred write never came and drop_resident below threw the long states away: their conversations were computed
+    // from the start when they came back. a long state pushed out of RAM is written out now instead (the --cache-min-tokens
+    // step still holds): the decodes of the other slots wait for the write, a second or so per few GB, while computing the
+    // state again takes minutes of the GPU and pauses them too (LLAMA_PREFILL_EXCLUSIVE)
+    if (freed < need && !may_write && !spill_dir.empty()) {
+        freed += free_ram(need - freed, true);
+    }
 
     if (freed < need) {
         freed += drop_resident(need - freed);

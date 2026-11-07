@@ -506,24 +506,85 @@ static void test_ram_outside_alloc(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
-// fork: host RAM below the reserve while a decode may not wait for the disk (may_write = false): the cache drops what
-// it would have written, and says whether that covered the deficit
+// fork: host RAM below the reserve while the writes are deferred (may_write = false: other slots run). 07.11: a long
+// state goes to disk even then - with requests in the queue other slots always run, the deferred write never came, and
+// the state was dropped for good; a state below the --cache-min-tokens step leaves RAM with no write, as before. the
+// cache says whether that covered the deficit
 static void test_reserve_no_write(const std::string & dir) {
     if (common_host_mem_available() == 0) {
         return; // the reserve does nothing where the free host RAM is unknown
     }
 
-    // a reserve no host has
-    server_prompt_cache cache(0, 0, SIZE_MAX / 4, dir, 0, SIG);
-    cache.states.push_back(make_state(16, 100, 4096, 0));
-    cache.states.push_back(make_state(16, 200, 4096, 0));
+    // a reserve no host has: the states are written out and give up their RAM, the deficit stays
+    {
+        server_prompt_cache cache(0, 0, SIZE_MAX / 4, dir, 0, SIG);
+        cache.states.push_back(make_state(16, 100, 4096, 0));
+        cache.states.push_back(make_state(16, 200, 4096, 0));
 
-    assert(!cache.evict_for_reserve(0, false));
-    assert(cache.states.empty());
-    assert(dir_empty(dir));
-    server_prompt prompt;
-    prompt.tokens = server_tokens(make_tokens(16, 300), false);
-    assert(cache.alloc(prompt, 4096, 0) == nullptr);
+        assert(!cache.evict_for_reserve(0, false));
+        assert(cache.states.size() == 2);
+        for (const auto & st : cache.states) {
+            assert(st.on_disk && st.data.size() == 0);
+        }
+        server_prompt prompt;
+        prompt.tokens = server_tokens(make_tokens(16, 300), false);
+        assert(cache.alloc(prompt, 4096, 0) == nullptr);
+
+        // the states on disk are read back
+        for (auto & st : cache.states) {
+            assert(cache.unspill_state(st));
+            assert(st.data.main == make_blob(4096, (uint32_t) st.prompt.n_used + 1));
+        }
+        clear_cache(cache);
+        assert(dir_empty(dir));
+    }
+    // below the step: dropped with no write
+    {
+        server_prompt_cache cache(0, 0, SIZE_MAX / 4, dir, 0, SIG);
+        cache.min_tokens = 64;
+        cache.states.push_back(make_state(16, 100, 4096, 0));
+        cache.states.push_back(make_state(16, 200, 4096, 0));
+
+        assert(!cache.evict_for_reserve(0, false));
+        assert(cache.states.empty());
+        assert(dir_empty(dir));
+    }
+    // no spill dir: dropped, there is nowhere to write
+    {
+        server_prompt_cache cache(0, 0, SIZE_MAX / 4, "", 0, SIG);
+        cache.states.push_back(make_state(16, 100, 4096, 0));
+
+        assert(!cache.evict_for_reserve(0, false));
+        assert(cache.states.empty());
+    }
+}
+
+// fork: room in host RAM for a state from another node (07.11): enough free RAM moves nothing; a reserve no host has
+// sends the long states to disk, writes allowed whatever runs, and says the room was not made
+static void test_make_room(const std::string & dir) {
+    if (common_host_mem_available() == 0) {
+        return; // the reserve does nothing where the free host RAM is unknown
+    }
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        cache.states.push_back(make_state(16, 100, 4096, 0));
+        assert(cache.make_room(4096));
+        assert(!cache.states.front().on_disk && cache.states.front().data.size() > 0);
+        clear_cache(cache);
+    }
+    {
+        server_prompt_cache cache(0, 0, SIZE_MAX / 4, dir, 0, SIG);
+        cache.states.push_back(make_state(16, 100, 4096, 0));
+        cache.states.push_back(make_state(16, 200, 4096, 0));
+        cache.defer_writes = true; // a slot runs: the room is made anyway, a transfer waits for it
+        assert(!cache.make_room(4096));
+        assert(cache.states.size() == 2);
+        for (const auto & st : cache.states) {
+            assert(st.on_disk && st.data.size() == 0);
+        }
+        clear_cache(cache);
+        assert(dir_empty(dir));
+    }
 }
 
 // shutdown -> restart: the files are adopted by a run with the same signature
@@ -918,6 +979,7 @@ int main(int argc, char ** argv) {
         { "ram-outside",        test_ram_outside        },
         { "ram-outside-alloc",  test_ram_outside_alloc  },
         { "reserve-no-write",   test_reserve_no_write   },
+        { "make-room",          test_make_room          },
         { "rewrite-step",       test_rewrite_step       },
         { "rewrite-step-shared", test_rewrite_step_shared },
         { "ram-limit-only",     test_ram_limit_only     },

@@ -211,6 +211,8 @@ struct server_task {
         uint64_t    signature; // import: the portable cache signature of the node the state comes from
         size_t      min_match; // export: a state the request takes fewer tokens from is not worth the move
         std::shared_ptr<server_pool_inbox_fork> inbox; // import: the state as it came
+        bool        probe = false; // export: only how much of the prompt the node holds, nothing saved or copied
+        uint64_t    room  = 0;     // import: before a transfer, make this many bytes of host RAM free above the reserve
     };
     pool_action pool_action = {};
 
@@ -836,6 +838,11 @@ struct server_prompt_cache {
     // dropped instead, host RAM below the reserve costs more than a cache miss. false when the cache could not cover
     // the deficit
     bool evict_for_reserve(size_t extra, bool may_write = true);
+
+    // fork: room in host RAM for `bytes` more above the reserve before a state comes from another node (--pool): older
+    // states go to disk (the --cache-min-tokens step still holds), shorter ones are dropped. false when the cache could
+    // not make that room. true where the free host RAM is unknown
+    bool make_room(size_t bytes);
 
     // spill support (no-ops when spill_dir is empty)
     // paths are std::filesystem::path rather than std::string: spill_dir arrives as UTF-8, and the

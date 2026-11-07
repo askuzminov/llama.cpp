@@ -189,10 +189,13 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
         return false;
     }
     static const int64_t min_n = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_N"); return e ? (int64_t) atoll(e) : (int64_t) 64; }();
+    // few rows over a long K (the hc down projection of qwen4exp, 320 x 10240) leave few workgroups, each a long walk
+    // over K: there the int8 path was faster on the 395 (07.11, 05-mm: 17.2 against 15.8 TFLOP/s with f16 activations)
+    static const int64_t min_m = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_M"); return e ? (int64_t) atoll(e) : (int64_t) 512; }();
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
-    if (N < min_n || M < 16 || K % 64 != 0 || src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
+    if (N < min_n || M < std::max<int64_t>(16, min_m) || K % 64 != 0 || src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         return false;
     }

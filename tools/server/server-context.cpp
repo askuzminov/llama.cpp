@@ -2061,7 +2061,22 @@ private:
 
         std::string error;
         json data;
-        if (task.type == SERVER_TASK_TYPE_POOL_EXPORT) {
+        if (task.type == SERVER_TASK_TYPE_POOL_EXPORT && task.pool_action.probe) {
+            // a probe (07.11): the longest prefix of the prompt in the cache and the idle slots of this node, with nothing
+            // saved or copied. the pool asks the node a conversation would go to: its own figure is only where the
+            // conversation went before, and the node may have let that copy go since. a prefix is an upper bound of what
+            // a slot restores here (a hybrid memory goes back to a checkpoint)
+            size_t held = 0;
+            for (const auto & st : prompt_cache->states) {
+                held = std::max(held, st.prompt.tokens.get_common_prefix(task.tokens));
+            }
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    held = std::max(held, slot.prompt.tokens.get_common_prefix(task.tokens));
+                }
+            }
+            data = {{"n_match", held}, {"n_tokens", task.tokens.size()}};
+        } else if (task.type == SERVER_TASK_TYPE_POOL_EXPORT) {
             // the state with the longest prefix of the prompt, the shortest of them (find_best weighs what a slot keeps)
             size_t n_match = 0;
             auto best = [&]() {
@@ -2111,6 +2126,15 @@ private:
                     it->prompt.tokens.size(), plan.file.empty() ? "RAM" : "disk", (unsigned long long) plan.n_reuse,
                     (unsigned long long) plan.n_ckpt, (unsigned long long) plan.n_ckpt_all, plan.size / (1024.0 * 1024.0));
             server_pool_xfer_plan_fork(task.pool_action.id, std::move(plan));
+        } else if (task.pool_action.room > 0) {
+            // room for a state that is about to come: the writes it takes run now, the transfer waits for them
+            if (!prompt_cache->make_room(task.pool_action.room)) {
+                send_error(task, string_format("no room in host RAM for a state of %.0f MiB: the prompt cache could not free "
+                    "enough above its reserve (%.0f MiB available)", task.pool_action.room / (1024.0 * 1024.0),
+                    common_host_mem_available() / (1024.0 * 1024.0)), ERROR_TYPE_UNAVAILABLE);
+                return;
+            }
+            data = {{"room", task.pool_action.room}};
         } else {
             size_t n_tokens = 0;
             if (!task.pool_action.inbox) {
@@ -7799,6 +7823,7 @@ void server_routes::init_routes() {
             task.tokens                = std::move(tokens);
             task.pool_action.id        = server_pool_xfer_id_fork();
             task.pool_action.min_match = json_value(body, "min_match", (size_t) 0);
+            task.pool_action.probe     = json_value(body, "probe", false);
             rd.post_task(std::move(task), true);
         }
         auto result = rd.next(req.should_stop);
@@ -7913,6 +7938,26 @@ void server_routes::init_routes() {
             return res;
         }
         const json body = json::parse(req.body);
+        // before a transfer (07.11): room in host RAM for the state, the prompt cache moves older states to disk first
+        if (body.contains("room")) {
+            auto & rd = res->rd;
+            {
+                server_task task(SERVER_TASK_TYPE_POOL_IMPORT);
+                task.id               = rd.get_new_id();
+                task.pool_action.room = std::max<uint64_t>(1, json_value(body, "room", (uint64_t) 1));
+                rd.post_task(std::move(task), true);
+            }
+            auto result = rd.next(req.should_stop);
+            if (!result) {
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            res->ok(result->to_json());
+            return res;
+        }
         auto inbox = server_pool_inbox_take_fork(json_value(body, "id", std::string()));
         if (json_value(body, "abort", false)) {
             res->ok({{"dropped", inbox != nullptr}});

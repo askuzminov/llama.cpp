@@ -2196,7 +2196,7 @@ MM_VARIANTS = ["r16x64/8x1", "r32x32/4x2", "r32x64/4x2", "r64x32/2x4", "r64x64/2
 def cmd_mm():
     """The dense q8_0 matmuls of a prompt on the device of the machine (test-backend-ops): the default path and the
     variants of mul_mm_f16reg.comp (GGML_VK_MM_F16REG). For each variant first the MUL_MAT tests of q8_0 against the CPU,
-    all of them through the variant (GGML_VK_MM_F16REG_MIN_N=1), then perf of the q8_0 shapes of qwen4exp at QA_MM_N
+    all of them through the variant (GGML_VK_MM_F16REG_MIN_N=1, _MIN_M=1), then perf of the q8_0 shapes of qwen4exp at QA_MM_N
     tokens (4096): TFLOP/s per shape, and the registers, the scratch (registers spilled to memory) and the shared memory
     the driver gave the shader. QA_MMARMS: variants (name VAR=value ...;...), a run each, the default path first."""
     run = Run("mm")
@@ -2215,7 +2215,7 @@ def cmd_mm():
         run_env = dict(os.environ, **arm_env)
 
         # the tests: every q8_0 case through the variant, its log line counts the matmuls it took
-        test_env = dict(run_env, GGML_VK_MM_F16REG_MIN_N="1", GGML_VK_MM_F16REG_LOG="1")
+        test_env = dict(run_env, GGML_VK_MM_F16REG_MIN_N="1", GGML_VK_MM_F16REG_MIN_M="1", GGML_VK_MM_F16REG_LOG="1")
         cmd = [exe, "test", "-b", device, "-o", "MUL_MAT", "-p", "type_a=q8_0"]
         identity = {"v": VERSION, "kind": "mm-test", "build": bid, "args": [str(c) for c in cmd[1:]],
                     "env": env_identity(test_env), "machine": machine()}

@@ -175,8 +175,11 @@ void common_fork_add_preset_options(std::vector<common_arg> & args) {
         {"pool-wait-max",    COMMON_ARG_PRESET_POOL_FORK "_WAIT_MAX",    "SECONDS",
          "the longest wait for the node of a conversation (default: 300)"},
         {"pool-migrate",     COMMON_ARG_PRESET_POOL_FORK "_MIGRATE",     "0|1",
-         "a conversation that goes to another node takes its cached state along when that is faster than computing it "
-         "again (default: 1)"},
+         "a conversation that goes to another node takes its cached state along, which it can whenever the nodes run "
+         "the same model and configuration (default: 1)"},
+        {"pool-drain-move",  COMMON_ARG_PRESET_POOL_FORK "_DRAIN_MOVE",  "0|1",
+         "a drained node hands its active conversations (a request in the last 30 minutes) over to other nodes with "
+         "their states at once, not at their next requests (default: 1)"},
         {"pool-link-mbps",   COMMON_ARG_PRESET_POOL_FORK "_LINK_MBPS",   "N",
          "the speed of a link until it is measured, Mbit/s (default: 500)"},
         {"pool-prefill-tps", COMMON_ARG_PRESET_POOL_FORK "_PREFILL_TPS", "N",

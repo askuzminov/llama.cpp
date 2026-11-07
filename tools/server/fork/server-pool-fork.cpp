@@ -377,6 +377,7 @@ struct pool_config {
     double  chars_tok   = 3.5;   // characters per token, for the estimates
     int     ttl_s       = 6*3600; // how long the pool remembers which node holds a prefix
     bool    migrate     = true;  // a conversation moves with its cached state when the nodes can
+    bool    drain_move  = true;  // a drained node hands its active conversations over at once (evacuate)
     double  link_mbps   = 500.0; // the speed of a link not measured yet (Mbit/s)
     int     probe_s     = 10;    // how often a node on a slower link tries the faster ones again (s)
     bool    same_model  = true;  // a node of another model than the most of the others takes no request
@@ -408,6 +409,7 @@ static void pool_read_options(pool_config & cfg, const common_preset & preset) {
     get("_WAIT_MAX",    "pool-wait-max",    [&](const std::string & v) { cfg.wait_max_s  = std::stoi(v); });
     get("_PREFILL_TPS", "pool-prefill-tps", [&](const std::string & v) { cfg.prefill_tps = std::max(1.0, std::stod(v)); });
     get("_MIGRATE",     "pool-migrate",     [&](const std::string & v) { cfg.migrate     = common_arg_utils::is_truthy(v); });
+    get("_DRAIN_MOVE",  "pool-drain-move",  [&](const std::string & v) { cfg.drain_move  = common_arg_utils::is_truthy(v); });
     get("_LINK_MBPS",   "pool-link-mbps",   [&](const std::string & v) { cfg.link_mbps   = std::max(1.0, std::stod(v)); });
     get("_PROBE_S",     "pool-probe-s",     [&](const std::string & v) { cfg.probe_s     = std::max(1, std::stoi(v)); });
     get("_SAME_MODEL",  "pool-same-model",  [&](const std::string & v) { cfg.same_model  = common_arg_utils::is_truthy(v); });
@@ -551,7 +553,12 @@ struct pool_node {
     double      gen_tps    = 0.0;
     double      prompt_tps = 0.0;
     double      prefill_tps = 0.0; // measured: the timings of the prompts of move_tokens and more it read, 0 = none yet
-    double      decode_tps  = 0.0; // measured: the timings of the answers of 16 tokens and more, 0 = none yet
+    // measured: the timings of the answers of 16 tokens and more that ran alone on the node (07.11: under load the slots
+    // of a node share its GPU and a prompt next to an answer pauses it, a 395 with 2 slots measured half the speed of a
+    // 3090 with 1 and its weight was half), 0 = none yet; the speed of all answers apart, for the dashboard
+    double      decode_tps  = 0.0;
+    double      decode_all  = 0.0;
+    uint64_t    starts      = 0;   // the requests this router started there, to tell an answer that ran alone
     // measured: the part of a prefix of other conversations it reused for a prompt (cache_n of the answers), -1 = none
     // yet. a transformer takes all of it, a hybrid model (qwen4exp: gated delta net) or SWA only up to a checkpoint
     // within it, which a node often does not have
@@ -607,6 +614,8 @@ struct pool_req {
     int                  node          = -1; // where it went
     int64_t              t_start       = 0;
     std::string          stage;              // "moving": its state comes from another node
+    bool                 alone         = false; // nothing else ran on its node when it started
+    uint64_t             starts_at     = 0;  // the starts of its node with it: another start meanwhile = not alone
 
     int64_t cached_max() const {
         return cached.empty() ? 0 : *std::max_element(cached.begin(), cached.end());
@@ -651,6 +660,12 @@ struct server_pool_fork::impl {
         uint64_t n = 0;
         int64_t  t_moved = 0;      // when it went to another node last (wall ms)
         std::vector<int64_t> held; // per node: the tokens of the conversation it took last
+        // the last request, for the export when its node is drained (evacuate): its kind, body and key; none for a
+        // conversation shorter than pool-move-tokens
+        std::string kind;
+        json        body;
+        pool_key    key;
+        int64_t     t_evac_fail = 0; // when its state last failed to leave a drained node (wall ms)
     };
     std::unordered_map<std::string, conv_t> convs;
 
@@ -819,7 +834,8 @@ struct server_pool_fork::impl {
         return nodes[n].prefill_tps > 0 ? nodes[n].prefill_tps : cfg.prefill_tps;
     }
 
-    // the share of the new conversations a node takes: its decode speed against the fastest node, 1 until measured
+    // the share of the new conversations a node takes: its speed for one conversation alone (decode_tps) against the
+    // fastest node, 1 until measured
     double weight_of(int n) const {
         double best = 0.0;
         for (int i = 0; i < n_nodes.load(); ++i) {
@@ -957,6 +973,20 @@ struct server_pool_fork::impl {
         return held == 0 || held + r.prompt_tokens + answer(r) + n.room_margin <= n.room_ctx;
     }
 
+    // whether the other requests in the queue fill the free slots of node n with no history to compute there: new
+    // conversations, and those whose node with the most cached is n (07.11: with a queue on every node a conversation
+    // that waited as long as its prompt takes went to the first node to free a slot and was computed there from the start,
+    // in the slot of a request that node had cached)
+    bool others_fill(const pool_req & r, int n) const {
+        int want = 0;
+        for (const pool_req * q : queue) {
+            if (q != &r && (q->conv_new || holder(*q) == n)) {
+                ++want;
+            }
+        }
+        return want > 0 && want >= free_slots(nodes[n]);
+    }
+
     // the usable node with the most of the prompt cached, -1 = none holds any of it
     int holder(const pool_req & r) const {
         int best = -1;
@@ -984,6 +1014,15 @@ struct server_pool_fork::impl {
         const int light = best_free(r, true, true);
         if (rebalance(r, hold, light)) {
             return quiet_wait(r, light, now);
+        }
+        // its node is busy (best_free takes the node with the most cached when it is free). while the other requests in
+        // the queue fill the free slots of alt with nothing to compute again there, a move only reorders the work: the
+        // slot it takes on alt would serve one of them, and the pool pays the move on top - the difference computed, the
+        // state read or sent, one more copy of it in a cache (07.11, user: both nodes full with queues of 4-6, the
+        // conversations went back and forth for nothing). it waits for its node then, up to pool-wait-max; it leaves only
+        // for a slot that would stand idle otherwise (and a crowded node or a long prompt for a quiet one, above)
+        if (alt != hold && others_fill(r, alt)) {
+            return (now - r.t_arrive) / 1000.0 < cfg.wait_max_s ? -1 : quiet_wait(r, alt, now);
         }
         const int64_t gain = pool_at(r.cached, hold) - pool_at(r.cached, alt);
         if (gain >= cfg.move_tokens) {
@@ -1267,8 +1306,10 @@ struct server_pool_fork::impl {
             }
             if (n >= 0) {
                 queue.erase(std::find(queue.begin(), queue.end(), &r));
+                r.alone = streams(nodes[n]) == 0;
                 nodes[n].inflight++;
                 nodes[n].n_requests++;
+                r.starts_at = ++nodes[n].starts;
                 r.node = n;
                 r.t_start = now;
                 running[r.id] = r;
@@ -1332,7 +1373,7 @@ struct server_pool_fork::impl {
     //   characters; at least move_tokens of it) the share of it the node took from its cache (cache_n). a node that took
     //   more than reaches to the end of the next message (`shared_max`), where the prompt differs from the others, held
     //   this conversation itself (one the pool forgot, as after its restart): no sample
-    pool_timings note_timings(int n, const std::string & tail, double shared, double shared_max) {
+    pool_timings note_timings(int n, const std::string & tail, double shared, double shared_max, uint64_t req_id) {
         pool_timings res;
         const size_t at  = tail.rfind("\"timings\":");
         const size_t beg = at == std::string::npos ? std::string::npos : tail.find('{', at);
@@ -1356,7 +1397,14 @@ struct server_pool_fork::impl {
             nodes[n].prefill_tps = avg(nodes[n].prefill_tps, n_prompt*1000.0/t_ms, 0.0);
         }
         if (n_gen >= 16 && t_gen > 0) {
-            nodes[n].decode_tps = avg(nodes[n].decode_tps, n_gen*1000.0/t_gen, 0.0);
+            // the weight of a node: one stream on it, nothing next to it from start to end (other routers included)
+            auto it = running.find(req_id);
+            const bool alone = it != running.end() && it->second.alone && it->second.starts_at == nodes[n].starts &&
+                               nodes[n].external == 0;
+            if (alone) {
+                nodes[n].decode_tps = avg(nodes[n].decode_tps, n_gen*1000.0/t_gen, 0.0);
+            }
+            nodes[n].decode_all = avg(nodes[n].decode_all, n_gen*1000.0/t_gen, 0.0);
         }
         const double total = n_prompt + n_cache;
         if (shared > 0 && total > 0 && n_cache <= shared_max * total) {
@@ -1401,21 +1449,42 @@ struct server_pool_fork::impl {
     // the conversation of `r` moves from `from` to `to` with its state: `from` gives the cached state of the prompt
     // (POST /pool/export), `to` reads it from `from` itself and takes it into its prompt cache in RAM (POST /pool/pull).
     // false with `why` when it did not move: `to` then computes the conversation from the start, as without a move
+    // what node `to` holds of the prompt in fact, in its tokens (the longest prefix in its cache and its idle slots, an
+    // upper bound of what a slot restores there), and the tokens of the prompt there; -1 when the node cannot tell. the
+    // pool's own figure is where the conversation went before, and the node may have let that copy go since (07.11)
+    int64_t probe_hold(int to, const char * kind, const json & body, int64_t & n_tokens) {
+        const pool_node & nt = nodes[to]; // the fixed fields only, the state is under mu
+        pool_link lt;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            lt = nt.links[nt.link];
+        }
+        httplib::Client ct(pool_base(lt));
+        ct.set_connection_timeout(3, 0);
+        ct.set_read_timeout(30, 0);
+        json req_pr = {{"kind", kind}, {"body", body}, {"probe", true}, {"model", nt.model}};
+        req_pr["body"]["model"] = nt.model;
+        auto rx = ct.Post("/pool/export?model=" + nt.model + "&autoload=0", auth_headers(), req_pr.dump(), "application/json");
+        const json ex = rx && rx->status == 200 ? json::parse_no_throw(rx->body) : json();
+        if (!ex.is_object() || !ex.contains("n_match")) {
+            return -1;
+        }
+        n_tokens = json_value(ex, "n_tokens", (int64_t) 0);
+        return json_value(ex, "n_match", (int64_t) -1);
+    }
+
+    // to_held: what `to` holds of the prompt in its tokens as it answered a probe, -1 = the estimate of the pool
     bool migrate(const pool_req & r, int from, int to, const char * kind, const json & body,
-                 const std::function<bool()> & should_stop, std::string & why, std::string & detail) {
+                 const std::function<bool()> & should_stop, std::string & why, std::string & detail, int64_t to_held = -1) {
         const pool_node & nf = nodes[from]; // the fixed fields only, the state is under mu
         const pool_node & nt = nodes[to];
         pool_link lf;
         pool_link lt;
-        double bps;
-        double prefill_to;
         uint64_t cache_ram_to;
         {
             std::lock_guard<std::mutex> lk(mu);
             lf = nf.links[nf.link];
             lt = nt.links[nt.link];
-            bps          = pair_bps(from, to);
-            prefill_to   = prefill_of(to);
             cache_ram_to = nt.cache_ram;
         }
         const httplib::Headers hdrs = auth_headers();
@@ -1465,16 +1534,13 @@ struct server_pool_fork::impl {
             drop_export();
             return false;
         }
-        // worth it only when the transfer is shorter than computing what it brings
-        const double  t_xfer = move_s((double) size, bps);
-        const int64_t gain   = std::max<int64_t>(0, n_reuse - pool_at(r.cached, to));
-        const double  t_comp = gain / prefill_to;
-        if (t_xfer >= t_comp) {
-            why = gain > 0
-                ? string_format("the move of %.0f MB would take ~%.0f s, computing the ~%lld tok it brings ~%.0f s",
-                                size / 1e6, t_xfer, (long long) gain, t_comp)
-                : string_format("the state reaches ~%lld tok (a checkpoint), the node holds ~%lld", (long long) n_reuse,
-                                (long long) pool_at(r.cached, to));
+        // the state goes whenever it brings something: a transfer takes the network and the disks, computing what it
+        // brings takes the GPU every queued request waits for (07.11, user: "a transfer is always cheaper"; before, the
+        // pool compared the estimated times and computed when that came out shorter)
+        const int64_t gain = std::max<int64_t>(0, n_reuse - (to_held >= 0 ? to_held : pool_at(r.cached, to)));
+        if (gain <= 0) {
+            why = string_format("the state reaches ~%lld tok (a checkpoint), the node holds ~%lld", (long long) n_reuse,
+                                (long long) (to_held >= 0 ? to_held : pool_at(r.cached, to)));
             drop_export();
             std::lock_guard<std::mutex> lk(mu);
             state_bpt = state_bpt > 0 ? 0.5*state_bpt + 0.5*size / std::max<int64_t>(1, n_tok) : (double) size / std::max<int64_t>(1, n_tok);
@@ -1557,6 +1623,17 @@ struct server_pool_fork::impl {
         ct.set_write_timeout(60, 0);
         const std::string q_src = "&model=" + src_model + "&autoload=0";
         const std::string q_dst = "model=" + dst_model + "&autoload=0";
+
+        // room in the RAM of the instance first (07.11): the state takes its whole size in RAM as its chunks come, and the
+        // RAM of a 395 is what the GPU leaves - the cache there moves older states to disk for it now, or says it cannot,
+        // before gigabytes cross the network
+        {
+            auto rr = ct.Post("/pool/import/done?" + q_dst, hdrs, json{{"room", size}, {"model", dst_model}}.dump(), "application/json");
+            // 404: an instance of an older build takes the request for a transfer it does not know, and makes room after
+            if (!rr || (rr->status != 200 && rr->status != 404)) {
+                return pool_error(507, "no room for the state: " + pool_error_text(rr));
+            }
+        }
 
         // the reader keeps up to two chunks ahead of the writer
         std::mutex              m;
@@ -1688,7 +1765,9 @@ struct server_pool_fork::impl {
         }
 
         const char * kind = pool_kind_of(req.path);
-        int move_from = -1;
+        int move_from  = -1;
+        int probe_from = -1;
+        int64_t best   = 0;
         std::string move_why;
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -1696,7 +1775,7 @@ struct server_pool_fork::impl {
             remember(key, r, n, now);
             trim(now);
             const double  waited = (now - r.t_arrive) / 1000.0;
-            const int64_t best   = r.cached_max();
+            best                 = r.cached_max();
             const int64_t got    = pool_at(r.cached, n);
             const std::string w  = (waited >= 0.5 ? string_format(", waited %.1f s", waited) : std::string()) +
                                    (r.short_answer ? string_format(", short answer (max %lld tok)", (long long) r.max_answer) : std::string());
@@ -1723,20 +1802,22 @@ struct server_pool_fork::impl {
                 move_why = string_format("~%lld tok cached on %s (%s), ~%lld here, ~%lld tok to compute%s",
                     (long long) best, nodes[from].name.c_str(), state.c_str(),
                     (long long) got, (long long) (r.prompt_tokens - got), w.c_str());
-                // the export copies the whole state on its node (GBs, behind the batch there), so not when the estimate
-                // of the moves so far already says computing the difference is shorter (03.11: 10 of 13 exports were
-                // dropped for that)
-                const double t_xfer = transfer_s(from, n, best);
-                const double t_comp = (best - got) / prefill_of(n);
-                if (*kind && best - got >= cfg.move_tokens && can_migrate(from, n) && state_bpt > 0 && t_xfer >= t_comp) {
-                    event("move", r.conv, n, move_why + string_format("; no state moved: the move of ~%.0f MB would take "
-                        "~%.0f s, computing the ~%lld tok it brings ~%.0f s (estimate)", best * state_bpt / 1e6, t_xfer,
-                        (long long) (best - got), t_comp));
-                } else if (*kind && best - got >= cfg.move_tokens && can_migrate(from, n)) {
+                // where it goes, by name (07.11): "migrate" - with its state (the state goes whenever it brings
+                // pool-move-tokens or more and can move, migrate()); "switch" - onto an older copy on that node, which
+                // computes the difference; "recompute" - that node computes the prompt, the reason after "no state"
+                if (*kind && best - got >= cfg.move_tokens && can_migrate(from, n)) {
                     move_from = from;
                     running[r.id].stage = "moving";
+                } else if (*kind && got > 0 && can_migrate(from, n)) {
+                    // the node is held to have an older copy, the difference below pool-move-tokens: it says what it has,
+                    // a copy it let go would have the whole prompt computed there
+                    probe_from = from;
+                    running[r.id].stage = "moving";
                 } else {
-                    event("move", r.conv, n, move_why);
+                    const std::string no_state = !*kind ? "; no state: the request is not a chat or a completion"
+                                               : !can_migrate(from, n) ? "; no state: none moves between these nodes "
+                                                 "(pool-migrate, another configuration, no prompt cache)" : "";
+                    event(got > 0 && best - got < cfg.move_tokens ? "switch" : "recompute", r.conv, n, move_why + no_state);
                 }
             }
             if (!r.conv.empty()) {
@@ -1752,6 +1833,39 @@ struct server_pool_fork::impl {
                 c.n++;
                 c.held.resize(n_nodes.load(), 0);
                 c.held[n] = r.prompt_tokens;
+                if (*kind && r.prompt_tokens >= cfg.move_tokens) {
+                    c.kind = kind;
+                    c.body = body;
+                    c.key  = key;
+                } else {
+                    c.kind.clear();
+                    c.body = json();
+                }
+            }
+        }
+
+        // a move onto an older copy: the copy as the node has it. the node counts its tokens, the pool characters (its
+        // thresholds too), so the copy goes into the units of the pool by its share of the prompt. the state comes along
+        // when the copy is short of what the holder has by pool-move-tokens or more
+        int64_t to_held = -1;
+        if (probe_from >= 0) {
+            int64_t n_tok = 0;
+            const int64_t held = probe_hold(n, kind, body, n_tok);
+            std::lock_guard<std::mutex> lk(mu);
+            const int64_t held_est = held >= 0 && n_tok > 0 && r.prompt_tokens > 0
+                ? (int64_t) ((double) held * r.prompt_tokens / n_tok) : -1;
+            if (held_est >= 0 && best - held_est >= cfg.move_tokens) {
+                move_from = probe_from;
+                to_held   = held;
+                move_why += string_format("; %lld of %lld tok there in fact", (long long) held, (long long) n_tok);
+            } else {
+                auto it = running.find(r.id);
+                if (it != running.end()) {
+                    it->second.stage.clear();
+                }
+                event("switch", r.conv, n, move_why + (held >= 0
+                    ? string_format("; %lld of %lld tok there in fact", (long long) held, (long long) n_tok)
+                    : std::string("; the node did not say what it holds")));
             }
         }
 
@@ -1759,7 +1873,7 @@ struct server_pool_fork::impl {
         if (move_from >= 0) {
             std::string why;
             std::string detail;
-            moved = migrate(r, move_from, n, kind, body, req.should_stop, why, detail);
+            moved = migrate(r, move_from, n, kind, body, req.should_stop, why, detail, to_held);
             std::lock_guard<std::mutex> lk(mu);
             auto it = running.find(r.id);
             if (it != running.end()) {
@@ -1768,7 +1882,7 @@ struct server_pool_fork::impl {
             if (moved) {
                 event("migrate", r.conv, n, detail);
             } else {
-                event("move", r.conv, n, move_why + "; no state moved: " + why);
+                event("recompute", r.conv, n, move_why + "; no state: " + why);
             }
         }
         if (req.should_stop()) {
@@ -1796,7 +1910,7 @@ struct server_pool_fork::impl {
                 return more;
             };
             proxy->cleanup = [this, req_id, p, n, tail, shared, shared_max]() {
-                release(req_id, p->status, note_timings(n, *tail, shared, shared_max));
+                release(req_id, p->status, note_timings(n, *tail, shared, shared_max, req_id));
             };
             return std::unique_ptr<server_http_res>(std::move(proxy));
         } catch (...) {
@@ -2272,6 +2386,117 @@ struct server_pool_fork::impl {
     void start() {
         if (!started.exchange(true)) {
             start_poller(0);
+            std::lock_guard<std::mutex> lk(mu_threads);
+            if (!stopping.load()) {
+                pollers.emplace_back([this]() { evacuate(); });
+            }
+        }
+    }
+
+    // a conversation of a drained node whose state can go to another node now, the one used last first: an active one
+    // (a request in the last 30 minutes), its last request known, none of its requests runs or waits (a running one
+    // leaves when it ends, a waiting one moves at its placement), no try failed in the last 10 minutes; the target is the
+    // node with the fewest active conversations per slot by its speed that its state can move to. false when there is
+    // none. under mu
+    bool evac_pick(std::string & conv, int & from, int & to) const {
+        if (!cfg.drain_move) {
+            return false;
+        }
+        const int64_t now = pool_wall_ms();
+        std::vector<std::pair<int64_t, const std::string *>> order;
+        for (const auto & e : convs) {
+            order.push_back({e.second.t_last, &e.first});
+        }
+        std::sort(order.begin(), order.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        for (const auto & o : order) {
+            const auto & e = *convs.find(*o.second);
+            const conv_t & c = e.second;
+            if (c.node < 0 || c.node >= n_nodes.load() || !nodes[c.node].draining || nodes[c.node].status != "up" ||
+                    c.kind.empty() || now - c.t_last > 1800 * 1000 || now - c.t_evac_fail < 600000) {
+                continue;
+            }
+            const bool busy = std::any_of(running.begin(), running.end(), [&](const auto & q) { return q.second.conv == e.first; }) ||
+                              std::any_of(queue.begin(), queue.end(), [&](const pool_req * q) { return q->conv == e.first; });
+            if (busy) {
+                continue;
+            }
+            // the target: the fewest active conversations per slot by the speed of the node, those handed over before
+            // counted (with every node busy the free slots tell nothing, and a score by them sent every conversation of
+            // the drained node to one node)
+            int best = -1;
+            double best_load = 0.0;
+            for (int i = 0; i < n_nodes.load(); ++i) {
+                if (i == c.node || !usable(nodes[i]) || !can_migrate(c.node, i)) {
+                    continue;
+                }
+                int held = 0;
+                for (const auto & h : convs) {
+                    held += h.second.node == i && now - h.second.t_last <= 1800 * 1000 ? 1 : 0;
+                }
+                const double load = (held + 1) / (std::max(1, nodes[i].slots) * std::max(0.05, weight_of(i)));
+                if (best < 0 || load < best_load) {
+                    best      = i;
+                    best_load = load;
+                }
+            }
+            if (best >= 0) {
+                conv = e.first;
+                from = c.node;
+                to   = best;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // a drained node hands its conversations over (07.11, user: "a drain should pass the state to another node, at
+    // least of the active conversations"): their states go to other nodes one at a time, before their next requests
+    // come, which then stay where the state is (keep) - the node can go away without them being computed again
+    void evacuate() {
+        while (!stopping.load()) {
+            std::string conv;
+            int from = -1;
+            int to   = -1;
+            std::string kind;
+            json body;
+            pool_req r;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (evac_pick(conv, from, to)) {
+                    const conv_t & c = convs[conv];
+                    kind     = c.kind;
+                    body     = c.body;
+                    r.conv   = conv;
+                    r.cached.assign(n_nodes.load(), 0);
+                }
+            }
+            if (from < 0) {
+                std::unique_lock<std::mutex> lk(mu_stop);
+                cv_stop.wait_for(lk, std::chrono::milliseconds(500), [&] { return stopping.load(); });
+                continue;
+            }
+            std::string why;
+            std::string detail;
+            const bool moved = migrate(r, from, to, kind.c_str(), body, [this]() { return stopping.load(); }, why, detail, 0);
+            std::lock_guard<std::mutex> lk(mu);
+            auto it = convs.find(conv);
+            if (it == convs.end()) {
+                continue;
+            }
+            conv_t & c = it->second;
+            if (moved) {
+                // the next request finds the state on `to`: the history it continues is held there now, as by the node
+                // that served it (count_shared counts a node in `held` in full)
+                remember(c.key, r, to, ggml_time_ms());
+                c.node    = to;
+                c.t_moved = pool_wall_ms();
+                c.held.resize(n_nodes.load(), 0);
+                c.held[to] = c.prompt_tokens;
+                event("migrate", conv, to, "drain of " + nodes[from].name + ": " + detail);
+            } else {
+                c.t_evac_fail = pool_wall_ms();
+                event("drain", conv, from, "the state stays on the drained node: " + why);
+            }
         }
     }
 
@@ -2380,7 +2605,7 @@ struct server_pool_fork::impl {
                 {"n_ctx", n_ctx}, {"slots", n.slots}, {"inflight", n.inflight}, {"busy", n.busy},
                 {"external", n.external}, {"weight", weight_of(i)}, {"requests", n.n_requests},
                 {"gen_tps", n.gen_tps}, {"prompt_tps", n.prompt_tps}, {"queued_for", queued_for},
-                {"prefill_tps", n.prefill_tps}, {"prefill_cfg", cfg.prefill_tps}, {"decode_tps", n.decode_tps},
+                {"prefill_tps", n.prefill_tps}, {"prefill_cfg", cfg.prefill_tps}, {"decode_tps", n.decode_tps}, {"decode_all", n.decode_all},
                 {"share", n.share},
                 {"room", n.room_held >= 0 ? json{{"held", n.room_held}, {"n_ctx", n.room_ctx}, {"deferred", n.room_deferred}} : json()},
                 {"stats", n.stats}, {"gpus", n.gpus},
@@ -2444,7 +2669,7 @@ struct server_pool_fork::impl {
             {"config", {
                 {"model", model}, {"names", std::vector<std::string>(names.begin(), names.end())},
                 {"move_tokens", cfg.move_tokens}, {"wait_max", cfg.wait_max_s}, {"prefill_tps", cfg.prefill_tps},
-                {"poll_ms", cfg.poll_ms}, {"migrate", cfg.migrate}, {"link_mbps", cfg.link_mbps},
+                {"poll_ms", cfg.poll_ms}, {"migrate", cfg.migrate}, {"drain_move", cfg.drain_move}, {"link_mbps", cfg.link_mbps},
                 {"same_model", cfg.same_model}, {"port", cfg.port}, {"discover", cfg.discover}, {"peers", cfg.peers},
                 {"rebalance_s", cfg.rebalance_s}, {"quiet_wait_s", cfg.quiet_wait_s}, {"short_tokens", cfg.short_tokens},
                 {"evict_idle_s", cfg.evict_idle_s},

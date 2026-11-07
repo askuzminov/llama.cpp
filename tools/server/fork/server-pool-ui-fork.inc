@@ -342,7 +342,7 @@ function gpuText(g) {
 function gpuCls(g) { return g.temp_c >= 90 ? "ba" : g.temp_c >= 80 ? "wa" : ""; }
 
 const KIND = {
-  "new": "ac", cold: "ac", keep: "ok", migrate: "te", move: "wa",
+  "new": "ac", cold: "ac", keep: "ok", "switch": "ok", migrate: "te", recompute: "wa",
   done: "", error: "ba", gone: "wa", fail: "ba",
   up: "ok", down: "ba", loading: "wa", unloaded: "wa", load: "ac", link: "wa", "link+": "ac", found: "ac",
   match: "", mismatch: "ba", conflict: "ba", drain: "wa", undrain: ""
@@ -351,8 +351,9 @@ const KIND_INFO = {
   "new": "a new conversation, to the node with the most free slots",
   cold: "no node holds the conversation: computed from the start",
   keep: "stays on the node that holds its cache",
-  move: "goes to another node, which computes its prompt",
+  "switch": "goes to another node that holds an older copy of it: that node computes the difference",
   migrate: "goes to another node with its cached state",
+  recompute: "goes to another node, which computes its prompt: no state could come along (the reason in the details)",
   done: "a request finished", error: "a request ended with an error",
   gone: "the client left while the request waited", fail: "no node could take the request",
   up: "a node is up", down: "a node does not answer", loading: "a node loads the model", unloaded: "the model of a node is unloaded",
@@ -360,7 +361,7 @@ const KIND_INFO = {
   found: "a router joined the pool", match: "the model of a node matches the others", mismatch: "a node has another model",
   conflict: "two routers have the same id", drain: "a node takes no new conversations", undrain: "a node takes conversations again"
 };
-const GROUPS = { routing: ["new", "cold", "keep", "move", "migrate"], requests: ["done", "error", "gone", "fail"] };
+const GROUPS = { routing: ["new", "cold", "keep", "switch", "migrate", "recompute"], requests: ["done", "error", "gone", "fail"] };
 function groupOf(k) { return GROUPS.routing.includes(k) ? "routing" : GROUPS.requests.includes(k) ? "requests" : "nodes"; }
 function kb(k) { return '<span class="kb ' + (KIND[k] || "") + '" title="' + esc(KIND_INFO[k] || k) + '">' + esc(k) + '</span>'; }
 
@@ -440,9 +441,9 @@ function nodeCard(n) {
     metric("gen", tps(n.gen_tps), "t/s", n.gen_tps > 0 ? "gen" : "zero", "tokens its slots generate per second now") +
     metric("prompt", tps(n.prompt_tps), "t/s", n.prompt_tps > 0 ? "prompt" : "zero", "prompt tokens its slots compute per second now, each over its last batch") +
     metric("busy", b, "/ " + (n.slots || 0), "", "requests in its slots: from this router" + (n.external ? ", " + n.external + " from other routers and clients" : "")) +
-    metric("waiting", n.queued_for || 0, "", "", "requests in the queue of the pool that wait for this node") + '</div>';
 )POOLUI",
-R"POOLUI(  h += '<canvas class="spark" data-spark="node" data-name="' + esc(n.name) + '" title="the last 5 minutes: generation (fill) and prompt (line), each on its own scale"></canvas>';
+R"POOLUI(    metric("waiting", n.queued_for || 0, "", "", "requests in the queue of the pool that wait for this node") + '</div>';
+  h += '<canvas class="spark" data-spark="node" data-name="' + esc(n.name) + '" title="the last 5 minutes: generation (fill) and prompt (line), each on its own scale"></canvas>';
   if (n.slot_list && n.slot_list.length) h += '<div class="sec">Slots</div>' + n.slot_list.map(slotRow).join("");
   const mem = (n.devices || []).map(d => memRow(d, false)).join("") + roomRow(n, false);
   if (mem) h += '<div class="sec">Memory</div>' + mem;
@@ -621,9 +622,9 @@ function pageNode(s, name) {
   if (st !== "up" && n.error) h += '<div class="err mb">' + esc(n.error) + '</div>';
   h += '<div class="mgrid mb">' +
     metric("gen now", tps(n.gen_tps), "t/s", n.gen_tps > 0 ? "gen" : "zero") + metric("prompt now", tps(n.prompt_tps), "t/s", n.prompt_tps > 0 ? "prompt" : "zero") +
-    metric("busy", busyOf(n), "/ " + (n.slots || 0), "", n.external ? n.external + " from other routers and clients" : "") +
 )POOLUI",
-R"POOLUI(    metric("waiting for it", n.queued_for || 0, "") +
+R"POOLUI(    metric("busy", busyOf(n), "/ " + (n.slots || 0), "", n.external ? n.external + " from other routers and clients" : "") +
+    metric("waiting for it", n.queued_for || 0, "") +
     metric("decode", n.decode_tps > 0 ? tps(n.decode_tps) : "-", n.decode_tps > 0 ? "t/s" : "", "", "one request: the average of its answers of 16 tokens and more") +
     metric("prefill", tps(n.prefill_tps > 0 ? n.prefill_tps : n.prefill_cfg), n.prefill_tps > 0 ? "t/s" : "t/s default", "", "one request: the average of its prompts of move_tokens and more") +
     metric("shared prefix", n.share >= 0 ? Math.round(n.share * 100) + "%" : "-", "", "", "the part of a shared prefix it took from its cache") +
@@ -805,10 +806,10 @@ function draw(cv, series) {
     const d = sr.data;
     if (!d || d.length < 2) continue;
     const max = Math.max(1, ...d);
-    const x0 = 1 + (span - d.length) * step;
-    c.beginPath();
 )POOLUI",
-R"POOLUI(    d.forEach((v, i) => { const x = x0 + i * step, y = h - 1.5 - (v / max) * (h - 4); if (i) c.lineTo(x, y); else c.moveTo(x, y); });
+R"POOLUI(    const x0 = 1 + (span - d.length) * step;
+    c.beginPath();
+    d.forEach((v, i) => { const x = x0 + i * step, y = h - 1.5 - (v / max) * (h - 4); if (i) c.lineTo(x, y); else c.moveTo(x, y); });
     c.lineWidth = sr.fill ? 1.6 : 1.3; c.lineJoin = "round"; c.strokeStyle = sr.color; c.stroke();
     if (sr.fill) {
       c.lineTo(x0 + (d.length - 1) * step, h); c.lineTo(x0, h); c.closePath();

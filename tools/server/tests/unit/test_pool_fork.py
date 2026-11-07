@@ -69,6 +69,9 @@ def with_pool(r: ServerProcess, options: str):
 
 
 def start_pool(options: str = "", slots: int | None = None, broadcast_port: int | None = None) -> dict:
+    # a drain steers the requests of most tests; the hand-over of the conversations of a drained node has its own test
+    if "drain_move" not in options:
+        options += " drain_move=0"
     ports = [r.server_port for r in routers]
     for i, r in enumerate(routers):
         if broadcast_port is None:
@@ -414,9 +417,9 @@ def test_pool_rebalances_a_crowded_node(rebalance: bool):
         t.join()
     if rebalance:
         moved = events("migrate")
-        assert len(moved) == 1 and moved[0]["node"] == "n1", (moved, events("move"), events("keep"))
+        assert len(moved) == 1 and moved[0]["node"] == "n1", (moved, events("recompute"), events("keep"))
     else:
-        assert events("migrate") == [] and events("keep")[0]["node"] == "n0", (events("keep"), events("move"))
+        assert events("migrate") == [] and events("keep")[0]["node"] == "n0", (events("keep"), events("recompute"))
 
 
 @pytest.mark.parametrize("long_message", [True, False])
@@ -452,9 +455,9 @@ def test_pool_moves_a_long_prompt_to_a_quiet_node(long_message: bool):
     t.join()
     if long_message:
         moved = events("migrate")
-        assert len(moved) == 1 and moved[0]["node"] == "n1", (moved, events("move"), events("keep"))
+        assert len(moved) == 1 and moved[0]["node"] == "n1", (moved, events("recompute"), events("keep"))
     else:
-        assert events("migrate") == [] and events("keep")[0]["node"] == "n0", (events("keep"), events("move"))
+        assert events("migrate") == [] and events("keep")[0]["node"] == "n0", (events("keep"), events("recompute"))
 
 
 @pytest.mark.parametrize("quiet_wait,max_tokens", [(30, 1000), (0, 1000), (30, 8)])
@@ -496,6 +499,85 @@ def test_pool_waits_with_a_long_prompt_for_a_quiet_node(quiet_wait: int, max_tok
 
 
 
+@pytest.mark.parametrize("case", ["queue", "idle", "copies"])
+def test_pool_keeps_a_conversation_off_a_node_others_wait_for(case: str):
+    # 07.11: with every node busy and a queue on each, a waiting conversation went to the first node to free a slot: after
+    # as long as computing its prompt takes (queue), at once when that node held an older copy of it (copies: the
+    # difference below pool-move-tokens; the conversations went back and forth). a move then takes the slot of a queued
+    # request with nothing to compute again there and costs the move on top. now it waits for its node while the other
+    # queued requests fill the free one: conversation A on its node H, H runs a long answer, the other node O a shorter
+    # one; the next turn of A queues, then a new conversation Z with a long answer. O frees first: Z takes it, A waits for
+    # H. idle: without Z, A goes to O as before (O would stand idle)
+    for r in routers:
+        r.n_ctx = 4096
+    move_tokens = 4096 if case == "copies" else 16
+    start_pool(f"move_tokens={move_tokens} wait_max=60 prefill_tps=100000000 migrate=0 quiet_wait_s=0 rebalance_s=0 short_tokens=0")
+    a_msgs = [{"role": "user", "content": "a conversation about cats and their long naps in the warm sun " * 2}]
+    a_msgs.append({"role": "assistant", "content": chat(a_msgs)})
+    a_msgs.append({"role": "user", "content": "and then?"})
+    first = events("new")
+    assert len(first) == 1, first
+    hold, a_conv = first[0]["node"], first[0]["conv"]
+    if case == "copies":
+        # the next turn on the other node: both hold a copy of A, the other one the longer
+        drain(hold)
+        a_msgs.append({"role": "assistant", "content": chat(a_msgs)})
+        a_msgs.append({"role": "user", "content": "and what next?"})
+        drain(hold, False)
+        hold = "n1" if hold == "n0" else "n0"
+        assert [e["node"] for e in status()["events"] if e["conv"] == a_conv and e["kind"] in ("cold", "recompute")] == [hold]
+    other_node = "n1" if hold == "n0" else "n0"
+    other = case != "idle"
+    done = {}
+
+    def ask(name: str, msgs: list, max_tokens: int):
+        res = routers[0].make_request("POST", "/v1/chat/completions", data={
+            "model": "tiny", "messages": msgs, "max_tokens": max_tokens, "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+        done[name] = time.time()
+
+    def running(node: str):
+        deadline = time.time() + 10
+        while node_of(node)["inflight"] < 1:
+            assert time.time() < deadline, node_of(node)
+            time.sleep(0.005)
+
+    def queued(n: int):
+        deadline = time.time() + 10
+        while status()["pool"]["queued"] < n:
+            assert time.time() < deadline, status()["pool"]
+            time.sleep(0.005)
+
+    # H runs the long answer of a new conversation (O out while it starts), O a shorter one
+    drain(other_node)
+    ths = [threading.Thread(target=ask, args=("x", [{"role": "user", "content": "a long story"}], 3000))]
+    ths[-1].start()
+    running(hold)
+    drain(other_node, False)
+    ths.append(threading.Thread(target=ask, args=("y", [{"role": "user", "content": "a shorter story"}], 1200)))
+    ths[-1].start()
+    running(other_node)
+    ths.append(threading.Thread(target=ask, args=("a", a_msgs, 8)))
+    ths[-1].start()
+    queued(1)
+    if other:
+        ths.append(threading.Thread(target=ask, args=("z", [{"role": "user", "content": "a new conversation"}], 3000)))
+        ths[-1].start()
+        queued(2)
+    for t in ths:
+        t.join()
+    assert done["y"] < done["x"], done
+    # the placement of the last turn of A (the events come newest first)
+    mine = [e for e in status()["events"] if e["conv"] == a_conv and e["kind"] in ("keep", "switch", "recompute", "migrate")][:1]
+    assert mine, status()["events"]
+    if other:
+        assert mine[0]["kind"] == "keep" and mine[0]["node"] == hold, mine
+        assert done["x"] < done["a"] < done["z"], done
+    else:
+        assert mine[0]["kind"] == "recompute" and mine[0]["node"] == other_node, mine
+
+
 @pytest.mark.parametrize("repeat", [60, 3])
 def test_pool_sends_no_prompt_that_has_no_room_in_the_kv(repeat: int):
     # a node with a unified KV cache takes a task only when its prompt fits next to what the running slots hold with
@@ -532,7 +614,8 @@ def test_pool_sends_no_prompt_that_has_no_room_in_the_kv(repeat: int):
     drain("n1", False)
     chat(conv)
     t.join()
-    went = [e for e in events("move") + events("migrate") + events("keep") if e["conv"] == events("new")[-1]["conv"]]
+    went = [e for e in events("recompute") + events("switch") + events("migrate") + events("keep")
+            if e["conv"] == events("new")[-1]["conv"]]
     assert len(went) == 1 and went[0]["node"] == ("n1" if repeat == 60 else "n0"), (went, node_of("n0")["room"])
     assert node_of("n1")["room"] is None  # one slot, no unified cache: no room logic
 
@@ -707,16 +790,43 @@ def test_pool_moves_the_state_of_a_conversation(spill: bool, min_tokens: int | N
     t2 = {}
     chat(msgs, timings=t2)
     moved = events("migrate")
-    assert len(moved) == 1 and moved[0]["node"] != first, events("move")
+    assert len(moved) == 1 and moved[0]["node"] != first, events("recompute")
     assert spill or "(RAM)" in moved[0]["detail"], moved[0]["detail"]
     # the state holds the first prompt and its answer
     assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
 
 
-def test_pool_exports_no_state_the_estimate_rejects():
-    # the export copies the whole state on its node, so the pool asks for none when the moves so far say computing the
-    # difference is shorter: the first move of n0 exports and drops the state (prefill_tps so high that computing is
-    # always shorter), which gives the bytes per token; the second does not export
+def test_pool_drain_hands_the_conversations_over():
+    # 07.11 (user: a drain should hand the active conversations over): the conversation of a drained node goes to the
+    # other node with its state before its next request comes; that request stays there (keep) and computes only the
+    # new message
+    start_pool("move_tokens=16 wait_max=0 prefill_tps=1 drain_move=1")
+    msgs = [{"role": "user", "content": "once upon a time there was a little girl who " * 12}]
+    t1 = {}
+    msgs.append({"role": "assistant", "content": chat(msgs, timings=t1)})
+    msgs.append({"role": "user", "content": "and then?"})
+    first = events("new")[0]
+    other = "n1" if first["node"] == "n0" else "n0"
+    drain(first["node"])
+    deadline = time.time() + 20
+    while not [e for e in events("migrate") if e["conv"] == first["conv"]]:
+        assert time.time() < deadline, status()["events"]
+        time.sleep(0.1)
+    moved = [e for e in events("migrate") if e["conv"] == first["conv"]]
+    assert len(moved) == 1 and moved[0]["node"] == other and "drain of " + first["node"] in moved[0]["detail"], moved
+    t2 = {}
+    chat(msgs, timings=t2)
+    keep = [e for e in events("keep") if e["conv"] == first["conv"]]
+    assert len(keep) == 1 and keep[0]["node"] == other, status()["events"]
+    assert len([e for e in events("migrate") if e["conv"] == first["conv"]]) == 1, events("migrate")
+    assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
+
+
+def test_pool_moves_the_state_when_computing_looks_shorter():
+    # 07.11: the state goes whenever it brings pool-move-tokens or more, also when computing it looks shorter (a transfer
+    # takes the network and the disks, computing takes the GPU the queue waits for; before, the pool computed then and
+    # stopped exporting once the moves so far said so): prefill_tps so high that computing always looks shorter, the
+    # conversations of the drained n0 both go to n1 with their state
     start_pool("move_tokens=16 wait_max=0 prefill_tps=100000000")
     drain("n1")
     convs = []
@@ -727,13 +837,13 @@ def test_pool_exports_no_state_the_estimate_rejects():
         convs.append(msgs)
     drain("n1", False)
     drain("n0")
+    t = {}
     for msgs in convs:
-        chat(msgs)
-    move = events("move")
-    move.reverse()
-    assert len(move) == 2 and all(e["node"] == "n1" for e in move), move
-    assert "no state moved: the move of" in move[0]["detail"] and "(estimate)" not in move[0]["detail"], move
-    assert "no state moved: the move of" in move[1]["detail"] and "(estimate)" in move[1]["detail"], move
+        chat(msgs, timings=t)
+        assert t["cache_n"] > t["prompt_n"], t
+    moved = events("migrate")
+    assert len(moved) == 2 and all(e["node"] == "n1" for e in moved), (moved, events("recompute"))
+    assert events("recompute") == [], events("recompute")
 
 
 @pytest.mark.parametrize("first", [0, 1])
@@ -755,7 +865,7 @@ def test_pool_moves_between_stream_counts(first: int):
     t2 = {}
     chat(msgs, timings=t2)
     moved = events("migrate")
-    assert len(moved) == 1 and moved[0]["node"] == other, (events("move"), moved)
+    assert len(moved) == 1 and moved[0]["node"] == other, (events("recompute"), moved)
     assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
 
 
@@ -770,9 +880,9 @@ def test_pool_moves_no_state_with_migrate_0():
     drain(first)
     t = {}
     chat(msgs, timings=t)
-    move = events("move")
+    move = events("recompute")
     assert events("migrate") == [] and len(move) == 1 and move[0]["node"] != first, (move, events("migrate"))
-    assert "no state moved" not in move[0]["detail"] and t["cache_n"] == 0, (move, t)
+    assert "none moves between these nodes" in move[0]["detail"] and t["cache_n"] == 0, (move, t)
 
 
 def test_pool_pull_needs_a_known_node():
@@ -827,6 +937,54 @@ def test_pool_measures_the_decode_speed():
         time.sleep(0.1)
 
 
+def test_pool_weighs_a_node_by_its_answers_alone():
+    # 07.11: the weight of a node is its speed for one conversation, from answers that ran alone there (under load the
+    # slots of a node share its GPU, and a 395 with 2 slots weighed half a 3090 with 1): two answers at once on n0 (2
+    # slots, n1 out) give no sample of the weight, only of the speed of all answers; one alone gives one
+    routers[0].n_slots = 2
+    routers[0].n_ctx = 2048
+    start_pool(slots=3)
+    drain("n1")
+    ths = [threading.Thread(target=chat, args=([{"role": "user", "content": f"conversation {i}: tell a long story"}], 200))
+           for i in range(2)]
+    ths[0].start()
+    deadline = time.time() + 10
+    while node_of("n0")["inflight"] < 1:
+        assert time.time() < deadline
+        time.sleep(0.005)
+    ths[1].start()
+    for t in ths:
+        t.join()
+    deadline = time.time() + 5
+    while node_of("n0")["decode_all"] <= 0:
+        assert time.time() < deadline, node_of("n0")
+        time.sleep(0.05)
+    assert node_of("n0")["decode_tps"] == 0, node_of("n0")
+    chat([{"role": "user", "content": "one more long story, alone"}], n_predict=32)
+    deadline = time.time() + 5
+    while node_of("n0")["decode_tps"] <= 0:
+        assert time.time() < deadline, node_of("n0")
+        time.sleep(0.05)
+
+
+def test_pool_moves_no_state_into_a_node_without_room():
+    # 07.11: the node a state goes to makes room in its RAM before the transfer (on a 395 the RAM is what the GPU leaves,
+    # and the cache holds all of it down to its reserve), or says it cannot before gigabytes cross the network: n1 keeps
+    # a reserve no host has, the conversation of the drained n0 is computed on n1, with the reason
+    routers[1].cache_ram_reserve = 1 << 30  # MiB
+    start_pool("move_tokens=16 wait_max=0 prefill_tps=1")
+    drain("n1")
+    msgs = [{"role": "user", "content": "once upon a time there was a little girl who " * 12}]
+    msgs.append({"role": "assistant", "content": chat(msgs)})
+    msgs.append({"role": "user", "content": "and then?"})
+    drain("n1", False)
+    drain("n0")
+    chat(msgs)
+    rec = events("recompute")
+    assert events("migrate") == [] and len(rec) == 1 and rec[0]["node"] == "n1", (rec, events("migrate"))
+    assert "no room" in rec[0]["detail"], rec
+
+
 def test_pool_counts_a_shared_prefix_at_its_measured_share():
     # what a node holds of a conversation from other ones (the system prompt of an agent) counts at the share of such a
     # prefix the node reused, measured from cache_n of its answers. tinyllama2 is a transformer and reuses all of it:
@@ -849,9 +1007,9 @@ def test_pool_counts_a_shared_prefix_at_its_measured_share():
     drain("n1", False)
     drain("n0")
     chat(msgs)
-    move = events("move")
-    assert events("migrate") == [] and len(move) == 1, (move, events("migrate"))
-    assert move[0]["node"] == "n1" and "no state moved" not in move[0]["detail"], move
+    move = events("switch")
+    assert events("migrate") == [] and len(move) == 1, (move, events("migrate"), events("recompute"))
+    assert move[0]["node"] == "n1" and "no state" not in move[0]["detail"] and "there in fact" in move[0]["detail"], move
 
 
 def test_pool_measures_no_reuse_without_a_checkpoint():
@@ -881,8 +1039,8 @@ def test_pool_measures_no_reuse_without_a_checkpoint():
     drain("n1", False)
     drain("n0")
     chat(conv)
-    move = events("move")
-    assert len(move) == 1 and move[0]["node"] == "n1" and "no state moved" in move[0]["detail"], move
+    moved = events("migrate")
+    assert len(moved) == 1 and moved[0]["node"] == "n1", (moved, events("recompute"))
     # the first router restarts and forgets; the conversation of the drained n0 stays on n1, which holds it
     routers[0].stop()
     routers[0].start()
@@ -917,7 +1075,7 @@ def test_pool_router_needs_its_key():
     drain(first)
     chat(msgs)
     moved = events("migrate")
-    assert len(moved) == 1 and moved[0]["node"] != first, events("move")
+    assert len(moved) == 1 and moved[0]["node"] != first, events("recompute")
 
 
 def test_pool_probes_its_links():
@@ -1055,6 +1213,90 @@ def test_pool_node_sends_the_checkpoint_the_request_needs():
     res = dst.make_request("POST", "/completion", data=body)
     assert res.status_code == 200, res.body
     assert res.body["timings"]["cache_n"] == ex["n_reuse"], (ex, res.body["timings"])
+
+
+def test_pool_node_tells_what_it_holds():
+    # a probe (07.11): the export with "probe" says how much of a prompt the node holds, in its cache or an idle slot,
+    # and builds nothing to fetch: the node that served the conversation holds its first prompt, a node that never saw
+    # it holds next to none
+    src, other = plain_nodes()
+    msgs = [{"role": "user", "content": "a story about a lighthouse keeper " * 8}]
+    res = src.make_request("POST", "/v1/chat/completions", data={"messages": msgs, "max_tokens": 8, "temperature": 0})
+    assert res.status_code == 200, res.body
+    n_prompt = res.body["usage"]["prompt_tokens"]
+    msgs.append({"role": "assistant", "content": res.body["choices"][0]["message"]["content"]})
+    body = {"messages": msgs + [{"role": "user", "content": "and then?"}], "max_tokens": 4}
+    pr = src.make_request("POST", "/pool/export", data={"kind": "chat", "body": body, "probe": True}).body
+    assert "id" not in pr and n_prompt <= pr["n_match"] < pr["n_tokens"], pr
+    pr = other.make_request("POST", "/pool/export", data={"kind": "chat", "body": body, "probe": True}).body
+    assert "id" not in pr and pr["n_match"] < n_prompt // 2, pr
+
+
+@pytest.mark.parametrize("lost", [True, False])
+def test_pool_moves_the_state_onto_a_node_that_lost_its_copy(lost: bool):
+    # 07.11: a conversation that goes to a node held to have an older copy of it (the difference below pool-move-tokens)
+    # had the whole prompt computed there when the node had let the copy go. the pool asks the node what it holds first:
+    # the copy is gone (the model was loaded again there) - the state comes along; the copy is there - no state moves
+    # and the node computes the difference
+    for r in routers:
+        r.n_ctx = 4096
+    # the pool counts characters / 3.5 (here ~25 for the first message, ~110 for the history n2 holds): the difference
+    # between the copies stays below pool-move-tokens (100), the lost copy does not. the first prompt is below 100
+    # tokens of the model: n1 measures no prefill speed, and prefill_tps=1 makes a transfer worth it as on a real model
+    # (the tiny one computes these tokens faster than a move takes)
+    start_pool("move_tokens=100 wait_max=0 prefill_tps=1 quiet_wait_s=0 rebalance_s=0 short_tokens=0")
+    msgs = [{"role": "user", "content": "once upon a time there was a little girl who " * 2}]
+    msgs.append({"role": "assistant", "content": chat(msgs)})
+    msgs.append({"role": "user", "content": "and then she walked into the forest to look for her lost dog, and she met an old man "
+                 "who told her a long story about a magic tree that grew in the middle of the woods, where the animals came "
+                 "every night to talk about the stars, the moon and the rain, and she sat down to listen."})
+    first = events("new")
+    n1, conv = first[0]["node"], first[0]["conv"]
+    n2 = "n1" if n1 == "n0" else "n0"
+    # the next turn on n2: both hold a copy, n2 the longer
+    drain(n1)
+    msgs.append({"role": "assistant", "content": chat(msgs)})
+    msgs.append({"role": "user", "content": "and what next?"})
+    drain(n1, False)
+    assert [e["node"] for e in status()["events"] if e["conv"] == conv][0] == n2, status()["events"]
+    if lost:
+        r1 = routers[int(n1[1:])]
+        res = r1.make_request("POST", "/models/unload", data={"model": "tiny"}, headers=headers())
+        assert res.status_code == 200, res.body
+        deadline = time.time() + 30
+        while node_of(n1)["status"] == "up":
+            assert time.time() < deadline, node_of(n1)
+            time.sleep(0.05)
+        r1.make_request("POST", "/models/load", data={"model": "tiny"}, headers=headers())
+        wait_nodes()
+
+    def long_answer():
+        res = routers[0].make_request("POST", "/v1/chat/completions", headers=headers(), data={
+            "model": "tiny", "messages": [{"role": "user", "content": "a long story"}], "max_tokens": 2000,
+            "temperature": 0, "ignore_eos": True,
+        })
+        assert res.status_code == 200, res.body
+
+    # n2 runs a long answer (n1 out while it starts), the next turn goes to n1
+    drain(n1)
+    th = threading.Thread(target=long_answer)
+    th.start()
+    deadline = time.time() + 10
+    while node_of(n2)["inflight"] < 1:
+        assert time.time() < deadline, node_of(n2)
+        time.sleep(0.005)
+    drain(n1, False)
+    t3 = {}
+    chat(msgs, timings=t3)
+    th.join()
+    # the placement of the last turn (the events come newest first)
+    mine = [e for e in status()["events"] if e["conv"] == conv and e["kind"] in ("keep", "switch", "recompute", "migrate")][0]
+    assert mine["node"] == n1, mine
+    if lost:
+        assert mine["kind"] == "migrate", mine
+        assert t3["cache_n"] >= 30 and t3["prompt_n"] < t3["cache_n"], t3
+    else:
+        assert mine["kind"] == "switch" and "there in fact" in mine["detail"], mine
 
 
 def test_pool_node_without_a_prompt_cache_moves_nothing():

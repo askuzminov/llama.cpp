@@ -1823,6 +1823,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // make room so the new state keeps host RAM above the reserve
     if (!evict_for_reserve(state_size_new, !defer_writes)) {
+        // fork: logged, the conversation of this prompt is computed again from the front when it comes back
+        SRV_WRN(" - no host RAM above the reserve for a state of %zu tokens (%.3f MiB): not cached\n",
+                prompt.tokens.size(), state_size_new / (1024.0 * 1024.0));
         return nullptr;
     }
 
