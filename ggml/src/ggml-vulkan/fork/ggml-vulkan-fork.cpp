@@ -212,6 +212,85 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
 #endif
 }
 
+void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
+    // the dense q8_0 matmuls of prompts on mul_mm_f16reg.comp (07.11, variants under test, off by default):
+    // GGML_VK_MM_F16REG=<a><rows>x<tokens>/<m>x<n>, a = r (each subgroup decodes the codes into its A fragments) or l (the
+    // codes decoded to f16 on their way to shared memory, A fragments loaded from there); rows and tokens of a subgroup
+    // (multiples of 16), m x n subgroups of 32 in the workgroup. r32x64/4x2: tiles of 128 rows x 128 tokens, 8 subgroups
+    // of 32 x 64. GGML_VK_MM_F16REG_EMULATE=1: subgroup shuffles instead of coopmat (tests on devices without it)
+    device->mm_f16reg_mode = 0;
+    const char * env = getenv("GGML_VK_MM_F16REG");
+    if (env == nullptr || *env == 0 || strcmp(env, "0") == 0) {
+        return;
+    }
+    char a = 0;
+    unsigned wm = 0, wn = 0, gm = 0, gn = 0;
+    char tail = 0;
+    if (sscanf(env, "%c%ux%u/%ux%u%c", &a, &wm, &wn, &gm, &gn, &tail) != 5 || (a != 'r' && a != 'l') ||
+        wm == 0 || wn == 0 || wm % 16 != 0 || wn % 16 != 0 || gm == 0 || gn == 0) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: expected <r|l><rows>x<tokens>/<m>x<n>, e.g. r32x64/4x2\n", env);
+        return;
+    }
+    const uint32_t waves = gm * gn;
+    const uint32_t bs    = 32 * waves;
+    const uint32_t bm    = gm * wm;
+    const uint32_t bn    = gn * wn;
+    const uint32_t wmi   = wm / 16;
+    const uint32_t wni   = wn / 16;
+    if (waves > 16 || wmi * wni > 16 || bm > bs || bn > bs) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: at most 16 subgroups and 16 fragments per subgroup, the rows and "
+                      "the tokens of the tile at most its invocations\n", env);
+        return;
+    }
+    const bool lds = a == 'l';
+    // the shared memory of the shader: the A tile (f16, or codes and scales), the B tile in f16, a fragment per subgroup
+    const uint32_t bkp   = 72;
+    const uint32_t shmem = (lds ? bm * bkp * 2 : bm * 17 * 4 + bm * 2 * 2) + bn * bkp * 2 + waves * 256 * 4;
+    if (shmem > device->properties.limits.maxComputeSharedMemorySize) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: %u bytes of shared memory, the device has %u\n", env, shmem,
+                      device->properties.limits.maxComputeSharedMemorySize);
+        return;
+    }
+    const bool sg32 = device->subgroup_size_control ? (device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size)
+                                                     : device->subgroup_size == 32;
+    if (!device->fp16 || !sg32) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG needs fp16 and 32-invocation subgroups\n");
+        return;
+    }
+    int mode = 0;
+    const char * emu = getenv("GGML_VK_MM_F16REG_EMULATE");
+    if (emu != nullptr && strcmp(emu, "0") != 0) {
+        mode = 2;
+    } else {
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        if (!device->coopmat_support || !device->subgroup_size_control) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG needs KHR coopmat and the subgroup size control (GGML_VK_MM_F16REG_EMULATE=1 for the tests)\n");
+            return;
+        }
+        // the A fragments built in registers take the layout coopmat_a_probe.comp checks
+        if (!lds && device->mmid_f16reg_mode != 1 && !ggml_vk_fork_coopmat_a_probe(device)) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s off: the coopmat A layout is not the one the shader takes\n", env);
+            return;
+        }
+        mode = 1;
+#else
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG needs a build with coopmat shaders\n");
+        return;
+#endif
+    }
+    device->mm_f16reg_mode = mode;
+    device->mm_f16reg_lds  = lds;
+    device->mm_f16reg_tile = { bs, wmi, wni, gm };
+    device->mm_f16reg_name = "mul_mm_f16reg_" + std::string(1, a) + std::to_string(wm) + "x" + std::to_string(wn) + "_" +
+                             std::to_string(gm) + "x" + std::to_string(gn) + (mode == 2 ? "_emu" : "");
+    GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 on %s: tiles of %u rows x %u tokens, %u invocations, %u bytes of shared memory\n",
+                  device->mm_f16reg_name.c_str(), bm, bn, bs, shmem);
+    if (getenv("GGML_SCHED_LOG_REALLOC")) {
+        fprintf(stderr, "ggml_vulkan: MUL_MAT q8_0 on %s: tiles of %u rows x %u tokens, %u invocations, %u bytes of shared memory\n",
+                device->mm_f16reg_name.c_str(), bm, bn, bs, shmem);
+    }
+}
+
 void ggml_vk_fork_shmem_limit(vk_device & device) {
     // the shared memory in bytes that the shaders may declare. above the limit the driver reports, a shader is
     // outside the Vulkan spec: the driver may refuse it, run it, compute garbage or hang the device. the AMD

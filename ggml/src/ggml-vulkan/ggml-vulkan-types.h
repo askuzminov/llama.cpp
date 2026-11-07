@@ -1045,6 +1045,14 @@ struct vk_device_struct {
     int mmid_f16reg_mode;
     // [q4_K, q5_K, q5_1, q8_0][fused gate/up]
     vk_pipeline pipeline_mmid_f16reg[4][2];
+    // dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG (mul_mm_f16reg.comp): 0 off, 1 coopmat,
+    // 2 emulated; the A codes decoded to f16 in shared memory (else in registers); block size, A and B fragments of a
+    // subgroup, subgroups along M; the variant in the pipeline names; [f16 activations]
+    int mm_f16reg_mode;
+    bool mm_f16reg_lds;
+    std::array<uint32_t, 4> mm_f16reg_tile;
+    std::string mm_f16reg_name;
+    vk_pipeline pipeline_mm_f16reg[2];
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
     ggml_backend_buffer_type buffer_type_shared;
     ggml_backend_buffer_type_t extra_bufts[2] = {};

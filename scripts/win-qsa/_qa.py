@@ -2185,10 +2185,150 @@ def cmd_micro():
     return run.finish()
 
 
+# ---------------------------------------------------------------- mm
+
+# the tiles of mul_mm_f16reg.comp under test (07.11): <r|l><rows>x<tokens> of a subgroup / subgroups along M x N; r: the
+# codes decoded in registers, l: decoded to f16 in shared memory
+MM_VARIANTS = ["r16x64/8x1", "r32x32/4x2", "r32x64/4x2", "r64x32/2x4", "r64x64/2x2", "r64x64/4x2", "r64x64/2x4",
+               "r32x64/8x1", "r64x32/4x2", "l32x64/4x2", "l64x32/2x4", "l64x64/2x2", "l64x64/4x2"]
+
+
+def cmd_mm():
+    """The dense q8_0 matmuls of a prompt on the device of the machine (test-backend-ops): the default path and the
+    variants of mul_mm_f16reg.comp (GGML_VK_MM_F16REG). For each variant first the MUL_MAT tests of q8_0 against the CPU,
+    all of them through the variant (GGML_VK_MM_F16REG_MIN_N=1), then perf of the q8_0 shapes of qwen4exp at QA_MM_N
+    tokens (4096): TFLOP/s per shape, and the registers, the scratch (registers spilled to memory) and the shared memory
+    the driver gave the shader. QA_MMARMS: variants (name VAR=value ...;...), a run each, the default path first."""
+    run = Run("mm")
+    exe = binary("test-backend-ops")
+    device = env("CHECKDEVICE", DEVICES.get(env("BACKEND"), "CPU"))
+    n_tok = env("QA_MM_N", "4096")
+    arms = variants("QA_MMARMS", "default;" + ";".join(f"{v} GGML_VK_MM_F16REG={v}" for v in MM_VARIANTS))
+    bid = build_id(exe.parent)
+    run.add(f"mm: dense q8_0 matmuls on {device}, build {current_build()}, perf at {n_tok} tokens")
+    test_rows, stat_rows, fails = [], [], []
+    perf = {}      # (type_b, m, k) -> {arm: TFLOP/s}
+    perf_us = {}   # (type_b, m, k) -> {arm: us per matmul}
+    names = []
+    for name, arm_env in arms:
+        names.append(name)
+        run_env = dict(os.environ, **arm_env)
+
+        # the tests: every q8_0 case through the variant, its log line counts the matmuls it took
+        test_env = dict(run_env, GGML_VK_MM_F16REG_MIN_N="1", GGML_VK_MM_F16REG_LOG="1")
+        cmd = [exe, "test", "-b", device, "-o", "MUL_MAT", "-p", "type_a=q8_0"]
+        identity = {"v": VERSION, "kind": "mm-test", "build": bid, "args": [str(c) for c in cmd[1:]],
+                    "env": env_identity(test_env), "machine": machine()}
+
+        def go_test(log, cmd=cmd, test_env=test_env):
+            code, text = execute(cmd, log, test_env, model=False, check=False)
+            counts = re.findall(r"(\d+)/(\d+) tests passed", text)
+            if not counts:
+                raise Fail(f"{exit_text(code)}, no test result: {last_error(text)} ({log.name})")
+            return {"passed": sum(int(a) for a, _ in counts), "total": sum(int(b) for _, b in counts),
+                    "via": len(re.findall(r"MUL_MAT q8_0 \d+ x \d+ x \d+ on", text)),
+                    "fails": [s.strip() for s in text.splitlines() if "FAIL" in s][:8],
+                    # the tile and shared memory of the variant, or why it is off
+                    "notes": [s.strip()[len("ggml_vulkan: "):] for s in text.splitlines()
+                              if s.startswith("ggml_vulkan: ") and ("GGML_VK_MM_F16REG" in s or "tiles of" in s)][:3]}
+
+        try:
+            r, kept = run.measure(f"mm test {name}", identity, go_test)
+        except Fail as e:
+            run.failed = True
+            test_rows.append([name, f"FAIL {e}"])
+            continue
+        ok = r["passed"] == r["total"]
+        run.failed |= not ok
+        run.record("mm", f"test {name}", {"passed": r["passed"], "total": r["total"], "via": r["via"]}, kept, exe.parent)
+        test_rows.append([name, f"{r['passed']}/{r['total']}" + ("" if ok else " FAIL") + (" k" if kept else ""),
+                          str(r["via"]), "; ".join(r["notes"])])
+        fails.extend(f"  {name}: {s}" for s in r["fails"])
+        if not ok:
+            continue
+        # a variant the device refused (shared memory, coopmat) would measure the default path under its name
+        if arm_env.get("GGML_VK_MM_F16REG", "0") not in ("", "0") and r["via"] == 0:
+            test_rows[-1][1] += " (off: no matmul took it, no perf)"
+            continue
+
+        # perf of the q8_0 shapes and the statistics of the pipelines the variant compiled
+        perf_env = dict(run_env, GGML_VK_PIPELINE_STATS="mul_mm_f16reg")
+        cmd = [exe, "perf", "-b", device, "-o", "MUL_MAT", "-p", f"type_a=q8_0,type_b=f(32|16),m=\\d+,n={n_tok},k="]
+        identity = {"v": VERSION, "kind": "mm-perf", "build": bid, "args": [str(c) for c in cmd[1:]],
+                    "env": env_identity(perf_env), "machine": machine()}
+
+        def go_perf(log, cmd=cmd, perf_env=perf_env):
+            execute(cmd, log, perf_env, model=False)
+            text = read_log(log)
+            shapes, stats, current = [], {}, None
+            for line in text.splitlines():
+                m = re.search(r"MUL_MAT\(type_a=q8_0,type_b=(\w+),m=(\d+),n=(\d+),k=(\d+).*?([\d.]+) us/run.*?([\d.]+) ([GT])FLOPS", line)
+                if m:
+                    tf = float(m[6]) / (1000.0 if m[7] == "G" else 1.0)
+                    shapes.append({"b": m[1], "m": int(m[2]), "n": int(m[3]), "k": int(m[4]), "us": float(m[5]), "tflops": tf})
+                    continue
+                m = re.match(r"ggml_vulkan: pipeline stats for (\S+):", line)
+                if m:
+                    current = m[1]
+                    stats[current] = {}
+                    continue
+                m = re.match(r"ggml_vulkan:\s{2,}(.+?): (.+)$", line)
+                if m and current:
+                    stats[current][m[1].strip()] = m[2].strip()
+            if not shapes:
+                raise Fail(f"no perf line ({log.name})")
+            return {"shapes": shapes, "stats": stats}
+
+        try:
+            r, kept = run.measure(f"mm perf {name}", identity, go_perf)
+        except Fail as e:
+            run.failed = True
+            test_rows.append([name, f"perf FAIL {e}"])
+            continue
+        for s in r["shapes"]:
+            perf.setdefault((s["b"], s["m"], s["k"]), {})[name] = s["tflops"]
+            perf_us.setdefault((s["b"], s["m"], s["k"]), {})[name] = s["us"]
+            run.record("mm", f"{name} {s['b']} {s['m']}x{s['k']} n{s['n']}", {"tflops": s["tflops"], "us": s["us"]}, kept, exe.parent)
+        for pipe, st in r["stats"].items():
+            keep = {k: v for k, v in st.items() if re.search(r"vgpr|sgpr|scratch|spill|lds|shared|wave|subgroup", k, re.I)}
+            stat_rows.append([name, pipe, ", ".join(f"{k} {v}" for k, v in keep.items()) or ", ".join(f"{k} {v}" for k, v in st.items())])
+
+    run.add("", "tests: MUL_MAT q8_0 against the CPU, passed / cases, matmuls through the variant", *table(["variant", "tests", "via", "note"], test_rows))
+    if fails:
+        run.add("", "failed:", *fails)
+    if perf:
+        rows = []
+        for (b, mm_, k), by in sorted(perf.items(), key=lambda kv: (kv[0][0], -kv[0][1] * kv[0][2])):
+            best = max(by.values())
+            rows.append([f"q8_0 x {b} {mm_}x{k}", *[(f"{by[a]:.1f}" + ("*" if by[a] == best else "")) if a in by else "" for a in names]])
+        # the dense q8_0 matmuls of one 4096-token ubatch of qwen4exp as the 31.10 profile of the 395 counts them (the hc
+        # down projection reads f16 with LLAMA_HC_F16): their time on each variant
+        counts = {(10240, 2560): 37, (2560, 6144): 48, (6144, 2560): 36, (12288, 2560): 12, (320, 10240): 96,
+                  (10240, 320): 96, (640, 2560): 96, (2560, 640): 48, (512, 2560): 24, (2560, 2560): 1}
+        if n_tok == "4096":
+            total = []
+            for a in names:
+                ms = 0.0
+                for (mm_, k), c in counts.items():
+                    us = perf_us.get(("f16", mm_, k), {}).get(a) if (mm_, k) == (320, 10240) else None
+                    us = us if us is not None else perf_us.get(("f32", mm_, k), {}).get(a)
+                    if us is None:
+                        ms = None
+                        break
+                    ms += c * us / 1000.0
+                total.append(f"{ms:.0f}" if ms is not None else "")
+            rows.append(["ubatch ms (31.10 counts)", *total])
+        run.add("", f"TFLOP/s at {n_tok} tokens (* best of the shape); the last row: ms of the dense q8_0 matmuls of a "
+                    f"4096-token ubatch of qwen4exp", *table(["shape", *names], rows))
+    if stat_rows:
+        run.add("", "pipeline statistics of the driver", *table(["variant", "pipeline", "statistics"], stat_rows))
+    return run.finish()
+
+
 # ---------------------------------------------------------------- main
 
-COMMANDS = {"check": cmd_check, "long": cmd_long, "profile": cmd_profile, "micro": cmd_micro, "build-begin": cmd_build_begin,
-            "build-end": cmd_build_end, "build-stable": cmd_build_stable}
+COMMANDS = {"check": cmd_check, "long": cmd_long, "profile": cmd_profile, "micro": cmd_micro, "mm": cmd_mm,
+            "build-begin": cmd_build_begin, "build-end": cmd_build_end, "build-stable": cmd_build_stable}
 
 
 def main():

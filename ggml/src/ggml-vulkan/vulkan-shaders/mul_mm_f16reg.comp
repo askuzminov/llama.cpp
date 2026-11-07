@@ -1,0 +1,375 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#ifdef EMULATE
+#extension GL_KHR_shader_subgroup_shuffle : require
+#else
+#extension GL_KHR_cooperative_matrix : require
+#endif
+
+// fork: dense MUL_MAT of q8_0 weights on f16 WMMA (as gufo's dense prefill GEMM), the tile chosen at pipeline creation
+// (GGML_VK_MM_F16REG): BLOCK_SIZE invocations in subgroups of 32, WGM subgroups along M and the rest along N, each
+// subgroup WMI x 16 rows by WNI x 16 tokens, so that one B fragment serves WMI A fragments and one A fragment WNI B
+// fragments. K goes in stages of 64 columns (two q8_0 blocks of a row), the loads of the next stage in flight while one
+// computes, the sums in f32 over the whole K.
+// A_LDS: the codes are decoded to f16 on their way to shared memory and the A fragments are coopmat loads. otherwise the
+// codes go to shared memory as they are and each subgroup decodes the 16 values of its A fragment straight into the
+// fragment (the layout of mul_mmid_f16reg.comp, checked by coopmat_a_probe.comp: element e of invocation l is row l % 16,
+// column e).
+// B: the activations, f32 (f16 with B_F16) read in place and stored as f16 in shared memory. D: f32, column n at
+// n * stride_d. EMULATE: the same with subgroup shuffles instead of coopmat, for the tests of devices without them.
+// the host makes sure that K is a multiple of 64 (a block pair of a row starts on a word), B starts on 16 bytes and its
+// columns are contiguous, and that BM and BN are at most BLOCK_SIZE
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint WMI = 2;   // 16-row A fragments of a subgroup
+layout(constant_id = 2) const uint WNI = 4;   // 16-token B fragments of a subgroup
+layout(constant_id = 3) const uint WGM = 4;   // subgroups along M
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+const uint WARP  = 32;
+const uint NWAVE = BLOCK_SIZE / WARP;
+const uint WGN   = NWAVE / WGM;               // subgroups along N
+const uint BM    = WGM * WMI * 16;
+const uint BN    = WGN * WNI * 16;
+const uint BK    = 64;                        // columns per stage
+const uint BKP   = BK + 8;                    // pitch in halves of an A row (A_LDS) and of a B column in shared memory
+const uint NACC  = WMI * WNI;
+const uint A_IT  = (BM * 2 + BLOCK_SIZE - 1) / BLOCK_SIZE;   // row halves (one q8_0 block each) per invocation, <= 2
+const uint B_IT  = (BN * 4 + BLOCK_SIZE - 1) / BLOCK_SIZE;   // 16-column quarters of a token per invocation, <= 4
+
+layout(binding = 0) readonly buffer A { uint data_a[]; };    // q8_0 rows as words
+#ifdef B_F16
+layout(binding = 1) readonly buffer B { uvec4 data_b8[]; };  // 8 halves each
+#else
+layout(binding = 1) readonly buffer B { vec4 data_b4[]; };
+#endif
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint base_work_group_z;
+    uint num_batches;
+    uint k_split;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+    uint padded_N;
+    uint fusion_flags;
+} p;
+
+#ifdef A_LDS
+shared f16vec2   sh_a[BM * BKP / 2];          // A tile in f16, row m at m * BKP halves
+#else
+const uint QSW = 17;                          // words of codes per row (16) + 1 against bank conflicts
+shared uint      sh_qs[BM * QSW];
+shared float16_t sh_d[BM * 2];                // the scales of the two blocks of a row
+#endif
+shared f16vec2   sh_b[BN * BKP / 2];          // B tile in f16, token n at n * BKP halves
+#ifndef EMULATE
+shared float     sh_c[NWAVE * 256];           // a 16x16 output fragment per subgroup on its way out
+#endif
+
+// ---- A tile: BM rows x 64 columns, two invocations per row, each one q8_0 block (34 bytes). a block pair takes 17
+// words: block 0 is the scale in the low half of word 0 and its codes in the high half of word 0 .. the low half of
+// word 8, block 1 the scale in the high half of word 8 and its codes in words 9 .. 16. the 9 words of an invocation stay
+// as they are until the stage is written, so that the loads are in flight while the current stage computes
+
+uint ra_w[2][9];
+
+void load_a_tile(const uint ir, const uint k0) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint it = 0; it < 2; ++it) {
+        const uint t = tid + it * BLOCK_SIZE;
+        if (it >= A_IT || t >= BM * 2) {
+            continue;
+        }
+        const uint row  = t >> 1;
+        const uint h    = t & 1;
+        // rows past M read the last row, their results are not stored
+        const uint grow = min(ir * BM + row, p.M - 1);
+        const uint pw   = (grow * (p.stride_a / 32) + k0 / 32) / 2 * 17 + h * 8;
+        [[unroll]] for (uint i = 0; i < 9; ++i) {
+            ra_w[it][i] = data_a[pw + i];
+        }
+    }
+}
+
+// the scale and the 8 code words of block h from its 9 words
+float16_t a_scale(const uint it, const uint h) {
+    const f16vec2 s = unpackFloat2x16(ra_w[it][0]);
+    return h == 0 ? s.x : s.y;
+}
+
+uint a_codes(const uint it, const uint h, const uint i) {
+    return h == 0 ? ((ra_w[it][i] >> 16) | (ra_w[it][i + 1] << 16)) : ra_w[it][i + 1];
+}
+
+// the f16 values of the four signed bytes of x: bytes 0, 2 and 1, 3 (biased by 128 into 0 .. 255, then the f16 1024 trick)
+f16vec2 bytes02(uint x) { return unpackFloat2x16((x & 0x00FF00FFu) | 0x64006400u) - f16vec2(1152.0); }
+f16vec2 bytes13(uint x) { return unpackFloat2x16(((x >> 8) & 0x00FF00FFu) | 0x64006400u) - f16vec2(1152.0); }
+
+void write_a_tile() {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint it = 0; it < 2; ++it) {
+        const uint t = tid + it * BLOCK_SIZE;
+        if (it >= A_IT || t >= BM * 2) {
+            continue;
+        }
+        const uint row = t >> 1;
+        const uint h   = t & 1;
+        const float16_t d = a_scale(it, h);
+#ifdef A_LDS
+        const uint base = (row * BKP + h * 32) / 2;
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint x = a_codes(it, h, i) ^ 0x80808080u;
+            const f16vec2 v02 = bytes02(x) * d;
+            const f16vec2 v13 = bytes13(x) * d;
+            sh_a[base + 2 * i + 0] = f16vec2(v02.x, v13.x);
+            sh_a[base + 2 * i + 1] = f16vec2(v02.y, v13.y);
+        }
+#else
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            sh_qs[row * QSW + h * 8 + i] = a_codes(it, h, i);
+        }
+        sh_d[row * 2 + h] = d;
+#endif
+    }
+}
+
+// ---- B tile: BN tokens x 64 columns, four invocations per token, 16 columns each
+
+#ifdef B_F16
+uvec4 rb[4][2];
+#else
+vec4 rb[4][4];
+#endif
+
+void load_b_tile(const uint ic, const uint k0) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint it = 0; it < 4; ++it) {
+        const uint t = tid + it * BLOCK_SIZE;
+        if (it >= B_IT || t >= BN * 4) {
+            continue;
+        }
+        const uint n  = t >> 2;
+        const uint q  = t & 3;
+        const uint gn = ic * BN + n;
+#ifdef B_F16
+        if (gn < p.N) {
+            const uint base = (gn * p.stride_b + k0 + q * 16) / 8;
+            rb[it][0] = data_b8[base];
+            rb[it][1] = data_b8[base + 1];
+        } else {
+            rb[it][0] = uvec4(0);
+            rb[it][1] = uvec4(0);
+        }
+#else
+        if (gn < p.N) {
+            const uint base = (gn * p.stride_b + k0 + q * 16) / 4;
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                rb[it][i] = data_b4[base + i];
+            }
+        } else {
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                rb[it][i] = vec4(0.0);
+            }
+        }
+#endif
+    }
+}
+
+void write_b_tile() {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint it = 0; it < 4; ++it) {
+        const uint t = tid + it * BLOCK_SIZE;
+        if (it >= B_IT || t >= BN * 4) {
+            continue;
+        }
+        const uint n    = t >> 2;
+        const uint q    = t & 3;
+        const uint base = (n * BKP + q * 16) / 2;
+#ifdef B_F16
+        [[unroll]] for (uint j = 0; j < 2; ++j) {
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                sh_b[base + 4 * j + c] = unpackFloat2x16(rb[it][j][c]);
+            }
+        }
+#else
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            const f16vec4 v = f16vec4(rb[it][i]);
+            sh_b[base + 2 * i + 0] = v.xy;
+            sh_b[base + 2 * i + 1] = v.zw;
+        }
+#endif
+    }
+}
+
+#ifndef A_LDS
+// ---- A fragment in registers: the 16 columns of step f (0..3) of the stage of tile row lrow
+void decode_a(const uint lrow, const uint f, out float16_t v[16]) {
+    const float16_t d = sh_d[lrow * 2 + (f >> 1)];
+    // block f >> 1, bytes 16 (f & 1) .. + 15
+    const uint base = lrow * QSW + (f >> 1) * 8 + (f & 1) * 4;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint x = sh_qs[base + i] ^ 0x80808080u;
+        const f16vec2 v02 = bytes02(x) * d;
+        const f16vec2 v13 = bytes13(x) * d;
+        v[4 * i + 0] = v02.x; v[4 * i + 2] = v02.y;
+        v[4 * i + 1] = v13.x; v[4 * i + 3] = v13.y;
+    }
+}
+#endif
+
+#ifdef EMULATE
+// ---- the coopmat layouts with shuffles: invocation l holds row l % 16 of an A fragment (all 16 columns), token l % 16
+// of a B fragment, and of a 16x16 sum token l % 16 at rows l / 16 + 2 e, e = 0..7
+
+void load_a_frag_lds(const uint row0, const uint f, out float16_t v[16]) {
+#ifdef A_LDS
+    const uint lane = gl_SubgroupInvocationID;
+    const uint base = ((row0 + (lane & 15)) * BKP + f * 16) / 2;
+    [[unroll]] for (uint k = 0; k < 8; ++k) {
+        const f16vec2 x = sh_a[base + k];
+        v[2 * k] = x.x;
+        v[2 * k + 1] = x.y;
+    }
+#else
+    decode_a(row0 + (gl_SubgroupInvocationID & 15), f, v);
+#endif
+}
+
+void frag_mul_add(const float16_t a[16], const uint col0, const uint f, inout float acc[8]) {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint base = ((col0 + (lane & 15)) * BKP + f * 16) / 2;
+    float16_t b[16];
+    [[unroll]] for (uint k = 0; k < 8; ++k) {
+        const f16vec2 x = sh_b[base + k];
+        b[2 * k] = x.x;
+        b[2 * k + 1] = x.y;
+    }
+    [[unroll]] for (uint e = 0; e < 8; ++e) {
+        const uint row = (lane >> 4) + 2 * e;
+        float s = 0.0;
+        [[unroll]] for (uint k = 0; k < 16; ++k) {
+            s += subgroupShuffle(float(a[k]), row) * float(b[k]);
+        }
+        acc[e] += s;
+    }
+}
+#endif
+
+void main() {
+    const uint ir   = gl_WorkGroupID.x;
+    const uint ic   = gl_WorkGroupID.y;
+    const uint wave = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wm   = wave % WGM;             // the place of the subgroup in the tile, along M
+    const uint wn   = wave / WGM;             // and along N
+
+#ifdef EMULATE
+    float acc[NACC][8];
+    [[unroll]] for (uint c = 0; c < NACC; ++c) {
+        [[unroll]] for (uint e = 0; e < 8; ++e) {
+            acc[c][e] = 0.0;
+        }
+    }
+#else
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NACC];
+    [[unroll]] for (uint c = 0; c < NACC; ++c) {
+        acc[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+#endif
+
+    load_a_tile(ir, 0);
+    load_b_tile(ic, 0);
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        barrier();
+        write_a_tile();
+        write_b_tile();
+        barrier();
+
+        // the next stage's loads run while this one computes
+        if (k0 + BK < p.K) {
+            load_a_tile(ir, k0 + BK);
+            load_b_tile(ic, k0 + BK);
+        }
+
+        [[unroll]] for (uint f = 0; f < BK / 16; ++f) {
+#ifdef EMULATE
+            [[unroll]] for (uint i = 0; i < WMI; ++i) {
+                float16_t va[16];
+                load_a_frag_lds((wm * WMI + i) * 16, f, va);
+                [[unroll]] for (uint j = 0; j < WNI; ++j) {
+                    frag_mul_add(va, (wn * WNI + j) * 16, f, acc[i * WNI + j]);
+                }
+            }
+#else
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[WNI];
+            [[unroll]] for (uint j = 0; j < WNI; ++j) {
+                coopMatLoad(mb[j], sh_b, ((wn * WNI + j) * 16 * BKP + f * 16) / 2, BKP / 2, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0; i < WMI; ++i) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+#ifdef A_LDS
+                coopMatLoad(ma, sh_a, ((wm * WMI + i) * 16 * BKP + f * 16) / 2, BKP / 2, gl_CooperativeMatrixLayoutRowMajor);
+#else
+                float16_t va[16];
+                decode_a((wm * WMI + i) * 16 + (lane & 15), f, va);
+                [[unroll]] for (uint e = 0; e < 16; ++e) { ma[e] = va[e]; }
+#endif
+                [[unroll]] for (uint j = 0; j < WNI; ++j) {
+                    acc[i * WNI + j] = coopMatMulAdd(ma, mb[j], acc[i * WNI + j]);
+                }
+            }
+#endif
+        }
+    }
+
+    // the sums of each fragment: element (r, n) of a fragment goes to row row0 + r, token col0 + n
+    [[unroll]] for (uint i = 0; i < WMI; ++i) {
+        [[unroll]] for (uint j = 0; j < WNI; ++j) {
+            const uint row0 = ir * BM + (wm * WMI + i) * 16;
+            const uint col0 = ic * BN + (wn * WNI + j) * 16;
+#ifdef EMULATE
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const uint r = (lane >> 4) + 2 * e;
+                const uint n = lane & 15;
+                if (row0 + r < p.M && col0 + n < p.N) {
+                    data_d[(col0 + n) * p.stride_d + row0 + r] = acc[i * WNI + j][e];
+                }
+            }
+#else
+            // through the subgroup's part of shared memory, so that a store instruction writes two whole 64-byte columns
+            const uint c_off = wave * 256;
+            coopMatStore(acc[i * WNI + j], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const uint idx = lane + e * WARP;
+                const uint r   = idx % 16;
+                const uint n   = idx / 16;
+                if (row0 + r < p.M && col0 + n < p.N) {
+                    data_d[(col0 + n) * p.stride_d + row0 + r] = sh_c[c_off + idx];
+                }
+            }
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+#endif
+        }
+    }
+}

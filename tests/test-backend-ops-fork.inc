@@ -946,6 +946,19 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 64, 40, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F16, 64, 40, 256, {1, 1}, {1, 1}));
+
+    // the dense q8_0 matmul of mul_mm_f16reg.comp (GGML_VK_MM_F16REG; GGML_VK_MM_F16REG_MIN_N=1 takes the small n too):
+    // M under, across and over the tile rows (48, 200, 320, 640), N across the tile tokens (64, 100, 257), K of five
+    // stages (320), of one (64) and a long row (2560), f32 and f16 activations
+    for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t m : {48, 200, 320, 640}) {
+            for (int64_t n : {64, 100, 257}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, type_b, m, n, 320, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, type_b, 200, 300, 64, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, type_b, 640, 130, 2560, {1, 1}, {1, 1}));
+    }
     for (bool gated : {false, true}) {
         test_cases.emplace_back(new test_dsv4_hc_pre_f16(31, 17, gated));
         test_cases.emplace_back(new test_dsv4_hc_pre_f16(2560, 40, gated));
@@ -980,6 +993,12 @@ static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & 
     for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {2560, 6144}, {6144, 2560}, {12288, 2560}, {10240, 320}, {640, 2560}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 4096, k, {1, 1}, {1, 1}));
     }
+    // the rest of the dense q8_0 matmuls of that ubatch (the shared expert down, 512 x 2560, one 2560 x 2560) and the hc
+    // down projection of f16 streams (LLAMA_HC_F16), for the variants of mul_mm_f16reg.comp (05-mm)
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{2560, 640}, {512, 2560}, {2560, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 4096, k, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 4096, 10240, {1, 1}, {1, 1}));
 
     // qwen4exp: 512 experts, 10 per token. gate/up is q4_K [640, 2560] and down is q5_1 [2560, 640],
     // and at prefill q4_K reads its weights at about half the rate of q5_1. q4_0 runs the same shape

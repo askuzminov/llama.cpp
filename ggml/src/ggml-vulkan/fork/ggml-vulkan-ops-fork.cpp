@@ -158,6 +158,94 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
     return pipeline;
 }
 
+// the buffer of a tensor read or written in place, false when its offset is off the alignment the shader needs
+static bool ggml_vk_fork_tensor_buffer(const ggml_backend_vk_context * ctx, const ggml_tensor * t, uint64_t align, vk_subbuffer & out) {
+    vk_buffer buffer = nullptr;
+    size_t offset = 0;
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, t->data, buffer, offset);
+    }
+    if (!buffer) {
+        const auto * buf_ctx = (const ggml_backend_vk_buffer_context *) t->buffer->context;
+        buffer = buf_ctx->dev_buffer;
+        offset = vk_tensor_offset(t) + t->view_offs;
+    }
+    align = std::max<uint64_t>(align, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    if (buffer == nullptr || offset % align != 0) {
+        return false;
+    }
+    out = vk_subbuffer{ buffer, offset, ggml_nbytes(t) };
+    return true;
+}
+
+// MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): f32 or f16 activations read in place, from
+// GGML_VK_MM_F16REG_MIN_N tokens (64), 2D, K a multiple of 64 (a block pair of a row on a word), the activations on 16
+// bytes, nothing fused into the matmul
+bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                            const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags) {
+    const vk_device & device = ctx->device;
+    if (device->mm_f16reg_mode == 0 || fused_dst != nullptr || fusion_flags != 0 || src0->type != GGML_TYPE_Q8_0 ||
+        (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    static const int64_t min_n = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_N"); return e ? (int64_t) atoll(e) : (int64_t) 64; }();
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+    const int64_t N = src1->ne[1];
+    if (N < min_n || M < 16 || K % 64 != 0 || src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    // A: rows of whole blocks, a row stride of whole block pairs; B: contiguous columns on 16-byte steps; D: f32 rows
+    const size_t qs = ggml_type_size(src0->type);
+    if (src0->nb[0] != qs || src0->nb[1] % (2 * qs) != 0 || src1->nb[0] != ggml_type_size(src1->type) || src1->nb[1] % 16 != 0 ||
+        dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const uint64_t range = device->properties.limits.maxStorageBufferRange;
+    if (ggml_nbytes(src0) > range || ggml_nbytes(src1) > range || ggml_nbytes(dst) > range) {
+        return false;
+    }
+    const int bi = src1->type == GGML_TYPE_F16 ? 1 : 0;
+    vk_pipeline pipeline = device->pipeline_mm_f16reg[bi];
+    vk_subbuffer a, b, d;
+    if (!pipeline || !ggml_vk_fork_tensor_buffer(ctx, src0, 4, a) || !ggml_vk_fork_tensor_buffer(ctx, src1, 16, b) ||
+        !ggml_vk_fork_tensor_buffer(ctx, dst, 4, d)) {
+        return false;
+    }
+
+    vk_mat_mat_push_constants pc = {};
+    pc.M           = (uint32_t) M;
+    pc.N           = (uint32_t) N;
+    pc.K           = (uint32_t) K;
+    pc.stride_a    = (uint32_t) (src0->nb[1] / qs * ggml_blck_size(src0->type));
+    pc.stride_b    = (uint32_t) (src1->nb[1] / ggml_type_size(src1->type));
+    pc.stride_d    = (uint32_t) (dst->nb[1] / sizeof(float));
+    pc.num_batches = 1;
+    pc.k_split     = (uint32_t) K;
+    pc.ne02        = 1;
+    pc.ne12        = 1;
+    pc.broadcast2  = 1;
+    pc.broadcast3  = 1;
+    pc.padded_N    = (uint32_t) N;
+
+    // the first use of each pipeline, every one with GGML_VK_MM_F16REG_LOG=1; on stderr as well with GGML_SCHED_LOG_REALLOC
+    static const bool log_all    = getenv("GGML_VK_MM_F16REG_LOG") != nullptr;
+    static const bool log_stderr = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
+    static bool logged[2] = {};
+    if (!logged[bi] || log_all) {
+        logged[bi] = true;
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 %ld x %ld x %ld on %s\n", (long) M, (long) N, (long) K, pipeline->name.c_str());
+        if (log_stderr) {
+            fprintf(stderr, "ggml_vulkan: MUL_MAT q8_0 %ld x %ld x %ld on %s\n", (long) M, (long) N, (long) K, pipeline->name.c_str());
+        }
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { (uint32_t) M, (uint32_t) N, 1 });
+    return true;
+}
+
 // GATED_DELTA_NET_LAZY: one workgroup row per head of each info row, laid out as the plain net (gated_delta_net.comp);
 // the replay alone (op_params[0] 2) has no q, k, v, g and beta and binds the state in their place
 static int ggml_vk_gdn_size_idx(uint32_t S_v) {

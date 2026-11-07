@@ -151,6 +151,9 @@ size_t ggml_vk_fork_host_buffer_pad(const vk_device & device, size_t size);
 // queue exists
 void ggml_vk_fork_mmid_f16reg_init(vk_device & device);
 bool ggml_vk_fork_coopmat_a_probe(vk_device & device);
+// GGML_VK_MM_F16REG=<r|l><rows>x<tokens>/<m>x<n>: the variant of the dense q8_0 matmul on mul_mm_f16reg.comp (sets
+// mm_f16reg_mode, _lds, _tile, _name), after the shared memory limit and the A layout probe
+void ggml_vk_fork_mm_f16reg_init(vk_device & device);
 // GGML_VK_INT_COOPMAT: sets coopmat_int_ops and returns whether int8 coopmat may be enabled; mode gets the env value
 // (-1 when unset)
 bool ggml_vk_fork_int_coopmat(vk_device & device, int & mode);
@@ -218,6 +221,10 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
                                      bool y_f32_kernel, uint64_t n_per_expert);
 // MUL_MAT: the matmuls that stay off the int8 path (GGML_VK_INT_COOPMAT=3, graph outputs, K under 512)
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
+// MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): dispatches it and returns true, false for the
+// upstream path (off, a fused op, another type or shape)
+bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                            const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags);
 // GATED_DELTA_NET_LAZY: the net with deferred rollback and the replay alone (ggml_gated_delta_net_lazy), they write into
 // the state rows and records they get as sources
 bool ggml_vk_gated_delta_net_lazy_supported(const ggml_tensor * op);

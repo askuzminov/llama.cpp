@@ -3780,6 +3780,32 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
     }
+    // fork: dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG, [f16 activations]
+    if (device->mm_f16reg_mode != 0) {
+        struct mm_f16reg_shader { size_t len; const void * data; };
+        const bool emu = device->mm_f16reg_mode == 2;
+#define MMF16(a, b) (emu ? mm_f16reg_shader { mul_mm_f16reg_q8_0_##a##_##b##_emu_len, mul_mm_f16reg_q8_0_##a##_##b##_emu_data } : MMF16_CM1(a, b))
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+#define MMF16_CM1(a, b) mm_f16reg_shader { mul_mm_f16reg_q8_0_##a##_##b##_cm1_len, mul_mm_f16reg_q8_0_##a##_##b##_cm1_data }
+#else
+#define MMF16_CM1(a, b) mm_f16reg_shader { mul_mm_f16reg_q8_0_##a##_##b##_emu_len, mul_mm_f16reg_q8_0_##a##_##b##_emu_data }
+#endif
+        const mm_f16reg_shader shaders[2] = {
+            device->mm_f16reg_lds ? MMF16(lds, b32) : MMF16(reg, b32),
+            device->mm_f16reg_lds ? MMF16(lds, b16) : MMF16(reg, b16),
+        };
+#undef MMF16
+#undef MMF16_CM1
+        const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
+        const std::array<uint32_t, 4> & t = device->mm_f16reg_tile; // block size, wmi, wni, wgm
+        const uint32_t bm = t[3] * t[1] * 16;
+        const uint32_t bn = (t[0] / 32 / t[3]) * t[2] * 16;
+        for (int b = 0; b < 2; ++b) {
+            const std::string name = device->mm_f16reg_name + (b ? "_b16" : "_b32");
+            ggml_vk_create_pipeline(device, device->pipeline_mm_f16reg[b], name.c_str(), shaders[b].len, shaders[b].data, "main",
+                                    3, sizeof(vk_mat_mat_push_constants), {bm, bn, 1}, {t[0], t[1], t[2], t[3]}, 1, false, sg != 0, sg);
+        }
+    }
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
 
@@ -4995,6 +5021,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         ggml_vk_fork_shmem_limit(device);
         ggml_vk_fork_log_sparse(device);
         ggml_vk_fork_mmid_f16reg_init(device);
+        ggml_vk_fork_mm_f16reg_init(device);
 
         bool int_large_tile, int_large_tile_id;
         ggml_vk_fork_int_large_tile(device, int_large_tile, int_large_tile_id);
@@ -6610,6 +6637,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     std::cerr << "))");
     GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
     GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
+
+    // fork: the dense q8_0 matmuls of prompts on mul_mm_f16reg.comp (GGML_VK_MM_F16REG)
+    if (ggml_vk_fork_mm_f16reg(ctx, subctx, src0, src1, dst, fused_dst, fusion_flags)) {
+        return;
+    }
 
     const uint64_t ne00 = src0->ne[0];
     const uint64_t ne01 = src0->ne[1];
