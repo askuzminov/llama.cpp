@@ -44,7 +44,6 @@ const uint BM    = WGM * WMI * 16;
 const uint BN    = WGN * WNI * 16;
 const uint BK    = 64;                        // columns per stage
 const uint BKP   = BK + 8;                    // pitch in halves of an A row (A_LDS) and of a B column in shared memory
-const uint NACC  = WMI * WNI;
 const uint A_IT  = (BM * 2 + BLOCK_SIZE - 1) / BLOCK_SIZE;   // row halves (one q8_0 block each) per invocation, <= 2
 const uint B_IT  = (BN * 4 + BLOCK_SIZE - 1) / BLOCK_SIZE;   // 16-column quarters of a token per invocation, <= 4
 
@@ -92,7 +91,9 @@ shared float     sh_c[NWAVE * 256];           // a 16x16 output fragment per sub
 // ---- A tile: BM rows x 64 columns, two invocations per row, each one q8_0 block (34 bytes). a block pair takes 17
 // words: block 0 is the scale in the low half of word 0 and its codes in the high half of word 0 .. the low half of
 // word 8, block 1 the scale in the high half of word 8 and its codes in words 9 .. 16. the 9 words of an invocation stay
-// as they are until the stage is written, so that the loads are in flight while the current stage computes
+// as they are until the stage is written, so that the loads are in flight while the current stage computes. the loops
+// over it guard their body instead of a continue: spirv-opt unrolls them then and the arrays of the prefetch become
+// registers, with a continue it left them as arrays indexed at run time (07.11)
 
 uint ra_w[2][9];
 
@@ -100,16 +101,15 @@ void load_a_tile(const uint ir, const uint k0) {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint it = 0; it < 2; ++it) {
         const uint t = tid + it * BLOCK_SIZE;
-        if (it >= A_IT || t >= BM * 2) {
-            continue;
-        }
-        const uint row  = t >> 1;
-        const uint h    = t & 1;
-        // rows past M read the last row, their results are not stored
-        const uint grow = min(ir * BM + row, p.M - 1);
-        const uint pw   = (grow * (p.stride_a / 32) + k0 / 32) / 2 * 17 + h * 8;
-        [[unroll]] for (uint i = 0; i < 9; ++i) {
-            ra_w[it][i] = data_a[pw + i];
+        if (it < A_IT && t < BM * 2) {
+            const uint row  = t >> 1;
+            const uint h    = t & 1;
+            // rows past M read the last row, their results are not stored
+            const uint grow = min(ir * BM + row, p.M - 1);
+            const uint pw   = (grow * (p.stride_a / 32) + k0 / 32) / 2 * 17 + h * 8;
+            [[unroll]] for (uint i = 0; i < 9; ++i) {
+                ra_w[it][i] = data_a[pw + i];
+            }
         }
     }
 }
@@ -132,27 +132,26 @@ void write_a_tile() {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint it = 0; it < 2; ++it) {
         const uint t = tid + it * BLOCK_SIZE;
-        if (it >= A_IT || t >= BM * 2) {
-            continue;
-        }
-        const uint row = t >> 1;
-        const uint h   = t & 1;
-        const float16_t d = a_scale(it, h);
+        if (it < A_IT && t < BM * 2) {
+            const uint row = t >> 1;
+            const uint h   = t & 1;
+            const float16_t d = a_scale(it, h);
 #ifdef A_LDS
-        const uint base = (row * BKP + h * 32) / 2;
-        [[unroll]] for (uint i = 0; i < 8; ++i) {
-            const uint x = a_codes(it, h, i) ^ 0x80808080u;
-            const f16vec2 v02 = bytes02(x) * d;
-            const f16vec2 v13 = bytes13(x) * d;
-            sh_a[base + 2 * i + 0] = f16vec2(v02.x, v13.x);
-            sh_a[base + 2 * i + 1] = f16vec2(v02.y, v13.y);
-        }
+            const uint base = (row * BKP + h * 32) / 2;
+            [[unroll]] for (uint i = 0; i < 8; ++i) {
+                const uint x = a_codes(it, h, i) ^ 0x80808080u;
+                const f16vec2 v02 = bytes02(x) * d;
+                const f16vec2 v13 = bytes13(x) * d;
+                sh_a[base + 2 * i + 0] = f16vec2(v02.x, v13.x);
+                sh_a[base + 2 * i + 1] = f16vec2(v02.y, v13.y);
+            }
 #else
-        [[unroll]] for (uint i = 0; i < 8; ++i) {
-            sh_qs[row * QSW + h * 8 + i] = a_codes(it, h, i);
-        }
-        sh_d[row * 2 + h] = d;
+            [[unroll]] for (uint i = 0; i < 8; ++i) {
+                sh_qs[row * QSW + h * 8 + i] = a_codes(it, h, i);
+            }
+            sh_d[row * 2 + h] = d;
 #endif
+        }
     }
 }
 
@@ -171,42 +170,41 @@ void load_b_tile(const uint ic, const uint k0) {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint it = 0; it < 4; ++it) {
         const uint t = tid + it * BLOCK_SIZE;
-        if (it >= B_IT || t >= BN * 4) {
-            continue;
-        }
-        const uint n  = t >> 2;
-        const uint q  = t & 3;
-        const uint gn = ic * BN + n;
+        if (it < B_IT && t < BN * 4) {
+            const uint n  = t >> 2;
+            const uint q  = t & 3;
+            const uint gn = ic * BN + n;
 #ifdef B_F16
-        if (gn < p.N) {
-            const uint base = (gn * p.stride_b + k0 + q * 16) / 8;
-            rb[it][0] = data_b8[base];
-            rb[it][1] = data_b8[base + 1];
-        } else {
-            rb[it][0] = uvec4(0);
-            rb[it][1] = uvec4(0);
-        }
+            if (gn < p.N) {
+                const uint base = (gn * p.stride_b + k0 + q * 16) / 8;
+                rb[it][0] = data_b8[base];
+                rb[it][1] = data_b8[base + 1];
+            } else {
+                rb[it][0] = uvec4(0);
+                rb[it][1] = uvec4(0);
+            }
 #else
-        if (gn < p.N) {
-            const uint base = (gn * p.stride_b + k0 + q * 16) / 4;
-            [[unroll]] for (uint i = 0; i < 4; ++i) {
-                if (BPF == 2) {
-                    const vec4 v = data_b4[base + i];
-                    rbh[it][i] = uvec2(packFloat2x16(f16vec2(v.xy)), packFloat2x16(f16vec2(v.zw)));
-                } else {
-                    rb[it][i] = data_b4[base + i];
+            if (gn < p.N) {
+                const uint base = (gn * p.stride_b + k0 + q * 16) / 4;
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    if (BPF == 2) {
+                        const vec4 v = data_b4[base + i];
+                        rbh[it][i] = uvec2(packFloat2x16(f16vec2(v.xy)), packFloat2x16(f16vec2(v.zw)));
+                    } else {
+                        rb[it][i] = data_b4[base + i];
+                    }
+                }
+            } else {
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    if (BPF == 2) {
+                        rbh[it][i] = uvec2(0);
+                    } else {
+                        rb[it][i] = vec4(0.0);
+                    }
                 }
             }
-        } else {
-            [[unroll]] for (uint i = 0; i < 4; ++i) {
-                if (BPF == 2) {
-                    rbh[it][i] = uvec2(0);
-                } else {
-                    rb[it][i] = vec4(0.0);
-                }
-            }
-        }
 #endif
+        }
     }
 }
 
@@ -214,30 +212,29 @@ void write_b_tile() {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint it = 0; it < 4; ++it) {
         const uint t = tid + it * BLOCK_SIZE;
-        if (it >= B_IT || t >= BN * 4) {
-            continue;
-        }
-        const uint n    = t >> 2;
-        const uint q    = t & 3;
-        const uint base = (n * BKP + q * 16) / 2;
+        if (it < B_IT && t < BN * 4) {
+            const uint n    = t >> 2;
+            const uint q    = t & 3;
+            const uint base = (n * BKP + q * 16) / 2;
 #ifdef B_F16
-        [[unroll]] for (uint j = 0; j < 2; ++j) {
-            [[unroll]] for (uint c = 0; c < 4; ++c) {
-                sh_b[base + 4 * j + c] = unpackFloat2x16(rb[it][j][c]);
+            [[unroll]] for (uint j = 0; j < 2; ++j) {
+                [[unroll]] for (uint c = 0; c < 4; ++c) {
+                    sh_b[base + 4 * j + c] = unpackFloat2x16(rb[it][j][c]);
+                }
             }
-        }
 #else
-        [[unroll]] for (uint i = 0; i < 4; ++i) {
-            if (BPF == 2) {
-                sh_b[base + 2 * i + 0] = unpackFloat2x16(rbh[it][i].x);
-                sh_b[base + 2 * i + 1] = unpackFloat2x16(rbh[it][i].y);
-            } else {
-                const f16vec4 v = f16vec4(rb[it][i]);
-                sh_b[base + 2 * i + 0] = v.xy;
-                sh_b[base + 2 * i + 1] = v.zw;
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                if (BPF == 2) {
+                    sh_b[base + 2 * i + 0] = unpackFloat2x16(rbh[it][i].x);
+                    sh_b[base + 2 * i + 1] = unpackFloat2x16(rbh[it][i].y);
+                } else {
+                    const f16vec4 v = f16vec4(rb[it][i]);
+                    sh_b[base + 2 * i + 0] = v.xy;
+                    sh_b[base + 2 * i + 1] = v.zw;
+                }
             }
-        }
 #endif
+        }
     }
 }
 
@@ -295,6 +292,71 @@ void frag_mul_add(const float16_t a[16], const uint col0, const uint f, inout fl
 }
 #endif
 
+// the sums of a subgroup: element 4 i + j for A fragment i and B fragment j, of the 4 x 4 the WMI x WNI in use. with
+// coopmat every index below is a constant of the source and the arrays have their full size: in a loop the driver does
+// not unroll an index is computed at run time, and an array indexed at run time lives in scratch memory (07.11: every
+// 64x64 tile of a subgroup used 544 bytes or more of scratch a lane on the AMD driver, with or without the B tile in
+// registers - the 16 sums of 32 bytes and one more); the conditions on WMI and WNI fold at the creation of the pipeline.
+// the emulation keeps the loops of i and j: its registers are no question, and with the 16 calls written out 3 of 15
+// tiles failed the tests on the AMD GPU of the Mac (MoltenVK, 07.11), all passed with the loops
+#ifdef EMULATE
+#define ACC_ZERO(C) if ((C) / 4 < WMI && (C) % 4 < WNI) { [[unroll]] for (uint e = 0; e < 8; ++e) { acc[C][e] = 0.0; } }
+#define STORE_ACC(I, J) \
+    if (I < WMI && J < WNI) { \
+        const uint row0 = ir * BM + (wm * WMI + I) * 16; \
+        const uint col0 = ic * BN + (wn * WNI + J) * 16; \
+        [[unroll]] for (uint e = 0; e < 8; ++e) { \
+            const uint r = (lane >> 4) + 2 * e; \
+            const uint n = lane & 15; \
+            if (row0 + r < p.M && col0 + n < p.N) { \
+                data_d[(col0 + n) * p.stride_d + row0 + r] = acc[I * 4 + J][e]; \
+            } \
+        } \
+    }
+#else
+#define ACC_ZERO(C) if ((C) / 4 < WMI && (C) % 4 < WNI) { acc[C] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0); }
+#define B_FRAG(J) \
+            if (J < WNI) { \
+                coopMatLoad(mb[J], sh_b, ((wn * WNI + J) * 16 * BKP + f * 16) / 2, BKP / 2, gl_CooperativeMatrixLayoutColumnMajor); \
+            }
+#ifdef A_LDS
+#define A_FRAG(I) coopMatLoad(ma, sh_a, ((wm * WMI + I) * 16 * BKP + f * 16) / 2, BKP / 2, gl_CooperativeMatrixLayoutRowMajor);
+#else
+#define A_FRAG(I) \
+                { \
+                    float16_t va[16]; \
+                    decode_a((wm * WMI + I) * 16 + (lane & 15), f, va); \
+                    [[unroll]] for (uint e = 0; e < 16; ++e) { ma[e] = va[e]; } \
+                }
+#endif
+#define MMA_ROW(I) \
+            if (I < WMI) { \
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma; \
+                A_FRAG(I) \
+                if (0 < WNI) { acc[I * 4 + 0] = coopMatMulAdd(ma, mb[0], acc[I * 4 + 0]); } \
+                if (1 < WNI) { acc[I * 4 + 1] = coopMatMulAdd(ma, mb[1], acc[I * 4 + 1]); } \
+                if (2 < WNI) { acc[I * 4 + 2] = coopMatMulAdd(ma, mb[2], acc[I * 4 + 2]); } \
+                if (3 < WNI) { acc[I * 4 + 3] = coopMatMulAdd(ma, mb[3], acc[I * 4 + 3]); } \
+            }
+// through the subgroup's part of shared memory, so that a store instruction writes two whole 64-byte columns
+#define STORE_ACC(I, J) \
+    if (I < WMI && J < WNI) { \
+        const uint row0 = ir * BM + (wm * WMI + I) * 16; \
+        const uint col0 = ic * BN + (wn * WNI + J) * 16; \
+        coopMatStore(acc[I * 4 + J], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor); \
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
+        [[unroll]] for (uint e = 0; e < 8; ++e) { \
+            const uint idx = lane + e * WARP; \
+            const uint r   = idx % 16; \
+            const uint n   = idx / 16; \
+            if (row0 + r < p.M && col0 + n < p.N) { \
+                data_d[(col0 + n) * p.stride_d + row0 + r] = sh_c[c_off + idx]; \
+            } \
+        } \
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
+    }
+#endif
+
 void main() {
     const uint ir   = gl_WorkGroupID.x;
     const uint ic   = gl_WorkGroupID.y;
@@ -304,18 +366,14 @@ void main() {
     const uint wn   = wave / WGM;             // and along N
 
 #ifdef EMULATE
-    float acc[NACC][8];
-    [[unroll]] for (uint c = 0; c < NACC; ++c) {
-        [[unroll]] for (uint e = 0; e < 8; ++e) {
-            acc[c][e] = 0.0;
-        }
-    }
+    float acc[16][8];
 #else
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NACC];
-    [[unroll]] for (uint c = 0; c < NACC; ++c) {
-        acc[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    }
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[16];
 #endif
+    ACC_ZERO(0)  ACC_ZERO(1)  ACC_ZERO(2)  ACC_ZERO(3)
+    ACC_ZERO(4)  ACC_ZERO(5)  ACC_ZERO(6)  ACC_ZERO(7)
+    ACC_ZERO(8)  ACC_ZERO(9)  ACC_ZERO(10) ACC_ZERO(11)
+    ACC_ZERO(12) ACC_ZERO(13) ACC_ZERO(14) ACC_ZERO(15)
 
     load_a_tile(ir, 0);
     if (BPF != 0) {
@@ -345,59 +403,23 @@ void main() {
                 float16_t va[16];
                 load_a_frag_lds((wm * WMI + i) * 16, f, va);
                 [[unroll]] for (uint j = 0; j < WNI; ++j) {
-                    frag_mul_add(va, (wn * WNI + j) * 16, f, acc[i * WNI + j]);
+                    frag_mul_add(va, (wn * WNI + j) * 16, f, acc[i * 4 + j]);
                 }
             }
 #else
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[WNI];
-            [[unroll]] for (uint j = 0; j < WNI; ++j) {
-                coopMatLoad(mb[j], sh_b, ((wn * WNI + j) * 16 * BKP + f * 16) / 2, BKP / 2, gl_CooperativeMatrixLayoutColumnMajor);
-            }
-            [[unroll]] for (uint i = 0; i < WMI; ++i) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
-#ifdef A_LDS
-                coopMatLoad(ma, sh_a, ((wm * WMI + i) * 16 * BKP + f * 16) / 2, BKP / 2, gl_CooperativeMatrixLayoutRowMajor);
-#else
-                float16_t va[16];
-                decode_a((wm * WMI + i) * 16 + (lane & 15), f, va);
-                [[unroll]] for (uint e = 0; e < 16; ++e) { ma[e] = va[e]; }
-#endif
-                [[unroll]] for (uint j = 0; j < WNI; ++j) {
-                    acc[i * WNI + j] = coopMatMulAdd(ma, mb[j], acc[i * WNI + j]);
-                }
-            }
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[4];
+            B_FRAG(0) B_FRAG(1) B_FRAG(2) B_FRAG(3)
+            MMA_ROW(0) MMA_ROW(1) MMA_ROW(2) MMA_ROW(3)
 #endif
         }
     }
 
     // the sums of each fragment: element (r, n) of a fragment goes to row row0 + r, token col0 + n
-    [[unroll]] for (uint i = 0; i < WMI; ++i) {
-        [[unroll]] for (uint j = 0; j < WNI; ++j) {
-            const uint row0 = ir * BM + (wm * WMI + i) * 16;
-            const uint col0 = ic * BN + (wn * WNI + j) * 16;
-#ifdef EMULATE
-            [[unroll]] for (uint e = 0; e < 8; ++e) {
-                const uint r = (lane >> 4) + 2 * e;
-                const uint n = lane & 15;
-                if (row0 + r < p.M && col0 + n < p.N) {
-                    data_d[(col0 + n) * p.stride_d + row0 + r] = acc[i * WNI + j][e];
-                }
-            }
-#else
-            // through the subgroup's part of shared memory, so that a store instruction writes two whole 64-byte columns
-            const uint c_off = wave * 256;
-            coopMatStore(acc[i * WNI + j], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor);
-            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-            [[unroll]] for (uint e = 0; e < 8; ++e) {
-                const uint idx = lane + e * WARP;
-                const uint r   = idx % 16;
-                const uint n   = idx / 16;
-                if (row0 + r < p.M && col0 + n < p.N) {
-                    data_d[(col0 + n) * p.stride_d + row0 + r] = sh_c[c_off + idx];
-                }
-            }
-            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+#ifndef EMULATE
+    const uint c_off = wave * 256;
 #endif
-        }
-    }
+    STORE_ACC(0, 0) STORE_ACC(0, 1) STORE_ACC(0, 2) STORE_ACC(0, 3)
+    STORE_ACC(1, 0) STORE_ACC(1, 1) STORE_ACC(1, 2) STORE_ACC(1, 3)
+    STORE_ACC(2, 0) STORE_ACC(2, 1) STORE_ACC(2, 2) STORE_ACC(2, 3)
+    STORE_ACC(3, 0) STORE_ACC(3, 1) STORE_ACC(3, 2) STORE_ACC(3, 3)
 }

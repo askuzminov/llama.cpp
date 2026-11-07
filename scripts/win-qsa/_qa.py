@@ -2189,11 +2189,13 @@ def cmd_micro():
 
 # the tiles of mul_mm_f16reg.comp under test: <r|l><rows>x<tokens> of a subgroup / subgroups along M x N; r: the codes
 # decoded in registers, l: decoded to f16 in shared memory; a last n: the B tile of the next stage not held in registers,
-# h: held as f16. 07.11 run 1 (logs/395/mm-20261107-201543): best r16x64/8x1 (1324 ms of dense q8_0 per ubatch against
-# 1470 of int8), the 64x64 tiles of a subgroup spilled registers (227-256 VGPR); run 2: do they fit without the f32 B in
-# registers, and do they then go past ~24 TFLOP/s
-MM_VARIANTS = ["r16x64/8x1", "l32x64/4x2", "r64x64/4x2n", "r64x64/2x4n", "r64x64/2x2n", "r64x64/4x2h", "r64x64/2x4h",
-               "l64x64/4x2n", "l64x64/2x2n", "r16x64/8x1n", "r32x64/4x2n"]
+# h: held as f16; at most 64 x 64 a subgroup. 07.11 run 1 (logs/395/mm-20261107-201543): best r16x64/8x1 (1324 ms of
+# dense q8_0 per ubatch against 1470 of int8), the 64x64 tiles of a subgroup used scratch (544-640 bytes); run 2
+# (mm-20261107-220919): the same without the B tile in f32 registers, 544 bytes of scratch at the least, r16x64/8x1
+# 1305 ms against 1464. run 3: the sums named by constants in the shader instead of an array indexed in loops - do the
+# 64x64 and 48x64 tiles fit now, and do they go past ~24 TFLOP/s
+MM_VARIANTS = ["r16x64/8x1", "l32x64/4x2", "r32x64/4x2", "r64x64/4x2", "r64x64/4x2h", "r64x64/2x4h", "r64x64/2x2",
+               "l64x64/4x2n", "l64x64/2x2", "r48x64/4x2", "r48x64/4x2h", "r64x48/2x4"]
 
 
 def cmd_mm():
