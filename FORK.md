@@ -1853,6 +1853,12 @@
   4096; qwen4exp отказывает `compress_ratio`, не делящему 256; `-lzm dio` при загрузке из `FILE *` - ошибка вместо
   `GGML_ASSERT`; `LLAMA_REPLAN_DISABLE` читается как число (`0` больше не выключает); `test-elastic-buffer-fork` и
   `test-moe-cache-fork` без GPU отмечаются в ctest как пропущенные (`SKIP_REGULAR_EXPRESSION`), а не как пройденные.
+- Роутер, лог прокси (07.11): клиент отключился до конца ответа - предупреждение `client disconnected, stopped
+  proxying <метод> <путь>` вместо ошибки `http client error: Failed to read connection`. Ошибка осталась, когда
+  соединение с дочерним сервером рвётся при живом клиенте (клиент тогда получает 500 `proxy error: ...`). Различает
+  их флаг, который `cleanup_pipes` ставит перед закрытием сокета к дочернему серверу (`server_http_proxy`,
+  `server-models.cpp`). Mac: отключение посреди потока и в очереди до заголовков - W и отмена задачи в дочернем
+  сервере, `kill -9` дочернего сервера - E и 500.
 
 - Сэмплинг: top-k за один проход по логитам (23.10, `LLAMA_SAMPLER_FAST_TOP_K`, 1 по умолчанию, 0 - апстрим; по
   Rulith Inference `apply_prompt_sample_063`): вместо массива на весь словарь (248K) и частичной сортировки -

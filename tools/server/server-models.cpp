@@ -2685,7 +2685,9 @@ server_http_proxy::server_http_proxy(
     cli->set_write_timeout(timeout_read, 0); // reversed for cli (client) vs srv (server)
     cli->set_read_timeout(timeout_write, 0);
     this->status = 500; // to be overwritten upon response
-    this->cleanup_pipes = [pipe, cli]() {
+    auto stopped = std::make_shared<std::atomic<bool>>(false); // fork: the router ended the request (its client left)
+    this->cleanup_pipes = [pipe, cli, stopped]() {
+        stopped->store(true); // fork
         pipe->close_read();
         pipe->close_write();
         cli->stop();
@@ -2800,11 +2802,16 @@ server_http_proxy::server_http_proxy(
 
     // start the proxy thread
     SRV_DBG("start proxy thread %s %s\n", req.method.c_str(), req.path.c_str());
-    this->thread = std::thread([cli, pipe, req, headers_sent, make_header_msg]() {
+    this->thread = std::thread([cli, pipe, req, headers_sent, make_header_msg, stopped]() {
         auto result = cli->send(std::move(req));
         if (result.error() != httplib::Error::Success) {
             auto err_str = httplib::to_string(result.error());
-            SRV_ERR("http client error: %s\n", err_str.c_str());
+            if (stopped->load()) {
+                // fork: cleanup_pipes shut the socket to the child because the client disconnected, not an error
+                SRV_WRN("client disconnected, stopped proxying %s %s\n", req.method.c_str(), req.path.c_str());
+            } else {
+                SRV_ERR("http client error: %s\n", err_str.c_str());
+            }
             pipe->write({{}, 500, "", ""}); // header
             pipe->write({{}, 0, "proxy error: " + err_str, ""}); // body
         } else if (!headers_sent->load()) {
