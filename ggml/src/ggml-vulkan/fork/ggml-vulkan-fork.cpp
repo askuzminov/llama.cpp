@@ -217,7 +217,9 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     // GGML_VK_MM_F16REG=<a><rows>x<tokens>/<m>x<n>, a = r (each subgroup decodes the codes into its A fragments) or l (the
     // codes decoded to f16 on their way to shared memory, A fragments loaded from there); rows and tokens of a subgroup
     // (multiples of 16), m x n subgroups of 32 in the workgroup. r32x64/4x2: tiles of 128 rows x 128 tokens, 8 subgroups
-    // of 32 x 64. GGML_VK_MM_F16REG_EMULATE=1: subgroup shuffles instead of coopmat (tests on devices without it)
+    // of 32 x 64. a last letter: the B tile of the next stage not held in registers (n) or held as f16 (h), the shader's
+    // BPF; none: as read, f32. GGML_VK_MM_F16REG_EMULATE=1: subgroup shuffles instead of coopmat (tests on devices
+    // without it)
     device->mm_f16reg_mode = 0;
     const char * env = getenv("GGML_VK_MM_F16REG");
     if (env == nullptr || *env == 0 || strcmp(env, "0") == 0) {
@@ -226,11 +228,13 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     char a = 0;
     unsigned wm = 0, wn = 0, gm = 0, gn = 0;
     char tail = 0;
-    if (sscanf(env, "%c%ux%u/%ux%u%c", &a, &wm, &wn, &gm, &gn, &tail) != 5 || (a != 'r' && a != 'l') ||
+    const int got = sscanf(env, "%c%ux%u/%ux%u%c", &a, &wm, &wn, &gm, &gn, &tail);
+    if ((got != 5 && !(got == 6 && (tail == 'n' || tail == 'h'))) || (a != 'r' && a != 'l') ||
         wm == 0 || wn == 0 || wm % 16 != 0 || wn % 16 != 0 || gm == 0 || gn == 0) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: expected <r|l><rows>x<tokens>/<m>x<n>, e.g. r32x64/4x2\n", env);
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: expected <r|l><rows>x<tokens>/<m>x<n>[n|h], e.g. r32x64/4x2\n", env);
         return;
     }
+    const uint32_t bpf = got == 6 ? (tail == 'n' ? 0u : 2u) : 1u;
     const uint32_t waves = gm * gn;
     const uint32_t bs    = 32 * waves;
     const uint32_t bm    = gm * wm;
@@ -280,9 +284,10 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     }
     device->mm_f16reg_mode = mode;
     device->mm_f16reg_lds  = lds;
-    device->mm_f16reg_tile = { bs, wmi, wni, gm };
+    device->mm_f16reg_tile = { bs, wmi, wni, gm, bpf };
     device->mm_f16reg_name = "mul_mm_f16reg_" + std::string(1, a) + std::to_string(wm) + "x" + std::to_string(wn) + "_" +
-                             std::to_string(gm) + "x" + std::to_string(gn) + (mode == 2 ? "_emu" : "");
+                             std::to_string(gm) + "x" + std::to_string(gn) + (bpf == 0 ? "n" : bpf == 2 ? "h" : "") +
+                             (mode == 2 ? "_emu" : "");
     GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 on %s: tiles of %u rows x %u tokens, %u invocations, %u bytes of shared memory\n",
                   device->mm_f16reg_name.c_str(), bm, bn, bs, shmem);
     if (getenv("GGML_SCHED_LOG_REALLOC")) {

@@ -3797,13 +3797,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef MMF16
 #undef MMF16_CM1
         const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
-        const std::array<uint32_t, 4> & t = device->mm_f16reg_tile; // block size, wmi, wni, wgm
+        const std::array<uint32_t, 5> & t = device->mm_f16reg_tile; // block size, wmi, wni, wgm, bpf
         const uint32_t bm = t[3] * t[1] * 16;
         const uint32_t bn = (t[0] / 32 / t[3]) * t[2] * 16;
         for (int b = 0; b < 2; ++b) {
             const std::string name = device->mm_f16reg_name + (b ? "_b16" : "_b32");
             ggml_vk_create_pipeline(device, device->pipeline_mm_f16reg[b], name.c_str(), shaders[b].len, shaders[b].data, "main",
-                                    3, sizeof(vk_mat_mat_push_constants), {bm, bn, 1}, {t[0], t[1], t[2], t[3]}, 1, false, sg != 0, sg);
+                                    3, sizeof(vk_mat_mat_push_constants), {bm, bn, 1}, {t[0], t[1], t[2], t[3], t[4]}, 1, false, sg != 0, sg);
         }
     }
     for (auto &s : device->pipeline_solve_tri_f32) {

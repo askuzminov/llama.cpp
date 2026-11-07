@@ -1050,7 +1050,7 @@ struct vk_device_struct {
     // subgroup, subgroups along M; the variant in the pipeline names; [f16 activations]
     int mm_f16reg_mode;
     bool mm_f16reg_lds;
-    std::array<uint32_t, 4> mm_f16reg_tile;
+    std::array<uint32_t, 5> mm_f16reg_tile; // + the B prefetch of the shader (BPF)
     std::string mm_f16reg_name;
     vk_pipeline pipeline_mm_f16reg[2];
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)

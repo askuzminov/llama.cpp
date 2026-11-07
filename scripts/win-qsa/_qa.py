@@ -2187,10 +2187,13 @@ def cmd_micro():
 
 # ---------------------------------------------------------------- mm
 
-# the tiles of mul_mm_f16reg.comp under test (07.11): <r|l><rows>x<tokens> of a subgroup / subgroups along M x N; r: the
-# codes decoded in registers, l: decoded to f16 in shared memory
-MM_VARIANTS = ["r16x64/8x1", "r32x32/4x2", "r32x64/4x2", "r64x32/2x4", "r64x64/2x2", "r64x64/4x2", "r64x64/2x4",
-               "r32x64/8x1", "r64x32/4x2", "l32x64/4x2", "l64x32/2x4", "l64x64/2x2", "l64x64/4x2"]
+# the tiles of mul_mm_f16reg.comp under test: <r|l><rows>x<tokens> of a subgroup / subgroups along M x N; r: the codes
+# decoded in registers, l: decoded to f16 in shared memory; a last n: the B tile of the next stage not held in registers,
+# h: held as f16. 07.11 run 1 (logs/395/mm-20261107-201543): best r16x64/8x1 (1324 ms of dense q8_0 per ubatch against
+# 1470 of int8), the 64x64 tiles of a subgroup spilled registers (227-256 VGPR); run 2: do they fit without the f32 B in
+# registers, and do they then go past ~24 TFLOP/s
+MM_VARIANTS = ["r16x64/8x1", "l32x64/4x2", "r64x64/4x2n", "r64x64/2x4n", "r64x64/2x2n", "r64x64/4x2h", "r64x64/2x4h",
+               "l64x64/4x2n", "l64x64/2x2n", "r16x64/8x1n", "r32x64/4x2n"]
 
 
 def cmd_mm():

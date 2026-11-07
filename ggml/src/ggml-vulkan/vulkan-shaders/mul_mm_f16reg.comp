@@ -30,6 +30,10 @@ layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint WMI = 2;   // 16-row A fragments of a subgroup
 layout(constant_id = 2) const uint WNI = 4;   // 16-token B fragments of a subgroup
 layout(constant_id = 3) const uint WGM = 4;   // subgroups along M
+// the B tile of the next stage in registers while a stage computes: 1 as it is read (f32), 2 as f16 (half the registers
+// of f32 activations), 0 none - each stage reads its B tile into shared memory itself (07.11: the 64x64 tiles of a
+// subgroup spilled registers on the AMD driver with 1, 227-256 VGPR)
+layout(constant_id = 4) const uint BPF = 1;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -152,12 +156,15 @@ void write_a_tile() {
     }
 }
 
-// ---- B tile: BN tokens x 64 columns, four invocations per token, 16 columns each
+// ---- B tile: BN tokens x 64 columns, four invocations per token, 16 columns each. with BPF 1 and 2 the next stage
+// waits in registers (load_b_tile while a stage computes, write_b_tile at the next one); with BPF 0 a stage reads its
+// own tile, both calls in a row
 
 #ifdef B_F16
-uvec4 rb[4][2];
+uvec4 rb[4][2];   // 8 halves each, BPF 1 and 2 alike
 #else
-vec4 rb[4][4];
+vec4  rb[4][4];   // BPF 0 and 1
+uvec2 rbh[4][4];  // BPF 2: the f32 values as f16 pairs
 #endif
 
 void load_b_tile(const uint ic, const uint k0) {
@@ -183,11 +190,20 @@ void load_b_tile(const uint ic, const uint k0) {
         if (gn < p.N) {
             const uint base = (gn * p.stride_b + k0 + q * 16) / 4;
             [[unroll]] for (uint i = 0; i < 4; ++i) {
-                rb[it][i] = data_b4[base + i];
+                if (BPF == 2) {
+                    const vec4 v = data_b4[base + i];
+                    rbh[it][i] = uvec2(packFloat2x16(f16vec2(v.xy)), packFloat2x16(f16vec2(v.zw)));
+                } else {
+                    rb[it][i] = data_b4[base + i];
+                }
             }
         } else {
             [[unroll]] for (uint i = 0; i < 4; ++i) {
-                rb[it][i] = vec4(0.0);
+                if (BPF == 2) {
+                    rbh[it][i] = uvec2(0);
+                } else {
+                    rb[it][i] = vec4(0.0);
+                }
             }
         }
 #endif
@@ -212,9 +228,14 @@ void write_b_tile() {
         }
 #else
         [[unroll]] for (uint i = 0; i < 4; ++i) {
-            const f16vec4 v = f16vec4(rb[it][i]);
-            sh_b[base + 2 * i + 0] = v.xy;
-            sh_b[base + 2 * i + 1] = v.zw;
+            if (BPF == 2) {
+                sh_b[base + 2 * i + 0] = unpackFloat2x16(rbh[it][i].x);
+                sh_b[base + 2 * i + 1] = unpackFloat2x16(rbh[it][i].y);
+            } else {
+                const f16vec4 v = f16vec4(rb[it][i]);
+                sh_b[base + 2 * i + 0] = v.xy;
+                sh_b[base + 2 * i + 1] = v.zw;
+            }
         }
 #endif
     }
@@ -297,18 +318,25 @@ void main() {
 #endif
 
     load_a_tile(ir, 0);
-    load_b_tile(ic, 0);
+    if (BPF != 0) {
+        load_b_tile(ic, 0);
+    }
 
     for (uint k0 = 0; k0 < p.K; k0 += BK) {
         barrier();
         write_a_tile();
+        if (BPF == 0) {
+            load_b_tile(ic, k0); // this stage's own tile, its registers live only to the store
+        }
         write_b_tile();
         barrier();
 
         // the next stage's loads run while this one computes
         if (k0 + BK < p.K) {
             load_a_tile(ir, k0 + BK);
-            load_b_tile(ic, k0 + BK);
+            if (BPF != 0) {
+                load_b_tile(ic, k0 + BK);
+            }
         }
 
         [[unroll]] for (uint f = 0; f < BK / 16; ++f) {
