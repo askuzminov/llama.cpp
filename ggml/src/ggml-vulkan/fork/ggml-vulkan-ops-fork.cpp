@@ -179,8 +179,8 @@ static bool ggml_vk_fork_tensor_buffer(const ggml_backend_vk_context * ctx, cons
 }
 
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): f32 or f16 activations read in place, from
-// GGML_VK_MM_F16REG_MIN_N tokens (64), 2D, K a multiple of 64 (a block pair of a row on a word), the activations on 16
-// bytes, nothing fused into the matmul
+// GGML_VK_MM_F16REG_MIN_N tokens (64), GGML_VK_MM_F16REG_MIN_M rows (512) and GGML_VK_MM_F16REG_MIN_K columns (1024),
+// 2D, K a multiple of 64 (a block pair of a row on a word), the activations on 16 bytes, nothing fused into the matmul
 bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, const ggml_tensor * src1,
                             const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags) {
     const vk_device & device = ctx->device;
@@ -192,10 +192,14 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
     // few rows over a long K (the hc down projection of qwen4exp, 320 x 10240) leave few workgroups, each a long walk
     // over K: there the int8 path was faster on the 395 (07.11, 05-mm: 17.2 against 15.8 TFLOP/s with f16 activations)
     static const int64_t min_m = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_M"); return e ? (int64_t) atoll(e) : (int64_t) 512; }();
+    // a short K: in the model on the 395 the hc up projection (10240 x 320) took 2.43 ms a call against 1.49 on the int8
+    // path, while the 05-mm perf test gave 1.34 (profile-20261107-232325); 2560 x 640 and 640 x 2560 lost ~20% against
+    // that test as well. from K 2560 the kernel wins in the model too
+    static const int64_t min_k = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_K"); return e ? (int64_t) atoll(e) : (int64_t) 1024; }();
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
-    if (N < min_n || M < std::max<int64_t>(16, min_m) || K % 64 != 0 || src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
+    if (N < min_n || M < std::max<int64_t>(16, min_m) || K < min_k || K % 64 != 0 || src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         return false;
     }

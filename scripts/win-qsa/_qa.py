@@ -2193,7 +2193,8 @@ def cmd_micro():
 # dense q8_0 per ubatch against 1470 of int8), the 64x64 tiles of a subgroup used scratch (544-640 bytes); run 2
 # (mm-20261107-220919): the same without the B tile in f32 registers, 544 bytes of scratch at the least, r16x64/8x1
 # 1305 ms against 1464. run 3: the sums named by constants in the shader instead of an array indexed in loops - do the
-# 64x64 and 48x64 tiles fit now, and do they go past ~24 TFLOP/s
+# 64x64 and 48x64 tiles fit now, and do they go past ~24 TFLOP/s. run 3 (mm-20261107-225950): they fit (no scratch
+# but the 128-invocation 64x64/2x2), none passes r16x64/8x1: 1303 ms, r48x64/4x2 1361, l64x64/4x2n 1374, r64x64/4x2 1385
 MM_VARIANTS = ["r16x64/8x1", "l32x64/4x2", "r32x64/4x2", "r64x64/4x2", "r64x64/4x2h", "r64x64/2x4h", "r64x64/2x2",
                "l64x64/4x2n", "l64x64/2x2", "r48x64/4x2", "r48x64/4x2h", "r64x48/2x4"]
 
@@ -2201,7 +2202,7 @@ MM_VARIANTS = ["r16x64/8x1", "l32x64/4x2", "r32x64/4x2", "r64x64/4x2", "r64x64/4
 def cmd_mm():
     """The dense q8_0 matmuls of a prompt on the device of the machine (test-backend-ops): the default path and the
     variants of mul_mm_f16reg.comp (GGML_VK_MM_F16REG). For each variant first the MUL_MAT tests of q8_0 against the CPU,
-    all of them through the variant (GGML_VK_MM_F16REG_MIN_N=1, _MIN_M=1), then perf of the q8_0 shapes of qwen4exp at QA_MM_N
+    all of them through the variant (GGML_VK_MM_F16REG_MIN_N=1, _MIN_M=1, _MIN_K=1), then perf of the q8_0 shapes of qwen4exp at QA_MM_N
     tokens (4096): TFLOP/s per shape, and the registers, the scratch (registers spilled to memory) and the shared memory
     the driver gave the shader. QA_MMARMS: variants (name VAR=value ...;...), a run each, the default path first."""
     run = Run("mm")
@@ -2220,7 +2221,8 @@ def cmd_mm():
         run_env = dict(os.environ, **arm_env)
 
         # the tests: every q8_0 case through the variant, its log line counts the matmuls it took
-        test_env = dict(run_env, GGML_VK_MM_F16REG_MIN_N="1", GGML_VK_MM_F16REG_MIN_M="1", GGML_VK_MM_F16REG_LOG="1")
+        test_env = dict(run_env, GGML_VK_MM_F16REG_MIN_N="1", GGML_VK_MM_F16REG_MIN_M="1", GGML_VK_MM_F16REG_MIN_K="1",
+                        GGML_VK_MM_F16REG_LOG="1")
         cmd = [exe, "test", "-b", device, "-o", "MUL_MAT", "-p", "type_a=q8_0"]
         identity = {"v": VERSION, "kind": "mm-test", "build": bid, "args": [str(c) for c in cmd[1:]],
                     "env": env_identity(test_env), "machine": machine()}
