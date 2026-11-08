@@ -742,12 +742,21 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipeline_shader_create_info.setPNext(&pipeline_shader_stage_required_subgroup_size_create_info);
     }
 
+    // fork: GGML_VK_PIPELINE_ISA=<part of a pipeline name>: the internal representations the driver keeps of the matching
+    // pipelines (the shader ISA on AMD and RADV) go to stderr, for the instruction mix of a kernel
+    static const char * pipeline_isa_filter = getenv("GGML_VK_PIPELINE_ISA");
+    const bool dump_ir = pipeline_isa_filter != nullptr && device->pipeline_executable_properties_support &&
+                         pipeline->name.find(pipeline_isa_filter) != std::string::npos;
+
     vk::ComputePipelineCreateInfo compute_pipeline_create_info(
         device->pipeline_executable_properties_support ?
             vk::PipelineCreateFlagBits::eCaptureStatisticsKHR :
             vk::PipelineCreateFlags{},
         pipeline_shader_create_info,
         pipeline->layout);
+    if (dump_ir) {
+        compute_pipeline_create_info.flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+    }
 
     vk::PipelineRobustnessCreateInfoEXT rci;
 
@@ -764,6 +773,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipelineFlags2CreateInfo.flags = vk::PipelineCreateFlagBits2::e64BitIndexingEXT;
         if (device->pipeline_executable_properties_support) {
             pipelineFlags2CreateInfo.flags |= vk::PipelineCreateFlagBits2::eCaptureStatisticsKHR;
+        }
+        if (dump_ir) {
+            pipelineFlags2CreateInfo.flags |= vk::PipelineCreateFlagBits2::eCaptureInternalRepresentationsKHR;
         }
         pipelineFlags2CreateInfo.setPNext(compute_pipeline_create_info.pNext);
         compute_pipeline_create_info.setPNext(&pipelineFlags2CreateInfo);
@@ -783,6 +795,33 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         duoni.pObjectName = pipeline->name.c_str();
         duoni.objectHandle = /*reinterpret_cast*/(uint64_t)(static_cast<VkPipeline>(pipeline->pipeline));
         vk_instance.pfn_vkSetDebugUtilsObjectNameEXT(device->device, &static_cast<VkDebugUtilsObjectNameInfoEXT &>(duoni));
+    }
+
+    if (dump_ir) {
+        // fork: count, sizes, then the data of each representation (GGML_VK_PIPELINE_ISA above)
+        vk::PipelineExecutableInfoKHR info;
+        info.pipeline = pipeline->pipeline;
+        uint32_t n_ir = 0;
+        if (device->device.getPipelineExecutableInternalRepresentationsKHR(&info, &n_ir, nullptr) == vk::Result::eSuccess && n_ir > 0) {
+            std::vector<vk::PipelineExecutableInternalRepresentationKHR> irs(n_ir);
+            (void) device->device.getPipelineExecutableInternalRepresentationsKHR(&info, &n_ir, irs.data());
+            std::vector<std::vector<char>> data(n_ir);
+            for (uint32_t i = 0; i < n_ir; ++i) {
+                data[i].resize(irs[i].dataSize + 1, 0);
+                irs[i].pData = data[i].data();
+            }
+            (void) device->device.getPipelineExecutableInternalRepresentationsKHR(&info, &n_ir, irs.data());
+            for (uint32_t i = 0; i < n_ir; ++i) {
+                std::cerr << "ggml_vulkan: internal representation of " << pipeline->name << ": " << irs[i].name.data() << " ("
+                          << irs[i].description.data() << "), " << irs[i].dataSize << " bytes" << (irs[i].isText ? "" : ", binary")
+                          << std::endl;
+                if (irs[i].isText) {
+                    std::cerr << data[i].data() << std::endl << "ggml_vulkan: end of " << irs[i].name.data() << std::endl;
+                }
+            }
+        } else {
+            std::cerr << "ggml_vulkan: no internal representation of " << pipeline->name << " from the driver" << std::endl;
+        }
     }
 
     if (device->pipeline_executable_properties_support) {
@@ -3819,22 +3858,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #else
 #define MMF16_CM1(a, b) mm_f16reg_shader { mul_mm_f16reg_q8_0_##a##_##b##_emu_len, mul_mm_f16reg_q8_0_##a##_##b##_emu_data }
 #endif
+        // the tile of each B path: [0] f32 read in place, [1] f16
         const mm_f16reg_shader shaders[2] = {
-            device->mm_f16reg_lds ? MMF16(lds, b32) : MMF16(reg, b32),
-            device->mm_f16reg_lds ? MMF16(lds, b16) : MMF16(reg, b16),
+            device->mm_f16reg_lds[0] ? MMF16(lds, b32) : MMF16(reg, b32),
+            device->mm_f16reg_lds[1] ? MMF16(lds, b16) : MMF16(reg, b16),
         };
         const mm_f16reg_shader shaders_hc[2] = {
-            device->mm_f16reg_lds ? MMF16(lds, b32_hcpre) : MMF16(reg, b32_hcpre),
-            device->mm_f16reg_lds ? MMF16(lds, b16_hcpre) : MMF16(reg, b16_hcpre),
+            device->mm_f16reg_lds[0] ? MMF16(lds, b32_hcpre) : MMF16(reg, b32_hcpre),
+            device->mm_f16reg_lds[1] ? MMF16(lds, b16_hcpre) : MMF16(reg, b16_hcpre),
         };
 #undef MMF16
 #undef MMF16_CM1
         const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
-        const std::array<uint32_t, 5> & t = device->mm_f16reg_tile; // block size, wmi, wni, wgm, bpf
-        const uint32_t bm = t[3] * t[1] * 16;
-        const uint32_t bn = (t[0] / 32 / t[3]) * t[2] * 16;
         for (int b = 0; b < 2; ++b) {
-            const std::string name = device->mm_f16reg_name + (b ? "_b16" : "_b32");
+            const std::array<uint32_t, 5> & t = device->mm_f16reg_tile[b]; // block size, wmi, wni, wgm, bpf
+            const uint32_t bm = t[3] * t[1] * 16;
+            const uint32_t bn = (t[0] / 32 / t[3]) * t[2] * 16;
+            const std::string name = device->mm_f16reg_name[b] + (b ? "_b16" : "_b32");
             ggml_vk_create_pipeline(device, device->pipeline_mm_f16reg[b], name.c_str(), shaders[b].len, shaders[b].data, "main",
                                     3, sizeof(vk_mat_mat_push_constants), {bm, bn, 1}, {t[0], t[1], t[2], t[3], t[4]}, 1, false, sg != 0, sg);
             // the matmul with the DSV4_HC_PRE after it: the streams in f32 or f16 (spec constant 5)

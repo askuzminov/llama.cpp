@@ -1055,9 +1055,10 @@ struct vk_device_struct {
     // 2 emulated; the A codes decoded to f16 in shared memory (else in registers); block size, A and B fragments of a
     // subgroup, subgroups along M; the variant in the pipeline names; [f16 activations]
     int mm_f16reg_mode;
-    bool mm_f16reg_lds;
-    std::array<uint32_t, 5> mm_f16reg_tile; // + the B prefetch of the shader (BPF)
-    std::string mm_f16reg_name;
+    // a tile per B path, [0]: f32 activations read in place, [1]: f16 (GGML_VK_MM_F16REG, _B32)
+    bool mm_f16reg_lds[2];
+    std::array<uint32_t, 5> mm_f16reg_tile[2]; // + the B prefetch of the shader (BPF)
+    std::string mm_f16reg_name[2];
     vk_pipeline pipeline_mm_f16reg[2];
     // the same matmul with the DSV4_HC_PRE that follows it in the store (MUL_MAT_DSV4_HC_PRE): [f16 activations][f16 streams]
     vk_pipeline pipeline_mm_f16reg_hcpre[2][2];

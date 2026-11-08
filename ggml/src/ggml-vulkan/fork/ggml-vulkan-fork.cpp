@@ -263,14 +263,61 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
 #endif
 }
 
+// a tile of mul_mm_f16reg.comp from its GGML_VK_MM_F16REG spelling (see ggml_vk_fork_mm_f16reg_init): the spec constants
+// {invocations, A fragments, B fragments, subgroups along M, B prefetch}, whether A goes through shared memory, the name
+// of its pipelines and, for the log, the tile and the shared memory. false (and a warning) for a tile the shader or the
+// device does not take
+static bool ggml_vk_fork_mm_f16reg_tile(const vk_device & device, const char * var, const char * env, std::array<uint32_t, 5> & tile,
+                                        bool & lds, std::string & name, uint32_t & bm, uint32_t & bn, uint32_t & shmem) {
+    char a = 0;
+    unsigned wm = 0, wn = 0, gm = 0, gn = 0;
+    char tail = 0;
+    const int got = sscanf(env, "%c%ux%u/%ux%u%c", &a, &wm, &wn, &gm, &gn, &tail);
+    if ((got != 5 && !(got == 6 && (tail == 'n' || tail == 'h'))) || (a != 'r' && a != 'l') ||
+        wm == 0 || wn == 0 || wm % 16 != 0 || wn % 16 != 0 || gm == 0 || gn == 0) {
+        GGML_LOG_WARN("ggml_vulkan: %s=%s: expected <r|l><rows>x<tokens>/<m>x<n>[n|h], e.g. r32x64/4x2\n", var, env);
+        return false;
+    }
+    const uint32_t bpf   = got == 6 ? (tail == 'n' ? 0u : 2u) : 1u;
+    const uint32_t waves = gm * gn;
+    const uint32_t bs    = 32 * waves;
+    const uint32_t wmi   = wm / 16;
+    const uint32_t wni   = wn / 16;
+    bm = gm * wm;
+    bn = gn * wn;
+    // the shader holds the sums of a subgroup in 4 x 8 fragments named by constants (an array indexed at run time goes to
+    // scratch memory): at most 64 rows and 128 tokens per subgroup, at most 16 fragments of sums (08.11: 8 B fragments
+    // to one decoded A fragment, half the decode work of 64 tokens per multiply)
+    if (waves > 16 || wmi > 4 || wni > 8 || wmi * wni > 16 || bm > bs || bn > bs) {
+        GGML_LOG_WARN("ggml_vulkan: %s=%s: at most 16 subgroups of at most 64 rows x 128 tokens and 16 fragments of sums, the "
+                      "rows and the tokens of the tile at most its invocations\n", var, env);
+        return false;
+    }
+    lds = a == 'l';
+    // the shared memory of the shader: the A tile (f16, or codes and scales), the B tile in f16, a fragment per subgroup
+    const uint32_t bkp = 72;
+    shmem = (lds ? bm * bkp * 2 : bm * 17 * 4 + bm * 2 * 2) + bn * bkp * 2 + waves * 256 * 4;
+    if (shmem > device->properties.limits.maxComputeSharedMemorySize) {
+        GGML_LOG_WARN("ggml_vulkan: %s=%s: %u bytes of shared memory, the device has %u\n", var, env, shmem,
+                      device->properties.limits.maxComputeSharedMemorySize);
+        return false;
+    }
+    tile = { bs, wmi, wni, gm, bpf };
+    name = "mul_mm_f16reg_" + std::string(1, a) + std::to_string(wm) + "x" + std::to_string(wn) + "_" + std::to_string(gm) +
+           "x" + std::to_string(gn) + (bpf == 0 ? "n" : bpf == 2 ? "h" : "");
+    return true;
+}
+
 void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     // the dense q8_0 matmuls of prompts on mul_mm_f16reg.comp (07.11; the default on AMD RDNA3 since 08.11, below):
     // GGML_VK_MM_F16REG=<a><rows>x<tokens>/<m>x<n>, a = r (each subgroup decodes the codes into its A fragments) or l (the
     // codes decoded to f16 on their way to shared memory, A fragments loaded from there); rows and tokens of a subgroup
     // (multiples of 16), m x n subgroups of 32 in the workgroup. r32x64/4x2: tiles of 128 rows x 128 tokens, 8 subgroups
     // of 32 x 64. a last letter: the B tile of the next stage not held in registers (n) or held as f16 (h), the shader's
-    // BPF; none: as read, f32. GGML_VK_MM_F16REG_EMULATE=1: subgroup shuffles instead of coopmat (tests on devices
-    // without it)
+    // BPF; none: as read, f32. GGML_VK_MM_F16REG_B32: another tile for the matmuls that read f32 activations in place
+    // (K over GGML_VK_MM_F16REG_B16_MAX_K; 08.11, 05-mm: r16x96/8x1 25.2-25.9 TFLOP/s on the K 2560 shapes from the f16
+    // copy against 23.6-24.0 of r16x64/8x1, but 16.5 against 24.1 on 2560 x 6144 with f32 in place).
+    // GGML_VK_MM_F16REG_EMULATE=1: subgroup shuffles instead of coopmat (tests on devices without it)
     // the default on RDNA3 since 08.11, r16x64/8x1: on the 395 a 4010-token prompt at depth 0 3962.2 against 4042.6 ms of
     // gpu time (profile-20261107-234325, dense q8_0 1335.6 against 1415.1), the quality probes of 01 at least
     // as close to the reference as the int8 path (f16 activations: KL max 0.433 / 0.136 / 0.127 against 0.909 / 0.421 /
@@ -286,37 +333,15 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
         }
         env = "r16x64/8x1";
     }
-    char a = 0;
-    unsigned wm = 0, wn = 0, gm = 0, gn = 0;
-    char tail = 0;
-    const int got = sscanf(env, "%c%ux%u/%ux%u%c", &a, &wm, &wn, &gm, &gn, &tail);
-    if ((got != 5 && !(got == 6 && (tail == 'n' || tail == 'h'))) || (a != 'r' && a != 'l') ||
-        wm == 0 || wn == 0 || wm % 16 != 0 || wn % 16 != 0 || gm == 0 || gn == 0) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: expected <r|l><rows>x<tokens>/<m>x<n>[n|h], e.g. r32x64/4x2\n", env);
-        return;
+    const char * env32 = getenv("GGML_VK_MM_F16REG_B32");
+    if (env32 == nullptr || *env32 == 0) {
+        env32 = env;
     }
-    const uint32_t bpf = got == 6 ? (tail == 'n' ? 0u : 2u) : 1u;
-    const uint32_t waves = gm * gn;
-    const uint32_t bs    = 32 * waves;
-    const uint32_t bm    = gm * wm;
-    const uint32_t bn    = gn * wn;
-    const uint32_t wmi   = wm / 16;
-    const uint32_t wni   = wn / 16;
-    // the shader holds the sums of a subgroup in 4 x 8 fragments named by constants (an array indexed at run time goes to
-    // scratch memory): at most 64 rows and 128 tokens per subgroup, at most 16 fragments of sums (08.11: 8 B fragments
-    // to one decoded A fragment, half the decode work of 64 tokens per multiply)
-    if (waves > 16 || wmi > 4 || wni > 8 || wmi * wni > 16 || bm > bs || bn > bs) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: at most 16 subgroups of at most 64 rows x 128 tokens and 16 "
-                      "fragments of sums, the rows and the tokens of the tile at most its invocations\n", env);
-        return;
-    }
-    const bool lds = a == 'l';
-    // the shared memory of the shader: the A tile (f16, or codes and scales), the B tile in f16, a fragment per subgroup
-    const uint32_t bkp   = 72;
-    const uint32_t shmem = (lds ? bm * bkp * 2 : bm * 17 * 4 + bm * 2 * 2) + bn * bkp * 2 + waves * 256 * 4;
-    if (shmem > device->properties.limits.maxComputeSharedMemorySize) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: %u bytes of shared memory, the device has %u\n", env, shmem,
-                      device->properties.limits.maxComputeSharedMemorySize);
+    uint32_t bm[2], bn[2], shmem[2];
+    if (!ggml_vk_fork_mm_f16reg_tile(device, "GGML_VK_MM_F16REG_B32", env32, device->mm_f16reg_tile[0], device->mm_f16reg_lds[0],
+                                     device->mm_f16reg_name[0], bm[0], bn[0], shmem[0]) ||
+        !ggml_vk_fork_mm_f16reg_tile(device, "GGML_VK_MM_F16REG", env, device->mm_f16reg_tile[1], device->mm_f16reg_lds[1],
+                                     device->mm_f16reg_name[1], bm[1], bn[1], shmem[1])) {
         return;
     }
     const bool sg32 = device->subgroup_size_control ? (device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size)
@@ -336,7 +361,7 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
             return;
         }
         // the A fragments built in registers take the layout coopmat_a_probe.comp checks
-        if (!lds && device->mmid_f16reg_mode != 1 && !ggml_vk_fork_coopmat_a_probe(device)) {
+        if ((!device->mm_f16reg_lds[0] || !device->mm_f16reg_lds[1]) && device->mmid_f16reg_mode != 1 && !ggml_vk_fork_coopmat_a_probe(device)) {
             GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s off: the coopmat A layout is not the one the shader takes\n", env);
             return;
         }
@@ -347,16 +372,20 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
 #endif
     }
     device->mm_f16reg_mode = mode;
-    device->mm_f16reg_lds  = lds;
-    device->mm_f16reg_tile = { bs, wmi, wni, gm, bpf };
-    device->mm_f16reg_name = "mul_mm_f16reg_" + std::string(1, a) + std::to_string(wm) + "x" + std::to_string(wn) + "_" +
-                             std::to_string(gm) + "x" + std::to_string(gn) + (bpf == 0 ? "n" : bpf == 2 ? "h" : "") +
-                             (mode == 2 ? "_emu" : "");
-    GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 on %s: tiles of %u rows x %u tokens, %u invocations, %u bytes of shared memory\n",
-                  device->mm_f16reg_name.c_str(), bm, bn, bs, shmem);
-    if (getenv("GGML_SCHED_LOG_REALLOC")) {
-        fprintf(stderr, "ggml_vulkan: MUL_MAT q8_0 on %s: tiles of %u rows x %u tokens, %u invocations, %u bytes of shared memory\n",
-                device->mm_f16reg_name.c_str(), bm, bn, bs, shmem);
+    if (mode == 2) {
+        device->mm_f16reg_name[0] += "_emu";
+        device->mm_f16reg_name[1] += "_emu";
+    }
+    // the same tile on both paths: one line
+    const bool same = device->mm_f16reg_name[0] == device->mm_f16reg_name[1];
+    for (int b = same ? 1 : 0; b < 2; ++b) {
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 on %s%s: tiles of %u rows x %u tokens, %u invocations, %u bytes of shared memory\n",
+                      device->mm_f16reg_name[b].c_str(), same ? "" : b ? " (f16 activations)" : " (f32 activations in place)",
+                      bm[b], bn[b], device->mm_f16reg_tile[b][0], shmem[b]);
+        if (getenv("GGML_SCHED_LOG_REALLOC")) {
+            fprintf(stderr, "ggml_vulkan: MUL_MAT q8_0 on %s: tiles of %u rows x %u tokens, %u invocations, %u bytes of shared memory\n",
+                    device->mm_f16reg_name[b].c_str(), bm[b], bn[b], device->mm_f16reg_tile[b][0], shmem[b]);
+        }
     }
 }
 
