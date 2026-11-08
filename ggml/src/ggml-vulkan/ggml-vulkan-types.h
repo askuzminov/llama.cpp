@@ -1043,8 +1043,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_concat_f32[2];
     // MUL_MAT_ID with the codes decoded into f16 A fragments (mul_mmid_f16reg.comp): 0 off, 1 coopmat, 2 emulated
     int mmid_f16reg_mode;
-    // [q4_K, q5_K, q5_1, q8_0][fused gate/up]
-    vk_pipeline pipeline_mmid_f16reg[4][2];
+    // [q4_K, q5_K, q5_1, q8_0][single, fused gate/up, single in 256-row pairs (ROWS2)][tiles of 64, 128 tokens]
+    vk_pipeline pipeline_mmid_f16reg[4][3][2];
     // dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG (mul_mm_f16reg.comp): 0 off, 1 coopmat,
     // 2 emulated; the A codes decoded to f16 in shared memory (else in registers); block size, A and B fragments of a
     // subgroup, subgroups along M; the variant in the pipeline names; [f16 activations]

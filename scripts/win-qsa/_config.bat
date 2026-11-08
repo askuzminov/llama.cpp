@@ -45,7 +45,8 @@ if /i "%BACKEND%"=="cuda" goto :cuda_defaults
 rem the 395 (vulkan): the whole model on the gpu. DECARGS: the server as serve.bat runs it (models.ini)
 if not defined EXTRA     set "EXTRA=-ngl 99"
 if not defined DECARGS   set "DECARGS=-fit off -b 16384 -ub 4096"
-rem seconds of rest after a model run or a build before a timed run: the 395 runs warm (95 C in an hour of chats)
+rem seconds of rest after a build or a long model run (COOL_RUN seconds, 300) before a timed run: the 395 runs warm
+rem (95 C in an hour of chats); the short arms of a profile at depth 0 go one after another
 if not defined COOL      set "COOL=120"
 if not defined CHECKOPS  set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;GATED_DELTA_NET_LAZY;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16"
 rem int8: the int8 coopmat path of the experts, off by default (f16reg), checked as well

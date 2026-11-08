@@ -49,8 +49,11 @@ DEVICES = {"vulkan": "Vulkan0", "cuda": "CUDA0"}
 EXE = ".exe" if os.name == "nt" else ""
 
 LAST_RUN = CACHE / "last-model-run.txt"
-# the end of the last model run or build, for COOL: a build loads every core for minutes and heats the 395 as a run does
+# the end of the last build or long model run, for COOL: a build loads every core for minutes and heats the 395 as a
+# long run does
 LAST_HEAT = CACHE / "last-heat.txt"
+# the start of the model process running now, for mark_end()
+RUN_STARTED = [None]
 DEVICE_LINE = re.compile(r"^\s*(\S+): .*\((\d+) MiB, (\d+) MiB free\)\s*$")
 IDLE_USED = CACHE / "idle-used.json"
 # the GPU memory counters of Windows (Task Manager shows them): the memory of all processes on all adapters, also the
@@ -275,20 +278,18 @@ def gib(mib):
     return f"{mib / 1024:.1f}"
 
 def cool_down():
-    """COOL seconds (0): at least that long after the last model run or build, so that the arms of a run start from about
-    the same temperature (the 395 reached 95 C in an hour of chats to 213K on 14.10, the ops of the last profile depth
-    ran 2 percent slower than the night before; the first arm after the build of 14.10 ran 3 to 5 percent slower in
-    every phase than the second, also in the steps that read nothing from the drive). Returns the seconds it waited."""
+    """COOL seconds (0): at least that long after the last build or long model run (COOL_RUN seconds or more, see
+    mark_end()), so that the arms of a run start from about the same temperature (the 395 reached 95 C in an hour of
+    chats to 213K on 14.10, the ops of the last profile depth ran 2 percent slower than the night before; the first arm
+    after the build of 14.10 ran 3 to 5 percent slower in every phase than the second, also in the steps that read
+    nothing from the drive). Returns the seconds it waited."""
     cool = env_int("COOL", 0)
-    heat = None
-    for path in (LAST_HEAT, LAST_RUN):
-        try:
-            heat = time.time() - float(path.read_text())
-            break
-        except (OSError, ValueError):
-            continue
+    try:
+        heat = time.time() - float(LAST_HEAT.read_text())
+    except (OSError, ValueError):
+        heat = None
     if cool > 0 and heat is not None and heat < cool:
-        print(f"cooling {cool - heat:.0f} s after the last model run or build (COOL)", flush=True)
+        print(f"cooling {cool - heat:.0f} s after the last build or long model run (COOL)", flush=True)
         time.sleep(cool - heat)
         return cool - heat
     return 0
@@ -299,7 +300,8 @@ def settle(timed=True):
     (08.10-11.10). Done at once when the memory in use is within SETTLE_MARGIN MiB (2048) of the least seen on this
     machine (cache/idle-used.json), else the memory is read every SETTLE_STEP seconds (3) until it stops going down,
     SETTLE_MAX seconds (180) at most. Without a reading the old rule: SETTLE seconds (30) after the last model run.
-    timed=False: the run measures no speed (03, 08), so it does not wait for COOL either."""
+    timed=False: the run measures no speed (the probes of llama-quality-fork, the checkpoint replay), so it does not
+    wait for COOL either; a server (start_server: 01 spec probe, 02, 03) always does."""
     try:
         since = time.time() - float(LAST_RUN.read_text())
     except (OSError, ValueError):
@@ -353,9 +355,16 @@ def retry_wait(attempt):
     return 0 if device_used() is not None else float(env("SETTLE", "30")) * attempt
 
 def mark_end():
+    """The end of a model run: SETTLE counts from every one, COOL only from one of COOL_RUN seconds (300) or more. The
+    arms of a profile at depth 0 (2-3 minutes each, mostly the load) matched to 0.23 percent in the ops they do not
+    change, twice (07.11, 395, 120 s apart); a profile arm to the end of the context fills 248K tokens of prompt cache,
+    about 8 minutes"""
     CACHE.mkdir(parents=True, exist_ok=True)
-    LAST_RUN.write_text(f"{time.time()}\n")
-    LAST_HEAT.write_text(f"{time.time()}\n")
+    now = time.time()
+    LAST_RUN.write_text(f"{now}\n")
+    started, RUN_STARTED[0] = RUN_STARTED[0], None
+    if started is None or now - started >= env_int("COOL_RUN", 300):
+        LAST_HEAT.write_text(f"{now}\n")
 
 def exit_text(code):
     return f"exit {code}" if 0 <= code < 256 else f"exit {code & 0xffffffff:#010x}"
@@ -429,6 +438,8 @@ def execute(cmd, log, run_env, stdout=None, model=True, check=True, cwd=None, ti
             f.flush()
             out = stdout.open("w", encoding="utf-8") if stdout else f
             began = time.time()
+            if model and RUN_STARTED[0] is None:
+                RUN_STARTED[0] = began
             try:
                 proc = subprocess.Popen(cmd, stdout=out, stderr=f, env=run_env, cwd=cwd)
                 try:
@@ -536,6 +547,8 @@ def start_server(exe, args, run_env, log):
             f.flush()
             proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
         start = time.time()
+        if RUN_STARTED[0] is None:
+            RUN_STARTED[0] = start
         # a load that stops writing its log hangs: 11.10, 395: mtp3 right after auto stopped in the load of the MTP head
         # (as on 08.10) and the arm failed after DECWAIT; a normal load is silent for 20 s at most
         stall = env_int("DECSTALL", 240)

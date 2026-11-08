@@ -938,6 +938,17 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 200, 256, 512,
             true, 8, 4, true, false, true, false, {1, 1}));
     }
+    // the tiles of 128 tokens and the 256-row pairs (GGML_VK_MMID_F16REG_BN, _GLU_BN, _ROWS2): 512 rows, 150 rows per
+    // expert on average, so that some experts take two tiles of 128
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        const int64_t k = ggml_blck_size(type_a) == 256 ? 768 : 640;
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 512, 300, k));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 8, 4, false, 512, 300, k, 1, true));
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 300, 256, 512,
+            true, 4, 2, true, false, true, false, {1, 1}));
+    }
 
     // the f16 hc read of qwen4exp (LLAMA_HC_F16): the hc down projection (q8_0, 320 x 10240) of f16 streams, int8 on
     // Vulkan through an f16 quantize; DSV4_HC_PRE over f16 streams; the combine with the next norm stored in f16

@@ -3761,22 +3761,35 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #else
 #define F16REG_CM1(t) f16reg_shader { "mul_mmid_f16reg_" #t "_emu", mul_mmid_f16reg_##t##_emu_len, mul_mmid_f16reg_##t##_emu_data }
 #endif
-        const f16reg_shader shaders[4][2] = {
-            { F16REG(q4_k), F16REG(q4_k_glu) },
-            { F16REG(q5_k), F16REG(q5_k_glu) },
-            { F16REG(q5_1), { nullptr, 0, nullptr } },
-            { F16REG(q8_0), { nullptr, 0, nullptr } },
+        const f16reg_shader shaders[4][3] = {
+            { F16REG(q4_k), F16REG(q4_k_glu), F16REG(q4_k_r2) },
+            { F16REG(q5_k), F16REG(q5_k_glu), F16REG(q5_k_r2) },
+            { F16REG(q5_1), { nullptr, 0, nullptr }, F16REG(q5_1_r2) },
+            { F16REG(q8_0), { nullptr, 0, nullptr }, F16REG(q8_0_r2) },
         };
 #undef F16REG
 #undef F16REG_CM1
         const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
         for (int t = 0; t < 4; ++t) {
-            for (int g = 0; g < 2; ++g) {
-                if (shaders[t][g].data == nullptr) {
+            for (int v = 0; v < 3; ++v) {
+                if (shaders[t][v].data == nullptr) {
                     continue;
                 }
-                ggml_vk_create_pipeline(device, device->pipeline_mmid_f16reg[t][g], shaders[t][g].name, shaders[t][g].len, shaders[t][g].data, "main",
-                                        g ? 7 : 6, sizeof(vk_mat_mat_id_push_constants), {128, 64, 1}, {256, 64}, 1, false, sg != 0, sg);
+                for (int b = 0; b < 2; ++b) {
+                    // the shared memory of the shader: the codes, (scale, offset) and high bits of one or two A tiles of 128
+                    // rows, the B tile in f16, a 16x16 f32 fragment per subgroup, the row ids
+                    const uint32_t bn   = b ? 128 : 64;
+                    const uint32_t qsw  = t == 3 ? 17 : 9;
+                    const uint32_t a_sz = 128 * qsw * 4 + 128 * 2 * 4 + (t == 1 || t == 2 ? 128 * 2 * 4 : 0);
+                    const uint32_t lds  = a_sz * (v ? 2 : 1) + bn * 72 * 2 + 8 * 256 * 4 + bn * 4;
+                    if (lds > device->properties.limits.maxComputeSharedMemorySize) {
+                        continue;
+                    }
+                    const std::string name = std::string(shaders[t][v].name) + (b ? "_bn128" : "");
+                    ggml_vk_create_pipeline2(device, device->pipeline_mmid_f16reg[t][v][b], name, shaders[t][v].len, shaders[t][v].data, "main",
+                                            v == 1 ? 7 : 6, sizeof(vk_mat_mat_id_push_constants), {v == 2 ? 256u : 128u, bn, 1}, {256, bn}, 1, false,
+                                            sg != 0, sg);
+                }
             }
         }
     }

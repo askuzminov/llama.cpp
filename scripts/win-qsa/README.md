@@ -29,7 +29,8 @@
 
 Перед `01`-`03` остановить `serve.bat`: скрипты запускают свои процессы и не работают, пока запущен
 `llama-server.exe` (он держит память GPU). Между запусками моделей скрипт ждёт, пока драйвер освободит память
-прошлого процесса (`SETTLE*`), на 395 перед замером скорости ещё `COOL` секунд.
+прошлого процесса (`SETTLE*`), на 395 перед замером скорости ещё `COOL` секунд после сборки или долгого прогона
+модели (от `COOL_RUN` секунд, 300); после короткого (вариант профиля на глубине 0) - нет.
 
 Итог каждого запуска - в `logs/<скрипт>-<время>/summary.txt`, рядом журналы и ответы; числа каждого нового
 результата добавляются в `logs/history-qa.csv`.
@@ -170,6 +171,30 @@ MTP графы цели (проверка черновика) и головы (�
 таблицы: исправление разбора доходит и до сохранённых результатов (до 31.10 хранились таблицы, такие профили
 запускаются заново).
 
+Плитки экспертов (07-08.11, `mul_mmid_f16reg.comp`): `GGML_VK_MMID_F16REG_BN` (down и прочие одиночные) и
+`GGML_VK_MMID_F16REG_GLU_BN` (слитый gate/up) - 64 или 128 токенов в плитке, `GGML_VK_MMID_F16REG_ROWS2=1` - down
+парами по 256 строк, которые делят фрагменты B. gate/up и down в профиле - разные операции, поэтому четыре варианта
+покрывают все сочетания, gate/up 128 и 64 - по два раза; `GGML_VK_PIPELINE_STATS` пишет в лог регистры и scratch
+каждого конвейера. Сначала тесты операций через каждый вариант (01 без проб; на Mac проверен только эмулированный путь,
+`GGML_VK_MMID_GLU_MIN_TOKENS=0` пускает слитый gate/up и на коротких тестах):
+
+```bash
+export QA_CHECK_QUALITY=0 QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none
+export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_ID_FUSION type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1"
+export CHECKARMS="default GGML_VK_MMID_GLU_MIN_TOKENS=0;bn128 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMID_F16REG_BN=128 GGML_VK_MMID_F16REG_GLU_BN=128;r2 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMID_F16REG_ROWS2=1;r2bn128 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMID_F16REG_ROWS2=1 GGML_VK_MMID_F16REG_BN=128 GGML_VK_MMID_F16REG_GLU_BN=128"
+./01-check.bat
+unset QA_CHECK_QUALITY QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS
+```
+
+Затем профиль:
+
+```bash
+export QA_PROF_DEPTHS=0
+export QA_PARMS="default GGML_VK_PIPELINE_STATS=mul_mmid_f16reg;bn128 GGML_VK_PIPELINE_STATS=mul_mmid_f16reg GGML_VK_MMID_F16REG_BN=128 GGML_VK_MMID_F16REG_GLU_BN=128;r2 GGML_VK_PIPELINE_STATS=mul_mmid_f16reg GGML_VK_MMID_F16REG_ROWS2=1;r2bn128 GGML_VK_PIPELINE_STATS=mul_mmid_f16reg GGML_VK_MMID_F16REG_ROWS2=1 GGML_VK_MMID_F16REG_BN=128 GGML_VK_MMID_F16REG_GLU_BN=128"
+./03-profile.bat
+unset QA_PROF_DEPTHS QA_PARMS
+```
+
 ## Микробенчмарк (04)
 
 `test-micro-fork` строит подграф индексатора так, как его строит граф qwen4exp, и гоняет его целиком на устройстве
@@ -208,7 +233,8 @@ scratch 544-640 байт. Второй (`mm-20261107-220919`): без B в f32 �
 Третий (`mm-20261107-225950`): влезают (scratch 0, VGPR 225-255, кроме 64x64/2x2), но не обгоняют: `r16x64/8x1` 1303
 мс, `r48x64/4x2` 1361, `l64x64/4x2n` 1374, `r64x64/4x2` 1385, int8 1465. Профиль 03 на глубине 0 с `r16x64/8x1`
 (`profile-20261107-232325`): промпт 4068.8 мс против 4071.2 - выигрыш на больших формах (-90 мс) съела форма
-10240 x 320 (+89 мс), отсюда порог `GGML_VK_MM_F16REG_MIN_K` (1024).
+10240 x 320 (+89 мс), отсюда порог `GGML_VK_MM_F16REG_MIN_K` (1024). С порогом (`profile-20261107-234325`): 3962.2
+против 4042.6 мс (-2.0%); `l32x64/4x2` на всех K - 4081.8.
 
 Дальше два-три лучших варианта на модели, профиль на малой глубине (строка `matmul` - время GPU плотных матмулов
 ubatch промпта):
@@ -271,7 +297,7 @@ set "QA_PARMS=default;r16x64 GGML_VK_MM_F16REG=r16x64/8x1"
 | `QA_PORT`, `QA_TIMEOUT` | 8097, 3600 | порт своих серверов, таймаут запроса |
 | `CHECKOPS`, `CHECKARMS`, `CHECKUNITS` | в `_config.bat` | операции, варианты и юнит-тесты 01 |
 | `EXTRA`, `DECARGS`, `LOADMODE` | в `_config.bat` | размещение весов; аргументы сервера; чтение весов |
-| `COOL`, `SETTLE`, `SETTLE_MAX`, `SETTLE_STEP`, `SETTLE_MARGIN` | 120 на 395 и 0; 30; 180; 3; 2048 | паузы между запусками моделей |
+| `COOL`, `COOL_RUN`, `SETTLE`, `SETTLE_MAX`, `SETTLE_STEP`, `SETTLE_MARGIN` | 120 на 395 и 0; 300; 30; 180; 3; 2048 | паузы между запусками моделей |
 | `DECWAIT`, `DECSTALL` | 900, 240 | ожидание загрузки сервера и молчания журнала при ней |
 
 ## Повседневный сервер (`models.ini`)

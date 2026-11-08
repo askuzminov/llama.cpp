@@ -24,7 +24,13 @@
 //
 // q4_K, q5_K: a 64-column stage is the 32-byte qs chunk of two sub-blocks (low and high nibbles), q5_1: two blocks
 // repacked to that layout, q8_0: two blocks of bytes. FUSED_GLU: binding 6 is the up projection, the result silu(A x) *
-// (A2 x). fusion_flags bit 0: the router weight of each (slot, token) scales the result (MUL_MAT_ID + MUL)
+// (A2 x). ROWS2: the workgroup takes 256 rows, the second 128 as the second A of FUSED_GLU (same binding, rows + 128),
+// so that each B fragment serves two A fragments as in the fused gate/up (07.11: the down projection, K 640, ran at
+// 12.7 TFLOP/s on the 395 against 18.6 of the fused gate/up). fusion_flags bit 0: the router weight of each (slot,
+// token) scales the result (MUL_MAT_ID + MUL).
+// BN (16..128 tokens a tile, a multiple of 16): count_experts.comp lays the rows of each expert out in tiles of BN, the
+// fragments past the rows of a tile are skipped. with coopmat the sums are named by constant indices (an array indexed
+// at run time goes to scratch memory on the AMD driver, see mul_mm_f16reg.comp); the emulation keeps loops
 
 #if defined(DATA_A_Q4_K)
 #define A_BLOCK_WORDS 36   // 144 bytes
@@ -43,6 +49,13 @@
 #define A_BYTES 1
 #else
 #error mul_mmid_f16reg.comp: no A type
+#endif
+
+#if defined(FUSED_GLU) || defined(ROWS2)
+#define TWO_A
+#endif
+#if defined(FUSED_GLU) && defined(ROWS2)
+#error mul_mmid_f16reg.comp: FUSED_GLU and ROWS2 both use the second A
 #endif
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
@@ -86,10 +99,15 @@ layout(push_constant) uniform parameter {
     uint fusion_flags;
 } p;
 
-const uint BM   = 128;          // 8 subgroups of 16 rows
+const uint BM   = 128;          // rows of an A tile: 8 subgroups of 16 rows
+#ifdef ROWS2
+const uint BMW  = 2 * BM;       // rows of the workgroup
+#else
+const uint BMW  = BM;
+#endif
 const uint BK   = 64;           // columns per stage
 const uint BKP  = BK + 8;       // B column pitch in halves
-const uint NC   = BN / 16;      // B fragments per subgroup
+const uint NC   = BN / 16;      // B fragments per subgroup, <= 8
 const uint WARP = 32;
 
 #ifdef A_BYTES
@@ -103,7 +121,7 @@ shared f16vec2   sh_so[BM * 2];             // (scale, offset) of the two 32-col
 #ifdef A_HIGH_BIT
 shared uint      sh_qh[BM * 2];             // bit e: the fifth bit of column e of a sub-block
 #endif
-#ifdef FUSED_GLU
+#ifdef TWO_A
 shared uint      sh_qs2[BM * QSW];
 shared f16vec2   sh_so2[BM * 2];
 #ifdef A_HIGH_BIT
@@ -114,7 +132,8 @@ shared float16_t sh_b[BN * BKP];            // B tile, column n at n * BKP
 shared float     sh_c[(BLOCK_SIZE / WARP) * 256]; // a 16x16 output fragment per subgroup
 shared u16vec2   row_ids[BN];
 
-// ---- A tile: the codes of 128 rows x 64 columns, two invocations per row
+// ---- A tile: the codes of 128 rows x 64 columns, two invocations per row. the second A: the up projection (FUSED_GLU,
+// binding 6) or the next 128 rows of the same experts (ROWS2)
 
 #ifndef A_BYTES
 uint a_word(const bool second, uint i) {
@@ -135,17 +154,17 @@ uint a_half(const bool second, uint i) {
 #endif
 
 #if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
-// 6-bit scale and min of sub-block j from the 12 scale bytes (get_scale_min_k4)
+// 6-bit scale and min of sub-block j from the 12 scale bytes (get_scale_min_k4). the words of each branch are fixed
+// (j < 4: bytes j of words 0 and 1; else bytes j - 4 of words 2, 0, 1), so no array indexed at run time
 uvec2 scale_min_k4(uint j, uint sw0, uint sw1, uint sw2) {
-    const uint sc[3] = { sw0, sw1, sw2 };
     uint d, m;
     if (j < 4) {
-        d = (sc[j / 4] >> (8 * (j % 4))) & 63u;
-        m = (sc[(j + 4) / 4] >> (8 * ((j + 4) % 4))) & 63u;
+        d = (sw0 >> (8 * j)) & 63u;
+        m = (sw1 >> (8 * j)) & 63u;
     } else {
-        const uint q  = (sc[(j + 4) / 4] >> (8 * ((j + 4) % 4))) & 0xFFu;
-        const uint lo = (sc[(j - 4) / 4] >> (8 * ((j - 4) % 4))) & 0xFFu;
-        const uint hi = (sc[j / 4] >> (8 * (j % 4))) & 0xFFu;
+        const uint q  = (sw2 >> (8 * (j - 4))) & 0xFFu;
+        const uint lo = (sw0 >> (8 * (j - 4))) & 0xFFu;
+        const uint hi = (sw1 >> (8 * (j - 4))) & 0xFFu;
         d = (q & 0xFu) | ((lo >> 6) << 4);
         m = (q >> 4)   | ((hi >> 6) << 4);
     }
@@ -170,7 +189,11 @@ void load_a_tile(const uint m, const uint expert, const uint ir, const uint k0) 
     const uint tid  = gl_LocalInvocationID.x;
     const uint row  = tid >> 1;
     const uint h    = tid & 1;
-    const uint grow = ir * BM + row;
+#ifdef ROWS2
+    const uint grow = ir * BMW + (second ? BM : 0) + row;
+#else
+    const uint grow = ir * BMW + row;
+#endif
 
     // first element of the row in blocks
     const uint row_blk = (expert * p.batch_stride_a + grow * p.stride_a) / A_QK;
@@ -225,7 +248,7 @@ void write_a_tile(const uint m) {
     const uint tid = gl_LocalInvocationID.x;
     const uint row = tid >> 1;
     const uint h   = tid & 1;
-#ifdef FUSED_GLU
+#ifdef TWO_A
     if (m != 0) {
         [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs2[row * QSW + h * QREG + i] = ra_qs[1][i]; }
         sh_so2[row * 2 + h] = ra_so[1];
@@ -247,25 +270,26 @@ void write_a_tile(const uint m) {
 const uint B_ITERS = (BN * 4 + BLOCK_SIZE - 1) / BLOCK_SIZE;
 vec4 rb[2][4];   // B_ITERS <= 2 (BN <= 128)
 
+// the loops over it guard their body instead of a continue, so that they unroll and rb stays in registers (see
+// mul_mm_f16reg.comp)
 void load_b_tile(const uint k0, const uint tile_count) {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint it = 0; it < 2; ++it) {
         const uint t = tid + it * BLOCK_SIZE;
-        if (it >= B_ITERS || t >= BN * 4) {
-            continue;
-        }
-        const uint n = t >> 2;
-        const uint q = t & 3;
-        if (n < tile_count) {
-            const u16vec2 ri = row_ids[n];
-            // a multiple of 4: K, the strides and k0 are
-            const uint base = (uint(ri.y) * p.batch_stride_b + (uint(ri.x) % p.ne11) * p.stride_b + k0 + q * 16) / 4;
-            [[unroll]] for (uint i = 0; i < 4; ++i) {
-                rb[it][i] = data_b4[base + i];
-            }
-        } else {
-            [[unroll]] for (uint i = 0; i < 4; ++i) {
-                rb[it][i] = vec4(0.0);
+        if (it < B_ITERS && t < BN * 4) {
+            const uint n = t >> 2;
+            const uint q = t & 3;
+            if (n < tile_count) {
+                const u16vec2 ri = row_ids[n];
+                // a multiple of 4: K, the strides and k0 are
+                const uint base = (uint(ri.y) * p.batch_stride_b + (uint(ri.x) % p.ne11) * p.stride_b + k0 + q * 16) / 4;
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    rb[it][i] = data_b4[base + i];
+                }
+            } else {
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    rb[it][i] = vec4(0.0);
+                }
             }
         }
     }
@@ -275,15 +299,14 @@ void write_b_tile() {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint it = 0; it < 2; ++it) {
         const uint t = tid + it * BLOCK_SIZE;
-        if (it >= B_ITERS || t >= BN * 4) {
-            continue;
-        }
-        const uint n = t >> 2;
-        const uint q = t & 3;
-        [[unroll]] for (uint i = 0; i < 4; ++i) {
-            const f16vec4 v = f16vec4(rb[it][i]);
-            const uint o = n * BKP + q * 16 + i * 4;
-            sh_b[o + 0] = v.x; sh_b[o + 1] = v.y; sh_b[o + 2] = v.z; sh_b[o + 3] = v.w;
+        if (it < B_ITERS && t < BN * 4) {
+            const uint n = t >> 2;
+            const uint q = t & 3;
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                const f16vec4 v = f16vec4(rb[it][i]);
+                const uint o = n * BKP + q * 16 + i * 4;
+                sh_b[o + 0] = v.x; sh_b[o + 1] = v.y; sh_b[o + 2] = v.z; sh_b[o + 3] = v.w;
+            }
         }
     }
 }
@@ -295,7 +318,7 @@ f16vec2 bytes02(uint x) { return unpackFloat2x16((x & 0x00FF00FFu) | 0x64006400u
 f16vec2 bytes13(uint x) { return unpackFloat2x16(((x >> 8) & 0x00FF00FFu) | 0x64006400u) - f16vec2(1024.0); }
 
 void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[16]) {
-#ifdef FUSED_GLU
+#ifdef TWO_A
     const f16vec2 so = second ? sh_so2[lrow * 2 + (f >> 1)] : sh_so[lrow * 2 + (f >> 1)];
 #else
     const f16vec2 so = sh_so[lrow * 2 + (f >> 1)];
@@ -304,7 +327,7 @@ void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[
     // q8_0: block f >> 1, bytes 16 (f & 1) .. + 15, signed: biased by 128
     const uint base = lrow * QSW + (f >> 1) * 8 + (f & 1) * 4;
     [[unroll]] for (uint i = 0; i < 4; ++i) {
-#ifdef FUSED_GLU
+#ifdef TWO_A
         const uint x = (second ? sh_qs2[base + i] : sh_qs[base + i]) ^ 0x80808080u;
 #else
         const uint x = sh_qs[base + i] ^ 0x80808080u;
@@ -319,14 +342,14 @@ void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[
     const uint base  = lrow * QSW + (f & 1) * 4;
     const uint shift = (f >> 1) * 4;
 #ifdef A_HIGH_BIT
-#ifdef FUSED_GLU
+#ifdef TWO_A
     const uint hb = (second ? sh_qh2[lrow * 2 + (f >> 1)] : sh_qh[lrow * 2 + (f >> 1)]) >> ((f & 1) * 16);
 #else
     const uint hb = sh_qh[lrow * 2 + (f >> 1)] >> ((f & 1) * 16);
 #endif
 #endif
     [[unroll]] for (uint i = 0; i < 4; ++i) {
-#ifdef FUSED_GLU
+#ifdef TWO_A
         uint x = ((second ? sh_qs2[base + i] : sh_qs[base + i]) >> shift) & 0x0F0F0F0Fu;
 #else
         uint x = (sh_qs[base + i] >> shift) & 0x0F0F0F0Fu;
@@ -346,8 +369,7 @@ void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[
 // ---- fragments and their multiply: coopmat, or the same layout emulated with shuffles
 
 #ifdef EMULATE
-#define AFRAG float16_t[16]
-#define ACCFRAG float[8]
+#define ACC_PARAM(name) const float name[8]
 
 void frag_mul_add(const float16_t a[16], const uint b_off, inout float acc[8]) {
     const uint lane = gl_SubgroupInvocationID;
@@ -365,12 +387,105 @@ void frag_mul_add(const float16_t a[16], const uint b_off, inout float acc[8]) {
     }
 }
 
-void frag_store(const float acc[8], const uint off) {
+void frag_stage(const float acc[8], const uint off) {
     const uint lane = gl_SubgroupInvocationID;
     [[unroll]] for (uint e = 0; e < 8; ++e) {
         sh_c[off + (lane & 15) * 16 + (lane >> 4) + 2 * e] = acc[e];
     }
 }
+#else
+#define ACC_PARAM(name) const coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> name
+
+void frag_stage(const coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc, const uint off) {
+    coopMatStore(acc, sh_c, off, 16, gl_CooperativeMatrixLayoutColumnMajor);
+}
+#endif
+
+// ---- the output: each subgroup stores a 16 rows x 16 tokens fragment through its part of sh_c, element (r, n) at
+// n * 16 + r, and writes it as two 64-byte columns a store
+
+void read_frag(out float v[8]) {
+    const uint c_off = gl_SubgroupID * 256;
+    [[unroll]] for (uint i = 0; i < 8; ++i) {
+        v[i] = sh_c[c_off + gl_SubgroupInvocationID + i * WARP];
+    }
+}
+
+void write_frag(const uint c, const uint grow0, const uint tile_count, const float v[8]) {
+    [[unroll]] for (uint i = 0; i < 8; ++i) {
+        const uint idx = gl_SubgroupInvocationID + i * WARP;
+        const uint r   = idx % 16;
+        const uint n   = c * 16 + idx / 16;
+        if (n < tile_count && grow0 + r < p.M) {
+            const u16vec2 ri = row_ids[n];
+            float val = v[i];
+            if ((p.fusion_flags & 1u) != 0) {
+                val *= data_fscale[uint(ri.y) * p.nei0 + uint(ri.x)];
+            }
+            data_d[uint(ri.y) * p.batch_stride_d + uint(ri.x) * p.stride_d + grow0 + r] = val;
+        }
+    }
+}
+
+// fragment c of the tile: a for the rows of A, a2 for those of the second A
+void epilogue(const uint c, const uint grow0, const uint tile_count, ACC_PARAM(a)
+#ifdef TWO_A
+              , ACC_PARAM(a2)
+#endif
+              ) {
+    const uint c_off = gl_SubgroupID * 256;
+    float v[8];
+    frag_stage(a, c_off);
+    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    read_frag(v);
+#ifdef TWO_A
+    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+#ifdef FUSED_GLU
+    frag_stage(a2, c_off);
+    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    float u[8];
+    read_frag(u);
+    [[unroll]] for (uint i = 0; i < 8; ++i) {
+        v[i] = v[i] / (1.0 + exp(-v[i])) * u[i];
+    }
+    write_frag(c, grow0, tile_count, v);
+#else
+    write_frag(c, grow0, tile_count, v);
+    frag_stage(a2, c_off);
+    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    read_frag(v);
+    write_frag(c, grow0 + BM, tile_count, v);
+#endif
+#else
+    write_frag(c, grow0, tile_count, v);
+#endif
+    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+}
+
+#ifdef TWO_A
+#define TWO_A_ARG(x) , x
+#else
+#define TWO_A_ARG(x)
+#endif
+
+#ifndef EMULATE
+// the sums of fragment C named by a constant; the conditions on NC fold at the creation of the pipeline
+#ifdef TWO_A
+#define ACC_ZERO(C) if (C < NC) { acc[C] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0); \
+                                  acc2[C] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0); }
+#define MMA2(C) acc2[C] = coopMatMulAdd(ma2, mb, acc2[C]);
+#else
+#define ACC_ZERO(C) if (C < NC) { acc[C] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0); }
+#define MMA2(C)
+#endif
+#define MMA_C(C) \
+                if (C < NC && C < nc_used) { \
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb; \
+                    coopMatLoad(mb, sh_b, C * 16 * BKP + f * 16, BKP, gl_CooperativeMatrixLayoutColumnMajor); \
+                    acc[C] = coopMatMulAdd(ma, mb, acc[C]); \
+                    MMA2(C) \
+                }
+#define EPILOGUE_C(C) if (C < NC && C < nc_used) { epilogue(C, grow0, tile_count, acc[C] TWO_A_ARG(acc2[C])); }
 #endif
 
 void main() {
@@ -397,34 +512,29 @@ void main() {
 
 #ifdef EMULATE
     float acc[NC][8];
-#ifdef FUSED_GLU
+#ifdef TWO_A
     float acc2[NC][8];
 #endif
     [[unroll]] for (uint c = 0; c < NC; ++c) {
         [[unroll]] for (uint e = 0; e < 8; ++e) {
             acc[c][e] = 0.0;
-#ifdef FUSED_GLU
+#ifdef TWO_A
             acc2[c][e] = 0.0;
 #endif
         }
     }
 #else
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NC];
-#ifdef FUSED_GLU
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2[NC];
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
+#ifdef TWO_A
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2[8];
 #endif
-    [[unroll]] for (uint c = 0; c < NC; ++c) {
-        acc[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-#ifdef FUSED_GLU
-        acc2[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-#endif
-    }
+    ACC_ZERO(0) ACC_ZERO(1) ACC_ZERO(2) ACC_ZERO(3) ACC_ZERO(4) ACC_ZERO(5) ACC_ZERO(6) ACC_ZERO(7)
 #endif
 
     // the row ids before the first B loads
     barrier();
     load_a_tile(0, expert, ir, 0);
-#ifdef FUSED_GLU
+#ifdef TWO_A
     load_a_tile(1, expert, ir, 0);
 #endif
     load_b_tile(0, tile_count);
@@ -432,7 +542,7 @@ void main() {
     for (uint k0 = 0; k0 < p.K; k0 += BK) {
         barrier();
         write_a_tile(0);
-#ifdef FUSED_GLU
+#ifdef TWO_A
         write_a_tile(1);
 #endif
         write_b_tile();
@@ -441,7 +551,7 @@ void main() {
         // the next stage's loads run while this one computes
         if (k0 + BK < p.K) {
             load_a_tile(0, expert, ir, k0 + BK);
-#ifdef FUSED_GLU
+#ifdef TWO_A
             load_a_tile(1, expert, ir, k0 + BK);
 #endif
             load_b_tile(k0 + BK, tile_count);
@@ -450,82 +560,40 @@ void main() {
         [[unroll]] for (uint f = 0; f < BK / 16; ++f) {
             float16_t va[16];
             decode_a(false, lrow, f, va);
-#ifdef FUSED_GLU
+#ifdef TWO_A
             float16_t va2[16];
             decode_a(true, lrow, f, va2);
 #endif
-#ifndef EMULATE
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
-            [[unroll]] for (uint e = 0; e < 16; ++e) { ma[e] = va[e]; }
-#ifdef FUSED_GLU
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma2;
-            [[unroll]] for (uint e = 0; e < 16; ++e) { ma2[e] = va2[e]; }
-#endif
-#endif
+#ifdef EMULATE
             [[unroll]] for (uint c = 0; c < NC; ++c) {
                 if (c < nc_used) {
                     const uint b_off = c * 16 * BKP + f * 16;
-#ifdef EMULATE
                     frag_mul_add(va, b_off, acc[c]);
-#ifdef FUSED_GLU
+#ifdef TWO_A
                     frag_mul_add(va2, b_off, acc2[c]);
-#endif
-#else
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
-                    coopMatLoad(mb, sh_b, b_off, BKP, gl_CooperativeMatrixLayoutColumnMajor);
-                    acc[c] = coopMatMulAdd(ma, mb, acc[c]);
-#ifdef FUSED_GLU
-                    acc2[c] = coopMatMulAdd(ma2, mb, acc2[c]);
-#endif
 #endif
                 }
             }
+#else
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+            [[unroll]] for (uint e = 0; e < 16; ++e) { ma[e] = va[e]; }
+#ifdef TWO_A
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma2;
+            [[unroll]] for (uint e = 0; e < 16; ++e) { ma2[e] = va2[e]; }
+#endif
+            MMA_C(0) MMA_C(1) MMA_C(2) MMA_C(3) MMA_C(4) MMA_C(5) MMA_C(6) MMA_C(7)
+#endif
         }
     }
 
-    // each subgroup stores its 16 rows x 16 tokens through its part of sh_c, element (r, n) at n * 16 + r
-    const uint c_off = wave * 256;
-    const uint grow0 = ir * BM + wave * 16;
+    const uint grow0 = ir * BMW + wave * 16;
+#ifdef EMULATE
     [[unroll]] for (uint c = 0; c < NC; ++c) {
-        if (c >= nc_used) {
-            continue;
+        if (c < nc_used) {
+            epilogue(c, grow0, tile_count, acc[c] TWO_A_ARG(acc2[c]));
         }
-#ifdef EMULATE
-        frag_store(acc[c], c_off);
-#else
-        coopMatStore(acc[c], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor);
-#endif
-        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-        float v[8];
-        [[unroll]] for (uint i = 0; i < 8; ++i) {
-            v[i] = sh_c[c_off + lane + i * WARP];
-        }
-#ifdef FUSED_GLU
-        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-#ifdef EMULATE
-        frag_store(acc2[c], c_off);
-#else
-        coopMatStore(acc2[c], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor);
-#endif
-        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-        [[unroll]] for (uint i = 0; i < 8; ++i) {
-            const float g = v[i];
-            v[i] = g / (1.0 + exp(-g)) * sh_c[c_off + lane + i * WARP];
-        }
-#endif
-        [[unroll]] for (uint i = 0; i < 8; ++i) {
-            const uint idx = lane + i * WARP;
-            const uint r   = idx % 16;
-            const uint n   = c * 16 + idx / 16;
-            if (n < tile_count && grow0 + r < p.M) {
-                const u16vec2 ri = row_ids[n];
-                float val = v[i];
-                if ((p.fusion_flags & 1u) != 0) {
-                    val *= data_fscale[uint(ri.y) * p.nei0 + uint(ri.x)];
-                }
-                data_d[uint(ri.y) * p.batch_stride_d + uint(ri.x) * p.stride_d + grow0 + r] = val;
-            }
-        }
-        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
     }
+#else
+    EPILOGUE_C(0) EPILOGUE_C(1) EPILOGUE_C(2) EPILOGUE_C(3) EPILOGUE_C(4) EPILOGUE_C(5) EPILOGUE_C(6) EPILOGUE_C(7)
+#endif
 }

@@ -107,7 +107,12 @@ bool ggml_vk_set_tensor_mapped(vk_context & cpy_ctx, const ggml_tensor * tensor,
 // MUL_MAT_ID on mul_mmid_f16reg.comp (GGML_VK_MMID_F16REG): q4_K, q5_K (also the fused gate/up), q5_1 and q8_0 experts
 // with f32 activations read in place, the row map of count_experts.comp, rows in whole 128-row tiles and K in
 // whole 64-column stages of whole blocks, 32-bit offsets. from GGML_VK_MMID_F16REG_MIN_ROWS rows per expert on average
-// (16): decode batches take the mat-vec path before they get here
+// (16): decode batches take the mat-vec path before they get here.
+// the tiles (07.11, under test): GGML_VK_MMID_F16REG_BN (the single matmuls, the down projection) and
+// GGML_VK_MMID_F16REG_GLU_BN (the fused gate/up) take 64 or 128 tokens a tile (64): with ~78 rows per expert at -ub 4096
+// most experts get two tiles of 64, each loading and decoding its A again. GGML_VK_MMID_F16REG_ROWS2=1: the single
+// matmuls of 256-row multiples take 256 rows a workgroup in two A tiles that share each B fragment, as the fused gate/up
+// does; without a pipeline (the shared memory of the device) the 64-token tile and the plain one
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
                                      bool y_f32_kernel, uint64_t n_per_expert) {
     if (ctx->device->mmid_f16reg_mode == 0 || !y_f32_kernel || src1->type != GGML_TYPE_F32) {
@@ -139,15 +144,26 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
     if (glu_up != nullptr && (glu_up->type != src0->type || !ggml_are_same_shape(glu_up, src0) || ggml_nbytes(glu_up) > range)) {
         return nullptr;
     }
+    static const int bn_single = [] { const char * e = getenv("GGML_VK_MMID_F16REG_BN"); return e ? atoi(e) : 64; }();
+    static const int bn_glu    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_BN"); return e ? atoi(e) : 64; }();
+    static const bool rows2    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_ROWS2"); return e != nullptr && atoi(e) != 0; }();
     const int g = glu_up != nullptr ? 1 : 0;
-    vk_pipeline pipeline = ctx->device->pipeline_mmid_f16reg[t][g];
+    int v = g ? 1 : (rows2 && src0->ne[1] % 256 == 0 ? 2 : 0);
+    int b = (g ? bn_glu : bn_single) == 128 ? 1 : 0;
+    if (!ctx->device->pipeline_mmid_f16reg[t][v][b] && b == 1) {
+        b = 0;
+    }
+    if (!ctx->device->pipeline_mmid_f16reg[t][v][b] && v == 2) {
+        v = 0;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_mmid_f16reg[t][v][b];
     // the first choice of each pipeline, every one with GGML_VK_MMID_F16REG_LOG=1; on stderr as well with
     // GGML_SCHED_LOG_REALLOC, which 02 sets (llama-bench drops the ggml log)
     static const bool log_all = getenv("GGML_VK_MMID_F16REG_LOG") != nullptr;
     static const bool log_stderr = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
-    static bool logged[4][2] = {};
-    if (pipeline && (!logged[t][g] || log_all)) {
-        logged[t][g] = true;
+    static bool logged[4][3][2] = {};
+    if (pipeline && (!logged[t][v][b] || log_all)) {
+        logged[t][v][b] = true;
         GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID %s on %s (%s, %ld rows per expert)\n", ggml_type_name(src0->type), pipeline->name.c_str(),
                       g ? "fused gate/up" : "single", (long) n_per_expert);
         if (log_stderr) {

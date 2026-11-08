@@ -1131,11 +1131,13 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("coopmat_a_probe", "coopmat_a_probe.comp", {}, true, true);
 #endif
-    // fork: MUL_MAT_ID with the codes decoded into f16 A fragments; _emu: the same with subgroup shuffles
+    // fork: MUL_MAT_ID with the codes decoded into f16 A fragments; _glu: the fused gate/up, _r2: 256 rows a workgroup
+    // in two A tiles; _emu: the same with subgroup shuffles
     for (const std::string t : {"q4_k", "q5_k", "q5_1", "q8_0"}) {
         std::string def = "DATA_A_" + t;
         std::transform(def.begin(), def.end(), def.begin(), ::toupper);
-        for (bool glu : {false, true}) {
+        for (int v : {0, 1, 2}) {
+            const bool glu = v == 1;
             if (glu && t != "q4_k" && t != "q5_k") {
                 continue;
             }
@@ -1143,7 +1145,10 @@ void process_shaders() {
             if (glu) {
                 d["FUSED_GLU"] = "1";
             }
-            const std::string name = "mul_mmid_f16reg_" + t + (glu ? "_glu" : "");
+            if (v == 2) {
+                d["ROWS2"] = "1";
+            }
+            const std::string name = "mul_mmid_f16reg_" + t + (glu ? "_glu" : v == 2 ? "_r2" : "");
             string_to_spv(name + "_emu", "mul_mmid_f16reg.comp", merge_maps(d, {{"EMULATE", "1"}}));
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
             string_to_spv(name, "mul_mmid_f16reg.comp", d, true, true);
