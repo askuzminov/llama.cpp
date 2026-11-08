@@ -691,9 +691,10 @@ struct test_dsv4_hc_post_norm_f16 : public test_dsv4_hc {
 };
 
 // the combine, the f16 norm and the injection of the next hc mix of qwen4exp: hc_post_norm_f16, the reshape of the f16
-// streams to [hc*n_embd, n_tokens], the injection MUL_MAT(that, w_inject) transposed to [hc, n_tokens], and with down the
-// hc down projection over the same reshape (q8_0, the int8 path quantizes the f16 streams; Vulkan: HC_POST_NORM_MIX writes
-// those q8_1 blocks itself, GGML_VK_HC_MIX_Q8). the streams, the f16 copy, the injection (and the hc down) are compared
+// streams to [hc*n_embd, n_tokens], the injection MUL_MAT(that, w_inject) transposed to [hc, n_tokens], and with rank > 0
+// the hc down projection over the same reshape (q8_0, the int8 path quantizes the f16 streams; Vulkan: HC_POST_NORM_F16
+// writes those q8_1 blocks itself, GGML_VK_HC_POST_NORM_Q8). the streams, the f16 copy, the injection (and the hc down)
+// are compared
 struct test_hc_post_mix : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -1237,9 +1238,9 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(2560, n));
     }
     test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(257, 40));
-    // HC_POST_NORM_MIX: with the injection of the next mix, and with the hc down that reads the q8_1 blocks of the shader
+    // HC_POST_NORM_F16 with the injection of the next mix, and with the hc down that reads the q8_1 blocks of the shader
     // on the int8 path (rank 64 stays off the f16 coopmat path, GGML_VK_MM_F16REG_MIN_M); 2560 values a stream as in
-    // qwen4exp, 320 not a multiple of 128 (the matmul quantizes itself)
+    // qwen4exp, 320 not a multiple of 128 (blocks shared by two streams)
     for (int64_t n : {33, 64, 100}) {
         test_cases.emplace_back(new test_hc_post_mix(256, n, 0));
         test_cases.emplace_back(new test_hc_post_mix(256, n, 64));

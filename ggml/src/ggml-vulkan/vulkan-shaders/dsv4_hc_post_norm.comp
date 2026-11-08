@@ -4,6 +4,12 @@
 #ifdef N_F16
 #extension GL_EXT_shader_16bit_storage : require
 #endif
+#ifdef Q8
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "types.glsl"
+#endif
 
 // dsv4_hc_post with identity mixing, followed by the grouped RMSNorm and gamma
 // of the next hc mix (qwen4exp hc_combine -> hc_mix):
@@ -13,6 +19,11 @@
 //
 // One workgroup per token and stream. Each invocation keeps its d values in
 // registers, so d is not read back for the norm.
+//
+// fork, Q8 (with N_F16): n also as the q8_1 x4 blocks of the flattened [4*n_embd, n_tokens] tensor, the layout and
+// the arithmetic of quantize_q8_1.comp (QBLOCK_X4, A_F16), which the int8 matmul of the hc down then reads instead of
+// quantizing n itself (ggml_vk_dsv4_hc_post_norm). a block is 32 consecutive invocations at one column step: amax,
+// the sum and the packed words by clustered subgroup operations (full subgroups of at least 32)
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 512;
 
@@ -53,6 +64,9 @@ layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
 layout(binding = 5, std430) writeonly buffer N { float16_t data_n[]; };
 #else
 layout(binding = 5, std430) writeonly buffer N { float data_n[]; };
+#endif
+#ifdef Q8
+layout(binding = 6, std430) writeonly buffer Q { block_q8_1_x4 data_q[]; };
 #endif
 
 // n_embd <= MAX_COLS*BLOCK_SIZE, the host checks it
@@ -102,6 +116,36 @@ void main() {
     [[unroll]]
     for (uint k = 0; k < MAX_COLS; ++k) {
         const uint i0 = k * BLOCK_SIZE + tid;
+#ifdef Q8
+        // n_embd % 32 == 0 (the host checks it): a block is active or not as a whole
+        if (k * BLOCK_SIZE < n_embd) {
+            const float16_t n = i0 < n_embd ? float16_t(v[k] * scale * data_w[wb + i0]) : float16_t(0.0);
+            if (i0 < n_embd) {
+                data_d[db + i0] = v[k];
+                data_n[nb + i0] = n;
+            }
+            const float nf    = float(n);
+            const float amax  = subgroupClusteredMax(abs(nf), 32);
+            const float d     = amax / 127.0;
+            const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+            const float q     = round(nf * d_inv);
+            const float sum   = subgroupClusteredAdd(q, 32);
+            // 4 values to a word, the lowest index in the lowest byte (pack32 of quantize_q8_1.comp)
+            const uint lane = tid % 32;
+            const uint word = subgroupClusteredOr(uint(uint8_t(int8_t(round(q)))) << (8 * (lane % 4)), 4);
+            if (i0 < n_embd) {
+                const uint ib    = (it * gl_NumWorkGroups.x * n_embd + s * n_embd + i0) / 32;
+                const uint outer = ib / 4;
+                const uint inner = ib % 4;
+                if (lane % 4 == 0) {
+                    data_q[outer].qs[inner * 8 + lane / 4] = int32_t(word);
+                }
+                if (lane == 0) {
+                    data_q[outer].ds[inner] = f16vec2(vec2(d, sum * d));
+                }
+            }
+        }
+#else
         if (i0 < n_embd) {
             data_d[db + i0] = v[k];
 #ifdef N_F16
@@ -110,5 +154,6 @@ void main() {
             data_n[nb + i0] = v[k] * scale * data_w[wb + i0];
 #endif
         }
+#endif
     }
 }

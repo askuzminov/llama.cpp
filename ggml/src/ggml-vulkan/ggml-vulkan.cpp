@@ -3742,9 +3742,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f32,  "dsv4_hc_post_norm_f32",  dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f16n, "dsv4_hc_post_norm_f16n", dsv4_hc_post_norm_f16n_len, dsv4_hc_post_norm_f16n_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
-    // fork: HC_POST_NORM_MIX, a workgroup per token (ggml_vk_dsv4_hc_post_norm); f16 arithmetic for the rounding of the
-    // stored values
-    if (device->fp16) ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_mix,  "dsv4_hc_post_norm_mix",  dsv4_hc_post_norm_mix_len,  dsv4_hc_post_norm_mix_data,  "main", 9, sizeof(vk_fork_hc_post_norm_mix_push_constants), {1, 1, 1}, { 512 }, 1);
+    // fork: with the q8_1 blocks of the hc down (ggml_vk_dsv4_hc_post_norm): clustered subgroup operations over 32
+    // invocations in full subgroups, f16 arithmetic for the rounding of the stored values
+    if (device->fp16 && device->subgroup_clustered && device->subgroup_require_full_support && device->subgroup_size >= 32) {
+        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f16n_q8, "dsv4_hc_post_norm_f16n_q8", dsv4_hc_post_norm_f16n_q8_len, dsv4_hc_post_norm_f16n_q8_data, "main", 7, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1, false, true);
+    }
     // fork: short-row RMS norm (32 x 8 invocations, a row per 32) and the conv over the concat sources
     for (uint32_t w = 0; w < 2; ++w) {
         for (uint32_t g = 0; g < 2; ++g) {
@@ -15350,21 +15352,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
         if (ctx->num_additional_fused_ops) {
-            // There are up to two output nodes - topk_moe has two. fork: three in HC_POST_NORM_MIX (the streams, their
-            // f16 copy and the injection)
+            // There are up to two output nodes - topk_moe has two.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
-            ggml_tensor *output_nodes[3] {};
+            ggml_tensor *output_nodes[2] {};
             output_nodes[0] = cgraph->nodes[i + ctx->num_additional_fused_ops];
-            for (int o = 1; o < 3 && bits; ++o) {
+            if (bits) {
                 int output_idx = find_first_set(bits);
-                output_nodes[o] = cgraph->nodes[i + output_idx];
-                bits &= bits - 1;
+                GGML_ASSERT(bits == (1u << output_idx));
+                output_nodes[1] = cgraph->nodes[i + output_idx];
             }
-            GGML_ASSERT(bits == 0);
 
             bool need_disable = false;
 
-            for (int j = 0; j < 3; ++j) {
+            for (int j = 0; j < 2; ++j) {
                 ggml_tensor *dst = output_nodes[j];
                 if (!dst) {
                     continue;

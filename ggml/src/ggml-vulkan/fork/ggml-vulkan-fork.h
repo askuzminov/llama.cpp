@@ -31,26 +31,6 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_f16_edge
     { 6, 0, 5 }, // cpy->src[0]      == mul
 };
 
-// HC_POST_NORM_MIX: hc_post_norm_f16, then the injection of the mix that reads the normalized streams: their reshape to
-// [hc*n_embd, n_tokens], MUL_MAT(that, w_inject) [n_tokens, hc] (qwen4exp swaps the product from 5 tokens), its
-// transpose and the cont to [hc, n_tokens]. dsv4_hc_post_norm_mix.comp computes the injection from the f16 values it
-// stores; the reshape stays readable by the other consumers (the hc down)
-static constexpr std::initializer_list<ggml_op> hc_post_norm_mix_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY,
-                                                                          GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_TRANSPOSE, GGML_OP_CONT };
-
-static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_mix_edges {
-    { 1, 0, 0 },  // sigmoid->src[0]   == scale
-    { 2, 0, 1 },  // scale->src[0]     == sigmoid
-    { 3, 2, 2 },  // hc_post->src[2]   == scale (post)
-    { 4, 0, 3 },  // rms_norm->src[0]  == hc_post
-    { 5, 0, 4 },  // mul->src[0]       == rms_norm
-    { 6, 0, 5 },  // cpy->src[0]       == mul
-    { 7, 0, 6 },  // reshape->src[0]   == cpy
-    { 8, 0, 7 },  // mul_mat->src[0]   == reshape (the streams are the first operand)
-    { 9, 0, 8 },  // transpose->src[0] == mul_mat
-    { 10, 0, 9 }, // cont->src[0]      == transpose
-};
-
 struct vk_op_dsv4_hc_post_norm_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
@@ -73,16 +53,6 @@ struct vk_op_dsv4_hc_post_norm_push_constants {
     float    gate_scale_in;
     float    gate_scale_out;
     float    eps;
-};
-
-// dsv4_hc_post_norm_mix.comp: the constants of dsv4_hc_post_norm.comp, then the injection weight (the stride of its
-// columns, its offset), the offset of the injection and whether the q8_1 blocks of the normalized streams are written
-struct vk_fork_hc_post_norm_mix_push_constants {
-    vk_op_dsv4_hc_post_norm_push_constants base;
-    uint32_t nbwi1;
-    uint32_t wi_offset;
-    uint32_t inj_offset;
-    uint32_t q8;
 };
 
 // the gated norm of the qwen4exp GDN output: RMS_NORM, MUL by the weight, SIGMOID of the gate, MUL (build_norm_gated)
