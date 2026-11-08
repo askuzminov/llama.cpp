@@ -2182,10 +2182,11 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_layer_ffn(ggml_tensor * cu
     // the down projection of the experts reads its activation in f16 (LLAMA_MOE_DOWN_F16, 0 = f32 as upstream) on Vulkan
     // from LLAMA_MOE_DOWN_F16_MIN_TOKENS tokens (2048, where Vulkan fuses gate/up with the GLU): the fused kernel writes
     // the f16 cast itself and the down reads it in place, the same f16 values its kernel made from the f32 before. the
-    // 395 (08.11): an f16 copy made in the down op cost more than it gained (400.8 -> 412.9 ms a 4010-token ubatch)
+    // 395 (08.11): an f16 copy made in the down op cost more than it gained (400.8 -> 412.9 ms a 4010-token ubatch).
+    // the rows of cur, not n_tokens: the last layer and the MTP head keep only the output rows here
     static const bool down_f16 = llama_fork_env_int("LLAMA_MOE_DOWN_F16", 1) != 0;
     static const int64_t down_f16_min = llama_fork_env_int("LLAMA_MOE_DOWN_F16_MIN_TOKENS", 2048);
-    moe_down_f16_fork = down_f16 && n_tokens >= down_f16_min && qwen4exp_dev_is_vulkan(model.dev_layer(il));
+    moe_down_f16_fork = down_f16 && ggml_nrows(cur) >= down_f16_min && qwen4exp_dev_is_vulkan(model.dev_layer(il));
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,

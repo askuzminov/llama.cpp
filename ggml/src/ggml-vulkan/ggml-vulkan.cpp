@@ -8392,6 +8392,11 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids = dst->src[2];
+    // fork: the mat-vec id shaders take an f32 or q8_1 src1 (ggml_vk_get_dequantize_mul_mat_vec_id asserts), an f16
+    // one (the f16 down activation of build_moe_ffn, LLAMA_MOE_DOWN_F16) goes to the matmul path at any token count
+    if (dst->src[1]->type == GGML_TYPE_F16) {
+        return false;
+    }
     return ids->ne[1] <= 8 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 

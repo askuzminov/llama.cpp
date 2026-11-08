@@ -1109,6 +1109,10 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
     test_cases.emplace_back(new test_moe_glu_f16_down(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 8, 4, 256, 512, 200));
     test_cases.emplace_back(new test_moe_glu_f16_down(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, 8, 4, 256, 512, 200));
     test_cases.emplace_back(new test_moe_glu_f16_down(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 16, 4, 128, 256, 64));
+    // up to 8 tokens Vulkan takes the mat-vec id path, which reads no f16 src1: an f16 down goes to the matmul path
+    for (int64_t n : {1, 3, 8}) {
+        test_cases.emplace_back(new test_moe_glu_f16_down(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 8, 4, 256, 512, n));
+    }
     // the tiles of 128 tokens and the 256-row pairs (GGML_VK_MMID_F16REG_BN, _GLU_BN, _ROWS2): 512 rows, 150 rows per
     // expert on average, so that some experts take two tiles of 128
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {

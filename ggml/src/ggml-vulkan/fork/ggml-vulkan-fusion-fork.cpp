@@ -1175,6 +1175,10 @@ void ggml_vk_fork_pull_nodes(ggml_backend_vk_context * ctx, const struct ggml_cg
                 used[rg_idx] = true;
                 current_set.push_back(hc_idx);
                 used[hc_idx] = true;
+                // the activations of the matmul stay allocated until the DSV4_HC_PRE: freed after the matmul, the
+                // allocator could place the result there, and the backend drops a fusion whose output overlaps one of
+                // its sources (395, 08.11, profile-20261108-194131: 22 of 96 fused before this dependency)
+                params->add_alloc_dep(params->user_data, mm->src[1], graph->nodes[hc_idx]);
             }
         }
     }
