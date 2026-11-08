@@ -1862,8 +1862,8 @@ OP_KINDS = [("attention", ("FLASH_ATTN", "SOFT_MAX")),
                              "EXP", "LOG", "SOFTPLUS", "STEP", "ABS", "SQR", "SUM", "ROPE", "CLAMP", "FILL"))]
 
 # the form of a kept profile result: the log parts of the requests since 31.10, read into tables when reported, so that
-# a fix of the reading applies to the kept results too
-PROFILE_FORM = 2
+# a fix of the reading applies to the kept results too. 3 (08.11): a warm-up request before the parts
+PROFILE_FORM = 3
 
 
 def op_kind(name):
@@ -2025,6 +2025,13 @@ def cmd_profile():
             # a request that computes before the first part: CUDA's first report of a request holds the request
             # before it, and without one the first report of the part of depth 0 was its own prompt
             ask("start", 1, [{"role": "user", "content": "ok"}])
+            # a part and a short reply of their own before the measured ones: the first use of a pipeline compiles it
+            # (without the driver's cache: the shaders of a new build) and the GPU waits meanwhile; the perf logger
+            # takes the time between two timestamps, so that wait went to the next op. 08.11, 395, depth 0 right after
+            # a build: q5_K gate/up 150 ms in the first variant against 21.7 in the next one with the same pipeline.
+            # the end of the corpus, a conversation of its own: the parts share no prefix with it
+            n = int(part / ratio)
+            ask("warm", 8, [{"role": "user", "content": text[len(text) - n:] + "\n\nWhat is this part about?"}])
             offset, depth = 0, 0
             for d in depths:
                 # up to the depth in parts of at most 32768 tokens, each a turn of its own
@@ -2054,7 +2061,7 @@ def cmd_profile():
         for m in re.finditer(r"(\S+) compute buffer size =\s*([\d.]+) MiB", log.read_text(encoding="utf-8", errors="replace")):
             buffers[m[1]] = max(buffers.get(m[1], 0.0), float(m[2]))
         # the parts the tables need: the fills are left out
-        return {"buffers": buffers, "slices": {k: v for k, v in slices.items() if not k.startswith(("fill", "start"))}}
+        return {"buffers": buffers, "slices": {k: v for k, v in slices.items() if not k.startswith(("fill", "start", "warm"))}}
 
     results = []
     for name, arm_env in arms:
