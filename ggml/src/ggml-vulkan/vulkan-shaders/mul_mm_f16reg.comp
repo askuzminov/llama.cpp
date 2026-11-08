@@ -32,7 +32,7 @@
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint WMI = 2;   // 16-row A fragments of a subgroup
-layout(constant_id = 2) const uint WNI = 4;   // 16-token B fragments of a subgroup
+layout(constant_id = 2) const uint WNI = 4;   // 16-token B fragments of a subgroup (up to 8, WMI * WNI <= 16)
 layout(constant_id = 3) const uint WGM = 4;   // subgroups along M
 // the B tile of the next stage in registers while a stage computes: 1 as it is read (f32), 2 as f16 (half the registers
 // of f32 activations), 0 none - each stage reads its B tile into shared memory itself (07.11: the 64x64 tiles of a
@@ -314,7 +314,7 @@ void frag_mul_add(const float16_t a[16], const uint col0, const uint f, inout fl
 }
 #endif
 
-// the sums of a subgroup: element 4 i + j for A fragment i and B fragment j, of the 4 x 4 the WMI x WNI in use. with
+// the sums of a subgroup: element 8 i + j for A fragment i and B fragment j, of the 4 x 8 the WMI x WNI in use. with
 // coopmat every index below is a constant of the source and the arrays have their full size: in a loop the driver does
 // not unroll an index is computed at run time, and an array indexed at run time lives in scratch memory (07.11: every
 // 64x64 tile of a subgroup used 544 bytes or more of scratch a lane on the AMD driver, with or without the B tile in
@@ -322,7 +322,7 @@ void frag_mul_add(const float16_t a[16], const uint col0, const uint f, inout fl
 // the emulation keeps the loops of i and j: its registers are no question, and with the 16 calls written out 3 of 15
 // tiles failed the tests on the AMD GPU of the Mac (MoltenVK, 07.11), all passed with the loops
 #ifdef EMULATE
-#define ACC_ZERO(C) if ((C) / 4 < WMI && (C) % 4 < WNI) { [[unroll]] for (uint e = 0; e < 8; ++e) { acc[C][e] = 0.0; } }
+#define ACC_ZERO(C) if ((C) / 8 < WMI && (C) % 8 < WNI) { [[unroll]] for (uint e = 0; e < 8; ++e) { acc[C][e] = 0.0; } }
 #define STORE_ACC(I, J) \
     if (I < WMI && J < WNI) { \
         const uint row0 = ir * BM + (wm * WMI + I) * 16; \
@@ -331,12 +331,12 @@ void frag_mul_add(const float16_t a[16], const uint col0, const uint f, inout fl
             const uint r = (lane >> 4) + 2 * e; \
             const uint n = lane & 15; \
             if (row0 + r < p.M && col0 + n < p.N) { \
-                data_d[(col0 + n) * p.stride_d + row0 + r] = acc[I * 4 + J][e]; \
+                data_d[(col0 + n) * p.stride_d + row0 + r] = acc[I * 8 + J][e]; \
             } \
         } \
     }
 #else
-#define ACC_ZERO(C) if ((C) / 4 < WMI && (C) % 4 < WNI) { acc[C] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0); }
+#define ACC_ZERO(C) if ((C) / 8 < WMI && (C) % 8 < WNI) { acc[C] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0); }
 #define B_FRAG(J) \
             if (J < WNI) { \
                 coopMatLoad(mb[J], sh_b, ((wn * WNI + J) * 16 * BKP + f * 16) / 2, BKP / 2, gl_CooperativeMatrixLayoutColumnMajor); \
@@ -355,17 +355,21 @@ void frag_mul_add(const float16_t a[16], const uint col0, const uint f, inout fl
             if (I < WMI) { \
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma; \
                 A_FRAG(I) \
-                if (0 < WNI) { acc[I * 4 + 0] = coopMatMulAdd(ma, mb[0], acc[I * 4 + 0]); } \
-                if (1 < WNI) { acc[I * 4 + 1] = coopMatMulAdd(ma, mb[1], acc[I * 4 + 1]); } \
-                if (2 < WNI) { acc[I * 4 + 2] = coopMatMulAdd(ma, mb[2], acc[I * 4 + 2]); } \
-                if (3 < WNI) { acc[I * 4 + 3] = coopMatMulAdd(ma, mb[3], acc[I * 4 + 3]); } \
+                if (0 < WNI) { acc[I * 8 + 0] = coopMatMulAdd(ma, mb[0], acc[I * 8 + 0]); } \
+                if (1 < WNI) { acc[I * 8 + 1] = coopMatMulAdd(ma, mb[1], acc[I * 8 + 1]); } \
+                if (2 < WNI) { acc[I * 8 + 2] = coopMatMulAdd(ma, mb[2], acc[I * 8 + 2]); } \
+                if (3 < WNI) { acc[I * 8 + 3] = coopMatMulAdd(ma, mb[3], acc[I * 8 + 3]); } \
+                if (4 < WNI) { acc[I * 8 + 4] = coopMatMulAdd(ma, mb[4], acc[I * 8 + 4]); } \
+                if (5 < WNI) { acc[I * 8 + 5] = coopMatMulAdd(ma, mb[5], acc[I * 8 + 5]); } \
+                if (6 < WNI) { acc[I * 8 + 6] = coopMatMulAdd(ma, mb[6], acc[I * 8 + 6]); } \
+                if (7 < WNI) { acc[I * 8 + 7] = coopMatMulAdd(ma, mb[7], acc[I * 8 + 7]); } \
             }
 // through the subgroup's part of shared memory, so that a store instruction writes two whole 64-byte columns
 #define STORE_ACC(I, J) \
     if (I < WMI && J < WNI) { \
         const uint row0 = ir * BM + (wm * WMI + I) * 16; \
         const uint col0 = ic * BN + (wn * WNI + J) * 16; \
-        coopMatStore(acc[I * 4 + J], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor); \
+        coopMatStore(acc[I * 8 + J], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor); \
         controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
         [[unroll]] for (uint e = 0; e < 8; ++e) { \
             const uint idx = lane + e * WARP; \
@@ -411,7 +415,7 @@ void hc_pre_store(const uint row0, const uint col0, const uint c_off) {
     if (I < WMI && J < WNI) { \
         const uint c_off = wave * 256; \
         [[unroll]] for (uint e = 0; e < 8; ++e) { \
-            sh_c[c_off + (lane & 15) * 16 + (lane >> 4) + 2 * e] = acc[I * 4 + J][e]; \
+            sh_c[c_off + (lane & 15) * 16 + (lane >> 4) + 2 * e] = acc[I * 8 + J][e]; \
         } \
         controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
         hc_pre_store(ir * BM + (wm * WMI + I) * 16, ic * BN + (wn * WNI + J) * 16, c_off); \
@@ -420,7 +424,7 @@ void hc_pre_store(const uint row0, const uint col0, const uint c_off) {
 #else
 #define STORE_ACC(I, J) \
     if (I < WMI && J < WNI) { \
-        coopMatStore(acc[I * 4 + J], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor); \
+        coopMatStore(acc[I * 8 + J], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor); \
         controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
         hc_pre_store(ir * BM + (wm * WMI + I) * 16, ic * BN + (wn * WNI + J) * 16, c_off); \
         controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
@@ -437,14 +441,14 @@ void main() {
     const uint wn   = wave / WGM;             // and along N
 
 #ifdef EMULATE
-    float acc[16][8];
+    float acc[32][8];
 #else
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[16];
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[32];
 #endif
-    ACC_ZERO(0)  ACC_ZERO(1)  ACC_ZERO(2)  ACC_ZERO(3)
-    ACC_ZERO(4)  ACC_ZERO(5)  ACC_ZERO(6)  ACC_ZERO(7)
-    ACC_ZERO(8)  ACC_ZERO(9)  ACC_ZERO(10) ACC_ZERO(11)
-    ACC_ZERO(12) ACC_ZERO(13) ACC_ZERO(14) ACC_ZERO(15)
+    ACC_ZERO(0)  ACC_ZERO(1)  ACC_ZERO(2)  ACC_ZERO(3)  ACC_ZERO(4)  ACC_ZERO(5)  ACC_ZERO(6)  ACC_ZERO(7)
+    ACC_ZERO(8)  ACC_ZERO(9)  ACC_ZERO(10) ACC_ZERO(11) ACC_ZERO(12) ACC_ZERO(13) ACC_ZERO(14) ACC_ZERO(15)
+    ACC_ZERO(16) ACC_ZERO(17) ACC_ZERO(18) ACC_ZERO(19) ACC_ZERO(20) ACC_ZERO(21) ACC_ZERO(22) ACC_ZERO(23)
+    ACC_ZERO(24) ACC_ZERO(25) ACC_ZERO(26) ACC_ZERO(27) ACC_ZERO(28) ACC_ZERO(29) ACC_ZERO(30) ACC_ZERO(31)
 
     load_a_tile(ir, 0);
     if (BPF != 0) {
@@ -474,12 +478,12 @@ void main() {
                 float16_t va[16];
                 load_a_frag_lds((wm * WMI + i) * 16, f, va);
                 [[unroll]] for (uint j = 0; j < WNI; ++j) {
-                    frag_mul_add(va, (wn * WNI + j) * 16, f, acc[i * 4 + j]);
+                    frag_mul_add(va, (wn * WNI + j) * 16, f, acc[i * 8 + j]);
                 }
             }
 #else
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[4];
-            B_FRAG(0) B_FRAG(1) B_FRAG(2) B_FRAG(3)
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[8];
+            B_FRAG(0) B_FRAG(1) B_FRAG(2) B_FRAG(3) B_FRAG(4) B_FRAG(5) B_FRAG(6) B_FRAG(7)
             MMA_ROW(0) MMA_ROW(1) MMA_ROW(2) MMA_ROW(3)
 #endif
         }
@@ -489,8 +493,8 @@ void main() {
 #ifndef EMULATE
     const uint c_off = wave * 256;
 #endif
-    STORE_ACC(0, 0) STORE_ACC(0, 1) STORE_ACC(0, 2) STORE_ACC(0, 3)
-    STORE_ACC(1, 0) STORE_ACC(1, 1) STORE_ACC(1, 2) STORE_ACC(1, 3)
-    STORE_ACC(2, 0) STORE_ACC(2, 1) STORE_ACC(2, 2) STORE_ACC(2, 3)
-    STORE_ACC(3, 0) STORE_ACC(3, 1) STORE_ACC(3, 2) STORE_ACC(3, 3)
+    STORE_ACC(0, 0) STORE_ACC(0, 1) STORE_ACC(0, 2) STORE_ACC(0, 3) STORE_ACC(0, 4) STORE_ACC(0, 5) STORE_ACC(0, 6) STORE_ACC(0, 7)
+    STORE_ACC(1, 0) STORE_ACC(1, 1) STORE_ACC(1, 2) STORE_ACC(1, 3) STORE_ACC(1, 4) STORE_ACC(1, 5) STORE_ACC(1, 6) STORE_ACC(1, 7)
+    STORE_ACC(2, 0) STORE_ACC(2, 1) STORE_ACC(2, 2) STORE_ACC(2, 3) STORE_ACC(2, 4) STORE_ACC(2, 5) STORE_ACC(2, 6) STORE_ACC(2, 7)
+    STORE_ACC(3, 0) STORE_ACC(3, 1) STORE_ACC(3, 2) STORE_ACC(3, 3) STORE_ACC(3, 4) STORE_ACC(3, 5) STORE_ACC(3, 6) STORE_ACC(3, 7)
 }

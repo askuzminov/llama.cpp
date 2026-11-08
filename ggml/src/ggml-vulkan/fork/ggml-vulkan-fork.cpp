@@ -302,11 +302,12 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     const uint32_t bn    = gn * wn;
     const uint32_t wmi   = wm / 16;
     const uint32_t wni   = wn / 16;
-    // the shader holds the sums of a subgroup in 4 x 4 fragments named by constants (an array indexed at run time goes to
-    // scratch memory): at most 64 rows and 64 tokens per subgroup
-    if (waves > 16 || wmi > 4 || wni > 4 || bm > bs || bn > bs) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: at most 16 subgroups of at most 64 rows x 64 tokens, the rows and "
-                      "the tokens of the tile at most its invocations\n", env);
+    // the shader holds the sums of a subgroup in 4 x 8 fragments named by constants (an array indexed at run time goes to
+    // scratch memory): at most 64 rows and 128 tokens per subgroup, at most 16 fragments of sums (08.11: 8 B fragments
+    // to one decoded A fragment, half the decode work of 64 tokens per multiply)
+    if (waves > 16 || wmi > 4 || wni > 8 || wmi * wni > 16 || bm > bs || bn > bs) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG=%s: at most 16 subgroups of at most 64 rows x 128 tokens and 16 "
+                      "fragments of sums, the rows and the tokens of the tile at most its invocations\n", env);
         return;
     }
     const bool lds = a == 'l';

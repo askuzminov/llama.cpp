@@ -2215,8 +2215,10 @@ def cmd_micro():
 # 1305 ms against 1464. run 3: the sums named by constants in the shader instead of an array indexed in loops - do the
 # 64x64 and 48x64 tiles fit now, and do they go past ~24 TFLOP/s. run 3 (mm-20261107-225950): they fit (no scratch
 # but the 128-invocation 64x64/2x2), none passes r16x64/8x1: 1303 ms, r48x64/4x2 1361, l64x64/4x2n 1374, r64x64/4x2 1385
-MM_VARIANTS = ["r16x64/8x1", "l32x64/4x2", "r32x64/4x2", "r64x64/4x2", "r64x64/4x2h", "r64x64/2x4h", "r64x64/2x2",
-               "l64x64/4x2n", "l64x64/2x2", "r48x64/4x2", "r48x64/4x2h", "r64x48/2x4"]
+# run 4 (08.11): up to 8 B fragments a subgroup (128 tokens), so that one decoded A fragment serves 8 multiplies
+# instead of 4 and a stage (two barriers) carries twice the work: does that pass the ~24-25 TFLOP/s of every 64-token
+# tile. r16x64/8x1 is the default for comparison
+MM_VARIANTS = ["r16x64/8x1", "r16x128/8x1", "r16x96/8x1", "r16x128/4x2", "r32x128/4x2", "l16x128/8x1"]
 
 
 def cmd_mm():
