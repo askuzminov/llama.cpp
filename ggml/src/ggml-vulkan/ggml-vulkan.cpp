@@ -742,11 +742,24 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipeline_shader_create_info.setPNext(&pipeline_shader_stage_required_subgroup_size_create_info);
     }
 
-    // fork: GGML_VK_PIPELINE_ISA=<part of a pipeline name>: the internal representations the driver keeps of the matching
-    // pipelines (the shader ISA on AMD and RADV) go to stderr, for the instruction mix of a kernel
-    static const char * pipeline_isa_filter = getenv("GGML_VK_PIPELINE_ISA");
-    const bool dump_ir = pipeline_isa_filter != nullptr && device->pipeline_executable_properties_support &&
-                         pipeline->name.find(pipeline_isa_filter) != std::string::npos;
+    // fork: GGML_VK_PIPELINE_ISA=<part of a pipeline name>[|<part>...]: the internal representations the driver keeps of
+    // the matching pipelines (the shader ISA on AMD and RADV) go to stderr, for the instruction mix of a kernel
+    static const std::vector<std::string> pipeline_isa_parts = [] {
+        std::vector<std::string> parts;
+        const char * e = getenv("GGML_VK_PIPELINE_ISA");
+        for (std::string rest = e ? e : ""; !rest.empty(); ) {
+            const size_t bar = rest.find('|');
+            if (bar != 0) {
+                parts.push_back(rest.substr(0, bar));
+            }
+            rest = bar == std::string::npos ? "" : rest.substr(bar + 1);
+        }
+        return parts;
+    }();
+    bool dump_ir = false;
+    for (const std::string & part : pipeline_isa_parts) {
+        dump_ir = dump_ir || (device->pipeline_executable_properties_support && pipeline->name.find(part) != std::string::npos);
+    }
 
     vk::ComputePipelineCreateInfo compute_pipeline_create_info(
         device->pipeline_executable_properties_support ?
