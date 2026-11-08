@@ -294,9 +294,10 @@ static bool ggml_vk_fork_mm_f16reg_tile(const vk_device & device, const char * v
         return false;
     }
     lds = a == 'l';
-    // the shared memory of the shader: the A tile (f16, or codes and scales), the B tile in f16, a fragment per subgroup
+    // the shared memory of the shader: the A tile (f16, or codes in rows of 20 words and scales), the B tile in f16, a
+    // fragment per subgroup
     const uint32_t bkp = 72;
-    shmem = (lds ? bm * bkp * 2 : bm * 17 * 4 + bm * 2 * 2) + bn * bkp * 2 + waves * 256 * 4;
+    shmem = (lds ? bm * bkp * 2 : bm * 20 * 4 + bm * 2 * 2) + bn * bkp * 2 + waves * 256 * 4;
     if (shmem > device->properties.limits.maxComputeSharedMemorySize) {
         GGML_LOG_WARN("ggml_vulkan: %s=%s: %u bytes of shared memory, the device has %u\n", var, env, shmem,
                       device->properties.limits.maxComputeSharedMemorySize);
@@ -318,7 +319,8 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     // (K over GGML_VK_MM_F16REG_B16_MAX_K; 08.11, 05-mm: r16x96/8x1 25.2-25.9 TFLOP/s on the K 2560 shapes from the f16
     // copy against 23.6-24.0 of r16x64/8x1, but 16.5 against 24.1 on 2560 x 6144 with f32 in place).
     // GGML_VK_MM_F16REG_EMULATE=1: subgroup shuffles instead of coopmat (tests on devices without it)
-    // the default on RDNA3 since 08.11, r16x64/8x1: on the 395 a 4010-token prompt at depth 0 3962.2 against 4042.6 ms of
+    // the default on RDNA3 since 08.11, r16x64/8x1 (r16x96/8x1 for f16 activations since the evening, below): on the 395
+    // a 4010-token prompt at depth 0 3962.2 against 4042.6 ms of
     // gpu time (profile-20261107-234325, dense q8_0 1335.6 against 1415.1), the quality probes of 01 at least
     // as close to the reference as the int8 path (f16 activations: KL max 0.433 / 0.136 / 0.127 against 0.909 / 0.421 /
     // 0.133 at 4096 / 16384 / 32768, check-20261108-174220). GGML_VK_MM_F16REG=0: the int8 path
@@ -327,13 +329,20 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     if (env != nullptr && (*env == 0 || strcmp(env, "0") == 0)) {
         return;
     }
+    const char * env32 = getenv("GGML_VK_MM_F16REG_B32");
     if (env == nullptr) {
         if (!(device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3)) {
             return;
         }
-        env = "r16x64/8x1";
+        // since 08.11 (profile-20261108-225731, a 4010-token prompt at depth 0): r16x96/8x1 for the f16 activations and
+        // r16x64/8x1 for f32 in place, 3508.2 against 3557.6 ms with r16x64/8x1 on both; the shapes from the f16 copy
+        // 6-8% faster (10240 x 2560 7.67 against 8.32 ms), 512 and 640 rows 6-7% slower (4 ms of a ubatch), 2560 x 6144
+        // (f32 in place) the same. the tile does not change the order of the sums over K: the same results
+        env = "r16x96/8x1";
+        if (env32 == nullptr) {
+            env32 = "r16x64/8x1";
+        }
     }
-    const char * env32 = getenv("GGML_VK_MM_F16REG_B32");
     if (env32 == nullptr || *env32 == 0) {
         env32 = env;
     }
