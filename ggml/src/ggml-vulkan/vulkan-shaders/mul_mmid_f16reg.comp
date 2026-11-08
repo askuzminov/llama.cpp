@@ -52,8 +52,7 @@
 #define A_QK 32
 #define A_HIGH_BIT 1
 #elif defined(DATA_A_Q8_0)
-#define A_BLOCK_HALFS 17   // 34 bytes
-#define A_QK 32
+#define A_QK 32            // 34 bytes a block, a pair of blocks 17 words
 #define A_BYTES 1
 #else
 #error mul_mmid_f16reg.comp: no A type
@@ -78,16 +77,9 @@ layout(constant_id = 5) const uint D_F16 = 0;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#ifdef A_BYTES
-layout(binding = 0) readonly buffer A { uint16_t data_a[]; };
-#ifdef HAS_A2
-layout(binding = 6) readonly buffer A2 { uint16_t data_a2[]; };
-#endif
-#else
 layout(binding = 0) readonly buffer A { uint data_a[]; };
 #ifdef HAS_A2
 layout(binding = 6) readonly buffer A2 { uint data_a2[]; };
-#endif
 #endif
 layout(binding = 1) readonly buffer B { uvec4 data_b[]; };   // 4 f32 or 8 f16
 layout(binding = 2) writeonly buffer D { float data_d[]; };
@@ -146,7 +138,9 @@ shared f16vec2   sh_so2[BM * 2];
 shared uint      sh_qh2[BM * 2];
 #endif
 #endif
-shared float16_t sh_b[BN * BKP];            // B tile, column n at n * BKP
+// B tile, column n at n * BKP halves, as uvec4 of 8 halves: 128-bit stores (16-bit stores of single halves before,
+// 08.11 ISA); coopMatLoad reads the f16 matrix from them, the stride in uvec4
+shared uvec4     sh_b[BN * BKP / 8];
 // a 16x16 output fragment per subgroup; with EPI 1 none, but the up projection of GLU_SPLIT on its way to the gate
 #ifdef GLU_SPLIT
 const uint SH_C = EPI == 0 ? (BLOCK_SIZE / WARP) * 256 : (BLOCK_SIZE / WARP / 2) * 256;
@@ -159,7 +153,6 @@ shared u16vec2   row_ids[BN];
 // ---- A tile: the codes of 128 rows x 64 columns, two invocations per row. the second A: the up projection (FUSED_GLU,
 // binding 6) or the next 128 rows of the same experts (ROWS2)
 
-#ifndef A_BYTES
 uint a_word(const bool second, uint i) {
 #ifdef HAS_A2
     return second ? data_a2[i] : data_a[i];
@@ -167,15 +160,6 @@ uint a_word(const bool second, uint i) {
     return data_a[i];
 #endif
 }
-#else
-uint a_half(const bool second, uint i) {
-#ifdef HAS_A2
-    return uint(second ? data_a2[i] : data_a[i]);
-#else
-    return uint(data_a[i]);
-#endif
-}
-#endif
 
 #if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
 // 6-bit scale and min of sub-block j from the 12 scale bytes (get_scale_min_k4). the words of each branch are fixed
@@ -196,17 +180,26 @@ uvec2 scale_min_k4(uint j, uint sw0, uint sw1, uint sw2) {
 }
 #endif
 
-// the next stage of this invocation in registers: its loads are in flight while the current stage computes
+// the next stage of this invocation in registers as the words were loaded, [binding 0 or the first rows, binding 6 or the
+// second]: the loads are in flight while the current stage computes, the scales, the high bits and the repacked codes
+// are made at the write (08.11: made right at the loads, the AMD driver waited for each load before the stage could
+// compute, several memory round trips a stage in the ISA of q4_k_glu and q5_1_r2)
 #ifdef A_BYTES
 #define QREG 8
 #else
 #define QREG 4
 #endif
-uint    ra_qs[2][QREG];     // [binding 0, binding 6]
-f16vec2 ra_so[2];
-#ifdef A_HIGH_BIT
-uint    ra_qh[2];
+#if defined(DATA_A_Q4_K)
+#define RAW 8     // d and dmin, 3 words of scales, 4 words of codes
+#elif defined(DATA_A_Q5_K)
+#define RAW 16    // d and dmin, 3 words of scales, 8 words of high bits, 4 words of codes
+#elif defined(DATA_A_Q5_1)
+#define RAW 10    // d and m, qh of block h, 4 words of codes of each of the two blocks
+#else
+#define RAW 9     // q8_0: the 9 words of block h of the pair (scale and codes, see write_a_tile)
 #endif
+uint ra_raw[2][RAW];
+uint ra_j;                  // q4_K, q5_K: the 64-column chunk of the super-block of the loaded stage
 
 void load_a_tile(const uint m, const uint expert, const uint ir, const uint k0) {
     const uint tid  = gl_LocalInvocationID.x;
@@ -230,45 +223,42 @@ void load_a_tile(const uint m, const uint expert, const uint ir, const uint k0) 
 #if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
     const uint j  = (k0 % 256) / 64;       // the 64-column chunk of the super-block
     const uint bw = (row_blk + k0 / 256) * A_BLOCK_WORDS;
-    const vec2 dm = vec2(unpackHalf2x16(a_word(second, bw)));
-    const uvec2 sm = scale_min_k4(2 * j + h, a_word(second, bw + 1), a_word(second, bw + 2), a_word(second, bw + 3));
-    ra_so[m] = f16vec2(dm.x * float(sm.x), dm.y * float(sm.y));
+    ra_j = j;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        ra_raw[m][i] = a_word(second, bw + i);
+    }
 #if defined(DATA_A_Q4_K)
     const uint qsw = bw + 4 + j * 8 + h * 4;
-#else
-    const uint qsw = bw + 12 + j * 8 + h * 4;
-    // bit 2j + h of qh[l], l = 0..31, as bit l
-    const uint sbit = 2 * j + h;
-    uint qh = 0;
-    [[unroll]] for (uint w = 0; w < 8; ++w) {
-        const uint x = a_word(second, bw + 4 + w) >> sbit;
-        qh |= ((x & 1u) | ((x >> 7) & 2u) | ((x >> 14) & 4u) | ((x >> 21) & 8u)) << (4 * w);
-    }
-    ra_qh[m] = qh;
-#endif
     [[unroll]] for (uint i = 0; i < 4; ++i) {
-        ra_qs[m][i] = a_word(second, qsw + i);
+        ra_raw[m][4 + i] = a_word(second, qsw + i);
     }
+#else
+    [[unroll]] for (uint w = 0; w < 8; ++w) {
+        ra_raw[m][4 + w] = a_word(second, bw + 4 + w);
+    }
+    const uint qsw = bw + 12 + j * 8 + h * 4;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        ra_raw[m][12 + i] = a_word(second, qsw + i);
+    }
+#endif
 #elif defined(DATA_A_Q5_1)
-    // blocks k0 / 32 and k0 / 32 + 1: byte e of the chunk holds column e of the first block in its low nibble and of the
-    // second in its high nibble, as a K-quant chunk; invocation h makes bytes 16h .. 16h + 15
+    // blocks k0 / 32 and k0 / 32 + 1: invocation h takes the scale and the high bits of block h and the codes of both
     const uint bw0 = (row_blk + k0 / 32) * A_BLOCK_WORDS;
     const uint bw1 = bw0 + A_BLOCK_WORDS;
-    const uint bwh = h == 0 ? bw0 : bw1;
-    const vec2 dm = vec2(unpackHalf2x16(a_word(second, bwh)));
-    ra_so[m] = f16vec2(dm.x, -dm.y);
-    ra_qh[m] = a_word(second, bwh + 1);
+    const uint bwh = bw0 + h * A_BLOCK_WORDS;
+    ra_raw[m][0] = a_word(second, bwh);
+    ra_raw[m][1] = a_word(second, bwh + 1);
     [[unroll]] for (uint i = 0; i < 4; ++i) {
-        const uint q0 = a_word(second, bw0 + 2 + i);
-        const uint q1 = a_word(second, bw1 + 2 + i);
-        ra_qs[m][i] = h == 0 ? ((q0 & 0x0F0F0F0Fu) | ((q1 & 0x0F0F0F0Fu) << 4)) : (((q0 >> 4) & 0x0F0F0F0Fu) | (q1 & 0xF0F0F0F0u));
+        ra_raw[m][2 + i] = a_word(second, bw0 + 2 + i);
+        ra_raw[m][6 + i] = a_word(second, bw1 + 2 + i);
     }
 #elif defined(DATA_A_Q8_0)
-    // block k0 / 32 + h: its 32 bytes
-    const uint bh = (row_blk + k0 / 32 + h) * A_BLOCK_HALFS;
-    ra_so[m] = f16vec2(unpackHalf2x16(a_half(second, bh)).x, 0.0);
-    [[unroll]] for (uint i = 0; i < 8; ++i) {
-        ra_qs[m][i] = a_half(second, bh + 1 + 2 * i) | (a_half(second, bh + 2 + 2 * i) << 16);
+    // the block pair k0 / 32, k0 / 32 + 1 is 17 words (K % 64 == 0: rows and experts of whole pairs, a pair starts on a
+    // word): block 0 the scale in the low half of word 0, its codes in the high half of word 0 .. the low half of word 8,
+    // block 1 the scale in the high half of word 8, its codes in words 9 .. 16. invocation h takes words 8 h .. 8 h + 8
+    const uint pw = (row_blk + k0 / 32) / 2 * 17 + h * 8;
+    [[unroll]] for (uint i = 0; i < 9; ++i) {
+        ra_raw[m][i] = a_word(second, pw + i);
     }
 #endif
 }
@@ -277,20 +267,67 @@ void write_a_tile(const uint m) {
     const uint tid = gl_LocalInvocationID.x;
     const uint row = tid >> 1;
     const uint h   = tid & 1;
+    f16vec2 so;
+    uint qs[QREG];
+#ifdef A_HIGH_BIT
+    uint qh;
+#endif
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+    const vec2 dm = vec2(unpackHalf2x16(ra_raw[m][0]));
+    const uvec2 sm = scale_min_k4(2 * ra_j + h, ra_raw[m][1], ra_raw[m][2], ra_raw[m][3]);
+    so = f16vec2(dm.x * float(sm.x), dm.y * float(sm.y));
+#if defined(DATA_A_Q4_K)
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        qs[i] = ra_raw[m][4 + i];
+    }
+#else
+    // bit 2j + h of qh[l], l = 0..31, as bit l
+    const uint sbit = 2 * ra_j + h;
+    qh = 0;
+    [[unroll]] for (uint w = 0; w < 8; ++w) {
+        const uint x = ra_raw[m][4 + w] >> sbit;
+        qh |= ((x & 1u) | ((x >> 7) & 2u) | ((x >> 14) & 4u) | ((x >> 21) & 8u)) << (4 * w);
+    }
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        qs[i] = ra_raw[m][12 + i];
+    }
+#endif
+#elif defined(DATA_A_Q5_1)
+    // byte e of the chunk holds column e of the first block in its low nibble and of the second in its high nibble, as a
+    // K-quant chunk; invocation h makes bytes 16h .. 16h + 15. a select by mask (h == 0 ? .. : .. was a branch)
+    const vec2 dm = vec2(unpackHalf2x16(ra_raw[m][0]));
+    so = f16vec2(dm.x, -dm.y);
+    qh = ra_raw[m][1];
+    const uint msk = 0u - h;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint q0 = ra_raw[m][2 + i];
+        const uint q1 = ra_raw[m][6 + i];
+        qs[i] = ((((q0 >> 4) & 0x0F0F0F0Fu) | (q1 & 0xF0F0F0F0u)) & msk) | (((q0 & 0x0F0F0F0Fu) | ((q1 & 0x0F0F0F0Fu) << 4)) & ~msk);
+    }
+#elif defined(DATA_A_Q8_0)
+    // the scale: the low half of word 0 (block 0) or the high half of word 8 (block 1, its word 0 here); the codes of
+    // block 0 shifted by a half word, of block 1 as they are (a select by mask); stored biased by 128 (see bytes01)
+    const f16vec2 s2 = unpackFloat2x16(ra_raw[m][0]);
+    so = f16vec2(h == 0 ? s2.x : s2.y, 0.0);
+    const uint msk = 0u - h;
+    [[unroll]] for (uint i = 0; i < 8; ++i) {
+        qs[i] = ((ra_raw[m][i + 1] & msk) | (((ra_raw[m][i] >> 16) | (ra_raw[m][i + 1] << 16)) & ~msk)) ^ 0x80808080u;
+    }
+#endif
 #ifdef TWO_A
     if (m != 0) {
-        [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs2[row * QSW + h * QREG + i] = ra_qs[1][i]; }
-        sh_so2[row * 2 + h] = ra_so[1];
+        [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs2[row * QSW + h * QREG + i] = qs[i]; }
+        sh_so2[row * 2 + h] = so;
 #ifdef A_HIGH_BIT
-        sh_qh2[row * 2 + h] = ra_qh[1];
+        sh_qh2[row * 2 + h] = qh;
 #endif
         return;
     }
 #endif
-    [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs[row * QSW + h * QREG + i] = ra_qs[0][i]; }
-    sh_so[row * 2 + h] = ra_so[0];
+    [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs[row * QSW + h * QREG + i] = qs[i]; }
+    sh_so[row * 2 + h] = so;
 #ifdef A_HIGH_BIT
-    sh_qh[row * 2 + h] = ra_qh[0];
+    sh_qh[row * 2 + h] = qh;
 #endif
 }
 
@@ -309,26 +346,17 @@ void load_b_tile(const uint k0, const uint tile_count) {
         if (it < B_ITERS && t < BN * 4) {
             const uint n = t >> 2;
             const uint q = t & 3;
-            if (n < tile_count) {
-                const u16vec2 ri = row_ids[n];
-                // a multiple of 8: K, the strides (of the f16 copy, or f32 with 16-byte steps) and k0 are
-                const uint e0 = uint(ri.y) * p.batch_stride_b + (uint(ri.x) % p.ne11) * p.stride_b + k0 + q * 16;
-                if (B_F16 != 0) {
-                    rbh[it][0] = data_b[e0 / 8];
-                    rbh[it][1] = data_b[e0 / 8 + 1];
-                } else {
-                    [[unroll]] for (uint i = 0; i < 4; ++i) {
-                        rb[it][i] = uintBitsToFloat(data_b[e0 / 4 + i]);
-                    }
-                }
+            // columns past the rows of the tile read its last row: a column of B only feeds the same column of the
+            // sums, whose fragment part is not stored (no zeroing of the registers after the loads)
+            const u16vec2 ri = row_ids[min(n, tile_count - 1)];
+            // a multiple of 8: K, the strides (of the f16 copy, or f32 with 16-byte steps) and k0 are
+            const uint e0 = uint(ri.y) * p.batch_stride_b + (uint(ri.x) % p.ne11) * p.stride_b + k0 + q * 16;
+            if (B_F16 != 0) {
+                rbh[it][0] = data_b[e0 / 8];
+                rbh[it][1] = data_b[e0 / 8 + 1];
             } else {
-                if (B_F16 != 0) {
-                    rbh[it][0] = uvec4(0);
-                    rbh[it][1] = uvec4(0);
-                } else {
-                    [[unroll]] for (uint i = 0; i < 4; ++i) {
-                        rb[it][i] = vec4(0.0);
-                    }
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    rb[it][i] = uintBitsToFloat(data_b[e0 / 4 + i]);
                 }
             }
         }
@@ -342,15 +370,14 @@ void write_b_tile() {
         if (it < B_ITERS && t < BN * 4) {
             const uint n = t >> 2;
             const uint q = t & 3;
-            [[unroll]] for (uint i = 0; i < 4; ++i) {
-                f16vec4 v;
+            const uint o = (n * BKP + q * 16) / 8;
+            [[unroll]] for (uint j = 0; j < 2; ++j) {
                 if (B_F16 != 0) {
-                    v = f16vec4(unpackFloat2x16(rbh[it][i >> 1][2 * (i & 1)]), unpackFloat2x16(rbh[it][i >> 1][2 * (i & 1) + 1]));
+                    sh_b[o + j] = rbh[it][j];
                 } else {
-                    v = f16vec4(rb[it][i]);
+                    sh_b[o + j] = uvec4(packFloat2x16(f16vec2(rb[it][2 * j].xy)), packFloat2x16(f16vec2(rb[it][2 * j].zw)),
+                                        packFloat2x16(f16vec2(rb[it][2 * j + 1].xy)), packFloat2x16(f16vec2(rb[it][2 * j + 1].zw)));
                 }
-                const uint o = n * BKP + q * 16 + i * 4;
-                sh_b[o + 0] = v.x; sh_b[o + 1] = v.y; sh_b[o + 2] = v.z; sh_b[o + 3] = v.w;
             }
         }
     }
@@ -358,9 +385,11 @@ void write_b_tile() {
 
 // ---- A fragment: 16 columns of the row of this invocation, fragment f (0..3) of the stage
 
-// the f16 values of the four bytes of x (each below 256 and above -1024 after the bias): bytes 0, 2 and 1, 3
-f16vec2 bytes02(uint x) { return unpackFloat2x16((x & 0x00FF00FFu) | 0x64006400u) - f16vec2(1024.0); }
-f16vec2 bytes13(uint x) { return unpackFloat2x16(((x >> 8) & 0x00FF00FFu) | 0x64006400u) - f16vec2(1024.0); }
+// the f16 values of the four bytes of x (0 .. 255): bytes 0, 1 and 2, 3, the pairs of an A fragment register (columns
+// 2 j, 2 j + 1; bytes 0, 2 and 1, 3 cost three 16-bit moves a word to pair up, 08.11 ISA), by the f16 1024 trick:
+// 0x6400 | b is 1024 + b. bias: 1024, or 1152 for the q8_0 codes stored biased by 128 (exact in f16 either way)
+f16vec2 bytes01(uint x, float16_t bias) { return unpackFloat2x16((x & 0xFFu) | ((x << 8) & 0x00FF0000u) | 0x64006400u) - f16vec2(bias); }
+f16vec2 bytes23(uint x, float16_t bias) { return unpackFloat2x16(((x >> 16) & 0xFFu) | ((x >> 8) & 0x00FF0000u) | 0x64006400u) - f16vec2(bias); }
 
 void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[16]) {
 #ifdef TWO_A
@@ -373,14 +402,14 @@ void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[
     const uint base = lrow * QSW + (f >> 1) * 8 + (f & 1) * 4;
     [[unroll]] for (uint i = 0; i < 4; ++i) {
 #ifdef TWO_A
-        const uint x = (second ? sh_qs2[base + i] : sh_qs[base + i]) ^ 0x80808080u;
+        const uint x = second ? sh_qs2[base + i] : sh_qs[base + i];
 #else
-        const uint x = sh_qs[base + i] ^ 0x80808080u;
+        const uint x = sh_qs[base + i];
 #endif
-        const f16vec2 v02 = (bytes02(x) - f16vec2(128.0)) * so.x;
-        const f16vec2 v13 = (bytes13(x) - f16vec2(128.0)) * so.x;
-        v[4 * i + 0] = v02.x; v[4 * i + 2] = v02.y;
-        v[4 * i + 1] = v13.x; v[4 * i + 3] = v13.y;
+        const f16vec2 v01 = bytes01(x, float16_t(1152.0)) * so.x;
+        const f16vec2 v23 = bytes23(x, float16_t(1152.0)) * so.x;
+        v[4 * i + 0] = v01.x; v[4 * i + 1] = v01.y;
+        v[4 * i + 2] = v23.x; v[4 * i + 3] = v23.y;
     }
 #else
     // nibbles: bytes 16 (f & 1) .. + 15 of the chunk, low nibble for sub-block 0 (f < 2), high for sub-block 1
@@ -400,13 +429,15 @@ void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[
         uint x = (sh_qs[base + i] >> shift) & 0x0F0F0F0Fu;
 #endif
 #ifdef A_HIGH_BIT
-        const uint b = hb >> (4 * i);
-        x |= ((b & 1u) << 4) | ((b & 2u) << 11) | ((b & 4u) << 18) | ((b & 8u) << 25);
+        // bits 0..3 of b to bit 4 of bytes 0..3: b * 0x204081 holds bit k at 8 k (the four shifted copies of b do not
+        // overlap), a 24-bit multiply
+        const uint b = (hb >> (4 * i)) & 0xFu;
+        x |= ((b * 0x00204081u) & 0x01010101u) << 4;
 #endif
-        const f16vec2 v02 = bytes02(x) * so.x - so.y;
-        const f16vec2 v13 = bytes13(x) * so.x - so.y;
-        v[4 * i + 0] = v02.x; v[4 * i + 2] = v02.y;
-        v[4 * i + 1] = v13.x; v[4 * i + 3] = v13.y;
+        const f16vec2 v01 = bytes01(x, float16_t(1024.0)) * so.x - so.y;
+        const f16vec2 v23 = bytes23(x, float16_t(1024.0)) * so.x - so.y;
+        v[4 * i + 0] = v01.x; v[4 * i + 1] = v01.y;
+        v[4 * i + 2] = v23.x; v[4 * i + 3] = v23.y;
     }
 #endif
 }
@@ -420,7 +451,8 @@ void frag_mul_add(const float16_t a[16], const uint b_off, inout float acc[8]) {
     const uint lane = gl_SubgroupInvocationID;
     float16_t b[16];
     [[unroll]] for (uint k = 0; k < 16; ++k) {
-        b[k] = sh_b[b_off + (lane & 15) * BKP + k];
+        const uint hi = b_off + (lane & 15) * BKP + k;
+        b[k] = unpackFloat2x16(sh_b[hi / 8][(hi % 8) / 2])[hi % 2];
     }
     [[unroll]] for (uint e = 0; e < 8; ++e) {
         const uint row = (lane >> 4) + 2 * e;
@@ -612,7 +644,7 @@ void epilogue(const uint c, const uint grow0, const uint tile_count, ACC_PARAM(a
 #define MMA_C(C) \
                 if (C < NC && C < nc_used) { \
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb; \
-                    coopMatLoad(mb, sh_b, C * 16 * BKP + f * 16, BKP, gl_CooperativeMatrixLayoutColumnMajor); \
+                    coopMatLoad(mb, sh_b, (C * 16 * BKP + f * 16) / 8, BKP / 8, gl_CooperativeMatrixLayoutColumnMajor); \
                     acc[C] = coopMatMulAdd(ma, mb, acc[C]); \
                     MMA2(C) \
                 }
