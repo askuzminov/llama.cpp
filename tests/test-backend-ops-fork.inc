@@ -50,6 +50,164 @@ struct test_mul_mat_id_repeat : public test_mul_mat_id {
     }
 };
 
+// the expert FFN of qwen4exp on Vulkan with the down projection reading the f16 cast of the GLU (LLAMA_MOE_DOWN_F16):
+// up and gate MUL_MAT_ID, swiglu, cast to f16, the down MUL_MAT_ID of the f16, the router weights. Vulkan runs the first
+// four as one shader that writes the f16 (MUL_MAT_ID_MUL_MAT_ID_GLU_CPY) and the down reads it in place
+struct test_moe_glu_f16_down : public test_case {
+    const ggml_type type_gu;
+    const ggml_type type_down;
+    const int n_mats;
+    const int n_used;
+    const int64_t n_ff;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    test_moe_glu_f16_down(ggml_type type_gu, ggml_type type_down, int n_mats, int n_used, int64_t n_ff, int64_t n_embd, int64_t n_tokens)
+        : type_gu(type_gu), type_down(type_down), n_mats(n_mats), n_used(n_used), n_ff(n_ff), n_embd(n_embd), n_tokens(n_tokens) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GLU_F16_DOWN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_gu, type_down, n_mats, n_used, n_ff, n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 3 * (uint64_t) n_ff * n_embd * n_tokens * n_used;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type_gu, n_embd, n_ff, n_mats);
+        ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type_gu, n_embd, n_ff, n_mats);
+        ggml_tensor * downs = ggml_new_tensor_3d(ctx, type_down, n_ff, n_embd, n_mats);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        }
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * up    = ggml_mul_mat_id(ctx, ups, cur, ids);
+        ggml_tensor * gate  = ggml_mul_mat_id(ctx, gates, cur, ids);
+        ggml_tensor * act   = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * act16 = ggml_cast(ctx, act, GGML_TYPE_F16);
+        ggml_tensor * out   = ggml_mul_mat_id(ctx, downs, act16, ids); // [n_embd, n_used, n_tokens]
+        ggml_tensor * w     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        out = ggml_mul(ctx, out, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, false);
+    }
+};
+
+// the up projection of a hyper-connection mix of qwen4exp and the gated DSV4_HC_PRE after it: MUL_MAT of q8_0 gates for
+// 4 streams of n_embd values, the reshape to [n_embd, 4, n_tokens], the mean of sigmoid(gate) * x over the streams.
+// Vulkan with mul_mm_f16reg.comp does the DSV4_HC_PRE in the matmul's store (MUL_MAT_DSV4_HC_PRE). x in f32 or, as on
+// Vulkan with LLAMA_HC_F16, cast to f16
+struct test_mm_hc_pre : public test_case {
+    const bool    x_f16;
+    const int64_t n_embd;
+    const int64_t k;
+    const int64_t n_tokens;
+
+    test_mm_hc_pre(bool x_f16, int64_t n_embd, int64_t k, int64_t n_tokens) : x_f16(x_f16), n_embd(n_embd), k(k), n_tokens(n_tokens) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_HC_PRE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(x_f16, n_embd, k, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * (uint64_t) 4 * n_embd * k * n_tokens;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 4 * n_embd);
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(lo, "lo");
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 4, n_tokens);
+        ggml_set_name(x, "x");
+        if (x_f16) {
+            x = ggml_cast(ctx, x, GGML_TYPE_F16);
+        }
+        ggml_tensor * gate = ggml_mul_mat(ctx, w, lo);
+        ggml_tensor * out  = ggml_dsv4_hc_pre_gated(ctx, x, ggml_reshape_3d(ctx, gate, n_embd, 4, n_tokens), 0.25f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// a whole hyper-connection mix of qwen4exp as its graph builds it on Vulkan (build_hc_mix): the grouped RMS norm cast to
+// f16, the down projection, silu of 1/4 of it, the up projection, the gated DSV4_HC_PRE, and the injection matmul of the
+// same streams. with graph_optimize, so that the injection matmul is free to move between the up projection and the
+// DSV4_HC_PRE (the reorder of MUL_MAT_DSV4_HC_PRE keeps them together)
+struct test_hc_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t rank;
+    const int64_t n_tokens;
+
+    test_hc_mix(int64_t n_embd, int64_t rank, int64_t n_tokens) : n_embd(n_embd), rank(rank), n_tokens(n_tokens) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, rank, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool test_graph_optimize() override { return true; }
+
+    // two q8_0 matmuls in a row, the second of a silu of the first: the int8 path ends near 5e-4
+    double max_nmse_err() override { return 2e-3; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w_norm   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_tensor * w_down   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc * n_embd, rank);
+        ggml_tensor * w_up     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, rank, hc * n_embd);
+        ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc * n_embd, hc);
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
+        xn = ggml_cast(ctx, xn, GGML_TYPE_F16);
+        xn = ggml_reshape_2d(ctx, xn, hc * n_embd, n_tokens);
+
+        ggml_tensor * lo   = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down, xn), 1.0f / hc));
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, lo);
+        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, n_embd, hc, n_tokens),
+                                                     ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f / hc);
+        ggml_tensor * inject = ggml_cont(ctx, ggml_transpose(ctx, ggml_mul_mat(ctx, xn, w_inject))); // [hc, n_tokens]
+
+        // both results in one output: the mix plus the sum of the injection of its token
+        ggml_tensor * out = ggml_add(ctx, mixed, ggml_sum_rows(ctx, inject));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MUL_MAT followed by RELU, as the per-head indexer scores of qwen4exp. heads > 1 reads b as every heads-th row of
 // a larger matrix (the scores of one head). backends may rectify the result at the matmul store
 struct test_mul_mat_relu : public test_case {
@@ -938,6 +1096,19 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 200, 256, 512,
             true, 8, 4, true, false, true, false, {1, 1}));
     }
+    // the hc up projection and the DSV4_HC_PRE in one store (MUL_MAT_DSV4_HC_PRE; GGML_VK_MM_F16REG_MIN_N/_MIN_M=1 take
+    // the small ones): qwen4exp at 2560 values a stream and K 320, partial tiles of rows and tokens
+    test_cases.emplace_back(new test_hc_mix(256, 64, 128));
+    test_cases.emplace_back(new test_hc_mix(640, 320, 100));
+    for (bool x_f16 : { true, false }) {
+        test_cases.emplace_back(new test_mm_hc_pre(x_f16, 640, 320, 257));
+        test_cases.emplace_back(new test_mm_hc_pre(x_f16, 64, 320, 64));
+        test_cases.emplace_back(new test_mm_hc_pre(x_f16, 96, 128, 100));
+    }
+    // the f16 GLU into the down projection (LLAMA_MOE_DOWN_F16; GGML_VK_MMID_GLU_MIN_TOKENS=0 fuses below 2048 tokens)
+    test_cases.emplace_back(new test_moe_glu_f16_down(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 8, 4, 256, 512, 200));
+    test_cases.emplace_back(new test_moe_glu_f16_down(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, 8, 4, 256, 512, 200));
+    test_cases.emplace_back(new test_moe_glu_f16_down(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 16, 4, 128, 256, 64));
     // the tiles of 128 tokens and the 256-row pairs (GGML_VK_MMID_F16REG_BN, _GLU_BN, _ROWS2): 512 rows, 150 rows per
     // expert on average, so that some experts take two tiles of 128
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {

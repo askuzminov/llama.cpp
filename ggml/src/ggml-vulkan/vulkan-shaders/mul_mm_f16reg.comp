@@ -24,7 +24,11 @@
 // B: the activations, f32 (f16 with B_F16) read in place and stored as f16 in shared memory. D: f32, column n at
 // n * stride_d. EMULATE: the same with subgroup shuffles instead of coopmat, for the tests of devices without them.
 // the host makes sure that K is a multiple of 64 (a block pair of a row starts on a word), B starts on 16 bytes and its
-// columns are contiguous, and that BM and BN are at most BLOCK_SIZE
+// columns are contiguous, and that BM and BN are at most BLOCK_SIZE.
+// HC_PRE (qwen4exp, the up projection of a hyper-connection mix and the DSV4_HC_PRE after it in one): the M = 4 E rows
+// of A are the gates of 4 streams of E values (row s E + e), taken interleaved (tile row 4 e + s), and the store writes
+// D[e, t] = hc_scale * sum_s sigmoid(sum[4 e + s, t]) * X[e, s, t] instead of the sums, so that the gates (4 E floats a
+// token) never go to memory. X: the normalized streams, f32 or f16 (X_F16)
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint WMI = 2;   // 16-row A fragments of a subgroup
@@ -34,6 +38,7 @@ layout(constant_id = 3) const uint WGM = 4;   // subgroups along M
 // of f32 activations), 0 none - each stage reads its B tile into shared memory itself (07.11: the 64x64 tiles of a
 // subgroup spilled registers on the AMD driver with 1, 227-256 VGPR)
 layout(constant_id = 4) const uint BPF = 1;
+layout(constant_id = 5) const uint X_F16 = 1;   // HC_PRE: the streams in f16
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -74,7 +79,18 @@ layout(push_constant) uniform parameter {
     uint broadcast3;
     uint padded_N;
     uint fusion_flags;
+#ifdef HC_PRE
+    uint hc_e;          // values of a stream, M / 4
+    uint hc_x1;         // X: elements between the streams of a token
+    uint hc_x2;         // X: elements between tokens
+    uint hc_d1;         // D: elements between tokens
+    float hc_scale;
+#endif
 } p;
+#ifdef HC_PRE
+layout(binding = 3) readonly buffer X { float data_x[]; };
+layout(binding = 3) readonly buffer X16 { float16_t data_x16[]; };
+#endif
 
 #ifdef A_LDS
 shared f16vec2   sh_a[BM * BKP / 2];          // A tile in f16, row m at m * BKP halves
@@ -84,7 +100,7 @@ shared uint      sh_qs[BM * QSW];
 shared float16_t sh_d[BM * 2];                // the scales of the two blocks of a row
 #endif
 shared f16vec2   sh_b[BN * BKP / 2];          // B tile in f16, token n at n * BKP halves
-#ifndef EMULATE
+#if !defined(EMULATE) || defined(HC_PRE)
 shared float     sh_c[NWAVE * 256];           // a 16x16 output fragment per subgroup on its way out
 #endif
 
@@ -105,7 +121,13 @@ void load_a_tile(const uint ir, const uint k0) {
             const uint row  = t >> 1;
             const uint h    = t & 1;
             // rows past M read the last row, their results are not stored
+#ifdef HC_PRE
+            // tile row 4 e + s is row s E + e of A
+            const uint g    = min(ir * BM + row, p.M - 1);
+            const uint grow = (g & 3u) * p.hc_e + (g >> 2);
+#else
             const uint grow = min(ir * BM + row, p.M - 1);
+#endif
             const uint pw   = (grow * (p.stride_a / 32) + k0 / 32) / 2 * 17 + h * 8;
             [[unroll]] for (uint i = 0; i < 9; ++i) {
                 ra_w[it][i] = data_a[pw + i];
@@ -355,6 +377,55 @@ void frag_mul_add(const float16_t a[16], const uint col0, const uint f, inout fl
         } \
         controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
     }
+#endif
+
+#ifdef HC_PRE
+// the fragment of a subgroup is in sh_c (element (r, n) at c_off + n * 16 + r): rows row0 + r are the gates of stream
+// r % 4 of value row0 / 4 + r / 4. each invocation writes 2 of the 4 x 16 results
+float hc_x(const uint i) {
+    return X_F16 != 0 ? float(data_x16[i]) : data_x[i];
+}
+
+void hc_pre_store(const uint row0, const uint col0, const uint c_off) {
+    const uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint i = 0; i < 2; ++i) {
+        const uint o = lane + i * WARP;
+        const uint k = o & 3u;
+        const uint n = o >> 2;
+        const uint e = (row0 >> 2) + k;
+        const uint t = col0 + n;
+        if (e < p.hc_e && t < p.N) {
+            float v = 0.0;
+            [[unroll]] for (uint st = 0; st < 4; ++st) {
+                const float g = sh_c[c_off + n * 16 + 4 * k + st];
+                v += hc_x(t * p.hc_x2 + st * p.hc_x1 + e) / (1.0 + exp(-g));
+            }
+            data_d[t * p.hc_d1 + e] = v * p.hc_scale;
+        }
+    }
+}
+
+#undef STORE_ACC
+#ifdef EMULATE
+#define STORE_ACC(I, J) \
+    if (I < WMI && J < WNI) { \
+        const uint c_off = wave * 256; \
+        [[unroll]] for (uint e = 0; e < 8; ++e) { \
+            sh_c[c_off + (lane & 15) * 16 + (lane >> 4) + 2 * e] = acc[I * 4 + J][e]; \
+        } \
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
+        hc_pre_store(ir * BM + (wm * WMI + I) * 16, ic * BN + (wn * WNI + J) * 16, c_off); \
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
+    }
+#else
+#define STORE_ACC(I, J) \
+    if (I < WMI && J < WNI) { \
+        coopMatStore(acc[I * 4 + J], sh_c, c_off, 16, gl_CooperativeMatrixLayoutColumnMajor); \
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
+        hc_pre_store(ir * BM + (wm * WMI + I) * 16, ic * BN + (wn * WNI + J) * 16, c_off); \
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease); \
+    }
+#endif
 #endif
 
 void main() {

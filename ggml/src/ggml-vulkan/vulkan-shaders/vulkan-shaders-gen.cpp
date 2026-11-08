@@ -1161,21 +1161,27 @@ void process_shaders() {
         }
     }
     // fork: dense MUL_MAT of q8_0 on f16 WMMA (GGML_VK_MM_F16REG); _lds: A decoded to f16 in shared memory, _reg: in
-    // registers; _b16: f16 activations; _emu: subgroup shuffles instead of coopmat
+    // registers; _b16: f16 activations; _hcpre: the DSV4_HC_PRE after it in the store; _emu: subgroup shuffles instead
+    // of coopmat
     for (bool lds : {false, true}) {
         for (bool b16 : {false, true}) {
-            std::map<std::string, std::string> d;
-            if (lds) {
-                d["A_LDS"] = "1";
-            }
-            if (b16) {
-                d["B_F16"] = "1";
-            }
-            const std::string name = std::string("mul_mm_f16reg_q8_0") + (lds ? "_lds" : "_reg") + (b16 ? "_b16" : "_b32");
-            string_to_spv(name + "_emu", "mul_mm_f16reg.comp", merge_maps(d, {{"EMULATE", "1"}}));
+            for (bool hc : {false, true}) {
+                std::map<std::string, std::string> d;
+                if (lds) {
+                    d["A_LDS"] = "1";
+                }
+                if (b16) {
+                    d["B_F16"] = "1";
+                }
+                if (hc) {
+                    d["HC_PRE"] = "1";
+                }
+                const std::string name = std::string("mul_mm_f16reg_q8_0") + (lds ? "_lds" : "_reg") + (b16 ? "_b16" : "_b32") + (hc ? "_hcpre" : "");
+                string_to_spv(name + "_emu", "mul_mm_f16reg.comp", merge_maps(d, {{"EMULATE", "1"}}));
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-            string_to_spv(name, "mul_mm_f16reg.comp", d, true, true);
+                string_to_spv(name, "mul_mm_f16reg.comp", d, true, true);
 #endif
+            }
         }
     }
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

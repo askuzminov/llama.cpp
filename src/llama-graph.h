@@ -1110,6 +1110,10 @@ struct llm_graph_context {
 
     const llama_moe_cache_fork * moe_cache_fork;
 
+    // fork: build_moe_ffn casts the activation of the down projection to f16 (a model graph sets it for the layers of a
+    // backend whose fused gate/up writes the cast: qwen4exp on Vulkan, LLAMA_MOE_DOWN_F16)
+    bool moe_down_f16_fork = false;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 

@@ -116,11 +116,14 @@ bool ggml_vk_set_tensor_mapped(vk_context & cpy_ctx, const ggml_tensor * tensor,
 // 144 VGPR against 92 for a cheap decode), 0 - none, 1 - every type. without a pipeline (the shared memory of the
 // device) the 64-token tile and the plain one
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
-                                     bool y_f32_kernel, uint64_t n_per_expert, bool * b16) {
+                                     bool y_in_place, uint64_t n_per_expert, bool * b16, bool d16) {
     if (b16 != nullptr) {
         *b16 = false;
     }
-    if (ctx->device->mmid_f16reg_mode == 0 || !y_f32_kernel || src1->type != GGML_TYPE_F32) {
+    // f32 activations read in place or through an f16 copy; f16 ones (the down projection after the f16 result of the
+    // fused gate/up) read in place
+    if (ctx->device->mmid_f16reg_mode == 0 || !y_in_place || (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) ||
+        (d16 && glu_up == nullptr)) {
         return nullptr;
     }
     static const uint64_t min_rows = [] { const char * env = getenv("GGML_VK_MMID_F16REG_MIN_ROWS"); return env ? (uint64_t) atoi(env) : 16u; }();
@@ -156,25 +159,29 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
     static const int bn_glu    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_BN"); return e ? atoi(e) : 64; }();
     static const int rows2_env = [] { const char * e = getenv("GGML_VK_MMID_F16REG_ROWS2"); return e ? atoi(e) : -1; }();
     static const bool glu_split = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_SPLIT"); return e != nullptr && atoi(e) != 0; }();
+    // the fused gate/up reads the f16 copy by default since 08.11 (the 395, profile-20261108-181557: 664.3 -> 612.6 ms of
+    // a 4010-token ubatch with the copy); the single matmuls not (the down projection 400.8 -> 412.9: its 103 MB input
+    // costs more to copy than its kernel gains)
     static const bool b16_single = [] { const char * e = getenv("GGML_VK_MMID_F16REG_B16"); return e != nullptr && atoi(e) != 0; }();
-    static const bool b16_glu    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_B16"); return e != nullptr && atoi(e) != 0; }();
+    static const bool b16_glu    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_B16"); return e == nullptr || atoi(e) != 0; }();
     const bool rows2 = rows2_env > 0 || (rows2_env < 0 && src0->type == GGML_TYPE_Q5_1);
     const int g = glu_up != nullptr ? 1 : 0;
     int v = g ? (glu_split && src0->ne[1] % 64 == 0 ? 3 : 1) : (rows2 && src0->ne[1] % 256 == 0 ? 2 : 0);
     const int bn_want = g ? bn_glu : bn_single;
     int b = bn_want == 128 ? 1 : bn_want == 32 ? 2 : 0;
-    int h = (g ? b16_glu : b16_single) ? 1 : 0;
+    int h = src1->type == GGML_TYPE_F16 || (g ? b16_glu : b16_single) ? 1 : 0;
+    const int o = d16 ? 1 : 0;
     auto & pipes = ctx->device->pipeline_mmid_f16reg;
-    if (!pipes[t][v][b][h] && v == 3) {
+    if (!pipes[t][v][b][h][o] && v == 3) {
         v = 1;
     }
-    if (!pipes[t][v][b][h] && v == 2) {
+    if (!pipes[t][v][b][h][o] && v == 2) {
         v = 0;
     }
-    if (!pipes[t][v][b][h] && b != 0) {
+    if (!pipes[t][v][b][h][o] && b != 0) {
         b = 0;
     }
-    vk_pipeline pipeline = pipes[t][v][b][h];
+    vk_pipeline pipeline = pipes[t][v][b][h][o];
     if (b16 != nullptr) {
         *b16 = pipeline != nullptr && h != 0;
     }
@@ -182,9 +189,9 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
     // GGML_SCHED_LOG_REALLOC, which 02 sets (llama-bench drops the ggml log)
     static const bool log_all = getenv("GGML_VK_MMID_F16REG_LOG") != nullptr;
     static const bool log_stderr = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
-    static bool logged[4][4][3][2] = {};
-    if (pipeline && (!logged[t][v][b][h] || log_all)) {
-        logged[t][v][b][h] = true;
+    static bool logged[4][4][3][2][2] = {};
+    if (pipeline && (!logged[t][v][b][h][o] || log_all)) {
+        logged[t][v][b][h][o] = true;
         GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID %s on %s (%s, %ld rows per expert)\n", ggml_type_name(src0->type), pipeline->name.c_str(),
                       g ? "fused gate/up" : "single", (long) n_per_expert);
         if (log_stderr) {
@@ -215,11 +222,15 @@ static bool ggml_vk_fork_tensor_buffer(const ggml_backend_vk_context * ctx, cons
     return true;
 }
 
-// MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): f32 or f16 activations read in place, from
-// GGML_VK_MM_F16REG_MIN_N tokens (64), GGML_VK_MM_F16REG_MIN_M rows (512) and GGML_VK_MM_F16REG_MIN_K columns (1024),
-// 2D, K a multiple of 64 (a block pair of a row on a word), the activations on 16 bytes, nothing fused into the matmul
+// MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): f16 activations, f32 ones of K <= 4096 through an
+// f16 copy, longer ones read in place; from GGML_VK_MM_F16REG_MIN_N tokens (64) and GGML_VK_MM_F16REG_MIN_M rows (512)
+// (and K 1024 for f32 read in place), 2D, K a multiple of 64 (a block pair of a row on a word), the activations on 16
+// bytes, nothing fused into the matmul
+// hc_pre (MUL_MAT_DSV4_HC_PRE): the gated DSV4_HC_PRE that reads dst (through a reshape) takes the store, the result goes
+// to its tensor and dst is not written. check_only: the answer without a dispatch (the fusion check)
 bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                            const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags) {
+                            const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags, const ggml_tensor * hc_pre,
+                            bool check_only) {
     const vk_device & device = ctx->device;
     if (device->mm_f16reg_mode == 0 || fused_dst != nullptr || fusion_flags != 0 || src0->type != GGML_TYPE_Q8_0 ||
         (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
@@ -229,13 +240,22 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
     // few rows over a long K (the hc down projection of qwen4exp, 320 x 10240) leave few workgroups, each a long walk
     // over K: there the int8 path was faster on the 395 (07.11, 05-mm: 17.2 against 15.8 TFLOP/s with f16 activations)
     static const int64_t min_m = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_M"); return e ? (int64_t) atoll(e) : (int64_t) 512; }();
-    // a short K: in the model on the 395 the hc up projection (10240 x 320) took 2.43 ms a call against 1.49 on the int8
-    // path, while the 05-mm perf test gave 1.34 (profile-20261107-232325); 2560 x 640 and 640 x 2560 lost ~20% against
-    // that test as well. from K 2560 the kernel wins in the model too
-    static const int64_t min_k = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_K"); return e ? (int64_t) atoll(e) : (int64_t) 1024; }();
+    // the f32 activations of K <= GGML_VK_MM_F16REG_B16_MAX_K (4096) go to an f16 copy in prealloc_y first, once for the
+    // matmuls in a row that read the same tensor, and the f16 pipeline reads that (GGML_VK_MM_F16REG_B16=0: B read in
+    // place as f32). on the 395 (08.11, profile-20261108-181557, ms of a 4010-token ubatch) the f32 B read in place was
+    // what lost in the model on a short K: 10240 x 320 232.8 in place, 101.8 from the copy, 143.9 on the int8 path; the
+    // big shapes 10240 x 2560 334.6 -> 299.6, 6144 x 2560 186.4 -> 161.4; 2560 x 6144 233.2 -> 250.8 (a copy of 98 MB of
+    // one consumer costs more than the kernel gains), hence the bound on K
+    static const bool b16_copy = [] { const char * e = getenv("GGML_VK_MM_F16REG_B16"); return e == nullptr || atoi(e) != 0; }();
+    static const int64_t b16_max_k = [] { const char * e = getenv("GGML_VK_MM_F16REG_B16_MAX_K"); return e ? (int64_t) atoll(e) : (int64_t) 4096; }();
+    // a short K read in place as f32: in the model the hc up projection (10240 x 320) took 2.43 ms a call against 1.49 on
+    // the int8 path (profile-20261107-232325); with the f16 copy no bound (GGML_VK_MM_F16REG_MIN_K: for both)
+    static const int64_t min_k_env = [] { const char * e = getenv("GGML_VK_MM_F16REG_MIN_K"); return e ? (int64_t) atoll(e) : (int64_t) -1; }();
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
+    const bool to_f16 = b16_copy && src1->type == GGML_TYPE_F32 && K <= b16_max_k && device->pipeline_mm_f16reg[1] && ggml_is_contiguous(src1);
+    const int64_t min_k = min_k_env >= 0 ? min_k_env : to_f16 ? 0 : 1024;
     if (N < min_n || M < std::max<int64_t>(16, min_m) || K < min_k || K % 64 != 0 || src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         return false;
@@ -250,17 +270,30 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
     if (ggml_nbytes(src0) > range || ggml_nbytes(src1) > range || ggml_nbytes(dst) > range) {
         return false;
     }
-    // GGML_VK_MM_F16REG_B16=1 (08.11, under test): f32 activations go to an f16 copy in prealloc_y first, once for the
-    // matmuls in a row that read the same tensor, and the f16 pipeline reads that: half the bytes of B a workgroup and no
-    // conversion in it (in the model the short K lost against the 05-mm test, 2.43 against 1.34 ms on 10240 x 320)
-    static const bool b16_copy = [] { const char * e = getenv("GGML_VK_MM_F16REG_B16"); return e != nullptr && atoi(e) != 0; }();
-    const bool to_f16 = b16_copy && src1->type == GGML_TYPE_F32 && device->pipeline_mm_f16reg[1] && ggml_is_contiguous(src1);
     const int bi = src1->type == GGML_TYPE_F16 || to_f16 ? 1 : 0;
     vk_pipeline pipeline = device->pipeline_mm_f16reg[bi];
-    vk_subbuffer a, b, d;
+    vk_subbuffer a, b, d, x;
+    // the DSV4_HC_PRE: x [E, 4, N] (f32 or f16, values contiguous) with M = 4 E, its result [E, N] f32
+    const ggml_tensor * hc_x = hc_pre ? hc_pre->src[0] : nullptr;
+    if (hc_pre) {
+        const int64_t E = M / 4;
+        if (M % 4 != 0 || hc_x->ne[0] != E || hc_x->ne[1] != 4 || hc_x->ne[2] != N || hc_x->ne[3] != 1 ||
+            (hc_x->type != GGML_TYPE_F32 && hc_x->type != GGML_TYPE_F16) || hc_x->nb[0] != ggml_type_size(hc_x->type) ||
+            hc_pre->type != GGML_TYPE_F32 || hc_pre->ne[0] != E || hc_pre->ne[1] != N || hc_pre->nb[0] != sizeof(float) ||
+            ggml_nbytes(hc_x) > range || ggml_nbytes(hc_pre) > range) {
+            return false;
+        }
+        pipeline = device->pipeline_mm_f16reg_hcpre[bi][hc_x->type == GGML_TYPE_F16 ? 1 : 0];
+        if (!pipeline || !ggml_vk_fork_tensor_buffer(ctx, hc_x, 4, x)) {
+            return false;
+        }
+    }
     if (!pipeline || !ggml_vk_fork_tensor_buffer(ctx, src0, 4, a) || !ggml_vk_fork_tensor_buffer(ctx, src1, to_f16 ? 4 : 16, b) ||
-        !ggml_vk_fork_tensor_buffer(ctx, dst, 4, d)) {
+        !ggml_vk_fork_tensor_buffer(ctx, hc_pre ? hc_pre : dst, 4, d)) {
         return false;
+    }
+    if (check_only) {
+        return true;
     }
     if (to_f16) {
         vk_pipeline cpy = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, GGML_TYPE_F16);
@@ -315,6 +348,17 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
     }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (hc_pre) {
+        vk_fork_mm_hc_pre_push_constants hpc = {};
+        hpc.mm       = pc;
+        hpc.hc_e     = (uint32_t) (M / 4);
+        hpc.hc_x1    = (uint32_t) (hc_x->nb[1] / ggml_type_size(hc_x->type));
+        hpc.hc_x2    = (uint32_t) (hc_x->nb[2] / ggml_type_size(hc_x->type));
+        hpc.hc_d1    = (uint32_t) (hc_pre->nb[1] / sizeof(float));
+        hpc.hc_scale = ggml_get_op_params_f32(hc_pre, 0);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, x }, hpc, { (uint32_t) M, (uint32_t) N, 1 });
+        return true;
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { (uint32_t) M, (uint32_t) N, 1 });
     return true;
 }

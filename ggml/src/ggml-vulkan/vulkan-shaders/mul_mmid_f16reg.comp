@@ -37,7 +37,8 @@
 // BPF 0: each stage reads its own B tile (no next-stage B in registers). EPI 1: the sums go to memory straight from
 // the accumulator elements, in the RDNA3 layout that coopmat_c_probe.comp checks (element e of invocation l: row
 // (l / 16) + 2 e, column l % 16), without the 8 KB of shared memory of the output fragments. B_F16 1: B is f16 (the
-// host converts the activations once), 8 per uvec4
+// host converts the activations once, or the gate/up kernel wrote them so), 8 per uvec4. D_F16 1: the result goes out
+// as f16 (the fused gate/up straight into the f16 cast of its GLU that the down projection reads, qwen4exp on Vulkan)
 
 #if defined(DATA_A_Q4_K)
 #define A_BLOCK_WORDS 36   // 144 bytes
@@ -73,6 +74,7 @@ layout(constant_id = 1) const uint BN = 64;
 layout(constant_id = 2) const uint BPF = 1;
 layout(constant_id = 3) const uint EPI = 0;
 layout(constant_id = 4) const uint B_F16 = 0;
+layout(constant_id = 5) const uint D_F16 = 0;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -89,6 +91,7 @@ layout(binding = 6) readonly buffer A2 { uint data_a2[]; };
 #endif
 layout(binding = 1) readonly buffer B { uvec4 data_b[]; };   // 4 f32 or 8 f16
 layout(binding = 2) writeonly buffer D { float data_d[]; };
+layout(binding = 2) writeonly buffer D16 { float16_t data_d16[]; };   // the same buffer with D_F16
 layout(binding = 3) readonly buffer IDS { int data_ids[]; };
 layout(binding = 4) readonly buffer RowMap { uint data_row_map[]; };
 layout(binding = 5) readonly buffer FusedScale { float data_fscale[]; };
@@ -465,7 +468,12 @@ void write_frag(const uint c, const uint grow0, const uint tile_count, const flo
             if ((p.fusion_flags & 1u) != 0) {
                 val *= data_fscale[uint(ri.y) * p.nei0 + uint(ri.x)];
             }
-            data_d[uint(ri.y) * p.batch_stride_d + uint(ri.x) * p.stride_d + grow0 + r] = val;
+            const uint o = uint(ri.y) * p.batch_stride_d + uint(ri.x) * p.stride_d + grow0 + r;
+            if (D_F16 != 0) {
+                data_d16[o] = float16_t(val);
+            } else {
+                data_d[o] = val;
+            }
         }
     }
 }
@@ -481,7 +489,12 @@ void write_frag_acc(const uint c, const uint grow0, const uint tile_count, const
         const float s    = scale ? data_fscale[uint(ri.y) * p.nei0 + uint(ri.x)] : 1.0;
         [[unroll]] for (uint e = 0; e < 8; ++e) {
             if (grow0 + (lane >> 4) + 2 * e < p.M) {
-                data_d[base + 2 * e] = scale ? v[e] * s : v[e];
+                const float val = scale ? v[e] * s : v[e];
+                if (D_F16 != 0) {
+                    data_d16[base + 2 * e] = float16_t(val);
+                } else {
+                    data_d[base + 2 * e] = val;
+                }
             }
         }
     }

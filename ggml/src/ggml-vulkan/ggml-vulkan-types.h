@@ -1044,8 +1044,8 @@ struct vk_device_struct {
     // MUL_MAT_ID with the codes decoded into f16 A fragments (mul_mmid_f16reg.comp): 0 off, 1 coopmat, 2 emulated
     int mmid_f16reg_mode;
     // [q4_K, q5_K, q5_1, q8_0][single, fused gate/up, single in 256-row pairs (ROWS2), fused gate/up in separate
-    // subgroups (GLU_SPLIT)][tiles of 64, 128, 32 tokens][f16 B]
-    vk_pipeline pipeline_mmid_f16reg[4][4][3][2];
+    // subgroups (GLU_SPLIT)][tiles of 64, 128, 32 tokens][f16 B][f16 result: the fused gate/up only]
+    vk_pipeline pipeline_mmid_f16reg[4][4][3][2][2];
     // the B tile of the next stage in registers (BPF), the sums written straight from the accumulators (EPI, after
     // coopmat_c_probe.comp)
     uint32_t mmid_f16reg_bpf;
@@ -1058,6 +1058,8 @@ struct vk_device_struct {
     std::array<uint32_t, 5> mm_f16reg_tile; // + the B prefetch of the shader (BPF)
     std::string mm_f16reg_name;
     vk_pipeline pipeline_mm_f16reg[2];
+    // the same matmul with the DSV4_HC_PRE that follows it in the store (MUL_MAT_DSV4_HC_PRE): [f16 activations][f16 streams]
+    vk_pipeline pipeline_mm_f16reg_hcpre[2][2];
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
     ggml_backend_buffer_type buffer_type_shared;
     ggml_backend_buffer_type_t extra_bufts[2] = {};
@@ -1348,6 +1350,8 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_norm {};
     bool fused_hc_post_norm_f16 {}; // fork: with the cpy of the normalized streams to f16 fused in
     bool fused_mm_relu {};
+    // MUL_MAT_DSV4_HC_PRE: the matmul and the gated DSV4_HC_PRE that reads it (the last node of the run) in one shader
+    bool fused_mm_hc_pre {};
     // MUL_MAT_HEADSUM: the node run from the first matmul to the sum (or the bias add) is one matmul; the bias or nullptr
     bool fused_mm_headsum {};
     const ggml_tensor * fused_mm_headsum_bias {};

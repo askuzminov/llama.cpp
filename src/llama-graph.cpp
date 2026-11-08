@@ -2455,6 +2455,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
+        // fork: the down projection reads an f16 activation where the gate/up kernel writes it so (moe_down_f16_fork)
+        if (moe_down_f16_fork && amax_src1.res == nullptr && cur->type == GGML_TYPE_F32) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+            cb(cur, "ffn_moe_down_f16", il);
+        }
+
         experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);

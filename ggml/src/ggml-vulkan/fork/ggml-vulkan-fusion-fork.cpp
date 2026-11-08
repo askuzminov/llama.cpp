@@ -462,6 +462,70 @@ static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struc
     return int8 && ggml_vk_get_mul_mat_mat_pipeline_map(ctx, w0->type, GGML_TYPE_Q8_1, (ggml_prec) a->op_params[0], true, true) != nullptr;
 }
 
+// the fused gate/up and the f16 cast of its GLU (qwen4exp on Vulkan casts it for the down projection, LLAMA_MOE_DOWN_F16):
+// mul_mmid_f16reg.comp writes the result straight into the cast's tensor as f16, the GLU itself is not written. only on
+// that shader (the int8 one writes f32), and the GLU must have no other reader
+static bool ggml_vk_can_fuse_mmid_glu_cpy(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 3 >= cgraph->n_nodes || !ggml_vk_can_fuse_mmid_glu(ctx, cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * cpy = cgraph->nodes[node_idx + 3];
+    if (cpy->op != GGML_OP_CPY || cpy->src[0] != glu || cpy->type != GGML_TYPE_F16 || !ggml_are_same_shape(cpy, glu) ||
+        !ggml_is_contiguous(cpy) || glu->ne[0] % 2 != 0) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_CPY }, { node_idx + 3 })) {
+        return false;
+    }
+    const ggml_tensor * a   = cgraph->nodes[node_idx];
+    const ggml_tensor * b   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * x   = a->src[1];
+    const ggml_tensor * ids = a->src[2];
+    const bool y_in_place = ggml_vk_dim01_contiguous(x) && !ctx->device->coopmat2 &&
+        !(ctx->device->coopmat_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ggml_is_quantized(a->src[0]->type));
+    return ggml_vk_fork_mmid_f16reg(ctx, a->src[0], x, b->src[0], y_in_place, CEIL_DIV(ids->ne[0] * ids->ne[1], a->src[0]->ne[2]),
+                                    nullptr, true) != nullptr;
+}
+
+// the up projection of a hyper-connection mix and the gated DSV4_HC_PRE that reads it (qwen4exp): MUL_MAT, the reshape of
+// its result to [E, 4, N], the DSV4_HC_PRE, with the reshape of the streams (a view) in between or not. mul_mm_f16reg.comp
+// does the DSV4_HC_PRE in its store, the gates never go to memory. returns the nodes after the matmul (2 or 3), 0 if it
+// does not apply. GGML_VK_DISABLE_MM_HC_PRE: off
+static int ggml_vk_can_fuse_mm_hc_pre(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_MM_HC_PRE") != nullptr;
+    if (disabled || ctx->device->mm_f16reg_mode == 0) {
+        return 0;
+    }
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    for (int extra : { 2, 3 }) {
+        if (node_idx + extra >= cgraph->n_nodes) {
+            break;
+        }
+        const ggml_tensor * hc = cgraph->nodes[node_idx + extra];
+        const ggml_tensor * rg = cgraph->nodes[node_idx + extra - 1];
+        if (hc->op != GGML_OP_DSV4_HC_PRE || ggml_get_op_params_i32(hc, 1) == 0 || hc->src[1] != rg ||
+            rg->op != GGML_OP_RESHAPE || rg->src[0] != mm) {
+            continue;
+        }
+        bool ok;
+        if (extra == 2) {
+            ok = ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE }, { node_idx + 2 });
+        } else {
+            const ggml_tensor * rx = cgraph->nodes[node_idx + 1];
+            ok = rx->op == GGML_OP_RESHAPE && hc->src[0] == rx &&
+                 ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE },
+                                        { node_idx + 1, node_idx + 3 });
+        }
+        if (!ok) {
+            return 0;
+        }
+        vk_context none;
+        return ggml_vk_fork_mm_f16reg(ctx, none, mm->src[0], mm->src[1], mm, nullptr, 0, hc, true) ? extra : 0;
+    }
+    return 0;
+}
+
 // gated_delta_net + the strided cpy that scatters its state snapshots into the recurrent cache (slot i -> rollback
 // group i, slot 0 newest): the op writes the snapshots there and the cpy is skipped. Returns the number of nodes
 // after the op that the fusion covers (views and the cpy), 0 if it does not apply
@@ -767,6 +831,7 @@ void ggml_vk_fork_fusion_reset(ggml_backend_vk_context * ctx) {
     ctx->fused_hc_post_norm = false;
     ctx->fused_hc_post_norm_f16 = false;
     ctx->fused_mm_relu = false;
+    ctx->fused_mm_hc_pre = false;
     ctx->fused_mm_headsum = false;
     ctx->fused_mm_headsum_bias = nullptr;
     ctx->fused_gdn_cache = nullptr;
@@ -786,12 +851,26 @@ bool ggml_vk_fork_fuse_mul_mat(ggml_backend_vk_context * ctx, const struct ggml_
         for (int k = 0; k < headsum_run; ++k) {
             op_srcs_fused_elementwise[k] = cgraph->nodes[i + k]->op != GGML_OP_MUL_MAT;
         }
+    } else if (int hc_run = ggml_vk_can_fuse_mm_hc_pre(ctx, cgraph, i); hc_run > 0) {
+        ctx->num_additional_fused_ops = hc_run;
+        ctx->fused_mm_hc_pre = true;
+        fusion_string = "MUL_MAT_DSV4_HC_PRE";
+        for (int k = 0; k <= hc_run; ++k) {
+            op_srcs_fused_elementwise[k] = false;
+        }
     } else if (ggml_vk_can_fuse_mm_relu(ctx, cgraph, i)) {
         ctx->num_additional_fused_ops = 1;
         ctx->fused_mm_relu = true;
         fusion_string = "MUL_MAT_RELU";
         op_srcs_fused_elementwise[0] = false;
         op_srcs_fused_elementwise[1] = true;
+    } else if (ggml_vk_can_fuse_mmid_glu_cpy(ctx, cgraph, i)) {
+        ctx->num_additional_fused_ops = 3;
+        fusion_string = "MUL_MAT_ID_MUL_MAT_ID_GLU_CPY";
+        op_srcs_fused_elementwise[0] = false;
+        op_srcs_fused_elementwise[1] = false;
+        op_srcs_fused_elementwise[2] = false;
+        op_srcs_fused_elementwise[3] = false;
     } else if (ggml_vk_can_fuse_mmid_glu(ctx, cgraph, i)) {
         ctx->num_additional_fused_ops = 2;
         fusion_string = "MUL_MAT_ID_MUL_MAT_ID_GLU";
@@ -1047,6 +1126,59 @@ void ggml_vk_fork_pull_nodes(ggml_backend_vk_context * ctx, const struct ggml_cg
         }
     }
 
+    // MUL_MAT_DSV4_HC_PRE: the reshape of the matmul and the gated DSV4_HC_PRE that reads it right after it (and the
+    // reshape of the streams, a view, before them when it is not placed yet), so that ggml_vk_can_fuse_mm_hc_pre finds
+    // them in a row: the generic pass would pull the injection matmul of the same streams in between
+    if (graph->nodes[first_unused]->op == GGML_OP_MUL_MAT && ctx->device->mm_f16reg_mode != 0 && !ctx->device->disable_fusion) {
+        const ggml_tensor * mm = graph->nodes[first_unused];
+        const int end = std::min(first_unused + num_to_check, graph->n_nodes);
+        int rg_idx = -1;
+        int hc_idx = -1;
+        for (int k = first_unused + 1; k < end; ++k) {
+            const ggml_tensor * n = graph->nodes[k];
+            if (used[k]) {
+                continue;
+            }
+            if (rg_idx == -1 && n->op == GGML_OP_RESHAPE && n->src[0] == mm) {
+                rg_idx = k;
+                continue;
+            }
+            if (rg_idx != -1 && n->op == GGML_OP_DSV4_HC_PRE && n->src[1] == graph->nodes[rg_idx] && ggml_get_op_params_i32(n, 1) != 0) {
+                hc_idx = k;
+                break;
+            }
+        }
+        if (hc_idx != -1) {
+            const ggml_tensor * hc = graph->nodes[hc_idx];
+            int rx_idx = -1;
+            for (int k = first_unused + 1; k < hc_idx; ++k) {
+                if (!used[k] && graph->nodes[k] == hc->src[0] && graph->nodes[k]->op == GGML_OP_RESHAPE) {
+                    rx_idx = k;
+                }
+            }
+            // nothing else unplaced in between may feed them
+            bool can_pull = true;
+            for (int c = first_unused + 1; can_pull && c < hc_idx; ++c) {
+                if (used[c] || c == rg_idx || c == rx_idx) {
+                    continue;
+                }
+                if (is_src_of(hc_idx, c) || is_src_of(rg_idx, c) || (rx_idx != -1 && is_src_of(rx_idx, c))) {
+                    can_pull = false;
+                }
+            }
+            if (can_pull) {
+                if (rx_idx != -1) {
+                    current_set.push_back(rx_idx);
+                    used[rx_idx] = true;
+                }
+                current_set.push_back(rg_idx);
+                used[rg_idx] = true;
+                current_set.push_back(hc_idx);
+                used[hc_idx] = true;
+            }
+        }
+    }
+
     // Pull the MoE gate, up and swiglu together. Keep weight producers and alias dependencies before them.
     if (ctx->device->coopmat_int_support && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT_ID) {
         const ggml_tensor * mm = graph->nodes[first_unused];
@@ -1075,6 +1207,24 @@ void ggml_vk_fork_pull_nodes(ggml_backend_vk_context * ctx, const struct ggml_cg
                         used[q] = true;
                         current_set.push_back(k);
                         used[k] = true;
+                        // the f16 cast of the GLU right after it (MUL_MAT_ID_MUL_MAT_ID_GLU_CPY); it reads the GLU only
+                        for (int c2 = k + 1; c2 < std::min(first_unused + num_to_check, graph->n_nodes); ++c2) {
+                            const ggml_tensor * cp = graph->nodes[c2];
+                            if (used[c2] || cp->op != GGML_OP_CPY || cp->src[0] != n || cp->type != GGML_TYPE_F16) {
+                                continue;
+                            }
+                            bool cp_ok = true;
+                            for (int c = first_unused + 1; cp_ok && c < c2; ++c) {
+                                if (!used[c] && is_src_of(c2, c)) {
+                                    cp_ok = false;
+                                }
+                            }
+                            if (cp_ok) {
+                                current_set.push_back(c2);
+                                used[c2] = true;
+                            }
+                            break;
+                        }
                         break;
                     }
                 }

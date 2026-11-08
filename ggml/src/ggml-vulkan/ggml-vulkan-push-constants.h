@@ -17,6 +17,14 @@ struct vk_mat_mat_push_constants {
     uint32_t fusion_flags;
 };
 
+// fork: mul_mm_f16reg.comp with HC_PRE (MUL_MAT_DSV4_HC_PRE): the matmul's constants, then those of the DSV4_HC_PRE that
+// its store does: values of a stream, the element strides of the streams (between streams and tokens) and of the result
+struct vk_fork_mm_hc_pre_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t hc_e; uint32_t hc_x1; uint32_t hc_x2; uint32_t hc_d1;
+    float hc_scale;
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;

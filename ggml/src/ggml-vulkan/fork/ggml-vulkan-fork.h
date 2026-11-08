@@ -219,15 +219,18 @@ bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t
 // 1 with subgroups where the device has them (else upstream), 2 without subgroups, 0 the upstream atomic compaction
 int ggml_vk_topk_radix_stable();
 // MUL_MAT_ID: the mul_mmid_f16reg.comp pipeline for these operands, or nullptr for the upstream choice
-// (b16: set when the pipeline reads an f16 copy of the activations, which the caller makes in prealloc_y)
+// (y_in_place: src1 can be read where it is; b16: set when the pipeline reads f16 activations - src1 when it is f16,
+// else an f16 copy that the caller makes in prealloc_y; d16: the fused gate/up writes its result as f16)
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
-                                     bool y_f32_kernel, uint64_t n_per_expert, bool * b16 = nullptr);
+                                     bool y_in_place, uint64_t n_per_expert, bool * b16 = nullptr, bool d16 = false);
 // MUL_MAT: the matmuls that stay off the int8 path (GGML_VK_INT_COOPMAT=3, graph outputs, K under 512)
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): dispatches it and returns true, false for the
-// upstream path (off, a fused op, another type or shape)
+// upstream path (off, a fused op, another type or shape). hc_pre: the gated DSV4_HC_PRE after it takes the store
+// (MUL_MAT_DSV4_HC_PRE); check_only: the answer without a dispatch
 bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                            const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags);
+                            const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags,
+                            const ggml_tensor * hc_pre = nullptr, bool check_only = false);
 // GATED_DELTA_NET_LAZY: the net with deferred rollback and the replay alone (ggml_gated_delta_net_lazy), they write into
 // the state rows and records they get as sources
 bool ggml_vk_gated_delta_net_lazy_supported(const ggml_tensor * op);

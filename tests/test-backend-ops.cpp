@@ -1534,7 +1534,8 @@ struct test_case {
             for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
                 ggml_tensor * node = ggml_graph_node(gf, i);
                 for (ggml_tensor * src : node->src) {
-                    if (src && src->op != GGML_OP_NONE && seen.count(src) == 0) {
+                    // fork: ggml_cast keeps itself as src[1], that is no source moved after it
+                    if (src && src != node && src->op != GGML_OP_NONE && seen.count(src) == 0) {
                         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "optimizer moved a node before its source");
                         print_test_result_locked(output_printer, result);
                         return test_status_t::FAIL;
