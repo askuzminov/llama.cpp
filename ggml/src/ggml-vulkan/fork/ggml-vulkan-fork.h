@@ -31,6 +31,26 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_f16_edge
     { 6, 0, 5 }, // cpy->src[0]      == mul
 };
 
+// HC_POST_NORM_MIX: hc_post_norm_f16, then the injection of the mix that reads the normalized streams: their reshape to
+// [hc*n_embd, n_tokens], MUL_MAT(that, w_inject) [n_tokens, hc] (qwen4exp swaps the product from 5 tokens), its
+// transpose and the cont to [hc, n_tokens]. dsv4_hc_post_norm_mix.comp computes the injection from the f16 values it
+// stores; the reshape stays readable by the other consumers (the hc down)
+static constexpr std::initializer_list<ggml_op> hc_post_norm_mix_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY,
+                                                                          GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_TRANSPOSE, GGML_OP_CONT };
+
+static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_mix_edges {
+    { 1, 0, 0 },  // sigmoid->src[0]   == scale
+    { 2, 0, 1 },  // scale->src[0]     == sigmoid
+    { 3, 2, 2 },  // hc_post->src[2]   == scale (post)
+    { 4, 0, 3 },  // rms_norm->src[0]  == hc_post
+    { 5, 0, 4 },  // mul->src[0]       == rms_norm
+    { 6, 0, 5 },  // cpy->src[0]       == mul
+    { 7, 0, 6 },  // reshape->src[0]   == cpy
+    { 8, 0, 7 },  // mul_mat->src[0]   == reshape (the streams are the first operand)
+    { 9, 0, 8 },  // transpose->src[0] == mul_mat
+    { 10, 0, 9 }, // cont->src[0]      == transpose
+};
+
 struct vk_op_dsv4_hc_post_norm_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
@@ -53,6 +73,16 @@ struct vk_op_dsv4_hc_post_norm_push_constants {
     float    gate_scale_in;
     float    gate_scale_out;
     float    eps;
+};
+
+// dsv4_hc_post_norm_mix.comp: the constants of dsv4_hc_post_norm.comp, then the injection weight (the stride of its
+// columns, its offset), the offset of the injection and whether the q8_1 blocks of the normalized streams are written
+struct vk_fork_hc_post_norm_mix_push_constants {
+    vk_op_dsv4_hc_post_norm_push_constants base;
+    uint32_t nbwi1;
+    uint32_t wi_offset;
+    uint32_t inj_offset;
+    uint32_t q8;
 };
 
 // the gated norm of the qwen4exp GDN output: RMS_NORM, MUL by the weight, SIGMOID of the gate, MUL (build_norm_gated)
@@ -225,6 +255,8 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
                                      bool y_in_place, uint64_t n_per_expert, bool * b16 = nullptr, bool d16 = false);
 // MUL_MAT: the matmuls that stay off the int8 path (GGML_VK_INT_COOPMAT=3, graph outputs, K under 512)
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
+// MUL_MAT: whether ggml_vk_mul_mat quantizes its f16 src1 into prealloc_y as q8_1 x4 blocks (in ggml-vulkan.cpp)
+bool ggml_vk_fork_mul_mat_quantizes_y_x4(ggml_backend_vk_context * ctx, const ggml_tensor * dst);
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): dispatches it and returns true, false for the
 // upstream path (off, a fused op, another type or shape). hc_pre: the gated DSV4_HC_PRE after it takes the store
 // (MUL_MAT_DSV4_HC_PRE); check_only: the answer without a dispatch

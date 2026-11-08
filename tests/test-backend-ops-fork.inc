@@ -690,6 +690,90 @@ struct test_dsv4_hc_post_norm_f16 : public test_dsv4_hc {
     }
 };
 
+// the combine, the f16 norm and the injection of the next hc mix of qwen4exp: hc_post_norm_f16, the reshape of the f16
+// streams to [hc*n_embd, n_tokens], the injection MUL_MAT(that, w_inject) transposed to [hc, n_tokens], and with down the
+// hc down projection over the same reshape (q8_0, the int8 path quantizes the f16 streams; Vulkan: HC_POST_NORM_MIX writes
+// those q8_1 blocks itself, GGML_VK_HC_MIX_Q8). the streams, the f16 copy, the injection (and the hc down) are compared
+struct test_hc_post_mix : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int64_t rank; // 0: no hc down
+
+    ggml_tensor * out_post = nullptr;
+    ggml_tensor * out_n    = nullptr;
+    ggml_tensor * out_inj  = nullptr;
+    ggml_tensor * out_down = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_POST_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, rank);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool test_graph_optimize() override { return true; }
+
+    // the CPU takes the f32 injection weight to f16 for its dot products (~1e-7); the hc down: an int8 matmul
+    double max_nmse_err() override { return rank > 0 ? 2e-3 : 1e-6; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = { out_post, out_n, out_inj };
+        if (out_down) {
+            nodes.push_back(out_down);
+        }
+        return nodes;
+    }
+
+    test_hc_post_mix(int64_t n_embd, int64_t n_tokens, int64_t rank) : n_embd(n_embd), n_tokens(n_tokens), rank(rank) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+
+        post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+
+        out_post = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_set_name(out_post, "out_post");
+
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+
+        out_n = ggml_cast(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, out_post, 1e-6f), w_norm), GGML_TYPE_F16);
+        ggml_set_name(out_n, "out_n");
+
+        ggml_tensor * xn = ggml_reshape_2d(ctx, out_n, hc * n_embd, n_tokens);
+
+        ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc * n_embd, hc);
+        ggml_set_name(w_inject, "w_inject");
+
+        out_inj = ggml_cont(ctx, ggml_transpose(ctx, ggml_mul_mat(ctx, xn, w_inject))); // [hc, n_tokens]
+        ggml_set_name(out_inj, "out_inj");
+
+        // one output that reads all of them
+        out = ggml_sum_rows(ctx, out_inj);
+        if (rank > 0) {
+            ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc * n_embd, rank);
+            ggml_set_name(w_down, "w_down");
+
+            out_down = ggml_mul_mat(ctx, w_down, xn);
+            ggml_set_name(out_down, "out_down");
+
+            out = ggml_add(ctx, out, ggml_sum_rows(ctx, out_down));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GATED_DELTA_NET_LAZY, the qwen4exp delta net with deferred rollback (llama_memory_recurrent::rec_l). mode 1 runs the
 // net from the rows of its cells with their records and writes the records of its tokens, mode 2 replays records into
 // the rows the plain net reads. The info rows take the cases llama_memory_recurrent_context::lazy_info makes: a base
@@ -1153,6 +1237,16 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(2560, n));
     }
     test_cases.emplace_back(new test_dsv4_hc_post_norm_f16(257, 40));
+    // HC_POST_NORM_MIX: with the injection of the next mix, and with the hc down that reads the q8_1 blocks of the shader
+    // on the int8 path (rank 64 stays off the f16 coopmat path, GGML_VK_MM_F16REG_MIN_M); 2560 values a stream as in
+    // qwen4exp, 320 not a multiple of 128 (the matmul quantizes itself)
+    for (int64_t n : {33, 64, 100}) {
+        test_cases.emplace_back(new test_hc_post_mix(256, n, 0));
+        test_cases.emplace_back(new test_hc_post_mix(256, n, 64));
+    }
+    test_cases.emplace_back(new test_hc_post_mix(2560, 64, 0));
+    test_cases.emplace_back(new test_hc_post_mix(2560, 64, 320));
+    test_cases.emplace_back(new test_hc_post_mix(320, 40, 64));
 
     // the qwen4exp block top-k (513) of a 4096-token ubatch at n_kv 4352, 8448 and 15104, and one column past the
     // widest workgroup of the tournament (1024): radix-select on Vulkan there from 8 rows (ggml_vk_topk_use_radix)

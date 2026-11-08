@@ -28,11 +28,42 @@ void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx
     // the gamma is the second source of the mul, whether the cpy follows it or not
     const ggml_tensor * w        = cgraph->nodes[node_idx + 5]->src[1];
 
-    vk_pipeline pipeline = ctx->fused_hc_post_norm_f16 ? ctx->device->pipeline_dsv4_hc_post_norm_f16n : ctx->device->pipeline_dsv4_hc_post_norm_f32;
+    vk_pipeline pipeline = ctx->fused_hc_post_norm_mix ? ctx->device->pipeline_dsv4_hc_post_norm_mix :
+                           ctx->fused_hc_post_norm_f16 ? ctx->device->pipeline_dsv4_hc_post_norm_f16n : ctx->device->pipeline_dsv4_hc_post_norm_f32;
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
     const uint32_t n_tokens = (uint32_t)x->ne[1];
+
+    // HC_POST_NORM_MIX: the hc down that reads the f16 streams on the int8 path finds its q8_1 blocks in prealloc_y
+    // (the cache of ggml_vk_mul_mat_q_f16 by quantize pipeline and tensor), the shader writes them.
+    // GGML_VK_HC_MIX_Q8=0: the matmul quantizes them itself
+    const ggml_tensor * xn   = ctx->fused_hc_post_norm_mix ? cgraph->nodes[node_idx + 7] : nullptr;
+    const ggml_tensor * down = nullptr;
+    uint64_t q_sz = 0;
+    if (xn) {
+        static const bool q8_on = [] { const char * e = getenv("GGML_VK_HC_MIX_Q8"); return e == nullptr || atoi(e) != 0; }();
+        if (q8_on && n_embd % 128 == 0) {
+            const int end = std::min(cgraph->n_nodes, node_idx + (int) hc_post_norm_mix_pattern.size() + 24);
+            for (int j = node_idx + (int) hc_post_norm_mix_pattern.size(); j < end && down == nullptr; ++j) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                if (n->op == GGML_OP_MUL_MAT && n->src[1] == xn && ggml_vk_fork_mul_mat_quantizes_y_x4(ctx, n)) {
+                    down = n;
+                }
+            }
+        }
+        if (down) {
+            // the size ggml_vk_mul_mat_q_f16 takes for the blocks: 144 bytes per 128 values
+            q_sz = (uint64_t) ((ggml_nelements(xn) + 127) / 128) * 144;
+            if (ctx->prealloc_size_y < q_sz) {
+                ctx->prealloc_size_y = q_sz;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+        }
+    }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -62,6 +93,30 @@ void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_get_op_params_f32(hc_post->src[2], 0),
         ggml_get_op_params_f32(norm, 0),
     };
+
+    if (xn) {
+        const ggml_tensor * mm   = cgraph->nodes[node_idx + 8];
+        const ggml_tensor * cont = cgraph->nodes[node_idx + 10];
+        const ggml_tensor * wi   = mm->src[1];
+        const vk_subbuffer wi_buf  = ggml_vk_tensor_subbuffer(ctx, wi,   true);
+        const vk_subbuffer inj_buf = ggml_vk_tensor_subbuffer(ctx, cont, true);
+        const vk_subbuffer q_buf   = down ? vk_subbuffer{ ctx->prealloc_y, 0, q_sz } : n_buf;
+        const vk_fork_hc_post_norm_mix_push_constants mpc = {
+            pc,
+            ggml_vk_nb_elem(wi, 1),
+            get_misalign_bytes(ctx, wi)   / (uint32_t) sizeof(float),
+            get_misalign_bytes(ctx, cont) / (uint32_t) sizeof(float),
+            down ? 1u : 0u,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, w_buf, d_buf, n_buf, wi_buf, inj_buf, q_buf }, mpc, { n_tokens, 1, 1 });
+        if (down) {
+            ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_quantize_q8_1_x4_f16.get();
+            ctx->prealloc_y_last_tensor_used   = xn;
+            ctx->prealloc_y_last_k_padded      = false;
+            ctx->prealloc_y_need_sync          = true;
+        }
+        return;
+    }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, w_buf, d_buf, n_buf }, pc, { 4, n_tokens, 1 });
 }
@@ -830,6 +885,7 @@ bool ggml_vk_fork_fuse_concat_ssm_conv(ggml_backend_vk_context * ctx, const stru
 void ggml_vk_fork_fusion_reset(ggml_backend_vk_context * ctx) {
     ctx->fused_hc_post_norm = false;
     ctx->fused_hc_post_norm_f16 = false;
+    ctx->fused_hc_post_norm_mix = false;
     ctx->fused_mm_relu = false;
     ctx->fused_mm_hc_pre = false;
     ctx->fused_mm_headsum = false;
@@ -883,8 +939,52 @@ bool ggml_vk_fork_fuse_mul_mat(ggml_backend_vk_context * ctx, const struct ggml_
     return true;
 }
 
+// HC_POST_NORM_MIX (hc_post_norm_mix_pattern): hc_post_norm_f16 and the injection product of the next mix, the f16
+// streams read through their reshape, the injection weight f32 [hc*n_embd, hc], the cont [hc, n_tokens].
+// GGML_VK_DISABLE_HC_POST_NORM_MIX: hc_post_norm_f16 and the injection apart
+static bool ggml_vk_hc_post_norm_mix_off() {
+    static const bool disabled = getenv("GGML_VK_DISABLE_HC_POST_NORM_MIX") != nullptr;
+    return disabled;
+}
+
+static bool ggml_vk_can_fuse_hc_post_norm_mix(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int i) {
+    if (ggml_vk_hc_post_norm_mix_off() || ctx->device->pipeline_dsv4_hc_post_norm_mix == nullptr ||
+        !ggml_can_fuse_subgraph(cgraph, i, hc_post_norm_mix_pattern, { i + 3, i + 6, i + 7, i + 10 }) ||
+        !ggml_check_edges(cgraph, i, hc_post_norm_mix_edges) || !ggml_vk_can_fuse_hc_post_norm(cgraph, i)) {
+        return false;
+    }
+    const ggml_tensor * hc_post = cgraph->nodes[i + 3];
+    const ggml_tensor * mul     = cgraph->nodes[i + 5];
+    const ggml_tensor * cpy     = cgraph->nodes[i + 6];
+    const ggml_tensor * xn      = cgraph->nodes[i + 7];
+    const ggml_tensor * mm      = cgraph->nodes[i + 8];
+    const ggml_tensor * cont    = cgraph->nodes[i + 10];
+    const ggml_tensor * wi      = mm->src[1];
+    const int64_t n_embd = hc_post->ne[0];
+    const int64_t hc     = hc_post->ne[1];
+    const int64_t nt     = hc_post->ne[2];
+    return cpy->type == GGML_TYPE_F16 && ggml_is_contiguous(cpy) && ggml_are_same_shape(mul, cpy) &&
+           xn->ne[0] == n_embd * hc && xn->ne[1] == nt && ggml_is_contiguous(xn) &&
+           wi->type == GGML_TYPE_F32 && ggml_is_contiguous(wi) && wi->ne[0] == n_embd * hc && wi->ne[1] == hc &&
+           wi->ne[2] == 1 && wi->ne[3] == 1 &&
+           mm->type == GGML_TYPE_F32 && mm->ne[0] == nt && mm->ne[1] == hc &&
+           cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) && cont->ne[0] == hc && cont->ne[1] == nt &&
+           cont->ne[2] == 1 && cont->ne[3] == 1;
+}
+
 bool ggml_vk_fork_fuse_hc_post_norm(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int i,
                                     bool * op_srcs_fused_elementwise, const char *& fusion_string) {
+    if (ggml_vk_can_fuse_hc_post_norm_mix(ctx, cgraph, i)) {
+        ctx->num_additional_fused_ops = hc_post_norm_mix_pattern.size() - 1;
+        // written: the hc_post output (the residual of the next combine), the f16 streams and (the last node) the cont
+        ctx->fused_ops_write_mask |= (1 << 3) | (1 << 6);
+        ctx->fused_hc_post_norm = true;
+        ctx->fused_hc_post_norm_f16 = true;
+        ctx->fused_hc_post_norm_mix = true;
+        fusion_string = "HC_POST_NORM_MIX";
+        std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+        return true;
+    }
     // the f16 copy of the normalized streams (qwen4exp, LLAMA_HC_F16) goes into the shader's store
     if (ggml_can_fuse_subgraph(cgraph, i, hc_post_norm_f16_pattern, { i + 3, i + 6 }) &&
         ggml_check_edges(cgraph, i, hc_post_norm_f16_edges) &&
@@ -1121,6 +1221,75 @@ void ggml_vk_fork_pull_nodes(ggml_backend_vk_context * ctx, const struct ggml_cg
                 for (int k : views) {
                     current_set.push_back(k);
                     used[k] = true;
+                }
+            }
+        }
+    }
+
+    // HC_POST_NORM_MIX: the reshape of the f16 streams, the injection product over it, its transpose and cont right
+    // after the cpy that closes hc_post_norm_f16 (the generic pass puts the product next to the hc down). the block
+    // output, the residual and the previous injection stay allocated until the cont: the shader reads them while it
+    // writes the injection, and the backend drops a fusion whose output overlaps a source
+    if (graph->nodes[first_unused]->op == GGML_OP_CPY && graph->nodes[first_unused]->type == GGML_TYPE_F16 &&
+        ctx->device->pipeline_dsv4_hc_post_norm_mix != nullptr && !ctx->device->disable_fusion && !ggml_vk_hc_post_norm_mix_off()) {
+        ggml_tensor * cpy  = graph->nodes[first_unused];
+        ggml_tensor * mul  = cpy->src[0];
+        ggml_tensor * norm = mul && mul->op == GGML_OP_MUL ? mul->src[0] : nullptr;
+        ggml_tensor * post = norm && norm->op == GGML_OP_RMS_NORM ? norm->src[0] : nullptr;
+        if (post && post->op == GGML_OP_DSV4_HC_POST) {
+            const int end = std::min(first_unused + num_to_check, graph->n_nodes);
+            int idx[4] = { -1, -1, -1, -1 }; // reshape, mul_mat, transpose, cont
+            for (int k = first_unused + 1; k < end && idx[3] == -1; ++k) {
+                const ggml_tensor * n = graph->nodes[k];
+                if (used[k]) {
+                    continue;
+                }
+                if (idx[0] == -1 && n->op == GGML_OP_RESHAPE && n->src[0] == cpy) {
+                    idx[0] = k;
+                } else if (idx[0] != -1 && idx[1] == -1 && n->op == GGML_OP_MUL_MAT && n->src[0] == graph->nodes[idx[0]] &&
+                           n->src[1]->type == GGML_TYPE_F32) {
+                    idx[1] = k;
+                } else if (idx[1] != -1 && idx[2] == -1 && n->op == GGML_OP_TRANSPOSE && n->src[0] == graph->nodes[idx[1]]) {
+                    idx[2] = k;
+                } else if (idx[2] != -1 && n->op == GGML_OP_CONT && n->src[0] == graph->nodes[idx[2]]) {
+                    idx[3] = k;
+                }
+            }
+            // a view in between (the reshape of the same streams for the DSV4_HC_PRE) writes nothing: it holds the pull
+            // back only as a source of a pulled node, is_src_of ties every two views of one tensor together
+            bool can_pull = idx[3] != -1;
+            for (int c = first_unused + 1; can_pull && c < idx[3]; ++c) {
+                if (used[c] || c == idx[0] || c == idx[1] || c == idx[2]) {
+                    continue;
+                }
+                const bool view = ggml_vk_graph_node_is_empty(graph->nodes[c]);
+                for (int q = 0; q < 4 && can_pull; ++q) {
+                    bool dep = false;
+                    if (view) {
+                        for (const ggml_tensor * src : graph->nodes[idx[q]]->src) {
+                            dep = dep || src == graph->nodes[c];
+                        }
+                    } else {
+                        dep = is_src_of(idx[q], c);
+                    }
+                    if (dep) {
+                        can_pull = false;
+                    }
+                }
+            }
+            if (can_pull) {
+                for (int q = 0; q < 4; ++q) {
+                    current_set.push_back(idx[q]);
+                    used[idx[q]] = true;
+                }
+                ggml_tensor * cont = graph->nodes[idx[3]];
+                // post = 2*sigmoid(inject/hc): scale <- sigmoid <- scale <- the previous injection
+                ggml_tensor * w   = post->src[2];
+                ggml_tensor * inj = w && w->src[0] && w->src[0]->src[0] ? w->src[0]->src[0]->src[0] : nullptr;
+                for (ggml_tensor * t : { post->src[0], post->src[1], inj }) {
+                    if (t != nullptr) {
+                        params->add_alloc_dep(params->user_data, t, cont);
+                    }
                 }
             }
         }

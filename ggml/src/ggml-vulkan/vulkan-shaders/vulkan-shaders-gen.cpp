@@ -1197,6 +1197,8 @@ void process_shaders() {
     // fork: f16 streams in and the normalized ones out (qwen4exp, LLAMA_HC_F16)
     string_to_spv("dsv4_hc_pre_f16",  "dsv4_hc_pre.comp",  {{"X_F16", "1"}});
     string_to_spv("dsv4_hc_post_norm_f16n", "dsv4_hc_post_norm.comp", {{"N_F16", "1"}});
+    // fork: all streams of a token, the injection of the next mix and the q8_1 blocks of the hc down (HC_POST_NORM_MIX)
+    string_to_spv("dsv4_hc_post_norm_mix", "dsv4_hc_post_norm_mix.comp", {});
     // fork: short-row RMS norm and the conv over the concat sources
     string_to_spv("rms_norm_rows_f32", "rms_norm_rows.comp", {});
     string_to_spv("ssm_conv_concat_f32", "ssm_conv_concat.comp", {});

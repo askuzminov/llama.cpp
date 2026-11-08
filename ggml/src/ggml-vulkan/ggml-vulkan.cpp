@@ -3742,6 +3742,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f32,  "dsv4_hc_post_norm_f32",  dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f16n, "dsv4_hc_post_norm_f16n", dsv4_hc_post_norm_f16n_len, dsv4_hc_post_norm_f16n_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 512 }, 1);
+    // fork: HC_POST_NORM_MIX, a workgroup per token (ggml_vk_dsv4_hc_post_norm); f16 arithmetic for the rounding of the
+    // stored values
+    if (device->fp16) ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_mix,  "dsv4_hc_post_norm_mix",  dsv4_hc_post_norm_mix_len,  dsv4_hc_post_norm_mix_data,  "main", 9, sizeof(vk_fork_hc_post_norm_mix_push_constants), {1, 1, 1}, { 512 }, 1);
     // fork: short-row RMS norm (32 x 8 invocations, a row per 32) and the conv over the concat sources
     for (uint32_t w = 0; w < 2; ++w) {
         for (uint32_t g = 0; g < 2; ++g) {
@@ -7750,6 +7753,30 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
+}
+
+// fork: true when ggml_vk_mul_mat takes dst (unfused) to ggml_vk_mul_mat_q_f16, which then quantizes its f16 src1 with
+// pipeline_quantize_q8_1_x4_f16 into prealloc_y, or finds it there (the same pipeline and tensor). HC_POST_NORM_MIX
+// writes those blocks for the hc down of qwen4exp (ggml_vk_dsv4_hc_post_norm); keep in step with the two functions
+bool ggml_vk_fork_mul_mat_quantizes_y_x4(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (dst->op != GGML_OP_MUL_MAT || src1->type != GGML_TYPE_F16 || ctx->device->pipeline_quantize_q8_1_x4_f16 == nullptr ||
+        !ggml_is_quantized(src0->type) || !ggml_vk_dim01_contiguous(src0) || dst->ne[1] <= mul_mat_vec_max_cols ||
+        dst->ne[2] != 1 || dst->ne[3] != 1 || ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_vk_can_use_fwht(ctx, src1, dst)) {
+        return false;
+    }
+    vk_context none;
+    if (ggml_vk_fork_mm_f16reg(ctx, none, src0, src1, dst, nullptr, 0, nullptr, true)) {
+        return false;
+    }
+    const uint64_t ne10 = src1->ne[0];
+    const uint64_t ne11 = src1->ne[1];
+    const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
+                                ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 &&
+                                !ggml_vk_mul_mat_int8_off(ctx, dst, ne10) && ggml_vk_src1_prec_allows_q8(dst);
+    return can_quantize_y && ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, ggml_prec_get_acc(dst)) != nullptr;
 }
 
 // glu_up, glu_dst: src0 is the gate projection of the experts, glu_up the up projection, and glu_dst (a GLU node)
@@ -15323,19 +15350,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
         if (ctx->num_additional_fused_ops) {
-            // There are up to two output nodes - topk_moe has two.
+            // There are up to two output nodes - topk_moe has two. fork: three in HC_POST_NORM_MIX (the streams, their
+            // f16 copy and the injection)
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
-            ggml_tensor *output_nodes[2] {};
+            ggml_tensor *output_nodes[3] {};
             output_nodes[0] = cgraph->nodes[i + ctx->num_additional_fused_ops];
-            if (bits) {
+            for (int o = 1; o < 3 && bits; ++o) {
                 int output_idx = find_first_set(bits);
-                GGML_ASSERT(bits == (1u << output_idx));
-                output_nodes[1] = cgraph->nodes[i + output_idx];
+                output_nodes[o] = cgraph->nodes[i + output_idx];
+                bits &= bits - 1;
             }
+            GGML_ASSERT(bits == 0);
 
             bool need_disable = false;
 
-            for (int j = 0; j < 2; ++j) {
+            for (int j = 0; j < 3; ++j) {
                 ggml_tensor *dst = output_nodes[j];
                 if (!dst) {
                     continue;
