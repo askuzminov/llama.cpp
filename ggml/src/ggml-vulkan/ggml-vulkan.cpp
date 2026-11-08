@@ -3761,34 +3761,42 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #else
 #define F16REG_CM1(t) f16reg_shader { "mul_mmid_f16reg_" #t "_emu", mul_mmid_f16reg_##t##_emu_len, mul_mmid_f16reg_##t##_emu_data }
 #endif
-        const f16reg_shader shaders[4][3] = {
-            { F16REG(q4_k), F16REG(q4_k_glu), F16REG(q4_k_r2) },
-            { F16REG(q5_k), F16REG(q5_k_glu), F16REG(q5_k_r2) },
-            { F16REG(q5_1), { nullptr, 0, nullptr }, F16REG(q5_1_r2) },
-            { F16REG(q8_0), { nullptr, 0, nullptr }, F16REG(q8_0_r2) },
+        const f16reg_shader shaders[4][4] = {
+            { F16REG(q4_k), F16REG(q4_k_glu), F16REG(q4_k_r2), F16REG(q4_k_glus) },
+            { F16REG(q5_k), F16REG(q5_k_glu), F16REG(q5_k_r2), F16REG(q5_k_glus) },
+            { F16REG(q5_1), { nullptr, 0, nullptr }, F16REG(q5_1_r2), { nullptr, 0, nullptr } },
+            { F16REG(q8_0), { nullptr, 0, nullptr }, F16REG(q8_0_r2), { nullptr, 0, nullptr } },
         };
 #undef F16REG
 #undef F16REG_CM1
-        const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
+        const uint32_t sg  = device->subgroup_size_control ? 32u : 0u;
+        const uint32_t bpf = device->mmid_f16reg_bpf;
+        const uint32_t epi = device->mmid_f16reg_epi;
+        static const uint32_t bns[3] = { 64, 128, 32 };
+        static const char * bn_names[3] = { "", "_bn128", "_bn32" };
         for (int t = 0; t < 4; ++t) {
-            for (int v = 0; v < 3; ++v) {
+            for (int v = 0; v < 4; ++v) {
                 if (shaders[t][v].data == nullptr) {
                     continue;
                 }
-                for (int b = 0; b < 2; ++b) {
+                for (int b = 0; b < 3; ++b) {
                     // the shared memory of the shader: the codes, (scale, offset) and high bits of one or two A tiles of 128
-                    // rows, the B tile in f16, a 16x16 f32 fragment per subgroup, the row ids
-                    const uint32_t bn   = b ? 128 : 64;
+                    // rows (GLU_SPLIT: 64 of the gate and 64 of the up projection in one), the B tile in f16, a 16x16 f32
+                    // fragment per subgroup (EPI 1: none, but those of the up projection of GLU_SPLIT), the row ids
+                    const uint32_t bn   = bns[b];
                     const uint32_t qsw  = t == 3 ? 17 : 9;
                     const uint32_t a_sz = 128 * qsw * 4 + 128 * 2 * 4 + (t == 1 || t == 2 ? 128 * 2 * 4 : 0);
-                    const uint32_t lds  = a_sz * (v ? 2 : 1) + bn * 72 * 2 + 8 * 256 * 4 + bn * 4;
+                    const uint32_t c_sz = epi == 0 ? 8 * 256 * 4 : v == 3 ? 4 * 256 * 4 : 4;
+                    const uint32_t lds  = a_sz * (v == 1 || v == 2 ? 2 : 1) + bn * 72 * 2 + c_sz + bn * 4;
                     if (lds > device->properties.limits.maxComputeSharedMemorySize) {
                         continue;
                     }
-                    const std::string name = std::string(shaders[t][v].name) + (b ? "_bn128" : "");
-                    ggml_vk_create_pipeline2(device, device->pipeline_mmid_f16reg[t][v][b], name, shaders[t][v].len, shaders[t][v].data, "main",
-                                            v == 1 ? 7 : 6, sizeof(vk_mat_mat_id_push_constants), {v == 2 ? 256u : 128u, bn, 1}, {256, bn}, 1, false,
-                                            sg != 0, sg);
+                    for (int h = 0; h < 2; ++h) {
+                        const std::string name = std::string(shaders[t][v].name) + bn_names[b] + (h ? "_b16" : "");
+                        ggml_vk_create_pipeline2(device, device->pipeline_mmid_f16reg[t][v][b][h], name, shaders[t][v].len, shaders[t][v].data,
+                                                "main", v == 1 || v == 3 ? 7 : 6, sizeof(vk_mat_mat_id_push_constants),
+                                                {v == 2 ? 256u : v == 3 ? 64u : 128u, bn, 1}, {256, bn, bpf, epi, (uint32_t) h}, 1, false, sg != 0, sg);
+                    }
                 }
             }
         }
@@ -7813,9 +7821,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // fork: mul_mmid_f16reg.comp (GGML_VK_MMID_F16REG) reads the f32 activations in place, B is not quantized
     const bool y_f32_in_place = src1->type == GGML_TYPE_F32 && ggml_vk_dim01_contiguous(src1) && !y_decode_vector_staging &&
                                 !prefer_f16_b && !ctx->device->coopmat2;
-    const vk_pipeline f16reg = ggml_vk_fork_mmid_f16reg(ctx, src0, src1, glu_up, y_f32_in_place, CEIL_DIV(nei0 * nei1, n_as));
+    // with f16reg_b16 the pipeline reads an f16 copy of the activations, made below in prealloc_y as for the f16 kernels
+    bool f16reg_b16 = false;
+    const vk_pipeline f16reg = ggml_vk_fork_mmid_f16reg(ctx, src0, src1, glu_up, y_f32_in_place, CEIL_DIV(nei0 * nei1, n_as), &f16reg_b16);
 
-    const ggml_type y_kernel_type = f16reg ? GGML_TYPE_F32 : ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+    const ggml_type y_kernel_type = f16reg ? (f16reg_b16 ? GGML_TYPE_F16 : GGML_TYPE_F32) : ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         ggml_prec_get_acc(dst), true, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y   = y_kernel_type == GGML_TYPE_Q8_1;
@@ -7827,11 +7837,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // one of them is taken
     GGML_ASSERT(glu_up == nullptr || (quantize_y && mmp_map != nullptr) || f16reg);
 
-    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
+    // fork: mul_mmid_f16reg.comp reads src0 as it is (its pipeline replaces the one picked from mmp_map)
+    const bool qx_needs_dequant = !f16reg && (mmp_map == nullptr || x_non_contig);
 
     if (qx_needs_dequant) {
         // dequant src0 to f16
         mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, ggml_prec_get_acc(dst), true);
+    }
+    if (f16reg && mmp_map == nullptr) {
+        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F32, ggml_prec_get_acc(dst), true);
     }
 
     GGML_ASSERT(mmp_map != nullptr);

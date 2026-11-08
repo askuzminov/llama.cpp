@@ -1,0 +1,35 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// fork: which element of an f32 16x16 accumulator an invocation holds. mul_mmid_f16reg.comp with EPI 1 writes its sums
+// straight from the accumulator elements and takes the RDNA3 wave32 layout: element e of invocation l is row
+// (l / 16) + 2 e, column l % 16. one subgroup of 32 loads C[r][c] = 16 r + c and writes element e of invocation l to
+// d[8 l + e]: the host checks d[8 l + e] == 16 ((l / 16) + 2 e) + l % 16 and d[256] == 8 (the fragment length)
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) writeonly buffer D { float data_d[]; };
+
+shared float src[16 * 16];
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+
+    for (uint i = lane; i < 16 * 16; i += 32) {
+        src[i] = float(i);
+    }
+    barrier();
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
+    coopMatLoad(c, src, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    for (uint e = 0; e < c.length() && e < 8; ++e) {
+        data_d[8 * lane + e] = c[e];
+    }
+    if (lane == 0) {
+        data_d[256] = float(c.length());
+    }
+}

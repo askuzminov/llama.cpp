@@ -108,13 +108,18 @@ bool ggml_vk_set_tensor_mapped(vk_context & cpy_ctx, const ggml_tensor * tensor,
 // with f32 activations read in place, the row map of count_experts.comp, rows in whole 128-row tiles and K in
 // whole 64-column stages of whole blocks, 32-bit offsets. from GGML_VK_MMID_F16REG_MIN_ROWS rows per expert on average
 // (16): decode batches take the mat-vec path before they get here.
-// the tiles (07.11, under test): GGML_VK_MMID_F16REG_BN (the single matmuls, the down projection) and
-// GGML_VK_MMID_F16REG_GLU_BN (the fused gate/up) take 64 or 128 tokens a tile (64): with ~78 rows per expert at -ub 4096
-// most experts get two tiles of 64, each loading and decoding its A again. GGML_VK_MMID_F16REG_ROWS2=1: the single
+// the tiles: GGML_VK_MMID_F16REG_BN (the single matmuls, the down projection) and GGML_VK_MMID_F16REG_GLU_BN (the fused
+// gate/up) take 64 or 128 tokens a tile (64). 128 lost on the 395 at -ub 4096 (08.11, profile-20261108-170847, ms of a
+// 4010-token ubatch): gate/up 664.9 -> 743.7, q5_1 down 445.4 -> 587.0 (221-255 VGPR against 150-171). the single
 // matmuls of 256-row multiples take 256 rows a workgroup in two A tiles that share each B fragment, as the fused gate/up
-// does; without a pipeline (the shared memory of the device) the 64-token tile and the plain one
+// does (GGML_VK_MMID_F16REG_ROWS2): unset - q5_1 only (q5_1 down 445.4 -> 398.2, the q8_0 down lost, 52.6 -> 63.0:
+// 144 VGPR against 92 for a cheap decode), 0 - none, 1 - every type. without a pipeline (the shared memory of the
+// device) the 64-token tile and the plain one
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
-                                     bool y_f32_kernel, uint64_t n_per_expert) {
+                                     bool y_f32_kernel, uint64_t n_per_expert, bool * b16) {
+    if (b16 != nullptr) {
+        *b16 = false;
+    }
     if (ctx->device->mmid_f16reg_mode == 0 || !y_f32_kernel || src1->type != GGML_TYPE_F32) {
         return nullptr;
     }
@@ -144,26 +149,42 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
     if (glu_up != nullptr && (glu_up->type != src0->type || !ggml_are_same_shape(glu_up, src0) || ggml_nbytes(glu_up) > range)) {
         return nullptr;
     }
+    // the variants under test (08.11): GGML_VK_MMID_F16REG_GLU_SPLIT=1 - the fused gate/up with gate and up in separate
+    // subgroups (64-row multiples); GGML_VK_MMID_F16REG_B16 / _GLU_B16 = 1 - the single matmuls / the fused gate/up read
+    // an f16 copy of the activations that the caller makes once (32 also for the tiles)
     static const int bn_single = [] { const char * e = getenv("GGML_VK_MMID_F16REG_BN"); return e ? atoi(e) : 64; }();
     static const int bn_glu    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_BN"); return e ? atoi(e) : 64; }();
-    static const bool rows2    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_ROWS2"); return e != nullptr && atoi(e) != 0; }();
+    static const int rows2_env = [] { const char * e = getenv("GGML_VK_MMID_F16REG_ROWS2"); return e ? atoi(e) : -1; }();
+    static const bool glu_split = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_SPLIT"); return e != nullptr && atoi(e) != 0; }();
+    static const bool b16_single = [] { const char * e = getenv("GGML_VK_MMID_F16REG_B16"); return e != nullptr && atoi(e) != 0; }();
+    static const bool b16_glu    = [] { const char * e = getenv("GGML_VK_MMID_F16REG_GLU_B16"); return e != nullptr && atoi(e) != 0; }();
+    const bool rows2 = rows2_env > 0 || (rows2_env < 0 && src0->type == GGML_TYPE_Q5_1);
     const int g = glu_up != nullptr ? 1 : 0;
-    int v = g ? 1 : (rows2 && src0->ne[1] % 256 == 0 ? 2 : 0);
-    int b = (g ? bn_glu : bn_single) == 128 ? 1 : 0;
-    if (!ctx->device->pipeline_mmid_f16reg[t][v][b] && b == 1) {
-        b = 0;
+    int v = g ? (glu_split && src0->ne[1] % 64 == 0 ? 3 : 1) : (rows2 && src0->ne[1] % 256 == 0 ? 2 : 0);
+    const int bn_want = g ? bn_glu : bn_single;
+    int b = bn_want == 128 ? 1 : bn_want == 32 ? 2 : 0;
+    int h = (g ? b16_glu : b16_single) ? 1 : 0;
+    auto & pipes = ctx->device->pipeline_mmid_f16reg;
+    if (!pipes[t][v][b][h] && v == 3) {
+        v = 1;
     }
-    if (!ctx->device->pipeline_mmid_f16reg[t][v][b] && v == 2) {
+    if (!pipes[t][v][b][h] && v == 2) {
         v = 0;
     }
-    vk_pipeline pipeline = ctx->device->pipeline_mmid_f16reg[t][v][b];
+    if (!pipes[t][v][b][h] && b != 0) {
+        b = 0;
+    }
+    vk_pipeline pipeline = pipes[t][v][b][h];
+    if (b16 != nullptr) {
+        *b16 = pipeline != nullptr && h != 0;
+    }
     // the first choice of each pipeline, every one with GGML_VK_MMID_F16REG_LOG=1; on stderr as well with
     // GGML_SCHED_LOG_REALLOC, which 02 sets (llama-bench drops the ggml log)
     static const bool log_all = getenv("GGML_VK_MMID_F16REG_LOG") != nullptr;
     static const bool log_stderr = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
-    static bool logged[4][3][2] = {};
-    if (pipeline && (!logged[t][v][b] || log_all)) {
-        logged[t][v][b] = true;
+    static bool logged[4][4][3][2] = {};
+    if (pipeline && (!logged[t][v][b][h] || log_all)) {
+        logged[t][v][b][h] = true;
         GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID %s on %s (%s, %ld rows per expert)\n", ggml_type_name(src0->type), pipeline->name.c_str(),
                       g ? "fused gate/up" : "single", (long) n_per_expert);
         if (log_stderr) {
@@ -229,12 +250,41 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
     if (ggml_nbytes(src0) > range || ggml_nbytes(src1) > range || ggml_nbytes(dst) > range) {
         return false;
     }
-    const int bi = src1->type == GGML_TYPE_F16 ? 1 : 0;
+    // GGML_VK_MM_F16REG_B16=1 (08.11, under test): f32 activations go to an f16 copy in prealloc_y first, once for the
+    // matmuls in a row that read the same tensor, and the f16 pipeline reads that: half the bytes of B a workgroup and no
+    // conversion in it (in the model the short K lost against the 05-mm test, 2.43 against 1.34 ms on 10240 x 320)
+    static const bool b16_copy = [] { const char * e = getenv("GGML_VK_MM_F16REG_B16"); return e != nullptr && atoi(e) != 0; }();
+    const bool to_f16 = b16_copy && src1->type == GGML_TYPE_F32 && device->pipeline_mm_f16reg[1] && ggml_is_contiguous(src1);
+    const int bi = src1->type == GGML_TYPE_F16 || to_f16 ? 1 : 0;
     vk_pipeline pipeline = device->pipeline_mm_f16reg[bi];
     vk_subbuffer a, b, d;
-    if (!pipeline || !ggml_vk_fork_tensor_buffer(ctx, src0, 4, a) || !ggml_vk_fork_tensor_buffer(ctx, src1, 16, b) ||
+    if (!pipeline || !ggml_vk_fork_tensor_buffer(ctx, src0, 4, a) || !ggml_vk_fork_tensor_buffer(ctx, src1, to_f16 ? 4 : 16, b) ||
         !ggml_vk_fork_tensor_buffer(ctx, dst, 4, d)) {
         return false;
+    }
+    if (to_f16) {
+        vk_pipeline cpy = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, GGML_TYPE_F16);
+        if (!cpy) {
+            return false;
+        }
+        const size_t y_sz = sizeof(ggml_fp16_t) * (size_t) ggml_nelements(src1);
+        if (ctx->prealloc_size_y < y_sz) {
+            ctx->prealloc_size_y = y_sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        ggml_pipeline_request_descriptor_sets(ctx, cpy, 1);
+        if (ctx->prealloc_y_last_pipeline_used != cpy.get() || ctx->prealloc_y_last_tensor_used != src1 || ctx->prealloc_y_last_k_padded) {
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            ggml_vk_cpy_to_contiguous(ctx, subctx, cpy, src1, b, ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0));
+            ctx->prealloc_y_last_pipeline_used = cpy.get();
+            ctx->prealloc_y_last_tensor_used   = src1;
+            ctx->prealloc_y_last_k_padded      = false;
+        }
+        ggml_vk_sync_buffers(ctx, subctx);
+        b = vk_subbuffer{ ctx->prealloc_y, 0, y_sz };
+        ctx->prealloc_y_need_sync = true;
     }
 
     vk_mat_mat_push_constants pc = {};
@@ -242,7 +292,7 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
     pc.N           = (uint32_t) N;
     pc.K           = (uint32_t) K;
     pc.stride_a    = (uint32_t) (src0->nb[1] / qs * ggml_blck_size(src0->type));
-    pc.stride_b    = (uint32_t) (src1->nb[1] / ggml_type_size(src1->type));
+    pc.stride_b    = to_f16 ? (uint32_t) K : (uint32_t) (src1->nb[1] / ggml_type_size(src1->type));
     pc.stride_d    = (uint32_t) (dst->nb[1] / sizeof(float));
     pc.num_batches = 1;
     pc.k_split     = (uint32_t) K;

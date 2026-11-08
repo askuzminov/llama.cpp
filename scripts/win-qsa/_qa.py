@@ -2224,12 +2224,13 @@ def cmd_mm():
     variants of mul_mm_f16reg.comp (GGML_VK_MM_F16REG). For each variant first the MUL_MAT tests of q8_0 against the CPU,
     all of them through the variant (GGML_VK_MM_F16REG_MIN_N=1, _MIN_M=1, _MIN_K=1), then perf of the q8_0 shapes of qwen4exp at QA_MM_N
     tokens (4096): TFLOP/s per shape, and the registers, the scratch (registers spilled to memory) and the shared memory
-    the driver gave the shader. QA_MMARMS: variants (name VAR=value ...;...), a run each, the default path first."""
+    the driver gave the shader. QA_MMARMS: variants (name VAR=value ...;...), a run each, the int8 path first."""
     run = Run("mm")
     exe = binary("test-backend-ops")
     device = env("CHECKDEVICE", DEVICES.get(env("BACKEND"), "CPU"))
     n_tok = env("QA_MM_N", "4096")
-    arms = variants("QA_MMARMS", "default;" + ";".join(f"{v} GGML_VK_MM_F16REG={v}" for v in MM_VARIANTS))
+    # the int8 path by name: since 08.11 r16x64/8x1 is the default on RDNA3
+    arms = variants("QA_MMARMS", "int8 GGML_VK_MM_F16REG=0;" + ";".join(f"{v} GGML_VK_MM_F16REG={v}" for v in MM_VARIANTS))
     bid = build_id(exe.parent)
     run.add(f"mm: dense q8_0 matmuls on {device}, build {current_build()}, perf at {n_tok} tokens")
     test_rows, stat_rows, fails = [], [], []

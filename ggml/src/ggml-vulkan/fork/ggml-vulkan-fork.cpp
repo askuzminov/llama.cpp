@@ -161,6 +161,53 @@ bool ggml_vk_fork_coopmat_a_probe(vk_device & device) {
 #endif
 }
 
+bool ggml_vk_fork_coopmat_c_probe(vk_device & device) {
+#if !(defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT))
+    GGML_UNUSED(device);
+    return false;
+#else
+    // coopmat_c_probe.comp: element e of an f32 16x16 accumulator of invocation l is row (l / 16) + 2 e, column l % 16
+    std::vector<uint32_t> d;
+    if (!ggml_vk_fork_run_probe(device, "coopmat C layout", coopmat_c_probe_cm1_data, coopmat_c_probe_cm1_len, {}, 1, 257, 32, d)) {
+        return false;
+    }
+    float v[257];
+    memcpy(v, d.data(), sizeof(v));
+    int bad = 0;
+    for (int l = 0; l < 32; l++) {
+        for (int e = 0; e < 8; e++) {
+            bad += v[8 * l + e] != (float) (16 * ((l / 16) + 2 * e) + l % 16);
+        }
+    }
+    if (bad != 0 || v[256] != 8.0f) {
+        GGML_LOG_INFO("ggml_vulkan: coopmat C layout probe: %d of 256 elements elsewhere, fragment length %g\n", bad, (double) v[256]);
+        return false;
+    }
+    return true;
+#endif
+}
+
+// the shader constants of mul_mmid_f16reg.comp that hold for the whole device: GGML_VK_MMID_F16REG_BPF=0 - each stage
+// reads its own B tile (1: the next stage's B in registers), GGML_VK_MMID_F16REG_EPI=1 - the sums written straight from
+// the accumulators where coopmat_c_probe.comp finds the RDNA3 layout (0: through shared memory)
+static void ggml_vk_fork_mmid_f16reg_consts(vk_device & device) {
+    const char * bpf = getenv("GGML_VK_MMID_F16REG_BPF");
+    device->mmid_f16reg_bpf = bpf != nullptr && atoi(bpf) == 0 ? 0 : 1;
+    device->mmid_f16reg_epi = 0;
+    const char * epi = getenv("GGML_VK_MMID_F16REG_EPI");
+    if (epi != nullptr && atoi(epi) != 0) {
+        if (device->mmid_f16reg_mode == 2 || ggml_vk_fork_coopmat_c_probe(device)) {
+            device->mmid_f16reg_epi = 1;
+        } else {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG_EPI=1 off: the coopmat C layout is not the one the shader takes\n");
+        }
+    }
+    if (device->mmid_f16reg_bpf == 0 || device->mmid_f16reg_epi != 0) {
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16reg: next-stage B in registers %u, sums straight from the accumulators %u\n",
+                      device->mmid_f16reg_bpf, device->mmid_f16reg_epi);
+    }
+}
+
 void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
     // the experts' prefill matmuls on mul_mmid_f16reg.comp (f16 coopmat, the codes decoded into the A fragments) where
     // coopmat_a_probe.comp finds the A layout it takes. the default on RDNA3 since 11.10: on the 395 a 4096-token prompt
@@ -169,6 +216,8 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
     // GGML_VK_MMID_F16REG=0: the int8 path, =1: on any device that passes the probe, =emulate: the same algorithm with
     // subgroup shuffles on any device with 32-invocation subgroups (tests)
     device->mmid_f16reg_mode = 0;
+    device->mmid_f16reg_bpf  = 1;
+    device->mmid_f16reg_epi  = 0;
     const char * env = getenv("GGML_VK_MMID_F16REG");
     if (env != nullptr && strcmp(env, "0") == 0) {
         return;
@@ -188,6 +237,7 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
     if (strcmp(env, "emulate") == 0) {
         device->mmid_f16reg_mode = 2;
         GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16reg emulated with subgroup shuffles\n");
+        ggml_vk_fork_mmid_f16reg_consts(device);
         return;
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -207,23 +257,34 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
     if (getenv("GGML_SCHED_LOG_REALLOC")) {
         fprintf(stderr, "ggml_vulkan: MUL_MAT_ID f16reg on (coopmat A layout probe passed)\n");
     }
+    ggml_vk_fork_mmid_f16reg_consts(device);
 #else
     GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG needs a build with coopmat shaders\n");
 #endif
 }
 
 void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
-    // the dense q8_0 matmuls of prompts on mul_mm_f16reg.comp (07.11, variants under test, off by default):
+    // the dense q8_0 matmuls of prompts on mul_mm_f16reg.comp (07.11; the default on AMD RDNA3 since 08.11, below):
     // GGML_VK_MM_F16REG=<a><rows>x<tokens>/<m>x<n>, a = r (each subgroup decodes the codes into its A fragments) or l (the
     // codes decoded to f16 on their way to shared memory, A fragments loaded from there); rows and tokens of a subgroup
     // (multiples of 16), m x n subgroups of 32 in the workgroup. r32x64/4x2: tiles of 128 rows x 128 tokens, 8 subgroups
     // of 32 x 64. a last letter: the B tile of the next stage not held in registers (n) or held as f16 (h), the shader's
     // BPF; none: as read, f32. GGML_VK_MM_F16REG_EMULATE=1: subgroup shuffles instead of coopmat (tests on devices
     // without it)
+    // the default on RDNA3 since 08.11, r16x64/8x1: on the 395 a 4010-token prompt at depth 0 3962.2 against 4042.6 ms of
+    // gpu time (profile-20261107-234325, dense q8_0 1335.6 against 1415.1), the quality probes of 01 at least
+    // as close to the reference as the int8 path (f16 activations: KL max 0.433 / 0.136 / 0.127 against 0.909 / 0.421 /
+    // 0.133 at 4096 / 16384 / 32768, check-20261108-174220). GGML_VK_MM_F16REG=0: the int8 path
     device->mm_f16reg_mode = 0;
     const char * env = getenv("GGML_VK_MM_F16REG");
-    if (env == nullptr || *env == 0 || strcmp(env, "0") == 0) {
+    if (env != nullptr && (*env == 0 || strcmp(env, "0") == 0)) {
         return;
+    }
+    if (env == nullptr) {
+        if (!(device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3)) {
+            return;
+        }
+        env = "r16x64/8x1";
     }
     char a = 0;
     unsigned wm = 0, wn = 0, gm = 0, gn = 0;

@@ -190,7 +190,8 @@ export CHECKARMS="default GGML_VK_MMID_GLU_MIN_TOKENS=0;bn128 GGML_VK_MMID_GLU_M
 unset QA_CHECK_QUALITY QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS
 ```
 
-Затем профиль:
+Затем профиль (08.11, `profile-20261108-170847`: BN 128 медленнее и у gate/up, и у down; пары строк ускорили down
+q5_1 на 10.6% и замедлили q8_0 на 20%, поэтому по умолчанию пары только у q5_1):
 
 ```bash
 export QA_PROF_DEPTHS=0
@@ -198,6 +199,42 @@ export QA_PARMS="default GGML_VK_PIPELINE_STATS=mul_mmid_f16reg;bn128 GGML_VK_PI
 ./03-profile.bat
 unset QA_PROF_DEPTHS QA_PARMS
 ```
+
+Второй круг (08.11): семь вариантов. Эксперты: `GGML_VK_MMID_F16REG_EPI=1` - суммы пишутся прямо из аккумуляторов (без
+8 КБ shared memory на выгрузку; раскладку проверяет `coopmat_c_probe.comp`), `_BPF=0` - без регистровой предвыборки B,
+`_BN` / `_GLU_BN` = 32, `_GLU_SPLIT=1` - gate и up в разных подгруппах, `_B16` / `_GLU_B16` = 1 - активации копируются
+в f16 один раз, `_ROWS2=1` - пары строк и у q8_0. Плотный: `GGML_VK_MM_F16REG_B16=1` - то же копирование в f16, ещё
+два тайла в модели. gate/up, down и плотные - разные операции профиля, поэтому вариант задаёт по одному на каждую, а
+`default` и `glub16` повторяют down и плотный по умолчанию (шум). Сначала тесты операций:
+
+```bash
+export QA_CHECK_QUALITY=0 QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none
+export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_ID_FUSION type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1;MUL_MAT type_a=q8_0,"
+E="GGML_VK_MMID_GLU_MIN_TOKENS=0"; O="@o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"; K="GGML_VK_MM_F16REG_MIN_N=1 GGML_VK_MM_F16REG_MIN_M=1 GGML_VK_MM_F16REG_MIN_K=1 @o=MUL_MAT"
+export CHECKARMS="epi $E GGML_VK_MMID_F16REG_EPI=1 $O;bpf0 $E GGML_VK_MMID_F16REG_BPF=0 $O;bn32 $E GGML_VK_MMID_F16REG_BN=32 GGML_VK_MMID_F16REG_GLU_BN=32 $O;split $E GGML_VK_MMID_F16REG_GLU_SPLIT=1 $O;splitepi $E GGML_VK_MMID_F16REG_GLU_SPLIT=1 GGML_VK_MMID_F16REG_EPI=1 $O;b16 $E GGML_VK_MMID_F16REG_B16=1 GGML_VK_MMID_F16REG_GLU_B16=1 $O;r2epi $E GGML_VK_MMID_F16REG_ROWS2=1 GGML_VK_MMID_F16REG_EPI=1 $O;mmb16 GGML_VK_MM_F16REG=r16x64/8x1 GGML_VK_MM_F16REG_B16=1 $K;mm3232 GGML_VK_MM_F16REG=r32x32/4x2 $K;mm1632 GGML_VK_MM_F16REG=r16x32/8x1 $K"
+./01-check.bat
+unset QA_CHECK_QUALITY QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS E O K
+```
+
+Затем профиль:
+
+```bash
+export QA_PROF_DEPTHS=0
+S="GGML_VK_PIPELINE_STATS=mul_m"
+export QA_PARMS="default $S;epi $S GGML_VK_MMID_F16REG_EPI=1 GGML_VK_MM_F16REG=r16x64/8x1;bpf0 $S GGML_VK_MMID_F16REG_BPF=0 GGML_VK_MM_F16REG=r16x64/8x1 GGML_VK_MM_F16REG_B16=1 GGML_VK_MM_F16REG_MIN_K=1;bn32 $S GGML_VK_MMID_F16REG_BN=32 GGML_VK_MMID_F16REG_GLU_BN=32 GGML_VK_MM_F16REG=r32x32/4x2;split $S GGML_VK_MMID_F16REG_GLU_SPLIT=1 GGML_VK_MMID_F16REG_B16=1 GGML_VK_MM_F16REG=r16x32/8x1;splitepi $S GGML_VK_MMID_F16REG_GLU_SPLIT=1 GGML_VK_MMID_F16REG_EPI=1 GGML_VK_MMID_F16REG_ROWS2=1 GGML_VK_MM_F16REG=r16x64/8x1 GGML_VK_MM_F16REG_B16=1;glub16 $S GGML_VK_MMID_F16REG_GLU_B16=1"
+./03-profile.bat
+unset QA_PROF_DEPTHS QA_PARMS S
+```
+
+| вариант | gate/up | down | плотные |
+|---|---|---|---|
+| `default` | как есть | как есть (пары q5_1) | `r16x64/8x1` (по умолчанию с 08.11) |
+| `epi` | прямая выгрузка | прямая выгрузка | `r16x64/8x1` |
+| `bpf0` | без предвыборки B | без предвыборки B | `r16x64/8x1` + f16-копия, все K |
+| `bn32` | плитка 32 | плитка 32 | `r32x32/4x2` |
+| `split` | gate и up в разных подгруппах | f16-копия | `r16x32/8x1` |
+| `splitepi` | то же + прямая выгрузка | пары и у q8_0 + прямая выгрузка | `r16x64/8x1` + f16-копия |
+| `glub16` | f16-копия | как есть | по умолчанию |
 
 ## Микробенчмарк (04)
 
@@ -229,8 +266,8 @@ shared memory, фрагменты A грузятся оттуда; послед�
 умолчанию (формы с M < 512 или K < 1024 идут int8-путём): TFLOP/s по формам (`*` - лучший на форме), последняя строка -
 мс всех плотных матмулов q8_0 одного ubatch 4096 по счёту профиля 31.10 (у int8 там ~1450 мс). Короткий K этот тест не
 судит: на 10240 x 320 он дал ядру 1.34 мс, а в модели (профиль 03) было 2.43 против 1.49 у int8. Внизу статистика конвейеров от драйвера: VGPR, scratch (сброс регистров в память, такой вариант медленный), LDS.
-`QA_MMARMS` - варианты (`имя VAR=значение ...;...`), по умолчанию `default` и варианты третьего прогона (`MM_VARIANTS`
-в `_qa.py`). Первый прогон 07.11 (`logs/395/mm-20261107-201543`): лучший `r16x64/8x1`, у тайлов 64x64 на подгруппу
+`QA_MMARMS` - варианты (`имя VAR=значение ...;...`), по умолчанию `int8` (`GGML_VK_MM_F16REG=0`: с 08.11 на RDNA3 по
+умолчанию `r16x64/8x1`) и варианты третьего прогона (`MM_VARIANTS` в `_qa.py`). Первый прогон 07.11 (`logs/395/mm-20261107-201543`): лучший `r16x64/8x1`, у тайлов 64x64 на подгруппу
 scratch 544-640 байт. Второй (`mm-20261107-220919`): без B в f32 на регистрах у 64x64 всё равно не меньше 544 байт
 (16 сумм по 32 байта и ещё 32), `r16x64/8x1` 1305 мс против 1464. Третий: суммы в шейдере названы константами, а не
 массивом с индексом в цикле - влезают ли теперь 64x64, 48x64 и 64x48 без scratch и обгоняют ли `r16x64/8x1`.
@@ -249,7 +286,10 @@ set "QA_PARMS=default;r16x64 GGML_VK_MM_F16REG=r16x64/8x1"
 03-profile.bat
 ```
 
-Лучший - качество против умолчания: `set QA_QARMS=default;mm GGML_VK_MM_F16REG=<вариант>` и `01-check.bat`.
+Лучший - качество против умолчания: `set QA_QARMS=default;mm GGML_VK_MM_F16REG=<вариант>` и `01-check.bat`. 08.11
+(`check-20261108-174220`): у `r16x64/8x1` пробы не дальше от эталона, чем у int8 (KL max 0.433 / 0.136 / 0.127 против
+0.909 / 0.421 / 0.133 на 4096 / 16384 / 32768), пары строк q5_1 бит в бит с обычным вариантом - `r16x64/8x1` по
+умолчанию на AMD RDNA3, `GGML_VK_MM_F16REG=0` - int8-путь.
 
 ## Что не запускается повторно
 

@@ -151,6 +151,8 @@ size_t ggml_vk_fork_host_buffer_pad(const vk_device & device, size_t size);
 // queue exists
 void ggml_vk_fork_mmid_f16reg_init(vk_device & device);
 bool ggml_vk_fork_coopmat_a_probe(vk_device & device);
+// coopmat_c_probe.comp: the f32 accumulator layout mul_mmid_f16reg.comp writes from with EPI 1
+bool ggml_vk_fork_coopmat_c_probe(vk_device & device);
 // GGML_VK_MM_F16REG=<r|l><rows>x<tokens>/<m>x<n>: the variant of the dense q8_0 matmul on mul_mm_f16reg.comp (sets
 // mm_f16reg_mode, _lds, _tile, _name), after the shared memory limit and the A layout probe
 void ggml_vk_fork_mm_f16reg_init(vk_device & device);
@@ -217,8 +219,9 @@ bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t
 // 1 with subgroups where the device has them (else upstream), 2 without subgroups, 0 the upstream atomic compaction
 int ggml_vk_topk_radix_stable();
 // MUL_MAT_ID: the mul_mmid_f16reg.comp pipeline for these operands, or nullptr for the upstream choice
+// (b16: set when the pipeline reads an f16 copy of the activations, which the caller makes in prealloc_y)
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
-                                     bool y_f32_kernel, uint64_t n_per_expert);
+                                     bool y_f32_kernel, uint64_t n_per_expert, bool * b16 = nullptr);
 // MUL_MAT: the matmuls that stay off the int8 path (GGML_VK_INT_COOPMAT=3, graph outputs, K under 512)
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): dispatches it and returns true, false for the
