@@ -66,6 +66,9 @@ if not defined DECARGS   set "DECARGS=-fit off -ncmoe 48 --moe-cache auto --phas
 if not defined CHECKOPS  set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_VEC_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;GATED_DELTA_NET_LAZY"
 if not defined GGML_OP_OFFLOAD_MIN_BATCH set "GGML_OP_OFFLOAD_MIN_BATCH=128"
 if not defined LLAMA_PREFILL_BUDGET set "LLAMA_PREFILL_BUDGET=0"
+rem --spec-auto caps drafts at 7 since 09.11 (measured on the 395); the 3090 had 3 ahead on 12.10 (CPU experts:
+rem the verify grows with every token) and is not measured since, so its runs keep 3
+if not defined QA_SPEC   set "QA_SPEC=--spec-auto --spec-draft-n-max 3"
 
 :defaults_done
 rem test-elastic-buffer-fork fails when it tested no device (a skip must not count as a pass)

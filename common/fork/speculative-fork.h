@@ -11,11 +11,15 @@
 #include <string>
 #include <vector>
 
-// draft length cap of --spec-auto when --spec-draft-n-max is not given. 3 since 12.10: on the 395 the cap 6 ran 35.87
-// t/s against 37.43 with 3 (MTP without ngram-mod, the same prompts), its verify cost 7.7 ms per token against 6.5 and
-// its recurrent state 788 MiB against 450; the user's own test on the 3090 also had 3 ahead. ngram-mod drafts are not
-// bound by it
-#define COMMON_SPECULATIVE_AUTO_N_MAX 3
+// draft length cap of --spec-auto when --spec-draft-n-max is not given. 7 since 09.11 (the user's call): on the 395
+// (06-decode, decode-20261109-203021, temperature 0) the cap 7 ran code 69.85 t/s against 60.74 with 3 (+15%: a file
+// edit +23%, JSON +19%, new code +10%), prose 42.66 against 44.28 (-3.7%), all +9.6%, with the dense int8 mat-vec of
+// 5-8 columns keeping its rows (ggml_vk_fork_mmvq_n5_rows4; with upstream's 4 rows the verify of 5 tokens cost 12 ms
+// more than 4) and a calibration row per draft position. 3 from 12.10 to 09.11: the cap 6 had run 35.87 against 37.43
+// on prose prompts before both changes (verify 7.7 ms per token against 6.5). The rollback states take ~0.45 GiB more
+// than at 3 (788 MiB at 6 against 450 at 3); the 3090 had 3 ahead on 12.10 and is not measured since (its harness
+// config pins 3). ngram-mod drafts are not bound by it
+#define COMMON_SPECULATIVE_AUTO_N_MAX 7
 // the cap of --spec-auto for a DFlash / DSpark draft without --spec-draft-n-max (the draft clamps it to its block size
 // - 1). 7 measured 22.10 with the gate (chats to 213K): the 395 36.91 against 36.60 t/s at 3 (the block of 8 drafts in
 // 10.8 against 7.2 ms), the 3090 26.42 against 28.02 (the 7 rollback states of the target take 450 MiB more VRAM from

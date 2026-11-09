@@ -1999,87 +1999,171 @@ def decode_ask(url, prompt, max_tokens, temp, log):
     return answer.get("timings", {}), answer["choices"][0]["message"].get("content") or ""
 
 
+def decode_row(task, t, content, stream=0, t0=0.0, t1=0.0):
+    return {"task": task, "stream": stream, "n": t.get("predicted_n", 0), "ms": t.get("predicted_ms", 0.0),
+            "prompt_n": t.get("prompt_n", 0), "prompt_ms": t.get("prompt_ms", 0.0), "draft_n": t.get("draft_n", 0),
+            "draft_acc": t.get("draft_n_accepted", 0), "text": text_digest(content)[:8], "t0": t0, "t1": t1}
+
+
+def decode_run(url, tasks, ntok, temp, log, par):
+    """the tasks on one server: in order for one stream; for par streams every stream runs all tasks from its own
+    offset (stream i starts at task i), all streams start together, so par requests run at once all the time"""
+    t0 = time.monotonic()
+    if par <= 1:
+        rows = []
+        for task, prompt in tasks:
+            a = time.monotonic() - t0
+            t, content = decode_ask(url, prompt, ntok, temp, log)
+            rows.append(decode_row(task, t, content, 0, a, time.monotonic() - t0))
+        return rows
+    rows, errors = [], []
+    lock = threading.Lock()
+    barrier = threading.Barrier(par)
+
+    def stream(i):
+        order = tasks[i % len(tasks):] + tasks[:i % len(tasks)]
+        try:
+            barrier.wait()
+            for task, prompt in order:
+                a = time.monotonic() - t0
+                t, content = decode_ask(url, prompt, ntok, temp, log)
+                with lock:
+                    rows.append(decode_row(task, t, content, i, a, time.monotonic() - t0))
+        except (Fail, threading.BrokenBarrierError) as e:
+            with lock:
+                errors.append(e)
+            barrier.abort()
+
+    threads = [threading.Thread(target=stream, args=(i,), daemon=True) for i in range(par)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    if errors:
+        raise next((e for e in errors if isinstance(e, Fail)), Fail(f"decode: a stream stopped ({errors[0]!r})"))
+    return sorted(rows, key=lambda x: (x["stream"], x["t0"]))
+
+
 def cmd_decode():
     """Decode speed on the server as serve.bat runs it (SPECDRAFT, QA_SPEC), by kind of text (09.11): one request per
     task of QA_DEC_SET in a conversation of its own, up to QA_DEC_TOKENS tokens at temperature QA_DEC_TEMP (0), TG t/s
     from the server's timings (no perf logger: the wall clock of the reply), drafted and accepted tokens. QA_DARMS:
     variants (name VAR=value ...;...), each a server of its own, e.g. a draft cap (LLAMA_ARG_SPEC_DRAFT_N_MAX=7). At
     temperature 0 the drafts do not change the text: two variants write the same reply up to a near-tie of the numbers
-    (the column "text" names the reply by a digest), so their TG compares on the same tokens."""
+    (the column "text" names the reply by a digest), so their TG compares on the same tokens.
+    QA_DEC_PAR: numbers of streams (1 by default), each a server with -np N --kv-unified where N requests run at once
+    (every stream all tasks from its own offset); the total is the tokens of all replies over the wall time from the
+    first request to the end of the last, prompts included (agents send prompts while others generate). A warm-up
+    server runs first (QA_DEC_WARM)."""
     run = Run("decode")
     model = model_path()
     exe = binary("llama-server")
     ctx, port = env_int("QA_DEC_CTX", 32768), env_int("QA_PORT", 8097)
     ntok, temp = env_int("QA_DEC_TOKENS", 1024), float(env("QA_DEC_TEMP", "0"))
-    args = server_args(model, ctx, 1, port)
+    pars = env_ints("QA_DEC_PAR", "1")
     tasks = decode_tasks()
     arms = variants("QA_DARMS", "default")
-    run.add(f"decode: llama-server, tasks {' '.join(n for n, _ in tasks)}, up to {ntok} tokens each at temperature {temp}, "
-            f"{model.name}, build {current_build()}" +
+    run.add(f"decode: llama-server, tasks {' '.join(n for n, _ in tasks)}, up to {ntok} tokens each at temperature {temp}"
+            f"{', streams ' + ' '.join(map(str, pars)) if pars != [1] else ''}, {model.name}, build {current_build()}" +
             (", variants " + "; ".join(f"{name} {' '.join(f'{k}={v}' for k, v in e.items())}".strip() for name, e in arms)
              if len(arms) > 1 else ""))
-    results = []
-    for name, arm_env in arms:
-        run_env = dict(os.environ, **arm_env)
-        identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
-                    "env": env_identity(run_env), "model": model_identity(model),
-                    "draft": model_identity(Path(env("SPECDRAFT"))) if "-md" in args else None,
-                    "tasks": text_digest("\n".join(n + "\x00" + p for n, p in tasks)), "tokens": ntok, "temp": temp,
-                    "machine": machine()}
-
-        def go(log, run_env=run_env):
-            proc, log = start_server(exe, args, run_env, log)
-            url = f"http://127.0.0.1:{port}"
-            try:
-                # the first use of a pipeline compiles it: a short reply before the measured ones
-                decode_ask(url, "Say hello in one sentence.", 16, temp, log)
-                rows = []
-                for task, prompt in tasks:
-                    t, content = decode_ask(url, prompt, ntok, temp, log)
-                    rows.append({"task": task, "n": t.get("predicted_n", 0), "ms": t.get("predicted_ms", 0.0),
-                                 "prompt_n": t.get("prompt_n", 0), "draft_n": t.get("draft_n", 0),
-                                 "draft_acc": t.get("draft_n_accepted", 0), "text": text_digest(content)[:8]})
-                return {"rows": rows}
-            finally:
-                proc.kill()
-                proc.wait()
-                mark_end()
-
-        label = "decode" if name == "default" else f"decode {name}"
+    # a warm-up server before the measured ones (QA_DEC_WARM=0: none): the first variant after a build compiles its
+    # pipelines in its first replies (the driver has no cache of the new shaders yet): prose of the first variant of
+    # decode-20261109-203021 34.5 t/s against 42.7 for the same settings later. The first variant with the most
+    # streams, every task with 32 tokens, nothing kept
+    if env("QA_DEC_WARM", "1") != "0":
+        warm_par = max(1, max(pars))
+        warm_args = server_args(model, ctx, warm_par, port)
+        proc, warm_log = start_server(exe, warm_args, dict(os.environ, **arms[0][1]), run.dir / "decode_warmup.log")
         try:
-            r, kept = run.measure(label, identity, go)
-        except Fail as e:
-            run.failed = True
-            run.add("", f"{label}: FAIL {e}")
-            continue
-        results.append((name, r["rows"]))
-        run.add("", label + (" k" if kept else ""),
-                *table(["task", "tokens", "TG t/s", "drafted", "accepted", "rate", "per verify", "prompt", "text"],
-                       [[x["task"], x["n"], f"{rate(x['n'], x['ms']):.2f}", x["draft_n"], x["draft_acc"],
-                         f"{x['draft_acc'] / x['draft_n']:.3f}" if x["draft_n"] else "",
-                         # the verify steps: every step but the first token of the reply verifies a draft or decodes one
-                         f"{x['n'] / max(1, x['n'] - x['draft_acc']):.2f}", x["prompt_n"], x["text"]] for x in r["rows"]]))
-    if len(results) > 1:
-        base_name, base = results[0]
+            print(f"decode: warm-up, {warm_par} stream(s), every task with 32 tokens, decode_warmup.log", flush=True)
+            decode_run(f"http://127.0.0.1:{port}", tasks, 32, temp, warm_log, warm_par)
+        finally:
+            proc.kill()
+            proc.wait()
+            mark_end()
+    results = []   # (name, par, rows)
+    for name, arm_env in arms:
+        for par in pars:
+            run_env = dict(os.environ, **arm_env)
+            args = server_args(model, ctx, max(1, par), port)
+            identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
+                        "env": env_identity(run_env), "model": model_identity(model),
+                        "draft": model_identity(Path(env("SPECDRAFT"))) if "-md" in args else None,
+                        "tasks": text_digest("\n".join(n + "\x00" + p for n, p in tasks)), "tokens": ntok, "temp": temp,
+                        "machine": machine(), **({"par": par} if par > 1 else {})}
+
+            def go(log, run_env=run_env, args=args, par=par):
+                proc, log = start_server(exe, args, run_env, log)
+                url = f"http://127.0.0.1:{port}"
+                try:
+                    # the first use of a pipeline compiles it: a short reply before the measured ones
+                    decode_ask(url, "Say hello in one sentence.", 16, temp, log)
+                    return {"rows": decode_run(url, tasks, ntok, temp, log, par)}
+                finally:
+                    proc.kill()
+                    proc.wait()
+                    mark_end()
+
+            label = ("decode" if name == "default" else f"decode {name}") + (f" x{par}" if par > 1 else "")
+            try:
+                r, kept = run.measure(label, identity, go)
+            except Fail as e:
+                run.failed = True
+                run.add("", f"{label}: FAIL {e}")
+                continue
+            rows = r["rows"]
+            results.append((name, par, rows))
+            head = ["task"] + (["stream"] if par > 1 else []) + ["tokens", "TG t/s", "drafted", "accepted", "rate",
+                                                                 "per verify", "prompt", "text"]
+            body = [[x["task"]] + ([x["stream"]] if par > 1 else []) +
+                    [x["n"], f"{rate(x['n'], x['ms']):.2f}", x["draft_n"], x["draft_acc"],
+                     f"{x['draft_acc'] / x['draft_n']:.3f}" if x["draft_n"] else "",
+                     # the verify steps: every step but the first token of the reply verifies a draft or decodes one
+                     f"{x['n'] / max(1, x['n'] - x['draft_acc']):.2f}", x["prompt_n"], x["text"]] for x in rows]
+            run.add("", label + (" k" if kept else ""), *table(head, body))
+    single = [(name, rows) for name, par, rows in results if par == 1]
+    if len(single) > 1:
+        base_name, base = single[0]
         groups = [(x["task"], [x["task"]]) for x in base] + [
             ("code", [t for t, _ in tasks if t != "prose"]), ("all", [t for t, _ in tasks])]
         rows = []
         for gname, members in groups:
             row = [gname]
             ref = None
-            for name, res in results:
+            for name, res in single:
                 sel = [x for x in res if x["task"] in members]
                 n, ms = sum(x["n"] for x in sel), sum(x["ms"] for x in sel)
                 tg = rate(n, ms) if ms else 0.0
                 ref = tg if ref is None else ref
                 row.append(f"{tg:.2f}" + ("" if name == base_name or not ref else f" ({(tg / ref - 1) * 100:+.1f}%)"))
             same = all(next((y["text"] for y in res if y["task"] == gname), None) ==
-                       next((y["text"] for y in base if y["task"] == gname), None) for _, res in results[1:])
+                       next((y["text"] for y in base if y["task"] == gname), None) for _, res in single[1:])
             row.append(("same" if same else "differs") if len(members) == 1 else "")
             rows.append(row)
         run.add("", "decode: TG t/s by task and variant (tokens over the time of the replies; the text of every variant "
                     "against the first)",
-                *table(["task"] + [name for name, _ in results] + ["text"], rows))
+                *table(["task"] + [name for name, _ in single] + ["text"], rows))
+    if any(par > 1 for _, par, _ in results):
+        rows = []
+        total1 = {}
+        for name, par, res in results:
+            n = sum(x["n"] for x in res)
+            wall = max(x["t1"] for x in res) - min(x["t0"] for x in res)
+            total = n / wall if wall > 0 else 0.0
+            if par == 1:
+                total1[name] = total
+            per = statistics.mean(rate(x["n"], x["ms"]) for x in res if x["ms"])
+            dn, da = sum(x["draft_n"] for x in res), sum(x["draft_acc"] for x in res)
+            ref = total1.get(name)
+            rows.append([name, par, len(res), n, f"{wall:.1f}", f"{total:.2f}",
+                         "" if par == 1 or not ref else f"{total / ref:.2f}x", f"{per:.2f}",
+                         f"{da / dn:.3f}" if dn else "", f"{sum(x['prompt_ms'] for x in res) / 1000 / max(wall, 1e-9) * 100:.0f}%"])
+        run.add("", "decode: streams at once: the tokens of all replies over the wall time (prompts included), against "
+                    "one stream of the same variant; per stream - the mean TG of a reply; prompts - the share of the "
+                    "wall time the prompts took, if one after another",
+                *table(["variant", "streams", "replies", "tokens", "wall s", "total t/s", "vs 1", "per stream t/s",
+                        "accepted", "prompts"], rows))
     return run.finish()
 
 
