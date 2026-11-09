@@ -184,10 +184,15 @@ void main() {
     const uint arow   = e * p.expert_stride + rowc * nsb;
     // get_scale_min_k4: sub-blocks 0-3 take the low 6 bits of scales bytes 0-3 (scale) and 4-7 (min), 4-7 the nibbles
     // of bytes 8-11 and the top 2 bits of bytes 0-3 (scale) and 4-7 (min); sub-block 2jp + u sits at byte
-    // (2jp + u) % 4 of each scales word
-    const uint sh0     = 8 * ((2 * jp) % 4);
-    const uint sh1     = sh0 + 8;
-    const bool hi_form = jp >= 2;
+    // (2jp + u) % 4 of each scales word. The two forms by masks and shifts of the lane (jp >= 2: the top 2 bits
+    // moved to bits 4-5 and a nibble of bytes 8-11 added), not a select: the AMD compiler turns that select into
+    // divergent branches, and the load of each round's head then waits right before its branch
+    const uint sh0   = 8 * ((2 * jp) % 4);
+    const uint sh1   = sh0 + 8;
+    const uint hi_m  = 0u - (jp >> 1);           // all ones for sub-blocks 4-7
+    const uint m6    = 0x3Fu ^ (hi_m & 0xFFu);   // 0x3F, or 0xC0 (the top 2 bits)
+    const uint m6s   = (jp >> 1) * 2;            // 0, or 2 (bits 6-7 to bits 4-5)
+    const uint mnib  = hi_m & 15u;               // 0, or 15 (the nibble of bytes 8-11)
     // blocks 2jp and 2jp + 1 of a superblock: nblk is a multiple of 8, so they are the inner blocks (jp % 2) * 2 and
     // + 1 of one x4 group; their (d, sum) pairs are its 8-byte word jp % 2
     const uint bq_off = 1 + (jp % 2) * 4 + hh;
@@ -213,13 +218,10 @@ void main() {
     float dsc0_##I, dsc1_##I, dmn0_##I, dmn1_##I; \
     if (I < MAXR) { \
         const vec2 dm = unpackHalf2x16(hd##I.x) * kp##I; \
-        const uint b0 = hd##I.y >> sh0, b1 = hd##I.y >> sh1; \
-        const uint m0 = hd##I.z >> sh0, m1 = hd##I.z >> sh1; \
-        const uint q0 = hd##I.w >> sh0, q1 = hd##I.w >> sh1; \
-        const uint sc0 = hi_form ? ((q0 & 15u) | ((b0 >> 2) & 48u)) : (b0 & 63u); \
-        const uint sc1 = hi_form ? ((q1 & 15u) | ((b1 >> 2) & 48u)) : (b1 & 63u); \
-        const uint mn0 = hi_form ? (((q0 >> 4) & 15u) | ((m0 >> 2) & 48u)) : (m0 & 63u); \
-        const uint mn1 = hi_form ? (((q1 >> 4) & 15u) | ((m1 >> 2) & 48u)) : (m1 & 63u); \
+        const uint sc0 = (((hd##I.y >> sh0) & m6) >> m6s) | ((hd##I.w >> sh0) & mnib); \
+        const uint sc1 = (((hd##I.y >> sh1) & m6) >> m6s) | ((hd##I.w >> sh1) & mnib); \
+        const uint mn0 = (((hd##I.z >> sh0) & m6) >> m6s) | ((hd##I.w >> (sh0 + 4)) & mnib); \
+        const uint mn1 = (((hd##I.z >> sh1) & m6) >> m6s) | ((hd##I.w >> (sh1 + 4)) & mnib); \
         dsc0_##I = dm.x * float(sc0); \
         dsc1_##I = dm.x * float(sc1); \
         /* each half of a sub-block takes half of the block sum of the activations, the two lanes of the halves make */ \

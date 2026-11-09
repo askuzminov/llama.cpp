@@ -1054,10 +1054,11 @@ struct vk_device_struct {
     uint32_t mmid_f16reg_db;   // fork: two LDS buffers, one barrier a stage (GGML_VK_MMID_F16REG_DB)
     // fork: MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK): 0 off, 1 where the upstream
     // mat-vec quantizes the activations, 2 every MUL_MAT_ID mat-vec of the types it has; the workgroup (one subgroup),
-    // the rounds a lane loads at once, lanes per row of q4_K and q5_1; pipelines by weight type
+    // the rounds a lane loads at once and the lanes per row, of q4_K and of q5_1; pipelines by weight type
     uint32_t mmv_id_fork_mode = 0;
     uint32_t mmv_id_fork_wg = 32;
-    uint32_t mmv_id_fork_maxr = 5;
+    uint32_t mmv_id_fork_maxr_q4_k = 5;
+    uint32_t mmv_id_fork_maxr_q5_1 = 5;
     uint32_t mmv_id_fork_lpr_q4_k = 16;
     uint32_t mmv_id_fork_lpr_q5_1 = 4;
     vk_pipeline pipeline_mmv_id_fork[GGML_TYPE_COUNT];
