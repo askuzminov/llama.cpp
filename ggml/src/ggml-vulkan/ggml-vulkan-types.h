@@ -1052,6 +1052,15 @@ struct vk_device_struct {
     uint32_t mmid_f16reg_bpf;
     uint32_t mmid_f16reg_epi;
     uint32_t mmid_f16reg_db;   // fork: two LDS buffers, one barrier a stage (GGML_VK_MMID_F16REG_DB)
+    // fork: MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK): 0 off, 1 where the upstream
+    // mat-vec quantizes the activations, 2 every MUL_MAT_ID mat-vec of the types it has; the workgroup (one subgroup),
+    // the rounds a lane loads at once, lanes per row of q4_K and q5_1; pipelines by weight type
+    uint32_t mmv_id_fork_mode = 0;
+    uint32_t mmv_id_fork_wg = 32;
+    uint32_t mmv_id_fork_maxr = 8;
+    uint32_t mmv_id_fork_lpr_q4_k = 16;
+    uint32_t mmv_id_fork_lpr_q5_1 = 4;
+    vk_pipeline pipeline_mmv_id_fork[GGML_TYPE_COUNT];
     // dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG (mul_mm_f16reg.comp): 0 off, 1 coopmat,
     // 2 emulated; the A codes decoded to f16 in shared memory (else in registers); block size, A and B fragments of a
     // subgroup, subgroups along M; the variant in the pipeline names; [f16 activations]

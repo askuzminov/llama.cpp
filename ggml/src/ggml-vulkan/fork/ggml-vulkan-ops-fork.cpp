@@ -452,3 +452,88 @@ void ggml_vk_gated_delta_net_lazy(ggml_backend_vk_context * ctx, vk_context & su
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], state_buf, rec_buf, info_buf, dst_buf},
         pc, { H, (uint32_t) info->ne[1], S_v });
 }
+
+// MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK, see ggml_vk_fork_mmv_id_init): src1
+// quantized to q8_1 x4 blocks in prealloc_y as the upstream mat-vec does it (and found there for the second projection
+// of the same activations), then one dispatch over (row blocks, slots, tokens). A fused MUL by the routing weights is
+// read as [token * nei0 + slot]; the fused ADD_ID of a bias stays on the upstream path
+bool ggml_vk_fork_mmv_id(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    if (!ggml_vk_fork_mmv_id_takes(ctx, dst)) {
+        return false;
+    }
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    uint32_t fusion_flags = 0;
+    const ggml_tensor * scale = nullptr;
+    if (ctx->num_additional_fused_ops > 0) {
+        const ggml_tensor * next = cgraph->nodes[node_idx + 1];
+        if (ctx->num_additional_fused_ops != 1 || next->op != GGML_OP_MUL) {
+            return false;
+        }
+        scale = next->src[1];
+        fusion_flags |= 0x4;   // MAT_VEC_FUSION_FLAGS_SCALE0
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_mmv_id_fork[src0->type];
+    vk_pipeline to_q8_1  = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    GGML_ASSERT(pipeline != nullptr && to_q8_1 != nullptr);
+
+    const uint64_t y_ne = ggml_nelements(src1);
+    const uint64_t y_sz = ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1);
+    if (y_sz > ctx->device->properties.limits.maxStorageBufferRange) {
+        GGML_ABORT("Requested preallocation size is too large");
+    }
+    if (ctx->prealloc_size_y < y_sz) {
+        ctx->prealloc_size_y = y_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const ggml_tensor * out = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    vk_subbuffer d_D   = ggml_vk_tensor_subbuffer(ctx, out);
+    vk_subbuffer d_X   = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer d_Qy  = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
+    vk_subbuffer d_F0  = scale ? ggml_vk_tensor_subbuffer(ctx, scale) : d_D;
+    vk_subbuffer d_Y   = { ctx->prealloc_y, 0, ctx->prealloc_y->size };
+
+    if (ctx->prealloc_y_last_pipeline_used != to_q8_1.get() || ctx->prealloc_y_last_tensor_used != src1 ||
+        ctx->prealloc_y_last_k_padded) {
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, (uint32_t) y_ne);
+        ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+        ctx->prealloc_y_last_tensor_used   = src1;
+        ctx->prealloc_y_last_k_padded      = false;
+    }
+
+    const uint32_t nrows = (uint32_t) src0->ne[1];
+    const vk_mmv_id_fork_push_constants pc = {
+        (uint32_t) src0->ne[0],
+        nrows,
+        (uint32_t) (src0->nb[2] / ggml_type_size(src0->type)),
+        (uint32_t) src1->ne[1],
+        (uint32_t) ids->ne[0],
+        (uint32_t) ids->ne[1],
+        (uint32_t) (ids->nb[1] / sizeof(int32_t)),
+        fusion_flags,
+        (uint32_t) dst->ne[0],
+        (uint32_t) (dst->ne[0] * dst->ne[1]),
+    };
+    // GGML_VK_MMV_ID_FORK_LOG: a line per dispatch (the tests count them)
+    static const bool log = getenv("GGML_VK_MMV_ID_FORK_LOG") != nullptr;
+    if (log) {
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID mat-vec fork %s %u x %u, %u tokens x %u slots%s\n", ggml_type_name(src0->type), nrows,
+                      pc.ncols, pc.nei1, pc.nei0, scale ? ", router weights" : "");
+    }
+    // wg_denoms[0] holds the rows of a workgroup
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_X, d_Y, d_D, d_F0, d_D, d_ids }, pc,
+                              { nrows, (uint32_t) ids->ne[0], (uint32_t) ids->ne[1] });
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}

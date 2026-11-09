@@ -1160,6 +1160,20 @@ void process_shaders() {
 #endif
         }
     }
+    // fork: MUL_MAT_ID of up to 8 tokens against q8_1 activations, an expert read once for the tokens that share it
+    // (GGML_VK_MMV_ID_FORK); _l<n>: lanes per row, _emu: the 4-byte dot without GL_EXT_integer_dot_product
+    for (const auto & [t, lprs] : std::vector<std::pair<std::string, std::vector<int>>>{{"q4_k", {8, 16, 32}}, {"q5_1", {2, 4, 8}}}) {
+        std::string def = "DATA_A_" + t;
+        std::transform(def.begin(), def.end(), def.begin(), ::toupper);
+        for (int lpr : lprs) {
+            const std::map<std::string, std::string> d = {{def, "1"}, {"LPR", std::to_string(lpr)}};
+            const std::string name = "mul_mat_vec_id_fork_" + t + "_l" + std::to_string(lpr);
+            string_to_spv(name + "_emu", "mul_mat_vec_id_fork.comp", merge_maps(d, {{"EMULATE_DOT", "1"}}));
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+            string_to_spv(name, "mul_mat_vec_id_fork.comp", d);
+#endif
+        }
+    }
     // fork: dense MUL_MAT of q8_0 on f16 WMMA (GGML_VK_MM_F16REG); _lds: A decoded to f16 in shared memory, _reg: in
     // registers; _b16: f16 activations; _hcpre: the DSV4_HC_PRE after it in the store; _emu: subgroup shuffles instead
     // of coopmat

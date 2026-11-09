@@ -68,6 +68,20 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_sigmoid_
 static constexpr std::initializer_list<ggml_op> concat_ssm_conv_silu_pattern { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY };
 static constexpr std::initializer_list<ggml_op> concat_ssm_conv_pattern { GGML_OP_CONCAT, GGML_OP_SSM_CONV };
 
+// mul_mat_vec_id_fork.comp (the MUL_MAT_ID mat-vec of the fork), strides in elements
+struct vk_mmv_id_fork_push_constants {
+    uint32_t ncols;
+    uint32_t nrows;
+    uint32_t expert_stride;   // blocks of one expert's matrix
+    uint32_t ne11;
+    uint32_t nei0;
+    uint32_t nei1;
+    uint32_t nbi1;
+    uint32_t fusion_flags;
+    uint32_t stride_d;
+    uint32_t batch_stride_d;
+};
+
 // the l2 norm of the GDN q and k: RMS_NORM, SCALE (build_gdn_l2_norm)
 static constexpr std::initializer_list<ggml_op> rms_norm_scale_pattern { GGML_OP_RMS_NORM, GGML_OP_SCALE };
 
@@ -227,6 +241,12 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
 // MUL_MAT: whether ggml_vk_mul_mat quantizes its f16 src1 into prealloc_y as q8_1 x4 blocks (in ggml-vulkan.cpp)
 bool ggml_vk_fork_mul_mat_quantizes_y_x4(ggml_backend_vk_context * ctx, const ggml_tensor * dst);
+// MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK): the mode and pipelines at device
+// init; whether the mat-vec path takes dst there (in ggml-vulkan.cpp, ggml_vk_can_fuse asks it for the MUL by the
+// routing weights at more than one token); the dispatch, false for the upstream path
+void ggml_vk_fork_mmv_id_init(vk_device & device);
+bool ggml_vk_fork_mmv_id_takes(const ggml_backend_vk_context * ctx, const ggml_tensor * dst);
+bool ggml_vk_fork_mmv_id(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx);
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): dispatches it and returns true, false for the
 // upstream path (off, a fused op, another type or shape). hc_pre: the gated DSV4_HC_PRE after it takes the store
 // (MUL_MAT_DSV4_HC_PRE); check_only: the answer without a dispatch

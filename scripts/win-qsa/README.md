@@ -241,6 +241,32 @@ unset QA_PROF_DEPTHS QA_PARMS S
 раздельный gate/up и без предвыборки B медленнее, копия у down дороже выигрыша. С 08.11 копия по умолчанию у gate/up и
 у плотных с K <= 4096.
 
+Матвек экспертов на 1-8 токенов (09.11, `GGML_VK_MMV_ID_FORK`, `mul_mat_vec_id_fork.comp`): один запуск на все
+токены, общий у токенов проверки эксперт читается один раз, MUL по весам роутера слит при любом числе токенов (FORK.md).
+`1` - где апстрим идёт int8-путём, `2` - и down q5_1 одного токена (апстрим считает его на f32-активациях, поэтому у
+`mmv2` смотреть и KLD). На Mac проверен только эмулированный dot4. Сначала тесты операций и пробы точности:
+
+```bash
+export QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none
+export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_1),;MUL_MAT_ID_SCALE;MUL_MAT_ID_REPEAT type_a=(q4_K|q5_1),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1;MOE_GLU_F16_DOWN"
+export CHECKARMS="default;mmv1 GGML_VK_MMV_ID_FORK=1 GGML_VK_MMV_ID_FORK_LOG=1;mmv2 GGML_VK_MMV_ID_FORK=2 GGML_VK_MMV_ID_FORK_LOG=1"
+export QA_QARMS="default;mmv1 GGML_VK_MMV_ID_FORK=1;mmv2 GGML_VK_MMV_ID_FORK=2"
+./01-check.bat
+unset QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS QA_QARMS
+```
+
+Затем профиль: строки `MUL_MAT_ID` проверок 1-4 токенов по вариантам, ISA и регистры конвейеров `mul_mat_vec_id*` (и
+апстрима, и форка) в логах `default` и `mmv1`; `r5` - 5 раундов загрузок вместо 8 (у формы модели их 5, меньше
+регистров), `wg64` - группа из 64 линий:
+
+```bash
+export QA_PROF_DEPTHS=0
+I="GGML_VK_PIPELINE_ISA=mul_mat_vec_id GGML_VK_PIPELINE_STATS=mul_mat_vec_id"
+export QA_PARMS="default $I;mmv1 $I GGML_VK_MMV_ID_FORK=1;mmv2 GGML_VK_MMV_ID_FORK=2;r5 GGML_VK_MMV_ID_FORK=1 GGML_VK_MMV_ID_FORK_MAXR=5;wg64 GGML_VK_MMV_ID_FORK=1 GGML_VK_MMV_ID_FORK_WG=64"
+./03-profile.bat
+unset QA_PROF_DEPTHS QA_PARMS I
+```
+
 ## Микробенчмарк (04)
 
 `test-micro-fork` строит подграф индексатора так, как его строит граф qwen4exp, и гоняет его целиком на устройстве

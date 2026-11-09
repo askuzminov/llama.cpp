@@ -271,6 +271,53 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
 #endif
 }
 
+void ggml_vk_fork_mmv_id_init(vk_device & device) {
+    // the decode and draft-check MUL_MAT_ID (up to 8 tokens) on mul_mat_vec_id_fork.comp instead of mul_mat_vecq.comp:
+    // one dispatch for all tokens, an expert read once for the tokens that share it, raw loads before the decode, the
+    // MUL by the routing weights fused at any token count. q4_K and q5_1 weights. GGML_VK_MMV_ID_FORK=1: where the
+    // upstream mat-vec quantizes the activations to q8_1, =2: also below its k threshold (the 1-token q5_1 down of
+    // qwen4exp, which upstream runs on f32 activations). _WG: 32 or 64 lanes (one subgroup), _MAXR: rounds of loads a
+    // lane holds (1-8), _LPR_Q4_K: lanes per q4_K row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row (2, 4, 8)
+    device->mmv_id_fork_mode = 0;
+    const char * env = getenv("GGML_VK_MMV_ID_FORK");
+    if (env == nullptr || atoi(env) <= 0) {
+        return;
+    }
+    if (!device->subgroup_clustered || !device->subgroup_ballot || !device->subgroup_vote || !device->subgroup_require_full_support) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMV_ID_FORK needs clustered, ballot and vote subgroup operations and full subgroups\n");
+        return;
+    }
+    auto env_u32 = [](const char * name, uint32_t def) {
+        const char * v = getenv(name);
+        return v != nullptr && v[0] != 0 ? (uint32_t) atoi(v) : def;
+    };
+    uint32_t wg = env_u32("GGML_VK_MMV_ID_FORK_WG", 32);
+    if (device->subgroup_size_control) {
+        if (wg < device->subgroup_min_size || wg > device->subgroup_max_size) {
+            wg = device->subgroup_size;
+        }
+    } else {
+        wg = device->subgroup_size;
+    }
+    if (wg != 32 && wg != 64) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMV_ID_FORK needs subgroups of 32 or 64, the device has %u\n", wg);
+        return;
+    }
+    const uint32_t lpr4 = env_u32("GGML_VK_MMV_ID_FORK_LPR_Q4_K", 16);
+    const uint32_t lpr5 = env_u32("GGML_VK_MMV_ID_FORK_LPR_Q5_1", 4);
+    if ((lpr4 != 8 && lpr4 != 16 && lpr4 != 32) || (lpr5 != 2 && lpr5 != 4 && lpr5 != 8)) {
+        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMV_ID_FORK_LPR_Q4_K takes 8, 16, 32 and _LPR_Q5_1 2, 4, 8\n");
+        return;
+    }
+    device->mmv_id_fork_wg       = wg;
+    device->mmv_id_fork_maxr     = std::min<uint32_t>(std::max<uint32_t>(env_u32("GGML_VK_MMV_ID_FORK_MAXR", 8), 1), 8);
+    device->mmv_id_fork_lpr_q4_k = lpr4;
+    device->mmv_id_fork_lpr_q5_1 = lpr5;
+    device->mmv_id_fork_mode     = std::min(atoi(env), 2);
+    GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID mat-vec of the fork, mode %u: subgroups of %u, %u rounds of loads, lanes per row q4_K %u, q5_1 %u, %s dot\n",
+                  device->mmv_id_fork_mode, wg, device->mmv_id_fork_maxr, lpr4, lpr5, device->integer_dot_product ? "int8" : "emulated");
+}
+
 // a tile of mul_mm_f16reg.comp from its GGML_VK_MM_F16REG spelling (see ggml_vk_fork_mm_f16reg_init): the spec constants
 // {invocations, A fragments, B fragments, subgroups along M, B prefetch}, whether A goes through shared memory, the name
 // of its pipelines and, for the log, the tile and the shared memory. false (and a warning) for a tile the shader or the

@@ -50,6 +50,32 @@ struct test_mul_mat_id_repeat : public test_mul_mat_id {
     }
 };
 
+// MUL_MAT_ID and the MUL by the router weights of each token's slots ([1, n_used, n_tokens]), as build_moe_ffn has it
+// after the down projection. Vulkan fuses the MUL into the mat-vec of up to 8 tokens of the fork (GGML_VK_MMV_ID_FORK
+// reads the weights per token and slot; the upstream mat-vec fuses it at one token only). Few experts: the tokens of a
+// case share most of them, so the shared reads of that shader are taken
+struct test_mul_mat_id_scale : public test_mul_mat_id {
+    test_mul_mat_id_scale(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SCALE";
+    }
+
+    // the whole graph, so that the backend may fuse the MUL
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(w, "w");
+        out = ggml_mul(ctx, out, w);
+        ggml_set_name(out, "out_w");
+        return out;
+    }
+};
+
 // the expert FFN of qwen4exp on Vulkan with the down projection reading the f16 cast of the GLU (LLAMA_MOE_DOWN_F16):
 // up and gate MUL_MAT_ID, swiglu, cast to f16, the down MUL_MAT_ID of the f16, the router weights. Vulkan runs the first
 // four as one shader that writes the f16 (MUL_MAT_ID_MUL_MAT_ID_GLU_CPY) and the down reads it in place
@@ -1085,6 +1111,23 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
     }
     for (int n : {9, 64}) {
         test_cases.emplace_back(new test_mul_mat_id_repeat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 17, 5, false, 256, n, 256));
+    }
+
+    // decode and draft checks of the qwen4exp experts (1-8 tokens, 10 of 12 or 40 experts): gate/up q4_K [640, 2560]
+    // on the shared activation row, down q5_1 [2560, 640] on a row per slot, the router weights after the down; one
+    // q4_K superblock per row and odd row counts for the tails
+    for (int n : {1, 2, 3, 4, 8}) {
+        for (int n_mats : {12, 40}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, n_mats, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_Q5_1, n_mats, 10, false, 2560, n, 640));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_Q4_K, 12, 10, true, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_scale(GGML_TYPE_Q5_1, 12, 10, true, 2560, n, 640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 6, 4, false, 37, n, 256));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 6, 4, true, 37, n, 160));
+        // an expert twice in a token's ids next to experts the tokens share
+        test_cases.emplace_back(new test_mul_mat_id_repeat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 38, 10, true, 64, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_repeat(GGML_TYPE_Q5_1, GGML_TYPE_F32, 38, 10, false, 64, n, 640));
     }
 
     // transposed sources; no i64, the CPU concat of it needs contiguous rows

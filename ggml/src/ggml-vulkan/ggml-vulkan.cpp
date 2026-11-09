@@ -3865,6 +3865,31 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
     }
+    // fork: MUL_MAT_ID of up to 8 tokens, a workgroup of one subgroup takes wg / lanes-per-row rows of one expert for
+    // every token that routed to it (GGML_VK_MMV_ID_FORK, ggml_vk_fork_mmv_id)
+    if (device->mmv_id_fork_mode != 0) {
+        struct mmv_id_shader { const char * name; size_t len; const void * data; };
+        const bool idot = device->integer_dot_product;
+#define MMVID_EMU(t, l) mmv_id_shader { "mul_mat_vec_id_fork_" #t "_l" #l "_emu", mul_mat_vec_id_fork_##t##_l##l##_emu_len, mul_mat_vec_id_fork_##t##_l##l##_emu_data }
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#define MMVID(t, l) (idot ? mmv_id_shader { "mul_mat_vec_id_fork_" #t "_l" #l, mul_mat_vec_id_fork_##t##_l##l##_len, mul_mat_vec_id_fork_##t##_l##l##_data } : MMVID_EMU(t, l))
+#else
+#define MMVID(t, l) MMVID_EMU(t, l)
+#endif
+        const uint32_t lpr4 = device->mmv_id_fork_lpr_q4_k;
+        const uint32_t lpr5 = device->mmv_id_fork_lpr_q5_1;
+        const mmv_id_shader q4k = lpr4 == 8 ? MMVID(q4_k, 8) : lpr4 == 32 ? MMVID(q4_k, 32) : MMVID(q4_k, 16);
+        const mmv_id_shader q51 = lpr5 == 2 ? MMVID(q5_1, 2) : lpr5 == 8 ? MMVID(q5_1, 8) : MMVID(q5_1, 4);
+#undef MMVID
+#undef MMVID_EMU
+        GGML_UNUSED(idot);
+        const uint32_t wg = device->mmv_id_fork_wg;
+        const uint32_t sg = device->subgroup_size_control ? wg : 0;
+        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q4_K], q4k.name, q4k.len, q4k.data, "main", 6,
+                                sizeof(vk_mmv_id_fork_push_constants), {wg / lpr4, 1, 1}, {wg, device->mmv_id_fork_maxr}, 1, true, true, sg);
+        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q5_1], q51.name, q51.len, q51.data, "main", 6,
+                                sizeof(vk_mmv_id_fork_push_constants), {wg / lpr5, 1, 1}, {wg, device->mmv_id_fork_maxr}, 1, true, true, sg);
+    }
     // fork: dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG, [f16 activations]
     if (device->mm_f16reg_mode != 0) {
         struct mm_f16reg_shader { size_t len; const void * data; };
@@ -5119,6 +5144,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         ggml_vk_fork_log_sparse(device);
         ggml_vk_fork_mmid_f16reg_init(device);
         ggml_vk_fork_mm_f16reg_init(device);
+        ggml_vk_fork_mmv_id_init(device);
 
         bool int_large_tile, int_large_tile_id;
         ggml_vk_fork_int_large_tile(device, int_large_tile, int_large_tile_id);
@@ -8238,7 +8264,49 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ctx->prealloc_split_k_need_sync = true;
 }
 
+// fork: true when ggml_vk_mul_mat_vec_id_q_f16 hands dst to mul_mat_vec_id_fork.comp (ggml_vk_fork_mmv_id): mode 1 where
+// it would quantize src1 to q8_1 itself (the conditions of quantize_y below), mode 2 also below the k threshold of
+// ggml_vk_should_use_mmvq. ggml_vk_can_fuse asks it for the MUL by the routing weights, keep the two in step
+bool ggml_vk_fork_mmv_id_takes(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const vk_device & device = ctx->device;
+    if (device->mmv_id_fork_mode == 0 || dst->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    if (device->pipeline_mmv_id_fork[src0->type] == nullptr || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t nei0 = ids->ne[0];
+    const int64_t nei1 = ids->ne[1];
+    // the shader: up to 8 tokens of up to 16 slots, an activation row per token or per slot, whole q8_1 x4 groups per
+    // q4_K superblock pair, contiguous rows of whole blocks (the experts may be strided), a contiguous dst of [rows,
+    // slots, tokens]
+    if (nei1 < 1 || nei1 > 8 || nei0 > 16 || ne12 != nei1 || (ne11 != 1 && ne11 != nei0) || ne00 != ne10 || ne10 % 128 != 0 ||
+        src1->ne[3] != 1 || ids->nb[0] != sizeof(int32_t) || !ggml_vk_dim01_contiguous(src0) || src0->ne[3] != 1 ||
+        src0->nb[2] % ggml_type_size(src0->type) != 0 || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || dst->ne[0] != ne01 ||
+        ggml_nbytes(src0) > device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    if ((ne11 * ne10) % 4 != 0 || !ggml_vk_src1_prec_allows_q8(dst)) {
+        return false;
+    }
+    const bool mmvq = device->integer_dot_product && ggml_vk_should_use_mmvq(device, (uint32_t) ne01, (uint32_t) ne12, (uint32_t) ne10, src0->type);
+    return mmvq || device->mmv_id_fork_mode >= 2;
+}
+
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    // fork: the mat-vec of the experts of the fork (GGML_VK_MMV_ID_FORK)
+    if (ggml_vk_fork_mmv_id(ctx, subctx, cgraph, node_idx)) {
+        return;
+    }
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
@@ -14466,6 +14534,12 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
             }
             return scale->ne[0] == 1 &&
                    scale->ne[1] == mmid->ne[1] && scale->ne[2] == mmid->ne[2] && scale->ne[3] == mmid->ne[3] &&
+                   ggml_are_same_shape(mul, mmid);
+        }
+        // fork: the mat-vec of the fork reads the scale as [token * nei0 + slot] at any token count (ggml_vk_fork_mmv_id)
+        if (ggml_vk_fork_mmv_id_takes(ctx, mmid)) {
+            return mmid->type == scale->type && ggml_is_contiguous(scale) && get_misalign_bytes(ctx, scale) == 0 &&
+                   scale->ne[0] == 1 && scale->ne[1] == mmid->ne[1] && scale->ne[2] == mmid->ne[2] && scale->ne[3] == 1 &&
                    ggml_are_same_shape(mul, mmid);
         }
         // shaders assume the types match
