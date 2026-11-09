@@ -3885,10 +3885,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         GGML_UNUSED(idot);
         const uint32_t wg = device->mmv_id_fork_wg;
         const uint32_t sg = device->subgroup_size_control ? wg : 0;
-        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q4_K], q4k.name, q4k.len, q4k.data, "main", 6,
-                                sizeof(vk_mmv_id_fork_push_constants), {wg / lpr4, 1, 1}, {wg, device->mmv_id_fork_maxr_q4_k}, 1, true, true, sg);
+        const uint32_t fence = device->mmv_id_fork_fence;
+        // q4_K only on request (GGML_VK_MMV_ID_FORK_Q4_K): without its pipeline ggml_vk_fork_mmv_id_takes leaves it upstream
+        if (device->mmv_id_fork_q4_k) {
+            ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q4_K], q4k.name, q4k.len, q4k.data, "main", 6,
+                                    sizeof(vk_mmv_id_fork_push_constants), {wg / lpr4, 1, 1}, {wg, device->mmv_id_fork_maxr_q4_k, fence}, 1,
+                                    true, true, sg);
+        }
         ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q5_1], q51.name, q51.len, q51.data, "main", 6,
-                                sizeof(vk_mmv_id_fork_push_constants), {wg / lpr5, 1, 1}, {wg, device->mmv_id_fork_maxr_q5_1}, 1, true, true, sg);
+                                sizeof(vk_mmv_id_fork_push_constants), {wg / lpr5, 1, 1}, {wg, device->mmv_id_fork_maxr_q5_1, fence}, 1,
+                                true, true, sg);
     }
     // fork: dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG, [f16 activations]
     if (device->mm_f16reg_mode != 0) {

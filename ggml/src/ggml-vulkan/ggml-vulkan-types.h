@@ -1061,6 +1061,8 @@ struct vk_device_struct {
     uint32_t mmv_id_fork_maxr_q5_1 = 5;
     uint32_t mmv_id_fork_lpr_q4_k = 16;
     uint32_t mmv_id_fork_lpr_q5_1 = 4;
+    bool mmv_id_fork_q4_k = false;       // q4_K on the fork's shader too (GGML_VK_MMV_ID_FORK_Q4_K)
+    uint32_t mmv_id_fork_fence = 0;      // the never-taken branch over the loads of a pass (GGML_VK_MMV_ID_FORK_FENCE)
     vk_pipeline pipeline_mmv_id_fork[GGML_TYPE_COUNT];
     // dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG (mul_mm_f16reg.comp): 0 off, 1 coopmat,
     // 2 emulated; the A codes decoded to f16 in shared memory (else in registers); block size, A and B fragments of a

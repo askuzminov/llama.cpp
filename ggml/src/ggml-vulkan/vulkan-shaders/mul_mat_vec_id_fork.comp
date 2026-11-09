@@ -23,7 +23,9 @@
 //   also moves the decode of a loaded word into the branch of its load), so each round would wait in turn;
 // - the weights of all rounds and the activations of the first token are loaded together, the decode follows; every
 //   other token of the workgroup takes one more round of activation loads (tokens in a compact list, a uniform
-//   branch each);
+//   branch each). The AMD scheduler still puts the first use of each round's words right after its loads (a wait a
+//   round); FENCE adds a branch that is never taken (fusion_flags is never all ones) and reads every word of the pass,
+//   so all loads stay before it;
 // - the sums of a row go through its lanes by clustered adds; the fused MUL by the routing weights reads them as
 //   [token * nei0 + slot] at any token count.
 // One dispatch for all tokens (the upstream shader is dispatched once per token).
@@ -33,6 +35,7 @@
 
 layout(constant_id = 0) const uint WG_SIZE = 32;   // the subgroup size, the host requires full subgroups of it
 layout(constant_id = 1) const uint MAXR = 5;       // rounds of a lane loaded at once (at most 8)
+layout(constant_id = 2) const uint FENCE = 0;      // 1: the never-taken branch that keeps the loads of a pass together
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -238,6 +241,12 @@ void main() {
         acc[K] += dsc0_##I * ds0.x * float(dot16(lo, bq0_##I)) + dsc1_##I * ds1.x * float(dot16(hi, bq1_##I)) - \
                   dmn0_##I * ds0.y - dmn1_##I * ds1.y; \
     }
+// every word round I loaded (weights and the first token's activations), for the FENCE branch
+#define TOUCH(K, I) \
+    if (I < MAXR) { \
+        const uvec4 t4 = hd##I ^ qv##I ^ bq0_##I ^ bq1_##I; \
+        touch ^= t4.x ^ t4.y ^ t4.z ^ t4.w ^ bds_##I.x ^ bds_##I.y; \
+    }
 #elif defined(DATA_A_Q5_1)
     const uint nround = (nblk + LPR - 1) / LPR;
     const uint arow   = e * p.expert_stride + rowc * nblk;
@@ -279,6 +288,12 @@ void main() {
         const vec2 ds = unpackHalf2x16(bds_##I); \
         acc[K] += dm_##I.x * ds.x * float(dot16(lo_##I, bq0_##I) + dot16(hi_##I, bq1_##I)) + dm_##I.y * ds.y; \
     }
+#define TOUCH(K, I) \
+    if (I < MAXR) { \
+        const uvec4 t4 = bq0_##I ^ bq1_##I; \
+        const uvec2 t2 = w0_##I ^ w1_##I ^ w2_##I; \
+        touch ^= t4.x ^ t4.y ^ t4.z ^ t4.w ^ t2.x ^ t2.y ^ bds_##I; \
+    }
 #endif
 
 #define ROUNDS(M, K) M(K, 0) M(K, 1) M(K, 2) M(K, 3) M(K, 4) M(K, 5) M(K, 6) M(K, 7)
@@ -292,11 +307,17 @@ void main() {
         LOAD_A(0) LOAD_A(1) LOAD_A(2) LOAD_A(3) LOAD_A(4) LOAD_A(5) LOAD_A(6) LOAD_A(7)
         // every workgroup has a first token: its activations go out with the weights
         ROUNDS(LOAD_B, 0)
+        if (FENCE != 0 && p.fusion_flags == 0xFFFFFFFFu) {
+            uint touch = 0;
+            ROUNDS(TOUCH, 0)
+            data_d[0] = uintBitsToFloat(touch);
+        }
         DEC_A(0) DEC_A(1) DEC_A(2) DEC_A(3) DEC_A(4) DEC_A(5) DEC_A(6) DEC_A(7)
         ROUNDS(COMP, 0)
         TOKEN(1) TOKEN(2) TOKEN(3) TOKEN(4) TOKEN(5) TOKEN(6) TOKEN(7)
     }
 #undef TOKEN
+#undef TOUCH
 #undef ROUNDS
 #undef LOAD_A
 #undef LOAD_B

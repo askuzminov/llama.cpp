@@ -274,19 +274,27 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
 void ggml_vk_fork_mmv_id_init(vk_device & device) {
     // the decode and draft-check MUL_MAT_ID (up to 8 tokens) on mul_mat_vec_id_fork.comp instead of mul_mat_vecq.comp:
     // one dispatch for all tokens, an expert read once for the tokens that share it, raw loads before the decode, the
-    // MUL by the routing weights fused at any token count. q4_K and q5_1 weights. GGML_VK_MMV_ID_FORK=1: where the
-    // upstream mat-vec quantizes the activations to q8_1, =2: also below its k threshold (the 1-token q5_1 down of
-    // qwen4exp, which upstream runs on f32 activations). _WG: 32 or 64 lanes (one subgroup), _LPR_Q4_K: lanes per q4_K
-    // row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row (2, 4, 8), _MAXR_Q4_K / _MAXR_Q5_1 (_MAXR: both): rounds of
-    // loads a lane holds (1-8). A round past the row is still loaded and computed, so the default is the whole row of
-    // qwen4exp (q4_K k=2560: 10 superblocks, q5_1 k=640: 20 blocks) at the lanes per row, in passes of at most 5
+    // MUL by the routing weights fused at any token count. q5_1 weights, q4_K with GGML_VK_MMV_ID_FORK_Q4_K=1 (slower
+    // than upstream on the 395: 4-8% a call over three versions, 09.11). GGML_VK_MMV_ID_FORK=1: where the upstream
+    // mat-vec quantizes the activations to q8_1 (the default on AMD RDNA3 with the int8 dot: the q5_1 down of the draft
+    // checks 4-16% faster a call at the decode quality of upstream), =2: also below its k threshold (the 1-token q5_1
+    // down of qwen4exp, which upstream runs on f32 activations), =0: upstream. _WG: 32 or 64 lanes (one subgroup),
+    // _LPR_Q4_K: lanes per q4_K row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row (2, 4, 8), _MAXR_Q4_K / _MAXR_Q5_1
+    // (_MAXR: both): rounds of loads a lane holds (1-8). A round past the row is still loaded and computed, so the
+    // default is the whole row of qwen4exp (q4_K k=2560: 10 superblocks, q5_1 k=640: 20 blocks) at the lanes per row,
+    // in passes of at most 5. _FENCE=1: the never-taken branch that keeps the loads of a pass together (see the shader)
     device->mmv_id_fork_mode = 0;
     const char * env = getenv("GGML_VK_MMV_ID_FORK");
-    if (env == nullptr || atoi(env) <= 0) {
+    const bool asked = env != nullptr && env[0] != 0;
+    const int  mode  = asked ? atoi(env) : (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 &&
+                                            device->integer_dot_product ? 1 : 0);
+    if (mode <= 0) {
         return;
     }
     if (!device->subgroup_clustered || !device->subgroup_ballot || !device->subgroup_vote || !device->subgroup_require_full_support) {
-        GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMV_ID_FORK needs clustered, ballot and vote subgroup operations and full subgroups\n");
+        if (asked) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMV_ID_FORK needs clustered, ballot and vote subgroup operations and full subgroups\n");
+        }
         return;
     }
     auto env_u32 = [](const char * name, uint32_t def) {
@@ -321,10 +329,16 @@ void ggml_vk_fork_mmv_id_init(vk_device & device) {
     device->mmv_id_fork_maxr_q5_1   = std::min<uint32_t>(std::max<uint32_t>(maxr5, 1), 8);
     device->mmv_id_fork_lpr_q4_k    = lpr4;
     device->mmv_id_fork_lpr_q5_1    = lpr5;
-    device->mmv_id_fork_mode        = std::min(atoi(env), 2);
-    GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID mat-vec of the fork, mode %u: subgroups of %u, q4_K %u lanes per row and %u rounds of loads, "
-                  "q5_1 %u and %u, %s dot\n", device->mmv_id_fork_mode, wg, lpr4, device->mmv_id_fork_maxr_q4_k, lpr5,
-                  device->mmv_id_fork_maxr_q5_1, device->integer_dot_product ? "int8" : "emulated");
+    device->mmv_id_fork_q4_k        = env_u32("GGML_VK_MMV_ID_FORK_Q4_K", 0) != 0;
+    device->mmv_id_fork_fence       = env_u32("GGML_VK_MMV_ID_FORK_FENCE", 0) != 0 ? 1 : 0;
+    device->mmv_id_fork_mode        = (uint32_t) std::min(mode, 2);
+    char q4k[64] = "q4_K upstream";
+    if (device->mmv_id_fork_q4_k) {
+        snprintf(q4k, sizeof(q4k), "q4_K %u lanes per row and %u rounds of loads", lpr4, device->mmv_id_fork_maxr_q4_k);
+    }
+    GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID mat-vec of the fork, mode %u%s: subgroups of %u, q5_1 %u lanes per row and %u rounds of loads, "
+                  "%s%s, %s dot\n", device->mmv_id_fork_mode, asked ? "" : " (default)", wg, lpr5, device->mmv_id_fork_maxr_q5_1, q4k,
+                  device->mmv_id_fork_fence ? ", loads fenced" : "", device->integer_dot_product ? "int8" : "emulated");
 }
 
 // a tile of mul_mm_f16reg.comp from its GGML_VK_MM_F16REG spelling (see ggml_vk_fork_mm_f16reg_init): the spec constants

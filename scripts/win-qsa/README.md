@@ -244,29 +244,29 @@ unset QA_PROF_DEPTHS QA_PARMS S
 Матвек экспертов на 1-8 токенов (09.11, `GGML_VK_MMV_ID_FORK`, `mul_mat_vec_id_fork.comp`): один запуск на все
 токены, общий у токенов проверки эксперт читается один раз, MUL по весам роутера слит при любом числе токенов (FORK.md).
 `1` - где апстрим идёт int8-путём, `2` - и down q5_1 одного токена (апстрим считает его на f32-активациях, поэтому у
-`mmv2` смотреть и KLD). На Mac проверен только эмулированный dot4. `wide` - 32 линии на строку q4_K и 8 на строку
-q5_1 (3 раунда вместо 5): строки q4_K и q5_1 в таблице операций отдельные, одно плечо проверяет оба типа. Сначала
-тесты операций и пробы точности (default пути декода не меняется от сборки к сборке, его берём из прошлого прогона):
+`mmv2` смотреть и KLD). С третьего прогона по умолчанию на AMD RDNA3 с int8 dot - q5_1 в режиме 1 (строка
+`... mode 1 (default) ...` в логе), `GGML_VK_MMV_ID_FORK=0` - апстрим, q4_K - только по `GGML_VK_MMV_ID_FORK_Q4_K=1`.
+`fence` - q4_K и q5_1 в режиме 2 с `GGML_VK_MMV_ID_FORK_FENCE=1` (ветка, которая держит загрузки прохода вместе).
+Сначала тесты операций и пробы точности нового умолчания:
 
 ```bash
-W="GGML_VK_MMV_ID_FORK_LPR_Q4_K=32 GGML_VK_MMV_ID_FORK_LPR_Q5_1=8"
+F="GGML_VK_MMV_ID_FORK=2 GGML_VK_MMV_ID_FORK_Q4_K=1 GGML_VK_MMV_ID_FORK_FENCE=1"
 export QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none
 export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_1),;MUL_MAT_ID_SCALE;MUL_MAT_ID_REPEAT type_a=(q4_K|q5_1),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1;MOE_GLU_F16_DOWN"
-export CHECKARMS="mmv2 GGML_VK_MMV_ID_FORK=2 GGML_VK_MMV_ID_FORK_LOG=1;wide GGML_VK_MMV_ID_FORK=2 GGML_VK_MMV_ID_FORK_LOG=1 $W"
-export QA_QARMS="mmv2 GGML_VK_MMV_ID_FORK=2;wide GGML_VK_MMV_ID_FORK=2 $W"
+export CHECKARMS="default GGML_VK_MMV_ID_FORK_LOG=1;fence GGML_VK_MMV_ID_FORK_LOG=1 $F"
+export QA_QARMS="default"
 ./01-check.bat
 unset QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS QA_QARMS
 ```
 
-Затем профиль: строки `MUL_MAT_ID` проверок 1-4 токенов по вариантам, ISA и регистры конвейеров форка в логах
-`mmv2` и `wide`:
+Затем профиль: `base` - апстрим, `fence` - с ISA конвейеров форка:
 
 ```bash
 export QA_PROF_DEPTHS=0
 I="GGML_VK_PIPELINE_ISA=mul_mat_vec_id_fork GGML_VK_PIPELINE_STATS=mul_mat_vec_id_fork"
-export QA_PARMS="default;mmv2 $I GGML_VK_MMV_ID_FORK=2;wide $I GGML_VK_MMV_ID_FORK=2 $W"
+export QA_PARMS="default;base GGML_VK_MMV_ID_FORK=0;fence $I $F"
 ./03-profile.bat
-unset QA_PROF_DEPTHS QA_PARMS I W
+unset QA_PROF_DEPTHS QA_PARMS I F
 ```
 
 Шейдер в сборке, если в логах вариантов `mmv*` есть строка `ggml_vulkan: MUL_MAT_ID mat-vec of the fork, mode ...`, а
@@ -285,8 +285,13 @@ q4_K gate/up на 1 токене 5.63 против 4.64, на 4 токенах 1
 Вторая версия (`check-20261109-150903`, `profile-20261109-151801`, сборка `src-a49ca14b25ececa2`, MTP не shared):
 точность декода как у default; down q5_1 быстрее апстрима (1 токен в режиме 2 - 2.92 против 3.31 мс на граф, 4 токена
 6.51 против 7.72), gate/up q4_K всё ещё медленнее (1 токен 5.12 против 4.64, 4 токена 12.07 против 11.37): выбор формы
-масштабов компилятор сделал ветками, загрузки заголовков пяти раундов шли по очереди. Третья версия (не закоммичена):
-масштабы масками без выбора, `_MAXR_Q4_K` / `_MAXR_Q5_1` по умолчанию от числа линий.
+масштабов компилятор сделал ветками, загрузки заголовков пяти раундов шли по очереди. Третья версия: масштабы
+масками без выбора, `_MAXR_Q4_K` / `_MAXR_Q5_1` по умолчанию от числа линий.
+
+Третья версия (`check-20261109-154501`, `profile-20261109-155144`): точность `mmv2` и `wide` как у default; q4_K
+`mmv2` 5.05 против 4.65 мс на граф на 1 токене, 11.98 против 11.47 на 4; q5_1 2.89 против 3.29 и 6.49 против 7.76;
+`wide` (32/8 линий) хуже `mmv2` с 2 токенов. ISA q4_K: ветвей нет, но перевод d/dmin стоит сразу за загрузками своего
+раунда. Отсюда умолчание q5_1 в режиме 1 и попытка `_FENCE` для q4_K (не закоммичено).
 
 ## Микробенчмарк (04)
 
