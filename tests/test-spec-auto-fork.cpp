@@ -286,6 +286,17 @@ int main() {
 #endif
     }
 
+    // the draft cap by generating slots (09.11): a verify step within 8 tokens by default - 2 slots 3 drafts, 3 and 4
+    // slots 1, 5 and more none; one slot keeps --spec-auto as it is
+    if (getenv("LLAMA_SPEC_DRAFT_BY_SLOTS") == nullptr && getenv("LLAMA_SPEC_SLOT_BATCH") == nullptr) {
+        CHECK(common_speculative_fork_draft_by_slots(1) == -1);
+        CHECK(common_speculative_fork_draft_by_slots(2) == 3);
+        CHECK(common_speculative_fork_draft_by_slots(3) == 1);
+        CHECK(common_speculative_fork_draft_by_slots(4) == 1);
+        CHECK(common_speculative_fork_draft_by_slots(5) == 0);
+        CHECK(common_speculative_fork_draft_by_slots(40) == 0);
+    }
+
     if (n_fail > 0) {
         fprintf(stderr, "%d checks failed\n", n_fail);
         return 1;

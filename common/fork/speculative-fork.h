@@ -64,9 +64,14 @@ void common_speculative_fork_dflash_fit(const llama_model * model_dft, int32_t n
 // stream verifies drafts of any lengths in one pass, and there the cut only loses drafts. LLAMA_SPEC_EVEN=0: per
 // sequence, as upstream
 bool    common_speculative_fork_even_drafts(const common_params_speculative & params);
-// the draft cap of a step with n_gen generating slots, -1 for none. LLAMA_SPEC_DRAFT_BY_SLOTS: the caps for 1, 2, ...
-// slots, the last one for more (default "3,3,2,2,2,1": what Rulith's measured adaptation picked on real tasks - two
-// conversations three drafts, four two, eight one), "0" or "" = no cap. one slot keeps --spec-auto as it is
+// the draft cap of a step with n_gen generating slots, -1 for none. default since 09.11: the most drafts a slot can
+// take while the verify of all of them stays within LLAMA_SPEC_SLOT_BATCH (8) tokens, the mat-vec path of the expert
+// matmuls (ggml_vk_use_mul_mat_vec_id: up to 8 tokens; a 9th moves them to the prompt kernels): 2 slots 3, 3 and 4
+// slots 1, 5+ none. Before, "3,3,2,2,2,1" (Rulith's adaptation: two conversations three drafts, four two, eight one)
+// verified 12 tokens with 4 slots: on the 395 4 streams ran 45.3 t/s together against 53.6 for one (06-decode,
+// decode-20261109-211519; --spec-auto fit 30.4 ms per verified token at 4 slots against 5.2 at 1-2).
+// LLAMA_SPEC_DRAFT_BY_SLOTS: an explicit list of the caps for 1, 2, ... slots, the last one for more ("3,3,2,2,2,1"
+// is the old default), "0" or "" = no cap; LLAMA_SPEC_SLOT_BATCH=0: no cap either. one slot keeps --spec-auto as it is
 int32_t common_speculative_fork_draft_by_slots(int n_gen);
 
 // the catch-up of the MTP head over a decoded batch (process of the MTP implementation): in chunks of the draft

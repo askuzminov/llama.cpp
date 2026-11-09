@@ -679,12 +679,33 @@ int32_t common_speculative_fork_draft_by_slots(int n_gen) {
             return true;
         };
 
+        // the default: the most drafts a slot can take while n slots verify within the step budget (budget / n - 1)
+        const auto by_budget = [](std::vector<int32_t> & res) {
+            const int64_t budget = common_fork_env_int("LLAMA_SPEC_SLOT_BATCH", 8);
+            if (budget <= 0) {
+                return;
+            }
+            std::string str;
+            for (int64_t n = 1; n <= 16; ++n) {
+                res.push_back((int32_t) std::max<int64_t>(0, budget / n - 1));
+                if (n == 1) {
+                    continue;
+                }
+                str += string_format("%s%" PRId64 "%s: %d", n > 2 ? ", " : "", n, res.back() == 0 ? "+" : "", res.back());
+                if (res.back() == 0) {
+                    break;
+                }
+            }
+            SPC_INF("draft cap by generating slots: %s (a verify step within %" PRId64 " tokens, LLAMA_SPEC_SLOT_BATCH; "
+                    "LLAMA_SPEC_DRAFT_BY_SLOTS: a list of its own)\n", str.c_str(), budget);
+        };
+
         const char * env = getenv("LLAMA_SPEC_DRAFT_BY_SLOTS");
         std::vector<int32_t> res;
-        if (env == nullptr || !parse(env, res)) {
-            if (env != nullptr) {
-                SPC_WRN("LLAMA_SPEC_DRAFT_BY_SLOTS=\"%s\" is not a list of whole numbers, using %s\n", env, def);
-            }
+        if (env == nullptr) {
+            by_budget(res);
+        } else if (!parse(env, res)) {
+            SPC_WRN("LLAMA_SPEC_DRAFT_BY_SLOTS=\"%s\" is not a list of whole numbers, using the old default %s\n", env, def);
             res.clear();
             parse(def, res);
         }
