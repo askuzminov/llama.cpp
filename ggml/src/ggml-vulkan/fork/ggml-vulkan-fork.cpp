@@ -204,7 +204,9 @@ static void ggml_vk_fork_mmid_f16reg_consts(vk_device & device) {
     }
     // GGML_VK_MMID_F16REG_DB=1: the stage tiles in two buffers of shared memory, the next one written while the current
     // one computes, one barrier a stage instead of two (09.11); a pipeline whose doubled shared memory does not fit keeps
-    // one buffer. twice the shared memory a workgroup: fewer workgroups on a CU
+    // one buffer. twice the shared memory a workgroup: fewer workgroups on a CU, and that lost on the 395
+    // (profile-20261109-104119, ms a call: gate/up q4_K 13.27 against 12.25, down q5_1 10.32 against 8.49, the prompt
+    // 3559.1 against 3427.5 ms; shared memory of gate/up 49664 against 29184 bytes)
     const char * db = getenv("GGML_VK_MMID_F16REG_DB");
     device->mmid_f16reg_db = db != nullptr && atoi(db) != 0 ? 1 : 0;
     if (device->mmid_f16reg_bpf == 0 || device->mmid_f16reg_epi != 0 || device->mmid_f16reg_db != 0) {
