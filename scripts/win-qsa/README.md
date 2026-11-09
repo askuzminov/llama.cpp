@@ -244,31 +244,25 @@ unset QA_PROF_DEPTHS QA_PARMS S
 Матвек экспертов на 1-8 токенов (09.11, `GGML_VK_MMV_ID_FORK`, `mul_mat_vec_id_fork.comp`): один запуск на все
 токены, общий у токенов проверки эксперт читается один раз, MUL по весам роутера слит при любом числе токенов (FORK.md).
 `1` - где апстрим идёт int8-путём, `2` - и down q5_1 одного токена (апстрим считает его на f32-активациях, поэтому у
-`mmv2` смотреть и KLD). По умолчанию на AMD RDNA3 с int8 dot - режим 1 для q5_1 и q4_K, с `_FENCE` (ветка, которая
-держит загрузки прохода вместе; строка `... mode 1 (default) ... loads fenced ...` в логе); `GGML_VK_MMV_ID_FORK=0` -
-апстрим, `_Q4_K=0` - q4_K на апстриме, `_FENCE=0` - без ветки. Тесты операций и пробы точности умолчания, затем
-пробы с декодом по одному токену (`QA_DECODE_BATCH=1`: q5_1 одного токена в режиме 2 идёт на q8_1-активациях, путь
-с декодом по 3 токена его не видит; `none @o=NONE` - без тестов операций):
+`mmv2` смотреть и KLD). По умолчанию на AMD RDNA3 с int8 dot - режим 2 для q5_1 и q4_K, с `_FENCE` (ветка, которая
+держит загрузки прохода вместе; строка `... mode 2 (default) ... loads fenced ...` в логе); `GGML_VK_MMV_ID_FORK=0` -
+апстрим, `=1` - q5_1 одного токена на апстриме, `_Q4_K=0` - q4_K на апстриме, `_FENCE=0` - без ветки. Пробы точности
+с декодом по одному токену (`QA_DECODE_BATCH=1`: q5_1 одного токена в режиме 2 идёт на q8_1-активациях, путь с
+декодом по 3 токена его не видит) - плечи `CHECKARMS="none @o=NONE"` (без тестов операций) и
+`QA_QARMS="default;mmv1 GGML_VK_MMV_ID_FORK=1;base GGML_VK_MMV_ID_FORK=0"`. Тесты операций умолчания и профиль с
+ответом до 512 токенов (принятие черновиков и GPU на токен по сотням проверок, а не по одному короткому ответу):
 
 ```bash
-export QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none
+export QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none QA_CHECK_QUALITY=0
 export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_1),;MUL_MAT_ID_SCALE;MUL_MAT_ID_REPEAT type_a=(q4_K|q5_1),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1;MOE_GLU_F16_DOWN"
 export CHECKARMS="default GGML_VK_MMV_ID_FORK_LOG=1"
-export QA_QARMS="default"
 ./01-check.bat
-export CHECKARMS="none @o=NONE" QA_DECODE_BATCH=1
-export QA_QARMS="default;mmv2 GGML_VK_MMV_ID_FORK=2;base GGML_VK_MMV_ID_FORK=0"
-./01-check.bat
-unset QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS QA_QARMS QA_DECODE_BATCH
-```
+unset QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS QA_CHECK_QUALITY CHECKOPS CHECKARMS
 
-Затем профиль: `base` - апстрим, `mmv2` - режим 2:
-
-```bash
-export QA_PROF_DEPTHS=0
-export QA_PARMS="default;base GGML_VK_MMV_ID_FORK=0;mmv2 GGML_VK_MMV_ID_FORK=2"
+export QA_PROF_DEPTHS=0 QA_PROF_TG=512
+export QA_PARMS="default;base GGML_VK_MMV_ID_FORK=0"
 ./03-profile.bat
-unset QA_PROF_DEPTHS QA_PARMS
+unset QA_PROF_DEPTHS QA_PROF_TG QA_PARMS
 ```
 
 Шейдер в сборке, если в логах вариантов `mmv*` есть строка `ggml_vulkan: MUL_MAT_ID mat-vec of the fork, mode ...`, а
@@ -298,7 +292,13 @@ q4_K gate/up на 1 токене 5.63 против 4.64, на 4 токенах 1
 Четвёртая версия (`check-20261109-160839`, `profile-20261109-161321`): с `_FENCE` загрузки прохода идут подряд;
 q4_K 4.66/7.20/9.68/11.19 мс на граф на 1-4 токенах против 4.65/7.17/9.80/11.39 у апстрима, q5_1 2.89/4.13/5.46/6.30
 против 3.38/4.43/6.21/7.70; шаг проверки 4 токенов 51.54 против 53.50. Точность декода q5_1 в режиме 1 как у
-апстрима. Умолчание стало: режим 1, q4_K и q5_1, `_FENCE` (не закоммичено).
+апстрима. Умолчание стало: режим 1, q4_K и q5_1, `_FENCE`.
+
+Пятая версия (`check-20261109-164243`, `check-20261109-164712`, `profile-20261109-165558`): с декодом по одному токену
+средний KL против своего пути промпта у апстрима 0.0179, режим 1 0.0181, режим 2 0.0163 (парно режим 2 больше
+апстрима в 190 из 384) - оба как апстрим. Шаг проверки 1-4 токенов: апстрим 39.37/44.21/49.25/53.29 мс, режим 2
+39.01/43.86/48.31/51.59. Умолчание - режим 2 (не закоммичено). Принятие черновиков в 32-токенном ответе 13 из 25
+против 14 из 24 у апстрима - один текст на плечо, поэтому дальше ответ до 512 токенов.
 
 ## Микробенчмарк (04)
 

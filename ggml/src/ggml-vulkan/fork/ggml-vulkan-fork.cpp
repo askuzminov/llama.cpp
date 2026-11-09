@@ -275,10 +275,11 @@ void ggml_vk_fork_mmv_id_init(vk_device & device) {
     // the decode and draft-check MUL_MAT_ID (up to 8 tokens) on mul_mat_vec_id_fork.comp instead of mul_mat_vecq.comp:
     // one dispatch for all tokens, an expert read once for the tokens that share it, raw loads before the decode, the
     // MUL by the routing weights fused at any token count. q5_1 and q4_K weights (GGML_VK_MMV_ID_FORK_Q4_K=0: q4_K
-    // upstream). GGML_VK_MMV_ID_FORK=1: where the upstream mat-vec quantizes the activations to q8_1 (the default on AMD
-    // RDNA3 with the int8 dot; 395 09.11, fenced loads: q5_1 down 7-18% faster a call at 2-4 tokens, q4_K gate/up equal
-    // at 1-2 and 1-2% faster at 3-4, decode quality of upstream), =2: also below its k threshold (the 1-token q5_1 down
-    // of qwen4exp, which upstream runs on f32 activations: 15% faster, q8_1 activations), =0: upstream. _WG: 32 or 64
+    // upstream). GGML_VK_MMV_ID_FORK=1: where the upstream mat-vec quantizes the activations to q8_1 (395 09.11, fenced
+    // loads: q5_1 down 7-18% faster a call at 2-4 tokens, q4_K gate/up equal at 1-2 and 1-2% faster at 3-4, decode
+    // quality of upstream), =2: also below its k threshold (the 1-token q5_1 down of qwen4exp, which upstream runs on
+    // f32 activations: 15% faster on q8_1 activations, decode quality of upstream with decode batches of 1; the default
+    // on AMD RDNA3 with the int8 dot), =0: upstream. _WG: 32 or 64
     // lanes (one subgroup), _LPR_Q4_K: lanes per q4_K row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row (2, 4, 8),
     // _MAXR_Q4_K / _MAXR_Q5_1 (_MAXR: both): rounds of loads a lane holds (1-8). A round past the row is still loaded and
     // computed, so the default is the whole row of qwen4exp (q4_K k=2560: 10 superblocks, q5_1 k=640: 20 blocks) at the
@@ -288,7 +289,7 @@ void ggml_vk_fork_mmv_id_init(vk_device & device) {
     const char * env = getenv("GGML_VK_MMV_ID_FORK");
     const bool asked = env != nullptr && env[0] != 0;
     const int  mode  = asked ? atoi(env) : (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 &&
-                                            device->integer_dot_product ? 1 : 0);
+                                            device->integer_dot_product ? 2 : 0);
     if (mode <= 0) {
         return;
     }
