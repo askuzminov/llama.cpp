@@ -271,6 +271,27 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
 #endif
 }
 
+bool ggml_vk_fork_mmvq_n5_rows4(const vk_device & device) {
+    // upstream gives the dense int8 mat-vec of 5-8 columns 4 rows per workgroup on RDNA3/4 ("bench faster than the
+    // default"). On the 395 (RDNA3 iGPU) every shape of qwen4exp got slower at 5 columns than at 4 with it, where one
+    // column more costs ~1% below 4: the verify of 5 tokens took 65.1 ms against 53.2 at 4; m=320 k=10240 1.90 -> 4.53 ms
+    // (80 workgroups for 40 CUs), m=2560 k=6144 3.85 -> 5.18, m=10240 k=2560 4.56 -> 5.28, the LM head 2.87 -> 3.24
+    // (09.11). The fork keeps the rows of 1-4 columns on an RDNA3/4 iGPU; GGML_VK_MMVQ_N5_ROWS4=1: upstream's 4 rows,
+    // =0: the rows of 1-4 columns on any RDNA3/4
+    const bool rdna = device->vendor_id == VK_VENDOR_ID_AMD &&
+                      (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
+    if (!rdna) {
+        return false;   // upstream applies the 4 rows to RDNA3/4 only
+    }
+    const char * env = getenv("GGML_VK_MMVQ_N5_ROWS4");
+    const bool rows4 = env != nullptr && env[0] != 0 ? atoi(env) != 0 : !device->uma;
+    if (!rows4) {
+        GGML_LOG_INFO("ggml_vulkan: the int8 mat-vec of 5-8 columns keeps the rows per workgroup of 1-4 columns "
+                      "(GGML_VK_MMVQ_N5_ROWS4=1: upstream's 4)\n");
+    }
+    return rows4;
+}
+
 void ggml_vk_fork_mmv_id_init(vk_device & device) {
     // the decode and draft-check MUL_MAT_ID (up to 8 tokens) on mul_mat_vec_id_fork.comp instead of mul_mat_vecq.comp:
     // one dispatch for all tokens, an expert read once for the tokens that share it, raw loads before the decode, the

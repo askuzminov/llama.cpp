@@ -245,6 +245,9 @@ bool ggml_vk_fork_mul_mat_quantizes_y_x4(ggml_backend_vk_context * ctx, const gg
 // init; whether the mat-vec path takes dst there (in ggml-vulkan.cpp, ggml_vk_can_fuse asks it for the MUL by the
 // routing weights at more than one token); the dispatch, false for the upstream path
 void ggml_vk_fork_mmv_id_init(vk_device & device);
+// the dense int8 mat-vec of 5-8 columns on RDNA3/4: true keeps upstream's 4 rows per workgroup (rm_int_n in
+// ggml_vk_load_shaders), false the rows of 1-4 columns (GGML_VK_MMVQ_N5_ROWS4)
+bool ggml_vk_fork_mmvq_n5_rows4(const vk_device & device);
 bool ggml_vk_fork_mmv_id_takes(const ggml_backend_vk_context * ctx, const ggml_tensor * dst);
 bool ggml_vk_fork_mmv_id(ggml_backend_vk_context * ctx, vk_context & subctx, const struct ggml_cgraph * cgraph, int node_idx);
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): dispatches it and returns true, false for the

@@ -46,12 +46,17 @@ void common_speculative_auto::init(bool enabled, uint32_t n_seq, int32_t n_cap, 
     n_cap_probe = std::max(1, n_cap);
     seqs.assign(n_seq, {});
 
-    // prior: the draft probability is the acceptance, worth two observations
+    const char * env_pool3 = getenv("LLAMA_SPEC_AUTO_POOL3");
+    pool3 = env_pool3 != nullptr && atoi(env_pool3) != 0;
+
+    // prior of rows 0-2 (and of the shared row 3+ with LLAMA_SPEC_AUTO_POOL3): the draft probability is the acceptance,
+    // worth two observations; the deeper rows start empty (acc_head leans them on the row before)
     for (int t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
-        for (int d = 0; d < n_depth; ++d) {
+        for (int d = 0; d < n_depth_cal; ++d) {
+            const bool prior = d < n_depth_prior || (pool3 && d == n_depth_prior);
             for (int b = 0; b < n_bins; ++b) {
-                cal_acc[t][d][b] = 2.0 * (b + 0.5) / n_bins;
-                cal_n  [t][d][b] = 2.0;
+                cal_acc[t][d][b] = prior ? 2.0 * (b + 0.5) / n_bins : 0.0;
+                cal_n  [t][d][b] = prior ? 2.0 : 0.0;
             }
         }
     }
@@ -76,9 +81,33 @@ static int common_speculative_auto_bin(float p) {
 }
 
 double common_speculative_auto::acc_head(common_speculative_type type, int j, float p) const {
-    const int d = std::min(j, n_depth - 1);
     const int b = common_speculative_auto_bin(p);
-    return b < 0 ? 0.0 : cal_acc[type][d][b] / cal_n[type][d][b];
+    if (b < 0) {
+        return 0.0;
+    }
+    const int d_max = cal_row(j);
+    if (pool3) {
+        return cal_acc[type][d_max][b] / cal_n[type][d_max][b];
+    }
+    const int d_own = std::min(d_max, n_depth_prior - 1);
+    double est = cal_acc[type][d_own][b] / cal_n[type][d_own][b];
+    // a deeper row: its observations and the estimate of the row before it with the weight w_lean
+    for (int d = n_depth_prior; d <= d_max; ++d) {
+        est = (cal_acc[type][d][b] + w_lean * est) / (cal_n[type][d][b] + w_lean);
+    }
+    return est;
+}
+
+double common_speculative_auto::acc_next(common_speculative_type type, int j) const {
+    double est = acc_mean(type);
+    if (pool3) {
+        return est;
+    }
+    const int d_max = std::min(j, n_depth_cal - 1);
+    for (int d = n_depth_prior; d <= d_max; ++d) {
+        est = (acc_sum_d[type][d] + w_lean * est) / (acc_n_d[type][d] + w_lean);
+    }
+    return est;
 }
 
 // prior 0.9 worth two observations: an ngram draft needs a long match to exist at all.
@@ -266,7 +295,8 @@ bool common_speculative_auto::keep(llama_seq_id seq_id, const llama_token_data_a
             return false;
         }
         s.pcum = pc;
-        more   = pc * acc_mean(drafting) >= thr_step;
+        // the next position: this token is at position hp.size()
+        more   = pc * acc_next(drafting, (int) s.hp.size() + 1) >= thr_step;
     }
 
     s.hp.push_back(p);
@@ -323,7 +353,7 @@ void common_speculative_auto::on_accept(llama_seq_id seq_id, uint16_t n_accepted
     if (common_speculative_type_is_gated(s.type) && (int) s.hp.size() == s.n_drf) {
         const int t = s.type;
         for (int j = 0; j < n_test; ++j) {
-            const int d = std::min(j, n_depth - 1);
+            const int d = cal_row(j);
             const int b = common_speculative_auto_bin(s.hp[j]);
             const double a = j < n_accepted ? 1.0 : 0.0;
 
@@ -335,6 +365,10 @@ void common_speculative_auto::on_accept(llama_seq_id seq_id, uint16_t n_accepted
 
             acc_sum[t] = acc_sum[t] * f_cal + a;
             acc_n  [t] = acc_n  [t] * f_cal + 1.0;
+
+            const int dn = std::min(j, n_depth_cal - 1);
+            acc_sum_d[t][dn] = acc_sum_d[t][dn] * f_cal + a;
+            acc_n_d  [t][dn] = acc_n_d  [t][dn] * f_cal + 1.0;
         }
     } else if (s.type != COMMON_SPECULATIVE_TYPE_NONE) {
         auto & a = pos_acc[s.type];
@@ -535,13 +569,14 @@ void common_speculative_auto::print() const {
         }
         const std::string name = common_speculative_type_to_str((common_speculative_type) t);
         SPC_DBG("auto: %s: mean acc %.3f\n", name.c_str(), acc_mean((common_speculative_type) t));
-        for (int d = 0; d < n_depth; ++d) {
+        for (int d = 0; d <= cal_row(n_depth_cal); ++d) {
             str.clear();
             for (int b = 0; b < n_bins; ++b) {
-                str += string_format(" %.2f", cal_acc[t][d][b] / cal_n[t][d][b]);
+                // the estimate keep() uses: the deeper rows lean on the rows before them
+                str += string_format(" %.2f", acc_head((common_speculative_type) t, d, (b + 0.5f) / n_bins));
             }
             SPC_DBG("auto: %s: acceptance by draft p (0.0..1.0 in steps of 0.1), pos %d%s:%s\n", name.c_str(), d,
-                    d == n_depth - 1 ? "+" : "", str.c_str());
+                    d == cal_row(n_depth_cal) ? "+" : "", str.c_str());
         }
     }
 

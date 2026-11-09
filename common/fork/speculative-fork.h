@@ -106,7 +106,14 @@ struct common_speculative_auto {
         MODE_GATE,
     };
 
-    static constexpr int    n_depth = 4;     // calibration rows: draft position 0, 1, 2, 3+
+    static constexpr int    n_depth = 4;     // rows of the acceptance by position (drafts without probabilities): 0, 1, 2, 3+
+    // calibration rows of the gated drafts: draft position 0..6, 7+. Rows 0-2 start from the draft probability as the
+    // acceptance (worth two observations); the deeper rows start empty and lean on the row before them with the weight of
+    // two observations: one row for 3+ (before 09.11) gave positions 4-6 the acceptance of position 3, and with a cap of 7
+    // the head drafted 5-8 tokens in 32% of the cycles where positions 4-7 were accepted in 0.7-6% (395, 09.11)
+    static constexpr int    n_depth_cal   = 8;
+    static constexpr int    n_depth_prior = 3;
+    static constexpr double w_lean        = 2.0;
     static constexpr int    n_bins  = 10;    // calibration columns: draft probability in steps of 0.1
     static constexpr double f_cal   = 0.99;  // forgetting factor of the acceptance estimates, per update
     static constexpr double f_cycle = 0.995; // forgetting factor of the cost and rate fits, per cycle
@@ -139,8 +146,8 @@ struct common_speculative_auto {
 
     // per draft type: the probabilities of the gated drafts mean different things (the MTP head: its confidence, the
     // DFlash2 lattice: the share of the pick among the top_k of its selector row), so each type has its own table
-    double cal_acc[COMMON_SPECULATIVE_TYPE_COUNT][n_depth][n_bins] = {};
-    double cal_n  [COMMON_SPECULATIVE_TYPE_COUNT][n_depth][n_bins] = {};
+    double cal_acc[COMMON_SPECULATIVE_TYPE_COUNT][n_depth_cal][n_bins] = {};
+    double cal_n  [COMMON_SPECULATIVE_TYPE_COUNT][n_depth_cal][n_bins] = {};
 
     std::vector<double> pos_acc[COMMON_SPECULATIVE_TYPE_COUNT];
     std::vector<double> pos_n  [COMMON_SPECULATIVE_TYPE_COUNT];
@@ -148,6 +155,13 @@ struct common_speculative_auto {
     // mean conditional acceptance of the gated positions per type, predicts the next position before it is drafted
     double acc_sum[COMMON_SPECULATIVE_TYPE_COUNT] = {};
     double acc_n  [COMMON_SPECULATIVE_TYPE_COUNT] = {};
+    // the same per position for positions 3+ (acc_next): position 4 of a draft is accepted less often than the mean
+    double acc_sum_d[COMMON_SPECULATIVE_TYPE_COUNT][n_depth_cal] = {};
+    double acc_n_d  [COMMON_SPECULATIVE_TYPE_COUNT][n_depth_cal] = {};
+
+    // LLAMA_SPEC_AUTO_POOL3=1: one calibration row for positions 3+ with the draft probability as its prior and the mean
+    // of all positions for the next one, as before 09.11
+    bool pool3 = false;
 
     // the implementation whose draft keep() and pad() see, set by cap_begin
     common_speculative_type drafting = COMMON_SPECULATIVE_TYPE_NONE;
@@ -200,6 +214,15 @@ struct common_speculative_auto {
 
     double acc_mean(common_speculative_type type) const {
         return acc_n[type] > 0.0 ? acc_sum[type] / acc_n[type] : 0.5;
+    }
+
+    // the predicted conditional acceptance of draft position j before it is drafted: the mean of all positions for
+    // positions 0-2, deeper ones lean on the position before them
+    double acc_next(common_speculative_type type, int j) const;
+
+    // the calibration row of draft position j
+    int cal_row(int j) const {
+        return std::min(j, pool3 ? n_depth_prior : n_depth_cal - 1);
     }
 
     // the calibrated acceptance of a draft of this type at position j with probability p, 0 for a p that is not a

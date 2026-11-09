@@ -3023,7 +3023,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
-    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
+    // fork: not on an RDNA3/4 iGPU, where the 4 rows cost more at every shape (ggml_vk_fork_mmvq_n5_rows4)
+    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4 && device->mmvq_n5_rows4) ? 4u : rows; };
     // RDNA3/4 and NVIDIA except pre-Turing: use 4 rows for MUL_MAT_ID MMVQ.
     auto const &rm_id = [&](uint32_t rows) {
         if (device->vendor_id == VK_VENDOR_ID_NVIDIA &&
@@ -5151,6 +5152,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         ggml_vk_fork_mmid_f16reg_init(device);
         ggml_vk_fork_mm_f16reg_init(device);
         ggml_vk_fork_mmv_id_init(device);
+        device->mmvq_n5_rows4 = ggml_vk_fork_mmvq_n5_rows4(device);
 
         bool int_large_tile, int_large_tile_id;
         ggml_vk_fork_int_large_tile(device, int_large_tile, int_large_tile_id);

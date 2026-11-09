@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -227,6 +228,62 @@ int main() {
             CHECK(ctl.seqs[0].ov.size() == 1 && ctl.seqs[0].ov[0] > 0.0f && ctl.seqs[0].ov[0] <= 1.0f);
         }
         std::remove(path);
+    }
+
+    // positions 3+ (09.11): each its own calibration row, empty at the start and leaning on the row before it, so a
+    // deep position starts at the estimate of the position before it and not at the draft probability; the next
+    // position's predicted acceptance (the step decision) leans the same way. LLAMA_SPEC_AUTO_POOL3=1: one row for 3+
+    // with the draft probability as its prior and the mean of all positions for the step, as before
+    {
+        common_speculative_auto ctl;
+        ctl.init(true, 1, 7, nullptr);
+
+        // drafts of 7 at p 0.95: in four cycles of five positions 0-2 are accepted and position 3 is not, in the fifth
+        // position 0 is not
+        for (int i = 0; i < 400; ++i) {
+            const int n_acc = i % 5 == 4 ? 0 : 3;
+            verify(ctl, MTP, {0.95f, 0.95f, 0.95f, 0.95f, 0.95f, 0.95f, 0.95f}, n_acc);
+        }
+        const double a2 = ctl.acc_head(MTP, 2, 0.95f);
+        const double a3 = ctl.acc_head(MTP, 3, 0.95f);
+        const double a6 = ctl.acc_head(MTP, 6, 0.95f);
+        printf("p 0.95, positions 2 / 3 / 6: %.3f %.3f %.3f, next position 2 / 3 / 6: %.3f %.3f %.3f\n", a2, a3, a6,
+               ctl.acc_next(MTP, 2), ctl.acc_next(MTP, 3), ctl.acc_next(MTP, 6));
+        CHECK(a2 > 0.6);
+        CHECK(a3 < 0.1);          // own observations: never accepted at position 3
+        CHECK(a6 <= a3 + 1e-9);   // never drafted past position 3 here: leans on position 3
+        CHECK(ctl.acc_next(MTP, 2) == ctl.acc_mean(MTP));
+        CHECK(ctl.acc_next(MTP, 3) < 0.1);
+
+        // a fresh table: a deep row starts at the estimate of row 2, not at the draft probability (0.95)
+        common_speculative_auto fresh;
+        fresh.init(true, 1, 7, nullptr);
+        for (int i = 0; i < 400; ++i) {
+            verify(fresh, MTP, {0.95f, 0.95f, 0.95f}, i % 2 == 0 ? 3 : 2);   // position 2 accepted half the time
+        }
+        printf("fresh: p 0.95 at position 2 %.3f, at position 5 %.3f\n", fresh.acc_head(MTP, 2, 0.95f), fresh.acc_head(MTP, 5, 0.95f));
+        CHECK(std::fabs(fresh.acc_head(MTP, 5, 0.95f) - fresh.acc_head(MTP, 2, 0.95f)) < 1e-9);
+
+#ifdef _WIN32
+        _putenv_s("LLAMA_SPEC_AUTO_POOL3", "1");
+#else
+        setenv("LLAMA_SPEC_AUTO_POOL3", "1", 1);
+#endif
+        common_speculative_auto pooled;
+        pooled.init(true, 1, 7, nullptr);
+        CHECK(pooled.pool3);
+        // the shared row 3+ starts at the draft probability, positions 3 and 6 share it
+        CHECK(std::fabs(pooled.acc_head(MTP, 3, 0.95f) - 0.95) < 1e-9);
+        for (int i = 0; i < 50; ++i) {
+            verify(pooled, MTP, {0.95f, 0.95f, 0.95f, 0.95f, 0.95f}, 4);
+        }
+        CHECK(pooled.acc_head(MTP, 3, 0.95f) == pooled.acc_head(MTP, 6, 0.95f));
+        CHECK(pooled.acc_next(MTP, 5) == pooled.acc_mean(MTP));
+#ifdef _WIN32
+        _putenv_s("LLAMA_SPEC_AUTO_POOL3", "");
+#else
+        unsetenv("LLAMA_SPEC_AUTO_POOL3");
+#endif
     }
 
     if (n_fail > 0) {

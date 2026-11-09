@@ -1951,6 +1951,138 @@ def cmd_long():
     return run.finish()
 
 
+# ---------------------------------------------------------------- decode speed by kind of text
+
+def decode_tasks():
+    """the requests of 06-decode (QA_DEC_SET): prose about a corpus part, new code in two languages, an edit of a source
+    file of the repository (QA_DEC_SOURCE; the reply copies most of it, as a coding agent rewriting a file does, and long
+    drafts pay there), JSON records"""
+    text = corpus_text()
+    src_path = ROOT / env("QA_DEC_SOURCE", "examples/simple/simple.cpp")
+    try:
+        src = src_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise Fail(f"QA_DEC_SOURCE: {e}")
+    a = text.find(" ", len(text) // 3)
+    part = text[a + 1:a + 4000]
+    tasks = {
+        "prose": part + "\n\nWrite a long, detailed essay about the subject of this text.",
+        "code-py": "Write a complete Python module that implements an LRU cache with a time-to-live per entry, thread "
+                   "safety, type hints and docstrings, followed by a full pytest test suite for it. Output only the code.",
+        "code-cpp": "Write a C++17 header-only lock-free single-producer single-consumer ring buffer with a templated "
+                    "element type, documented with comments, and a small test program that drives it from two threads. "
+                    "Output only the code.",
+        "edit": "Here is a source file:\n\n```cpp\n" + src + "\n```\n\nRewrite the whole file with two changes: rename the "
+                "variable `n_predict` to `n_tokens_to_predict` everywhere and the function `batch_set_tokens` to "
+                "`fill_batch`. Keep everything else exactly as it is. Output the complete file only.",
+        "json": "Generate a JSON array of 40 objects that describe fictional employees. Every object has the fields id "
+                "(integer), name, department, title, salary (integer), start_date (YYYY-MM-DD) and skills (a list of "
+                "three strings). Output only the JSON.",
+    }
+    names = env("QA_DEC_SET", "prose code-py code-cpp edit json").split()
+    unknown = [n for n in names if n not in tasks]
+    if unknown:
+        raise Fail(f"QA_DEC_SET: no task {' '.join(unknown)} (tasks: {' '.join(tasks)})")
+    return [(n, tasks[n]) for n in names]
+
+
+def decode_ask(url, prompt, max_tokens, temp, log):
+    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": temp, "seed": 1,
+            "cache_prompt": False, "stream": False, "chat_template_kwargs": {"enable_thinking": False}}
+    try:
+        _, raw = http(url + "/v1/chat/completions", body, env_int("QA_TIMEOUT", 3600))
+    except urllib.error.HTTPError as e:
+        raise Fail(f"decode: HTTP {e.code} {e.read()[:300]!r}")
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail(f"decode: {e} ({log.name})")
+    answer = json.loads(raw)
+    return answer.get("timings", {}), answer["choices"][0]["message"].get("content") or ""
+
+
+def cmd_decode():
+    """Decode speed on the server as serve.bat runs it (SPECDRAFT, QA_SPEC), by kind of text (09.11): one request per
+    task of QA_DEC_SET in a conversation of its own, up to QA_DEC_TOKENS tokens at temperature QA_DEC_TEMP (0), TG t/s
+    from the server's timings (no perf logger: the wall clock of the reply), drafted and accepted tokens. QA_DARMS:
+    variants (name VAR=value ...;...), each a server of its own, e.g. a draft cap (LLAMA_ARG_SPEC_DRAFT_N_MAX=7). At
+    temperature 0 the drafts do not change the text: two variants write the same reply up to a near-tie of the numbers
+    (the column "text" names the reply by a digest), so their TG compares on the same tokens."""
+    run = Run("decode")
+    model = model_path()
+    exe = binary("llama-server")
+    ctx, port = env_int("QA_DEC_CTX", 32768), env_int("QA_PORT", 8097)
+    ntok, temp = env_int("QA_DEC_TOKENS", 1024), float(env("QA_DEC_TEMP", "0"))
+    args = server_args(model, ctx, 1, port)
+    tasks = decode_tasks()
+    arms = variants("QA_DARMS", "default")
+    run.add(f"decode: llama-server, tasks {' '.join(n for n, _ in tasks)}, up to {ntok} tokens each at temperature {temp}, "
+            f"{model.name}, build {current_build()}" +
+            (", variants " + "; ".join(f"{name} {' '.join(f'{k}={v}' for k, v in e.items())}".strip() for name, e in arms)
+             if len(arms) > 1 else ""))
+    results = []
+    for name, arm_env in arms:
+        run_env = dict(os.environ, **arm_env)
+        identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
+                    "env": env_identity(run_env), "model": model_identity(model),
+                    "draft": model_identity(Path(env("SPECDRAFT"))) if "-md" in args else None,
+                    "tasks": text_digest("\n".join(n + "\x00" + p for n, p in tasks)), "tokens": ntok, "temp": temp,
+                    "machine": machine()}
+
+        def go(log, run_env=run_env):
+            proc, log = start_server(exe, args, run_env, log)
+            url = f"http://127.0.0.1:{port}"
+            try:
+                # the first use of a pipeline compiles it: a short reply before the measured ones
+                decode_ask(url, "Say hello in one sentence.", 16, temp, log)
+                rows = []
+                for task, prompt in tasks:
+                    t, content = decode_ask(url, prompt, ntok, temp, log)
+                    rows.append({"task": task, "n": t.get("predicted_n", 0), "ms": t.get("predicted_ms", 0.0),
+                                 "prompt_n": t.get("prompt_n", 0), "draft_n": t.get("draft_n", 0),
+                                 "draft_acc": t.get("draft_n_accepted", 0), "text": text_digest(content)[:8]})
+                return {"rows": rows}
+            finally:
+                proc.kill()
+                proc.wait()
+                mark_end()
+
+        label = "decode" if name == "default" else f"decode {name}"
+        try:
+            r, kept = run.measure(label, identity, go)
+        except Fail as e:
+            run.failed = True
+            run.add("", f"{label}: FAIL {e}")
+            continue
+        results.append((name, r["rows"]))
+        run.add("", label + (" k" if kept else ""),
+                *table(["task", "tokens", "TG t/s", "drafted", "accepted", "rate", "per verify", "prompt", "text"],
+                       [[x["task"], x["n"], f"{rate(x['n'], x['ms']):.2f}", x["draft_n"], x["draft_acc"],
+                         f"{x['draft_acc'] / x['draft_n']:.3f}" if x["draft_n"] else "",
+                         # the verify steps: every step but the first token of the reply verifies a draft or decodes one
+                         f"{x['n'] / max(1, x['n'] - x['draft_acc']):.2f}", x["prompt_n"], x["text"]] for x in r["rows"]]))
+    if len(results) > 1:
+        base_name, base = results[0]
+        groups = [(x["task"], [x["task"]]) for x in base] + [
+            ("code", [t for t, _ in tasks if t != "prose"]), ("all", [t for t, _ in tasks])]
+        rows = []
+        for gname, members in groups:
+            row = [gname]
+            ref = None
+            for name, res in results:
+                sel = [x for x in res if x["task"] in members]
+                n, ms = sum(x["n"] for x in sel), sum(x["ms"] for x in sel)
+                tg = rate(n, ms) if ms else 0.0
+                ref = tg if ref is None else ref
+                row.append(f"{tg:.2f}" + ("" if name == base_name or not ref else f" ({(tg / ref - 1) * 100:+.1f}%)"))
+            same = all(next((y["text"] for y in res if y["task"] == gname), None) ==
+                       next((y["text"] for y in base if y["task"] == gname), None) for _, res in results[1:])
+            row.append(("same" if same else "differs") if len(members) == 1 else "")
+            rows.append(row)
+        run.add("", "decode: TG t/s by task and variant (tokens over the time of the replies; the text of every variant "
+                    "against the first)",
+                *table(["task"] + [name for name, _ in results] + ["text"], rows))
+    return run.finish()
+
+
 # ---------------------------------------------------------------- profile
 
 # the kinds of op of the profile tables, by the start of the op name (the first match counts); op_kind sorts the top-k
@@ -2462,7 +2594,7 @@ def cmd_mm():
 
 # ---------------------------------------------------------------- main
 
-COMMANDS = {"check": cmd_check, "long": cmd_long, "profile": cmd_profile, "micro": cmd_micro, "mm": cmd_mm,
+COMMANDS = {"check": cmd_check, "long": cmd_long, "profile": cmd_profile, "micro": cmd_micro, "mm": cmd_mm, "decode": cmd_decode,
             "build-begin": cmd_build_begin, "build-end": cmd_build_end, "build-stable": cmd_build_stable}
 
 

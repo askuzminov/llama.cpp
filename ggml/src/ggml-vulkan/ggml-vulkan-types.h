@@ -1055,6 +1055,8 @@ struct vk_device_struct {
     // fork: MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK): 0 off, 1 where the upstream
     // mat-vec quantizes the activations, 2 every MUL_MAT_ID mat-vec of the types it has; the workgroup (one subgroup),
     // the rounds a lane loads at once and the lanes per row, of q4_K and of q5_1; pipelines by weight type
+    // fork: upstream's 4 rows per workgroup for the dense int8 mat-vec of 5-8 columns on RDNA3/4 (ggml_vk_fork_mmvq_n5_rows4)
+    bool mmvq_n5_rows4 = true;
     uint32_t mmv_id_fork_mode = 0;
     uint32_t mmv_id_fork_wg = 32;
     uint32_t mmv_id_fork_maxr_q4_k = 5;
