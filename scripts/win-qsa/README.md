@@ -375,6 +375,31 @@ export QA_DARMS="default;oldcaps LLAMA_SPEC_DRAFT_BY_SLOTS=3,3,2,2,2,1"
 unset QA_DEC_PAR QA_DEC_TOKENS QA_DARMS
 ```
 
+После правки (`decode-20261109-215510`): вместе 1/2/4 потока - 53.6/63.4/67.1 t/s (1.18x и 1.25x одного), со
+старой таблицей 53.4/63.8/44.8 (4 потока 0.84x). Больше не даёт цена проверенного токена (~5.4-6.3 мс - свои
+эксперты токена): один поток с MTP уже кладёт в шаг ~3.3 токена (FORK.md).
+
+`--spec-auto` против умолчания (без него: всегда 3 черновика, `n_max = 3`, `p_min = 0`). `QA_SPEC` без
+`--spec-auto` (иначе его не выключить), `--spec-auto` - переменной `LLAMA_ARG_SPEC_AUTO=1` в плече:
+
+```bash
+export QA_SPEC="--spec-draft-n-min 0" QA_DEC_TOKENS=1024
+export QA_DARMS="auto LLAMA_ARG_SPEC_AUTO=1;fixed3;fixed7 LLAMA_ARG_SPEC_DRAFT_N_MAX=7"
+./06-decode.bat
+unset QA_SPEC QA_DEC_TOKENS QA_DARMS
+```
+
+`LLAMA_PREFILL_EXCLUSIVE` с длинными промптами, как у агентов: задача `long` - ~24K токенов контекста
+(`QA_DEC_LONG_CHARS`, 96000 символов) и ответ в один абзац; в сводке по потокам `wall s` - время всей работы,
+в таблицах `prompt s` - время промпта запроса:
+
+```bash
+export QA_DEC_SET="prose code-py code-cpp edit json long" QA_DEC_PAR="2 4" QA_DEC_TOKENS=512 QA_DEC_CTX=131072
+export QA_DARMS="default;noexcl LLAMA_PREFILL_EXCLUSIVE=0"
+./06-decode.bat
+unset QA_DEC_SET QA_DEC_PAR QA_DEC_TOKENS QA_DEC_CTX QA_DARMS
+```
+
 Потолок черновика `--spec-auto` (09.11; по умолчанию 7 с того же дня): переменная сервера `LLAMA_ARG_SPEC_DRAFT_N_MAX` в плече. С потолком выше 3
 работают две правки: калибровка позиций 3+ по своим строкам (`LLAMA_SPEC_AUTO_POOL3=1` - одна строка 3+, как
 раньше) и строки матвека q8_0 при 5-8 столбцах (`GGML_VK_MMVQ_N5_ROWS4=1` - 4 строки апстрима). Первое плечо после

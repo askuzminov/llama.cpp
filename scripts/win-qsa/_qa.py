@@ -1956,7 +1956,7 @@ def cmd_long():
 def decode_tasks():
     """the requests of 06-decode (QA_DEC_SET): prose about a corpus part, new code in two languages, an edit of a source
     file of the repository (QA_DEC_SOURCE; the reply copies most of it, as a coding agent rewriting a file does, and long
-    drafts pay there), JSON records"""
+    drafts pay there), JSON records; on request a long prompt with a short reply (long)"""
     text = corpus_text()
     src_path = ROOT / env("QA_DEC_SOURCE", "examples/simple/simple.cpp")
     try:
@@ -1965,6 +1965,10 @@ def decode_tasks():
         raise Fail(f"QA_DEC_SOURCE: {e}")
     a = text.find(" ", len(text) // 3)
     part = text[a + 1:a + 4000]
+    # a long prompt as an agent sends (QA_DEC_LONG_CHARS, ~24K tokens by default) with a short reply: what the
+    # generating streams of other requests wait for (LLAMA_PREFILL_EXCLUSIVE). Not in the default set
+    b = text.find(" ", len(text) // 10)
+    long_part = text[b + 1:b + 1 + env_int("QA_DEC_LONG_CHARS", 96000)]
     tasks = {
         "prose": part + "\n\nWrite a long, detailed essay about the subject of this text.",
         "code-py": "Write a complete Python module that implements an LRU cache with a time-to-live per entry, thread "
@@ -1978,6 +1982,7 @@ def decode_tasks():
         "json": "Generate a JSON array of 40 objects that describe fictional employees. Every object has the fields id "
                 "(integer), name, department, title, salary (integer), start_date (YYYY-MM-DD) and skills (a list of "
                 "three strings). Output only the JSON.",
+        "long": long_part + "\n\nSummarize this text in one short paragraph.",
     }
     names = env("QA_DEC_SET", "prose code-py code-cpp edit json").split()
     unknown = [n for n in names if n not in tasks]
@@ -2115,18 +2120,19 @@ def cmd_decode():
             rows = r["rows"]
             results.append((name, par, rows))
             head = ["task"] + (["stream"] if par > 1 else []) + ["tokens", "TG t/s", "drafted", "accepted", "rate",
-                                                                 "per verify", "prompt", "text"]
+                                                                 "per verify", "prompt", "prompt s", "text"]
             body = [[x["task"]] + ([x["stream"]] if par > 1 else []) +
                     [x["n"], f"{rate(x['n'], x['ms']):.2f}", x["draft_n"], x["draft_acc"],
                      f"{x['draft_acc'] / x['draft_n']:.3f}" if x["draft_n"] else "",
                      # the verify steps: every step but the first token of the reply verifies a draft or decodes one
-                     f"{x['n'] / max(1, x['n'] - x['draft_acc']):.2f}", x["prompt_n"], x["text"]] for x in rows]
+                     f"{x['n'] / max(1, x['n'] - x['draft_acc']):.2f}", x["prompt_n"],
+                     f"{x.get('prompt_ms', 0.0) / 1000:.1f}", x["text"]] for x in rows]
             run.add("", label + (" k" if kept else ""), *table(head, body))
     single = [(name, rows) for name, par, rows in results if par == 1]
     if len(single) > 1:
         base_name, base = single[0]
         groups = [(x["task"], [x["task"]]) for x in base] + [
-            ("code", [t for t, _ in tasks if t != "prose"]), ("all", [t for t, _ in tasks])]
+            ("code", [t for t, _ in tasks if t not in ("prose", "long")]), ("all", [t for t, _ in tasks])]
         rows = []
         for gname, members in groups:
             row = [gname]
