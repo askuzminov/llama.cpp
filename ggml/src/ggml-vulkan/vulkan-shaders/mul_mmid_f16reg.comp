@@ -74,6 +74,9 @@ layout(constant_id = 2) const uint BPF = 1;
 layout(constant_id = 3) const uint EPI = 0;
 layout(constant_id = 4) const uint B_F16 = 0;
 layout(constant_id = 5) const uint D_F16 = 0;
+// DB 1: the stage tiles in two buffers of shared memory, the next stage written while the current one computes, one
+// barrier a stage instead of two (09.11, GGML_VK_MMID_F16REG_DB)
+layout(constant_id = 6) const uint DB = 0;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -126,21 +129,22 @@ const uint QSW = 17;            // words of codes per row (16) + 1 against bank 
 const uint QSW = 9;             // words of nibbles per row (8) + 1
 #endif
 
-shared uint      sh_qs[BM * QSW];
-shared f16vec2   sh_so[BM * 2];             // (scale, offset) of the two 32-column sub-blocks: x = q * scale - offset
+const uint NBUF = 1 + DB;       // buffers of the stage tiles
+shared uint      sh_qs[NBUF * BM * QSW];
+shared f16vec2   sh_so[NBUF * BM * 2];      // (scale, offset) of the two 32-column sub-blocks: x = q * scale - offset
 #ifdef A_HIGH_BIT
-shared uint      sh_qh[BM * 2];             // bit e: the fifth bit of column e of a sub-block
+shared uint      sh_qh[NBUF * BM * 2];      // bit e: the fifth bit of column e of a sub-block
 #endif
 #ifdef TWO_A
-shared uint      sh_qs2[BM * QSW];
-shared f16vec2   sh_so2[BM * 2];
+shared uint      sh_qs2[NBUF * BM * QSW];
+shared f16vec2   sh_so2[NBUF * BM * 2];
 #ifdef A_HIGH_BIT
-shared uint      sh_qh2[BM * 2];
+shared uint      sh_qh2[NBUF * BM * 2];
 #endif
 #endif
 // B tile, column n at n * BKP halves, as uvec4 of 8 halves: 128-bit stores (16-bit stores of single halves before,
 // 08.11 ISA); coopMatLoad reads the f16 matrix from them, the stride in uvec4
-shared uvec4     sh_b[BN * BKP / 8];
+shared uvec4     sh_b[NBUF * BN * BKP / 8];
 // a 16x16 output fragment per subgroup; with EPI 1 none, but the up projection of GLU_SPLIT on its way to the gate
 #ifdef GLU_SPLIT
 const uint SH_C = EPI == 0 ? (BLOCK_SIZE / WARP) * 256 : (BLOCK_SIZE / WARP / 2) * 256;
@@ -263,7 +267,7 @@ void load_a_tile(const uint m, const uint expert, const uint ir, const uint k0) 
 #endif
 }
 
-void write_a_tile(const uint m) {
+void write_a_tile(const uint m, const uint buf) {
     const uint tid = gl_LocalInvocationID.x;
     const uint row = tid >> 1;
     const uint h   = tid & 1;
@@ -314,20 +318,22 @@ void write_a_tile(const uint m) {
         qs[i] = ((ra_raw[m][i + 1] & msk) | (((ra_raw[m][i] >> 16) | (ra_raw[m][i + 1] << 16)) & ~msk)) ^ 0x80808080u;
     }
 #endif
+    const uint qo = buf * BM * QSW + row * QSW + h * QREG;
+    const uint so_o = buf * BM * 2 + row * 2 + h;
 #ifdef TWO_A
     if (m != 0) {
-        [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs2[row * QSW + h * QREG + i] = qs[i]; }
-        sh_so2[row * 2 + h] = so;
+        [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs2[qo + i] = qs[i]; }
+        sh_so2[so_o] = so;
 #ifdef A_HIGH_BIT
-        sh_qh2[row * 2 + h] = qh;
+        sh_qh2[so_o] = qh;
 #endif
         return;
     }
 #endif
-    [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs[row * QSW + h * QREG + i] = qs[i]; }
-    sh_so[row * 2 + h] = so;
+    [[unroll]] for (uint i = 0; i < QREG; ++i) { sh_qs[qo + i] = qs[i]; }
+    sh_so[so_o] = so;
 #ifdef A_HIGH_BIT
-    sh_qh[row * 2 + h] = qh;
+    sh_qh[so_o] = qh;
 #endif
 }
 
@@ -363,14 +369,14 @@ void load_b_tile(const uint k0, const uint tile_count) {
     }
 }
 
-void write_b_tile() {
+void write_b_tile(const uint buf) {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint it = 0; it < 2; ++it) {
         const uint t = tid + it * BLOCK_SIZE;
         if (it < B_ITERS && t < BN * 4) {
             const uint n = t >> 2;
             const uint q = t & 3;
-            const uint o = (n * BKP + q * 16) / 8;
+            const uint o = buf * (BN * BKP / 8) + (n * BKP + q * 16) / 8;
             [[unroll]] for (uint j = 0; j < 2; ++j) {
                 if (B_F16 != 0) {
                     sh_b[o + j] = rbh[it][j];
@@ -391,15 +397,16 @@ void write_b_tile() {
 f16vec2 bytes01(uint x, float16_t bias) { return unpackFloat2x16((x & 0xFFu) | ((x << 8) & 0x00FF0000u) | 0x64006400u) - f16vec2(bias); }
 f16vec2 bytes23(uint x, float16_t bias) { return unpackFloat2x16(((x >> 16) & 0xFFu) | ((x >> 8) & 0x00FF0000u) | 0x64006400u) - f16vec2(bias); }
 
-void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[16]) {
+void decode_a(const bool second, const uint lrow, const uint f, const uint buf, out float16_t v[16]) {
+    const uint so_o = buf * BM * 2 + lrow * 2 + (f >> 1);
 #ifdef TWO_A
-    const f16vec2 so = second ? sh_so2[lrow * 2 + (f >> 1)] : sh_so[lrow * 2 + (f >> 1)];
+    const f16vec2 so = second ? sh_so2[so_o] : sh_so[so_o];
 #else
-    const f16vec2 so = sh_so[lrow * 2 + (f >> 1)];
+    const f16vec2 so = sh_so[so_o];
 #endif
 #ifdef A_BYTES
     // q8_0: block f >> 1, bytes 16 (f & 1) .. + 15, signed: biased by 128
-    const uint base = lrow * QSW + (f >> 1) * 8 + (f & 1) * 4;
+    const uint base = buf * BM * QSW + lrow * QSW + (f >> 1) * 8 + (f & 1) * 4;
     [[unroll]] for (uint i = 0; i < 4; ++i) {
 #ifdef TWO_A
         const uint x = second ? sh_qs2[base + i] : sh_qs[base + i];
@@ -413,13 +420,13 @@ void decode_a(const bool second, const uint lrow, const uint f, out float16_t v[
     }
 #else
     // nibbles: bytes 16 (f & 1) .. + 15 of the chunk, low nibble for sub-block 0 (f < 2), high for sub-block 1
-    const uint base  = lrow * QSW + (f & 1) * 4;
+    const uint base  = buf * BM * QSW + lrow * QSW + (f & 1) * 4;
     const uint shift = (f >> 1) * 4;
 #ifdef A_HIGH_BIT
 #ifdef TWO_A
-    const uint hb = (second ? sh_qh2[lrow * 2 + (f >> 1)] : sh_qh[lrow * 2 + (f >> 1)]) >> ((f & 1) * 16);
+    const uint hb = (second ? sh_qh2[so_o] : sh_qh[so_o]) >> ((f & 1) * 16);
 #else
-    const uint hb = sh_qh[lrow * 2 + (f >> 1)] >> ((f & 1) * 16);
+    const uint hb = sh_qh[so_o] >> ((f & 1) * 16);
 #endif
 #endif
     [[unroll]] for (uint i = 0; i < 4; ++i) {
@@ -644,7 +651,7 @@ void epilogue(const uint c, const uint grow0, const uint tile_count, ACC_PARAM(a
 #define MMA_C(C) \
                 if (C < NC && C < nc_used) { \
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb; \
-                    coopMatLoad(mb, sh_b, (C * 16 * BKP + f * 16) / 8, BKP / 8, gl_CooperativeMatrixLayoutColumnMajor); \
+                    coopMatLoad(mb, sh_b, b_base + (C * 16 * BKP + f * 16) / 8, BKP / 8, gl_CooperativeMatrixLayoutColumnMajor); \
                     acc[C] = coopMatMulAdd(ma, mb, acc[C]); \
                     MMA2(C) \
                 }
@@ -700,44 +707,57 @@ void main() {
 #ifdef TWO_A
     load_a_tile(1, expert, ir, 0);
 #endif
-    if (BPF != 0) {
+    if (BPF != 0 || DB != 0) {
         load_b_tile(0, tile_count);
     }
-
-    for (uint k0 = 0; k0 < p.K; k0 += BK) {
-        barrier();
-        write_a_tile(0);
+    if (DB != 0) {
+        // the first stage into buffer 0; then each stage loads the next one, computes, writes it into the other buffer
+        write_a_tile(0, 0);
 #ifdef TWO_A
-        write_a_tile(1);
+        write_a_tile(1, 0);
 #endif
-        if (BPF == 0) {
-            load_b_tile(k0, tile_count); // this stage's own B tile, its registers live only to the store
-        }
-        write_b_tile();
+        write_b_tile(0);
         barrier();
+    }
+
+    uint cur = 0;
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        if (DB == 0) {
+            barrier();
+            write_a_tile(0, 0);
+#ifdef TWO_A
+            write_a_tile(1, 0);
+#endif
+            if (BPF == 0) {
+                load_b_tile(k0, tile_count); // this stage's own B tile, its registers live only to the store
+            }
+            write_b_tile(0);
+            barrier();
+        }
 
         // the next stage's loads run while this one computes
-        if (k0 + BK < p.K) {
+        const bool next = k0 + BK < p.K;
+        if (next) {
             load_a_tile(0, expert, ir, k0 + BK);
 #ifdef TWO_A
             load_a_tile(1, expert, ir, k0 + BK);
 #endif
-            if (BPF != 0) {
+            if (BPF != 0 || DB != 0) {
                 load_b_tile(k0 + BK, tile_count);
             }
         }
 
         [[unroll]] for (uint f = 0; f < BK / 16; ++f) {
             float16_t va[16];
-            decode_a(false, lrow, f, va);
+            decode_a(false, lrow, f, cur, va);
 #ifdef TWO_A
             float16_t va2[16];
-            decode_a(true, lrow, f, va2);
+            decode_a(true, lrow, f, cur, va2);
 #endif
 #ifdef EMULATE
             [[unroll]] for (uint c = 0; c < NC; ++c) {
                 if (c < nc_used) {
-                    const uint b_off = c * 16 * BKP + f * 16;
+                    const uint b_off = cur * BN * BKP + c * 16 * BKP + f * 16;
                     frag_mul_add(va, b_off, acc[c]);
 #ifdef TWO_A
                     frag_mul_add(va2, b_off, acc2[c]);
@@ -745,6 +765,7 @@ void main() {
                 }
             }
 #else
+            const uint b_base = cur * (BN * BKP / 8);
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
             [[unroll]] for (uint e = 0; e < 16; ++e) { ma[e] = va[e]; }
 #ifdef TWO_A
@@ -753,6 +774,19 @@ void main() {
 #endif
             MMA_C(0) MMA_C(1) MMA_C(2) MMA_C(3) MMA_C(4) MMA_C(5) MMA_C(6) MMA_C(7)
 #endif
+        }
+
+        if (DB != 0) {
+            // the other buffer was last read in the stage before, which every subgroup left at the barrier below
+            if (next) {
+                write_a_tile(0, cur ^ 1);
+#ifdef TWO_A
+                write_a_tile(1, cur ^ 1);
+#endif
+                write_b_tile(cur ^ 1);
+            }
+            barrier();
+            cur ^= 1;
         }
     }
 

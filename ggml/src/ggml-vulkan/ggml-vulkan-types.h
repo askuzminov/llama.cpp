@@ -1051,6 +1051,7 @@ struct vk_device_struct {
     // coopmat_c_probe.comp)
     uint32_t mmid_f16reg_bpf;
     uint32_t mmid_f16reg_epi;
+    uint32_t mmid_f16reg_db;   // fork: two LDS buffers, one barrier a stage (GGML_VK_MMID_F16REG_DB)
     // dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG (mul_mm_f16reg.comp): 0 off, 1 coopmat,
     // 2 emulated; the A codes decoded to f16 in shared memory (else in registers); block size, A and B fragments of a
     // subgroup, subgroups along M; the variant in the pipeline names; [f16 activations]

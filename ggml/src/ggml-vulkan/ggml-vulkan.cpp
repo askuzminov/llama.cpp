@@ -3844,16 +3844,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     const uint32_t qsw  = t == 3 ? 17 : 9;
                     const uint32_t a_sz = 128 * qsw * 4 + 128 * 2 * 4 + (t == 1 || t == 2 ? 128 * 2 * 4 : 0);
                     const uint32_t c_sz = epi == 0 ? 8 * 256 * 4 : v == 3 ? 4 * 256 * 4 : 4;
-                    const uint32_t lds  = a_sz * (v == 1 || v == 2 ? 2 : 1) + bn * 72 * 2 + c_sz + bn * 4;
+                    const uint32_t tiles = a_sz * (v == 1 || v == 2 ? 2 : 1) + bn * 72 * 2;
+                    const uint32_t lds   = tiles + c_sz + bn * 4;
                     if (lds > device->properties.limits.maxComputeSharedMemorySize) {
                         continue;
                     }
+                    // fork: two buffers of the stage tiles where they fit (GGML_VK_MMID_F16REG_DB)
+                    const uint32_t db = device->mmid_f16reg_db != 0 &&
+                                        lds + tiles <= device->properties.limits.maxComputeSharedMemorySize ? 1u : 0u;
                     for (int h = 0; h < 2; ++h) {
                         for (int o = 0; o < (v == 1 || v == 3 ? 2 : 1); ++o) {
                             const std::string name = std::string(shaders[t][v].name) + bn_names[b] + (h ? "_b16" : "") + (o ? "_d16" : "");
                             ggml_vk_create_pipeline2(device, device->pipeline_mmid_f16reg[t][v][b][h][o], name, shaders[t][v].len, shaders[t][v].data,
                                                     "main", v == 1 || v == 3 ? 7 : 6, sizeof(vk_mat_mat_id_push_constants),
-                                                    {v == 2 ? 256u : v == 3 ? 64u : 128u, bn, 1}, {256, bn, bpf, epi, (uint32_t) h, (uint32_t) o},
+                                                    {v == 2 ? 256u : v == 3 ? 64u : 128u, bn, 1}, {256, bn, bpf, epi, (uint32_t) h, (uint32_t) o, db},
                                                     1, false, sg != 0, sg);
                         }
                     }

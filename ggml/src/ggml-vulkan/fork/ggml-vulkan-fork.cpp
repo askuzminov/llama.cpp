@@ -202,9 +202,14 @@ static void ggml_vk_fork_mmid_f16reg_consts(vk_device & device) {
             GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMID_F16REG_EPI=1 off: the coopmat C layout is not the one the shader takes\n");
         }
     }
-    if (device->mmid_f16reg_bpf == 0 || device->mmid_f16reg_epi != 0) {
-        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16reg: next-stage B in registers %u, sums straight from the accumulators %u\n",
-                      device->mmid_f16reg_bpf, device->mmid_f16reg_epi);
+    // GGML_VK_MMID_F16REG_DB=1: the stage tiles in two buffers of shared memory, the next one written while the current
+    // one computes, one barrier a stage instead of two (09.11); a pipeline whose doubled shared memory does not fit keeps
+    // one buffer. twice the shared memory a workgroup: fewer workgroups on a CU
+    const char * db = getenv("GGML_VK_MMID_F16REG_DB");
+    device->mmid_f16reg_db = db != nullptr && atoi(db) != 0 ? 1 : 0;
+    if (device->mmid_f16reg_bpf == 0 || device->mmid_f16reg_epi != 0 || device->mmid_f16reg_db != 0) {
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16reg: next-stage B in registers %u, sums straight from the accumulators %u, "
+                      "two shared memory buffers %u\n", device->mmid_f16reg_bpf, device->mmid_f16reg_epi, device->mmid_f16reg_db);
     }
 }
 
@@ -218,6 +223,7 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
     device->mmid_f16reg_mode = 0;
     device->mmid_f16reg_bpf  = 1;
     device->mmid_f16reg_epi  = 0;
+    device->mmid_f16reg_db   = 0;
     const char * env = getenv("GGML_VK_MMID_F16REG");
     if (env != nullptr && strcmp(env, "0") == 0) {
         return;
