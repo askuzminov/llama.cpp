@@ -1057,7 +1057,7 @@ struct vk_device_struct {
     // the rounds a lane loads at once, lanes per row of q4_K and q5_1; pipelines by weight type
     uint32_t mmv_id_fork_mode = 0;
     uint32_t mmv_id_fork_wg = 32;
-    uint32_t mmv_id_fork_maxr = 8;
+    uint32_t mmv_id_fork_maxr = 5;
     uint32_t mmv_id_fork_lpr_q4_k = 16;
     uint32_t mmv_id_fork_lpr_q5_1 = 4;
     vk_pipeline pipeline_mmv_id_fork[GGML_TYPE_COUNT];

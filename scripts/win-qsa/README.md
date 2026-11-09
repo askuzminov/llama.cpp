@@ -255,17 +255,30 @@ export QA_QARMS="default;mmv1 GGML_VK_MMV_ID_FORK=1;mmv2 GGML_VK_MMV_ID_FORK=2"
 unset QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS QA_QARMS
 ```
 
-Затем профиль: строки `MUL_MAT_ID` проверок 1-4 токенов по вариантам, ISA и регистры конвейеров `mul_mat_vec_id*` (и
-апстрима, и форка) в логах `default` и `mmv1`; `r5` - 5 раундов загрузок вместо 8 (у формы модели их 5, меньше
-регистров), `wg64` - группа из 64 линий:
+Затем профиль: строки `MUL_MAT_ID` проверок 1-4 токенов по вариантам, ISA и регистры конвейеров `mul_mat_vec_id*`
+(форка) в логе `mmv1`:
 
 ```bash
 export QA_PROF_DEPTHS=0
-I="GGML_VK_PIPELINE_ISA=mul_mat_vec_id GGML_VK_PIPELINE_STATS=mul_mat_vec_id"
-export QA_PARMS="default $I;mmv1 $I GGML_VK_MMV_ID_FORK=1;mmv2 GGML_VK_MMV_ID_FORK=2;r5 GGML_VK_MMV_ID_FORK=1 GGML_VK_MMV_ID_FORK_MAXR=5;wg64 GGML_VK_MMV_ID_FORK=1 GGML_VK_MMV_ID_FORK_WG=64"
+I="GGML_VK_PIPELINE_ISA=mul_mat_vec_id_fork GGML_VK_PIPELINE_STATS=mul_mat_vec_id_fork"
+export QA_PARMS="default;mmv1 $I GGML_VK_MMV_ID_FORK=1;mmv2 GGML_VK_MMV_ID_FORK=2"
 ./03-profile.bat
 unset QA_PROF_DEPTHS QA_PARMS I
 ```
+
+Шейдер в сборке, если в логах вариантов `mmv*` есть строка `ggml_vulkan: MUL_MAT_ID mat-vec of the fork, mode ...`, а
+`MUL_MAT_ID_SCALE` в 01 не 0/0. 09.11 (`check-20261109-130330`, `profile-20261109-131212`, сборка
+`src-671d958f0f5aa0eb`) прогон пошёл на сборке без него: строки нет, `MUL_MAT_ID_SCALE` 0/0, NLL вариантов бит в бит
+как у default; все плечи - один код (29.52-29.61 мс на токен, первое 30.06).
+
+Первая версия (`check-20261109-132520`, `profile-20261109-141956`, сборка `src-46080d225d6a8b0c`): тесты с настоящим
+dot4 проходят, точность декода как у default, но ядро медленнее апстрима. Средние по графам ответа, мс на граф:
+q4_K gate/up на 1 токене 5.63 против 4.64, на 4 токенах 12.15 против 11.38; down q5_1 со слитым MUL на 4 токенах 6.87
+против 7.69 (+0.43 отдельных MUL), на 2 токенах 4.74 против 4.43. ISA: компилятор унёс перевод d/dmin в условный блок
+загрузки каждого раунда, за каждым раундом `s_waitcnt vmcnt(1)` - раунды шли по очереди; у q5_1 выбор пары (d, sum)
+стал расходящимися ветками с `vmcnt(0)` в каждом раунде и токене. Вторая версия (не закоммичена): загрузки без
+условий во время выполнения, активации первого токена вместе с весами, остальные токены списком - одна волна загрузок
+на токен; `_MAXR` по умолчанию 5.
 
 ## Микробенчмарк (04)
 

@@ -277,7 +277,9 @@ void ggml_vk_fork_mmv_id_init(vk_device & device) {
     // MUL by the routing weights fused at any token count. q4_K and q5_1 weights. GGML_VK_MMV_ID_FORK=1: where the
     // upstream mat-vec quantizes the activations to q8_1, =2: also below its k threshold (the 1-token q5_1 down of
     // qwen4exp, which upstream runs on f32 activations). _WG: 32 or 64 lanes (one subgroup), _MAXR: rounds of loads a
-    // lane holds (1-8), _LPR_Q4_K: lanes per q4_K row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row (2, 4, 8)
+    // lane holds (1-8; 5 is the whole row of qwen4exp at the default lanes: q4_K k=2560 and q5_1 k=640, a round past
+    // the row is still loaded and computed), _LPR_Q4_K: lanes per q4_K row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row
+    // (2, 4, 8)
     device->mmv_id_fork_mode = 0;
     const char * env = getenv("GGML_VK_MMV_ID_FORK");
     if (env == nullptr || atoi(env) <= 0) {
@@ -310,7 +312,7 @@ void ggml_vk_fork_mmv_id_init(vk_device & device) {
         return;
     }
     device->mmv_id_fork_wg       = wg;
-    device->mmv_id_fork_maxr     = std::min<uint32_t>(std::max<uint32_t>(env_u32("GGML_VK_MMV_ID_FORK_MAXR", 8), 1), 8);
+    device->mmv_id_fork_maxr     = std::min<uint32_t>(std::max<uint32_t>(env_u32("GGML_VK_MMV_ID_FORK_MAXR", 5), 1), 8);
     device->mmv_id_fork_lpr_q4_k = lpr4;
     device->mmv_id_fork_lpr_q5_1 = lpr5;
     device->mmv_id_fork_mode     = std::min(atoi(env), 2);

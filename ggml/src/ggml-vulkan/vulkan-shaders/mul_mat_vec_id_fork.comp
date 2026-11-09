@@ -17,8 +17,13 @@
 //   ends: the workgroup of that token computes both, so an expert that the tokens of a draft check share is read
 //   once. An expert twice in one token's ids (the zero slot of the MoE cache) leaves every slot its own workgroup;
 // - LPR lanes take a row: lane l reads the chunks l, l + LPR, ... of the row (q4_K: 16 bytes of codes, the low and
-//   the high nibbles are 16 codes of two sub-blocks; q5_1: a block of 32 codes). All chunks of a lane are loaded as
-//   raw words first, the decode follows the loads (a decode at the load site waits for each load in turn);
+//   the high nibbles are 16 codes of two sub-blocks; q5_1: a block of 32 codes), MAXR chunks (rounds) at a time;
+// - no load sits under a condition the compiler cannot fold: the addresses of rounds past the row are clamped into it
+//   and their sums multiplied by 0. A load under a runtime branch is waited for inside the branch (the AMD compiler
+//   also moves the decode of a loaded word into the branch of its load), so each round would wait in turn;
+// - the weights of all rounds and the activations of the first token are loaded together, the decode follows; every
+//   other token of the workgroup takes one more round of activation loads (tokens in a compact list, a uniform
+//   branch each);
 // - the sums of a row go through its lanes by clustered adds; the fused MUL by the routing weights reads them as
 //   [token * nei0 + slot] at any token count.
 // One dispatch for all tokens (the upstream shader is dispatched once per token).
@@ -27,7 +32,7 @@
 // without GL_EXT_integer_dot_product, for devices without it).
 
 layout(constant_id = 0) const uint WG_SIZE = 32;   // the subgroup size, the host requires full subgroups of it
-layout(constant_id = 1) const uint MAXR = 8;       // rounds of a lane loaded at once (at most 8)
+layout(constant_id = 1) const uint MAXR = 5;       // rounds of a lane loaded at once (at most 8)
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -54,7 +59,10 @@ layout(binding = 0) readonly buffer A { uvec2 data_a[]; };   // a block: ((d, m)
 #else
 #error unsupported type
 #endif
-layout(binding = 1) readonly buffer B { uvec4 data_b[]; };   // block_q8_1_x4: the 4 (d, sum) pairs, then 8 x 4 words
+// block_q8_1_x4 (the 4 (d, sum) pairs, then 4 x 32 code bytes) as 16-byte words, and its pairs as 8 and 4 bytes
+layout(binding = 1) readonly buffer B   { uvec4 data_b[]; };
+layout(binding = 1) readonly buffer B64 { uvec2 data_b64[]; };
+layout(binding = 1) readonly buffer B32 { uint  data_b32[]; };
 layout(binding = 2) writeonly buffer D { float data_d[]; };
 layout(binding = 3) readonly buffer Fuse0 { float data_fuse0[]; };
 layout(binding = 5) readonly buffer IDS { int data_ids[]; };
@@ -76,98 +84,6 @@ int dot16(const uvec4 a, const uvec4 b) {
     return dot4(a.x, b.x) + dot4(a.y, b.y) + dot4(a.z, b.z) + dot4(a.w, b.w);
 }
 
-// the sums of a lane per token, the slot + 1 of the expert in each token (0: not there), the tokens of the workgroup
-float acc[NT];
-uint  sl[NT];
-uint  tmask;
-bool  per_slot;
-uint  nblk;   // q8_1 blocks of an activation row
-
-// the activation row of token j: its own one, or its slot's
-uint b_row(const uint j) {
-    return j * p.ne11 + (per_slot ? sl[j] - 1 : 0);
-}
-
-#if defined(DATA_A_Q4_K)
-// a lane's chunk c (sub-blocks 2jp, 2jp + 1, half hh of their codes) of superblock sbi of the row: hd the superblock
-// head (d, dmin, scales), qv the 16 code bytes; keep 0 for a superblock past the row
-void round_q4k(const uvec4 hd, const uvec4 qv, const uint sbi, const uint nsb, const uint jp, const uint hh) {
-    const uint  sb   = min(sbi, nsb - 1);
-    const float keep = sbi < nsb ? 1.0 : 0.0;
-
-    const vec2 dm = unpackHalf2x16(hd.x);
-    // get_scale_min_k4: sub-blocks 0-3 take the low 6 bits of scales bytes 0-3 (scale) and 4-7 (min), 4-7 the nibbles
-    // of bytes 8-11 and the top 2 bits of bytes 0-3 (scale) and 4-7 (min); sub-block 2jp + u sits at byte
-    // (2jp + u) % 4 of each scales word
-    const uint sh0     = 8 * ((2 * jp) % 4);
-    const uint sh1     = sh0 + 8;
-    const bool hi_form = jp >= 2;
-    const uint b0 = hd.y >> sh0, b1 = hd.y >> sh1;
-    const uint m0 = hd.z >> sh0, m1 = hd.z >> sh1;
-    const uint q0 = hd.w >> sh0, q1 = hd.w >> sh1;
-    const uint sc0 = hi_form ? ((q0 & 15u) | ((b0 >> 2) & 48u)) : (b0 & 63u);
-    const uint sc1 = hi_form ? ((q1 & 15u) | ((b1 >> 2) & 48u)) : (b1 & 63u);
-    const uint mn0 = hi_form ? (((q0 >> 4) & 15u) | ((m0 >> 2) & 48u)) : (m0 & 63u);
-    const uint mn1 = hi_form ? (((q1 >> 4) & 15u) | ((m1 >> 2) & 48u)) : (m1 & 63u);
-    const float dsc0 = dm.x * float(sc0);
-    const float dsc1 = dm.x * float(sc1);
-    // each half of a sub-block takes half of the block sum of the activations, the two lanes of the halves make it
-    // whole (as mul_mat_vecq.comp)
-    const float dmn0 = 0.5 * dm.y * float(mn0);
-    const float dmn1 = 0.5 * dm.y * float(mn1);
-
-    const uvec4 lo = qv & 0x0F0F0F0Fu;
-    const uvec4 hi = (qv >> 4) & 0x0F0F0F0Fu;
-
-    [[unroll]] for (uint j = 0; j < NT; ++j) {
-        if ((tmask & (1u << j)) != 0) {
-            // blocks 2jp and 2jp + 1 of the superblock: nblk is a multiple of 8, so they are the inner blocks
-            // (jp % 2) * 2 and + 1 of one x4 group
-            const uint gi  = ((b_row(j) * nblk + sb * 8 + 2 * jp) / 4) * 9;
-            const uint in0 = (jp % 2) * 2;
-            const uvec4 bq0 = data_b[gi + 1 + in0 * 2 + hh];
-            const uvec4 bq1 = data_b[gi + 3 + in0 * 2 + hh];
-            const uvec4 bds = data_b[gi];
-            const vec2 ds0 = unpackHalf2x16((jp % 2) == 0 ? bds.x : bds.z);
-            const vec2 ds1 = unpackHalf2x16((jp % 2) == 0 ? bds.y : bds.w);
-            const int s0 = dot16(lo, bq0);
-            const int s1 = dot16(hi, bq1);
-            acc[j] += keep * (dsc0 * ds0.x * float(s0) + dsc1 * ds1.x * float(s1) - dmn0 * ds0.y - dmn1 * ds1.y);
-        }
-    }
-}
-#elif defined(DATA_A_Q5_1)
-// block bi of the row: w0 ((d, m), qh), w1 and w2 the 16 code bytes; keep 0 for a block past the row
-void round_q51(const uvec2 w0, const uvec2 w1, const uvec2 w2, const uint bi) {
-    const uint  b    = min(bi, nblk - 1);
-    const float keep = bi < nblk ? 1.0 : 0.0;
-
-    const vec2 dm = unpackHalf2x16(w0.x);
-    const uint qh = w0.y;
-    const uvec4 qs = uvec4(w1, w2);
-    // the fifth bit of codes 4w..4w+3 (low nibbles) and 16+4w.. (high) to bit 4 of their bytes
-    const uvec4 hl = ((uvec4(qh, qh >> 4, qh >> 8, qh >> 12) & 0xFu) * 0x02040810u) & 0x10101010u;
-    const uvec4 hh = ((uvec4(qh >> 16, qh >> 20, qh >> 24, qh >> 28) & 0xFu) * 0x02040810u) & 0x10101010u;
-    const uvec4 lo = (qs & 0x0F0F0F0Fu) | hl;
-    const uvec4 hi = ((qs >> 4) & 0x0F0F0F0Fu) | hh;
-
-    [[unroll]] for (uint j = 0; j < NT; ++j) {
-        if ((tmask & (1u << j)) != 0) {
-            const uint bb   = b_row(j) * nblk + b;
-            const uint gi   = (bb / 4) * 9;
-            const uint in0  = bb % 4;
-            const uvec4 bq0 = data_b[gi + 1 + in0 * 2];
-            const uvec4 bq1 = data_b[gi + 2 + in0 * 2];
-            const uvec4 bds = data_b[gi];
-            const uint dsw  = in0 == 0 ? bds.x : in0 == 1 ? bds.y : in0 == 2 ? bds.z : bds.w;
-            const vec2 ds   = unpackHalf2x16(dsw);
-            const int q     = dot16(lo, bq0) + dot16(hi, bq1);
-            acc[j] += keep * (dm.x * ds.x * float(q) + dm.y * ds.y);
-        }
-    }
-}
-#endif
-
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint s   = gl_WorkGroupID.y;
@@ -188,22 +104,23 @@ void main() {
         return;
     }
 
-    // the slot of e in each token: lane j looks through the ids of token j
+    // the slot of e in each token: lane j looks through the ids of token j (lanes past the tokens read the last one
+    // and count nothing; the loads go out together)
     uint found = 0;
     uint nfound = 0;
-    if (p.nei1 > 1 && tid < p.nei1) {
-        const uint base = tid * p.nbi1;
+    if (p.nei1 > 1) {
+        const uint base = min(tid, p.nei1 - 1) * p.nbi1;
         [[unroll]] for (uint k = 0; k < NS; ++k) {
-            if (k < p.nei0) {
-                const int v = data_ids[base + k];
-                if (v == e_id) {
-                    found = k + 1;
-                    nfound++;
-                }
+            const int v = data_ids[base + min(k, p.nei0 - 1)];
+            if (tid < p.nei1 && k < p.nei0 && v == e_id) {
+                found = k + 1;
+                nfound++;
             }
         }
     }
-    tmask = 0;
+    // the tokens of the workgroup (tmask) and the slot + 1 of e in each (sl)
+    uint sl[NT];
+    uint tmask = 0;
     if (subgroupAny(nfound > 1)) {
         // e twice in some token: no sharing, each slot its own workgroup
         [[unroll]] for (uint j = 0; j < NT; ++j) {
@@ -223,70 +140,176 @@ void main() {
         }
     }
 
-    const uint e = uint(e_id);
-    per_slot = p.ne11 != 1;
-    nblk     = p.ncols / 32;
-
-    [[unroll]] for (uint j = 0; j < NT; ++j) {
-        acc[j] = 0.0;
+    // the k-th token of the workgroup: its index, the slot of e in it, its activation row (past the count: the
+    // workgroup's own token, never used)
+    const uint cnt      = bitCount(tmask);
+    const bool per_slot = p.ne11 != 1;
+    uint tok[NT];
+    uint slt[NT];
+    uint brow[NT];
+    uint mrest = tmask;
+    [[unroll]] for (uint k = 0; k < NT; ++k) {
+        const uint j = mrest != 0 ? uint(findLSB(mrest)) : t;
+        mrest &= mrest - 1u;
+        uint sj = s + 1;
+        [[unroll]] for (uint i = 0; i < NT; ++i) {
+            if (i == j) {
+                sj = sl[i];
+            }
+        }
+        tok[k]  = j;
+        slt[k]  = sj - 1;
+        brow[k] = j * p.ne11 + (per_slot ? sj - 1 : 0);
     }
 
-    // rounds of a lane: the loads of up to MAXR rounds as raw words in variables named by constants (an array indexed
-    // in a loop stays an array until the driver unrolls it), then their decode and sums
+    const uint e    = uint(e_id);
+    const uint nblk = p.ncols / 32;   // q8_1 blocks of an activation row
+
+    float acc[NT];
+    [[unroll]] for (uint k = 0; k < NT; ++k) {
+        acc[k] = 0.0;
+    }
+
+    // a round I of a lane: LOAD_A its weights, LOAD_B(K, I) the activations of the K-th token for it, DEC_A the decode
+    // of the weights that the tokens share, COMP(K, I) the sum of the K-th token. Variables named by constants (an
+    // array indexed in a loop stays an array until the driver unrolls it); I < MAXR folds at specialization
 #if defined(DATA_A_Q4_K)
     const uint nsb    = p.ncols / 256;
     const uint SBR    = LPR / 8;                 // superblocks a round
     const uint nround = (nsb + SBR - 1) / SBR;
-    const uint c      = l % 8;                   // the chunk of the superblock
+    const uint c      = l % 8;                   // the chunk of the superblock: sub-blocks 2jp and 2jp + 1, half hh
     const uint sbl    = l / 8;                   // the superblock of the lane in a round
+    const uint jp     = c / 2;
+    const uint hh     = c % 2;
     const uint arow   = e * p.expert_stride + rowc * nsb;
+    // get_scale_min_k4: sub-blocks 0-3 take the low 6 bits of scales bytes 0-3 (scale) and 4-7 (min), 4-7 the nibbles
+    // of bytes 8-11 and the top 2 bits of bytes 0-3 (scale) and 4-7 (min); sub-block 2jp + u sits at byte
+    // (2jp + u) % 4 of each scales word
+    const uint sh0     = 8 * ((2 * jp) % 4);
+    const uint sh1     = sh0 + 8;
+    const bool hi_form = jp >= 2;
+    // blocks 2jp and 2jp + 1 of a superblock: nblk is a multiple of 8, so they are the inner blocks (jp % 2) * 2 and
+    // + 1 of one x4 group; their (d, sum) pairs are its 8-byte word jp % 2
+    const uint bq_off = 1 + (jp % 2) * 4 + hh;
 
-#define LOAD_R(I) \
-        uvec4 hd##I = uvec4(0), qv##I = uvec4(0); \
-        if (I < MAXR && i0 + I < nround) { \
-            const uint sb = min((i0 + I) * SBR + sbl, nsb - 1); \
-            hd##I = data_a[(arow + sb) * 9]; \
-            qv##I = data_a[(arow + sb) * 9 + 1 + c]; \
-        }
-#define COMP_R(I) \
-        if (I < MAXR && i0 + I < nround) { \
-            round_q4k(hd##I, qv##I, (i0 + I) * SBR + sbl, nsb, c / 2, c % 2); \
-        }
+#define LOAD_A(I) \
+    uint sb##I; float kp##I; uvec4 hd##I, qv##I; \
+    if (I < MAXR) { \
+        const uint sbi = (i0 + I) * SBR + sbl; \
+        sb##I = min(sbi, nsb - 1); \
+        kp##I = sbi < nsb ? 1.0 : 0.0; \
+        hd##I = data_a[(arow + sb##I) * 9]; \
+        qv##I = data_a[(arow + sb##I) * 9 + 1 + c]; \
+    }
+#define LOAD_B(K, I) \
+    uvec4 bq0_##I, bq1_##I; uvec2 bds_##I; \
+    if (I < MAXR) { \
+        const uint gi = ((brow[K] * nblk + sb##I * 8 + 2 * jp) / 4) * 9; \
+        bq0_##I = data_b[gi + bq_off]; \
+        bq1_##I = data_b[gi + bq_off + 2]; \
+        bds_##I = data_b64[gi * 2 + (jp % 2)]; \
+    }
+#define DEC_A(I) \
+    float dsc0_##I, dsc1_##I, dmn0_##I, dmn1_##I; \
+    if (I < MAXR) { \
+        const vec2 dm = unpackHalf2x16(hd##I.x) * kp##I; \
+        const uint b0 = hd##I.y >> sh0, b1 = hd##I.y >> sh1; \
+        const uint m0 = hd##I.z >> sh0, m1 = hd##I.z >> sh1; \
+        const uint q0 = hd##I.w >> sh0, q1 = hd##I.w >> sh1; \
+        const uint sc0 = hi_form ? ((q0 & 15u) | ((b0 >> 2) & 48u)) : (b0 & 63u); \
+        const uint sc1 = hi_form ? ((q1 & 15u) | ((b1 >> 2) & 48u)) : (b1 & 63u); \
+        const uint mn0 = hi_form ? (((q0 >> 4) & 15u) | ((m0 >> 2) & 48u)) : (m0 & 63u); \
+        const uint mn1 = hi_form ? (((q1 >> 4) & 15u) | ((m1 >> 2) & 48u)) : (m1 & 63u); \
+        dsc0_##I = dm.x * float(sc0); \
+        dsc1_##I = dm.x * float(sc1); \
+        /* each half of a sub-block takes half of the block sum of the activations, the two lanes of the halves make */ \
+        /* it whole (as mul_mat_vecq.comp) */ \
+        dmn0_##I = 0.5 * dm.y * float(mn0); \
+        dmn1_##I = 0.5 * dm.y * float(mn1); \
+    }
+#define COMP(K, I) \
+    if (I < MAXR) { \
+        const uvec4 lo  = qv##I & 0x0F0F0F0Fu; \
+        const uvec4 hi  = (qv##I >> 4) & 0x0F0F0F0Fu; \
+        const vec2  ds0 = unpackHalf2x16(bds_##I.x); \
+        const vec2  ds1 = unpackHalf2x16(bds_##I.y); \
+        acc[K] += dsc0_##I * ds0.x * float(dot16(lo, bq0_##I)) + dsc1_##I * ds1.x * float(dot16(hi, bq1_##I)) - \
+                  dmn0_##I * ds0.y - dmn1_##I * ds1.y; \
+    }
 #elif defined(DATA_A_Q5_1)
     const uint nround = (nblk + LPR - 1) / LPR;
     const uint arow   = e * p.expert_stride + rowc * nblk;
 
-#define LOAD_R(I) \
-        uvec2 w0_##I = uvec2(0), w1_##I = uvec2(0), w2_##I = uvec2(0); \
-        if (I < MAXR && i0 + I < nround) { \
-            const uint a = (arow + min((i0 + I) * LPR + l, nblk - 1)) * 3; \
-            w0_##I = data_a[a]; \
-            w1_##I = data_a[a + 1]; \
-            w2_##I = data_a[a + 2]; \
-        }
-#define COMP_R(I) \
-        if (I < MAXR && i0 + I < nround) { \
-            round_q51(w0_##I, w1_##I, w2_##I, (i0 + I) * LPR + l); \
-        }
+#define LOAD_A(I) \
+    uint b##I; float kp##I; uvec2 w0_##I, w1_##I, w2_##I; \
+    if (I < MAXR) { \
+        const uint bi = (i0 + I) * LPR + l; \
+        b##I  = min(bi, nblk - 1); \
+        kp##I = bi < nblk ? 1.0 : 0.0; \
+        const uint a = (arow + b##I) * 3; \
+        w0_##I = data_a[a]; \
+        w1_##I = data_a[a + 1]; \
+        w2_##I = data_a[a + 2]; \
+    }
+#define LOAD_B(K, I) \
+    uvec4 bq0_##I, bq1_##I; uint bds_##I; \
+    if (I < MAXR) { \
+        const uint bb = brow[K] * nblk + b##I; \
+        const uint gi = (bb / 4) * 9; \
+        bq0_##I = data_b[gi + 1 + (bb % 4) * 2]; \
+        bq1_##I = data_b[gi + 2 + (bb % 4) * 2]; \
+        bds_##I = data_b32[gi * 4 + bb % 4]; \
+    }
+#define DEC_A(I) \
+    vec2 dm_##I; uvec4 lo_##I, hi_##I; \
+    if (I < MAXR) { \
+        dm_##I = unpackHalf2x16(w0_##I.x) * kp##I; \
+        const uint  qh = w0_##I.y; \
+        const uvec4 qs = uvec4(w1_##I, w2_##I); \
+        /* the fifth bit of codes 4w..4w+3 (low nibbles) and 16+4w.. (high) to bit 4 of their bytes */ \
+        const uvec4 h0 = ((uvec4(qh, qh >> 4, qh >> 8, qh >> 12) & 0xFu) * 0x02040810u) & 0x10101010u; \
+        const uvec4 h1 = ((uvec4(qh >> 16, qh >> 20, qh >> 24, qh >> 28) & 0xFu) * 0x02040810u) & 0x10101010u; \
+        lo_##I = (qs & 0x0F0F0F0Fu) | h0; \
+        hi_##I = ((qs >> 4) & 0x0F0F0F0Fu) | h1; \
+    }
+#define COMP(K, I) \
+    if (I < MAXR) { \
+        const vec2 ds = unpackHalf2x16(bds_##I); \
+        acc[K] += dm_##I.x * ds.x * float(dot16(lo_##I, bq0_##I) + dot16(hi_##I, bq1_##I)) + dm_##I.y * ds.y; \
+    }
 #endif
 
-    for (uint i0 = 0; i0 < nround; i0 += MAXR) {
-        LOAD_R(0) LOAD_R(1) LOAD_R(2) LOAD_R(3) LOAD_R(4) LOAD_R(5) LOAD_R(6) LOAD_R(7)
-        COMP_R(0) COMP_R(1) COMP_R(2) COMP_R(3) COMP_R(4) COMP_R(5) COMP_R(6) COMP_R(7)
+#define ROUNDS(M, K) M(K, 0) M(K, 1) M(K, 2) M(K, 3) M(K, 4) M(K, 5) M(K, 6) M(K, 7)
+#define TOKEN(K) \
+    if (K < cnt) { \
+        ROUNDS(LOAD_B, K) \
+        ROUNDS(COMP, K) \
     }
-#undef LOAD_R
-#undef COMP_R
 
-    [[unroll]] for (uint j = 0; j < NT; ++j) {
-        if ((tmask & (1u << j)) != 0) {
-            const float v = subgroupClusteredAdd(acc[j], LPR);
+    for (uint i0 = 0; i0 < nround; i0 += MAXR) {
+        LOAD_A(0) LOAD_A(1) LOAD_A(2) LOAD_A(3) LOAD_A(4) LOAD_A(5) LOAD_A(6) LOAD_A(7)
+        // every workgroup has a first token: its activations go out with the weights
+        ROUNDS(LOAD_B, 0)
+        DEC_A(0) DEC_A(1) DEC_A(2) DEC_A(3) DEC_A(4) DEC_A(5) DEC_A(6) DEC_A(7)
+        ROUNDS(COMP, 0)
+        TOKEN(1) TOKEN(2) TOKEN(3) TOKEN(4) TOKEN(5) TOKEN(6) TOKEN(7)
+    }
+#undef TOKEN
+#undef ROUNDS
+#undef LOAD_A
+#undef LOAD_B
+#undef DEC_A
+#undef COMP
+
+    [[unroll]] for (uint k = 0; k < NT; ++k) {
+        if (k < cnt) {
+            const float v = subgroupClusteredAdd(acc[k], LPR);
             if (l == 0 && row < p.nrows) {
-                const uint slot = sl[j] - 1;
                 float r = v;
                 if ((p.fusion_flags & 4u) != 0) {
-                    r *= data_fuse0[j * p.nei0 + slot];
+                    r *= data_fuse0[tok[k] * p.nei0 + slt[k]];
                 }
-                data_d[j * p.batch_stride_d + slot * p.stride_d + row] = r;
+                data_d[tok[k] * p.batch_stride_d + slt[k] * p.stride_d + row] = r;
             }
         }
     }
