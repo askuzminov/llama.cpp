@@ -1263,6 +1263,15 @@ def cmd_check():
         except Fail as e:
             run.failed = True
             run.add("", f"spec: FAIL {e}")
+    # the draft acceptance on fixed text, on request (QA_CHECK_FORCED=1): an A/B of kernels the drafts go through
+    if env("QA_CHECK_FORCED", "0") != "0":
+        try:
+            forced_probe(run, model_path(), env_int("QA_PORT", 8097))
+        except Skip as e:
+            run.add("", f"forced: skipped, {e}")
+        except Fail as e:
+            run.failed = True
+            run.add("", f"forced: FAIL {e}")
     return run.finish()
 
 
@@ -1523,6 +1532,101 @@ def spec_probe(run, model, port):
                "accept": r["pit"]["spec"]["draft_acc"] / max(1, r["pit"]["spec"]["draft_n"])}, kept, exe.parent)
 
 
+def gbnf_literal(s):
+    """s as one GBNF string literal (the escapes of llama-grammar's parse_char)"""
+    out = []
+    for ch in s:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def forced_parts(n, ctx_chars, chars):
+    """n pairs (context, continuation) of the corpus spread over it, cut at spaces"""
+    text = corpus_text()
+    step = max(1, (len(text) - ctx_chars - chars - 200) // max(1, n))
+    parts = []
+    for i in range(n):
+        a = text.find(" ", i * step)
+        b = text.find(" ", a + ctx_chars)
+        c = text.find(" ", b + chars)
+        if a < 0 or b < 0 or c < 0:
+            break
+        parts.append((text[a + 1:b], text[b:c]))
+    return parts
+
+
+def forced_probe(run, model, port):
+    """the draft acceptance on fixed text (09.11): a grammar of one literal makes the target write the continuation of a
+    corpus part at temperature 0, the MTP head drafts without the grammar, so every variant drafts over the same tokens
+    from the same contexts and a difference of acceptance comes from the numbers, not from the text it wrote (the
+    acceptance of free replies differs with the text: 03 and the spec probe gave both signs for one kernel). Drafts of a
+    fixed length (QA_FORCED_SPEC in place of QA_SPEC): --spec-auto picks the length from the measured verify cost, so a
+    faster verify drafts longer and accepts a smaller share of the drafted tokens (03, 09.11: 81 verifies of 4 tokens
+    against 61); at temperature 0 the drafts are the head's argmax. Parts: QA_FORCED_PROMPTS of QA_FORCED_CTX characters
+    of context and QA_FORCED_CHARS of forced text; TG t/s includes the grammar on the CPU"""
+    if not env("SPECDRAFT") or env("QA_SPEC", "--spec-auto") == "none":
+        raise Skip("no MTP head (SPECDRAFT) or QA_SPEC=none")
+    exe = binary("llama-server")
+    n_ctx = env_int("QA_FORCED_N_CTX", 8192)
+    args = server_args(model, n_ctx, 1, port,
+                       spec_args=env("QA_FORCED_SPEC", "--spec-draft-n-min 3 --spec-draft-n-max 3 --spec-draft-p-min 0"))
+    parts = forced_parts(env_int("QA_FORCED_PROMPTS", 16), env_int("QA_FORCED_CTX", 3000), env_int("QA_FORCED_CHARS", 1500))
+    identity = {"v": VERSION, "kind": "forced", "build": build_id(exe.parent), "args": args, "model": model_identity(model),
+                "draft": model_identity(Path(env("SPECDRAFT"))), "env": env_identity(os.environ),
+                "parts": text_digest("\n".join(a + "\x00" + b for a, b in parts)), "machine": machine()}
+
+    def go(log):
+        proc, log = start_server(exe, args, os.environ.copy(), log)
+        try:
+            url = f"http://127.0.0.1:{port}"
+            rows = []
+            for i, (prompt, forced) in enumerate(parts):
+                body = {"prompt": prompt, "n_predict": len(forced) + 16, "temperature": 0, "cache_prompt": False,
+                        "grammar": "root ::= " + gbnf_literal(forced)}
+                try:
+                    _, raw = http(url + "/completion", body, env_int("QA_TIMEOUT", 3600))
+                except urllib.error.HTTPError as e:
+                    raise Fail(f"forced part {i}: HTTP {e.code} {e.read()[:300]!r}")
+                r = json.loads(raw)
+                t = r.get("timings", {})
+                rows.append({"part": i, "n": t.get("predicted_n", 0), "same": r.get("content", "") == forced,
+                             "draft_n": t.get("draft_n", 0), "draft_acc": t.get("draft_n_accepted", 0),
+                             "tg": t.get("predicted_per_second", 0.0)})
+            return {"rows": rows}
+        finally:
+            proc.kill()
+            proc.wait()
+            mark_end()
+
+    r, kept = run.measure("forced", identity, go)
+    k = " k" if kept else ""
+    rows = r["rows"]
+    dn, da, n = sum(x["draft_n"] for x in rows), sum(x["draft_acc"] for x in rows), sum(x["n"] for x in rows)
+    run.add("", f"forced: the draft acceptance on {len(rows)} parts of the corpus that a grammar makes the target write at "
+                f"temperature 0 (the same tokens for every variant): {da} of {dn} drafted accepted "
+                f"({da / max(1, dn):.4f}), {n} tokens" + k,
+            *table(["part", "tokens", "as forced", "drafted", "accepted", "rate", "TG t/s"],
+                   [[x["part"], x["n"], "yes" if x["same"] else "NO", x["draft_n"], x["draft_acc"],
+                     f"{x['draft_acc'] / max(1, x['draft_n']):.3f}", f"{x['tg']:.2f}"] for x in rows]))
+    if not all(x["same"] for x in rows):
+        run.failed = True
+        run.add("forced: FORCED TEXT DIFFERS (the grammar did not hold the target to the text)")
+    run.record("check", "forced", {"accept": da / max(1, dn), "drafted": dn, "tokens": n}, kept, exe.parent)
+
+
 # ---------------------------------------------------------------- the server
 
 ADJECTIVES = ["amber", "silver", "crimson", "golden", "violet", "copper", "ivory", "scarlet", "azure", "emerald",
@@ -1570,12 +1674,13 @@ def sampling():
         raise Fail(f"QA_SAMP must be temperature, top_k and top_p, as \"1.0 20 0.95\", got {env('QA_SAMP')!r}")
 
 
-def server_args(model, ctx, slots, port, extra=()):
-    """the server as serve.bat runs it: the model, LOADMODE, EXTRA, DECARGS, the MTP head of SPECDRAFT with QA_SPEC"""
+def server_args(model, ctx, slots, port, extra=(), spec_args=None):
+    """the server as serve.bat runs it: the model, LOADMODE, EXTRA, DECARGS, the MTP head of SPECDRAFT with QA_SPEC (or
+    with spec_args in its place)"""
     draft = env("SPECDRAFT") if env("QA_SPEC", "--spec-auto") != "none" else ""
     if draft and not Path(draft).is_file():
         raise Fail(f"SPECDRAFT not found: {draft!r}")
-    spec = split_args(env("QA_SPEC", "--spec-auto")) if draft else []
+    spec = (split_args(env("QA_SPEC", "--spec-auto")) if spec_args is None else split_args(spec_args)) if draft else []
     return [str(a) for a in ["-m", model, *(["-md", draft] if draft else []), "-c", ctx, "-np", slots, "-fa", "on",
             *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args(), *split_args(env("DECARGS")),
             *spec, *(["--kv-unified"] if slots > 1 else []), *extra, "--host", "127.0.0.1", "--port", port]]
