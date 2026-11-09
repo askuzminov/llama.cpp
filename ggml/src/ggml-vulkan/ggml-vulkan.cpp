@@ -3886,7 +3886,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t wg = device->mmv_id_fork_wg;
         const uint32_t sg = device->subgroup_size_control ? wg : 0;
         const uint32_t fence = device->mmv_id_fork_fence;
-        // q4_K only on request (GGML_VK_MMV_ID_FORK_Q4_K): without its pipeline ggml_vk_fork_mmv_id_takes leaves it upstream
+        // q4_K unless GGML_VK_MMV_ID_FORK_Q4_K=0: without its pipeline ggml_vk_fork_mmv_id_takes leaves it upstream
         if (device->mmv_id_fork_q4_k) {
             ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q4_K], q4k.name, q4k.len, q4k.data, "main", 6,
                                     sizeof(vk_mmv_id_fork_push_constants), {wg / lpr4, 1, 1}, {wg, device->mmv_id_fork_maxr_q4_k, fence}, 1,

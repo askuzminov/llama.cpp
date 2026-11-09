@@ -35,7 +35,7 @@
 
 layout(constant_id = 0) const uint WG_SIZE = 32;   // the subgroup size, the host requires full subgroups of it
 layout(constant_id = 1) const uint MAXR = 5;       // rounds of a lane loaded at once (at most 8)
-layout(constant_id = 2) const uint FENCE = 0;      // 1: the never-taken branch that keeps the loads of a pass together
+layout(constant_id = 2) const uint FENCE = 1;      // the never-taken branch that keeps the loads of a pass together (0: none)
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 

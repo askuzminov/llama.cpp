@@ -274,15 +274,16 @@ void ggml_vk_fork_mmid_f16reg_init(vk_device & device) {
 void ggml_vk_fork_mmv_id_init(vk_device & device) {
     // the decode and draft-check MUL_MAT_ID (up to 8 tokens) on mul_mat_vec_id_fork.comp instead of mul_mat_vecq.comp:
     // one dispatch for all tokens, an expert read once for the tokens that share it, raw loads before the decode, the
-    // MUL by the routing weights fused at any token count. q5_1 weights, q4_K with GGML_VK_MMV_ID_FORK_Q4_K=1 (slower
-    // than upstream on the 395: 4-8% a call over three versions, 09.11). GGML_VK_MMV_ID_FORK=1: where the upstream
-    // mat-vec quantizes the activations to q8_1 (the default on AMD RDNA3 with the int8 dot: the q5_1 down of the draft
-    // checks 4-16% faster a call at the decode quality of upstream), =2: also below its k threshold (the 1-token q5_1
-    // down of qwen4exp, which upstream runs on f32 activations), =0: upstream. _WG: 32 or 64 lanes (one subgroup),
-    // _LPR_Q4_K: lanes per q4_K row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row (2, 4, 8), _MAXR_Q4_K / _MAXR_Q5_1
-    // (_MAXR: both): rounds of loads a lane holds (1-8). A round past the row is still loaded and computed, so the
-    // default is the whole row of qwen4exp (q4_K k=2560: 10 superblocks, q5_1 k=640: 20 blocks) at the lanes per row,
-    // in passes of at most 5. _FENCE=1: the never-taken branch that keeps the loads of a pass together (see the shader)
+    // MUL by the routing weights fused at any token count. q5_1 and q4_K weights (GGML_VK_MMV_ID_FORK_Q4_K=0: q4_K
+    // upstream). GGML_VK_MMV_ID_FORK=1: where the upstream mat-vec quantizes the activations to q8_1 (the default on AMD
+    // RDNA3 with the int8 dot; 395 09.11, fenced loads: q5_1 down 7-18% faster a call at 2-4 tokens, q4_K gate/up equal
+    // at 1-2 and 1-2% faster at 3-4, decode quality of upstream), =2: also below its k threshold (the 1-token q5_1 down
+    // of qwen4exp, which upstream runs on f32 activations: 15% faster, q8_1 activations), =0: upstream. _WG: 32 or 64
+    // lanes (one subgroup), _LPR_Q4_K: lanes per q4_K row (8, 16, 32), _LPR_Q5_1: lanes per q5_1 row (2, 4, 8),
+    // _MAXR_Q4_K / _MAXR_Q5_1 (_MAXR: both): rounds of loads a lane holds (1-8). A round past the row is still loaded and
+    // computed, so the default is the whole row of qwen4exp (q4_K k=2560: 10 superblocks, q5_1 k=640: 20 blocks) at the
+    // lanes per row, in passes of at most 5. _FENCE=0: no never-taken branch over the loads of a pass (see the shader;
+    // without it the AMD scheduler waits for each round's loads in turn: q4_K 4-8% slower than upstream)
     device->mmv_id_fork_mode = 0;
     const char * env = getenv("GGML_VK_MMV_ID_FORK");
     const bool asked = env != nullptr && env[0] != 0;
@@ -329,8 +330,8 @@ void ggml_vk_fork_mmv_id_init(vk_device & device) {
     device->mmv_id_fork_maxr_q5_1   = std::min<uint32_t>(std::max<uint32_t>(maxr5, 1), 8);
     device->mmv_id_fork_lpr_q4_k    = lpr4;
     device->mmv_id_fork_lpr_q5_1    = lpr5;
-    device->mmv_id_fork_q4_k        = env_u32("GGML_VK_MMV_ID_FORK_Q4_K", 0) != 0;
-    device->mmv_id_fork_fence       = env_u32("GGML_VK_MMV_ID_FORK_FENCE", 0) != 0 ? 1 : 0;
+    device->mmv_id_fork_q4_k        = env_u32("GGML_VK_MMV_ID_FORK_Q4_K", 1) != 0;
+    device->mmv_id_fork_fence       = env_u32("GGML_VK_MMV_ID_FORK_FENCE", 1) != 0 ? 1 : 0;
     device->mmv_id_fork_mode        = (uint32_t) std::min(mode, 2);
     char q4k[64] = "q4_K upstream";
     if (device->mmv_id_fork_q4_k) {
