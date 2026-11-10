@@ -137,6 +137,7 @@ target_sources(${TARGET} PRIVATE
     fork/common-fork.h
     fork/speculative-fork.cpp
     fork/speculative-fork.h
+    fork/top-k-fork.h
     )
 
 set_target_properties(${TARGET} PROPERTIES

@@ -5,6 +5,7 @@
 #include "log.h"
 #include "reasoning-budget.h"
 #include "fork/env-fork.h" // fork: LLAMA_SAMPLER_FAST_TOP_K
+#include "fork/top-k-fork.h" // fork: LLAMA_SAMPLER_FAST_TOP_K
 
 #include "ggml.h"
 
@@ -212,25 +213,9 @@ struct common_sampler {
             return false;
         }
 
-        // the k + 1 largest in a min-heap
+        // the k + 1 largest, largest first (common/fork/top-k-fork.h)
         auto & h = fast_heap;
-        h.clear();
-        const auto greater = [](const std::pair<float, llama_token> & a, const std::pair<float, llama_token> & b) {
-            return a.first > b.first;
-        };
-        const bool has_bias = !fast_bias.empty();
-        for (int i = 0; i < n_vocab; ++i) {
-            const float v = has_bias ? logits[i] + fast_bias[i] : logits[i];
-            if ((int) h.size() <= k) {
-                h.emplace_back(v, (llama_token) i);
-                std::push_heap(h.begin(), h.end(), greater);
-            } else if (v > h.front().first) {
-                std::pop_heap(h.begin(), h.end(), greater);
-                h.back() = { v, (llama_token) i };
-                std::push_heap(h.begin(), h.end(), greater);
-            }
-        }
-        std::sort(h.begin(), h.end(), greater);
+        common_fork_top_k_heap(logits, fast_bias.empty() ? nullptr : fast_bias.data(), n_vocab, k, h);
         for (int j = 0; j < k; ++j) {
             if (!(h[j].first > h[j + 1].first)) {
                 return false;

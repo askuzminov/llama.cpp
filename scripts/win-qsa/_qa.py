@@ -13,6 +13,7 @@ kept result is printed and not measured again. FORCE=1 runs everything again, FO
 Uses only the Python standard library."""
 
 import argparse
+import bisect
 import csv
 import hashlib
 import json
@@ -2205,14 +2206,26 @@ def decode_trace(path):
         period = b["t0"] - a["t0"]
         steps.append({"period": period, "gpu": gpu_in(a["t0"], b["t0"]), "graph": a["graph"], "inputs": a.get("inputs", 0),
                       "submit": a.get("submit", 0), "after": b["t0"] - a["t1"]})
+    # the server's parts of a round (10.11): "spec process" - the catch-up of the head, "spec accept" - the sampling of
+    # the verified positions, "spec tokens" - the work on the accepted tokens (traces before 10.11 have the first only)
+    srv = sorted((e for e in ev if tracks.get(e.get("tid")) == "server"), key=lambda e: e["ts"])
+    gpu_t0 = [a for a, _ in gpu]
     rounds = []
     for a, b in zip(tgt, tgt[1:]):
         if b["t0"] - a["t0"] > 1e6:
             continue
         inner = [m for m in mtp if a["t0"] < m["t0"] < b["t0"]]
+        parts = [e for e in srv if a["t0"] < e["ts"] < b["t0"]]
+        proc = next((e for e in parts if e["name"].startswith("spec process")), None)
+        first = next((m for m in inner if m["t0"] >= proc["ts"] + proc["dur"]), None) if proc else None
+        g = bisect.bisect_left(gpu_t0, a["t0"])
         rounds.append({"period": b["t0"] - a["t0"], "gpu": gpu_in(a["t0"], b["t0"]), "mtp": len(inner),
                        "verify": (inner[0]["t0"] if inner else b["t0"]) - a["t0"],
-                       "verify_gpu": gpu_in(a["t0"], inner[0]["t0"] if inner else b["t0"])})
+                       "verify_gpu": gpu_in(a["t0"], inner[0]["t0"] if inner else b["t0"]),
+                       "lead": (gpu_t0[g] - a["t0"]) if g < len(gpu_t0) and gpu_t0[g] < b["t0"] else 0,
+                       "sample": sum(e["dur"] for e in parts if e["name"].startswith("spec accept")),
+                       "tokens": sum(e["dur"] for e in parts if e["name"].startswith("spec tokens")),
+                       "gap": (first["t0"] - proc["ts"] - proc["dur"]) if first else 0})
     return {"steps": steps, "rounds": rounds, "n_gpu": len(gpu)}
 
 
@@ -2386,7 +2399,9 @@ def cmd_decode():
                           ms(st, "graph"), ms(st, "inputs"), ms(st, "submit"), ms(st, "after"), tr["n_gpu"]])
             if rd:
                 rrows.append([name, len(rd), ms(rd, "period"), ms(rd, "gpu"), f"{statistics.mean(x['mtp'] for x in rd):.2f}",
-                              ms(rd, "verify"), ms(rd, "verify_gpu")])
+                              ms(rd, "verify"), ms(rd, "verify_gpu"), ms(rd, "lead"),
+                              ms(rd, "sample") if any(x["sample"] for x in rd) else "",
+                              ms(rd, "tokens") if any(x["tokens"] for x in rd) else "", ms(rd, "gap")])
         run.add("", f"decode: draft steps of the traced request "
                     f"{trace_req if not trace_extra else trace_extra[0] + ' after the measured ones'} "
                     "(GGML_TIMELINE, ms per step): period - to the "
@@ -2396,9 +2411,13 @@ def cmd_decode():
                        srows))
         if rrows:
             run.add("", "decode: rounds of the traced request (ms): from one decode of the target to the next; mtp - "
-                        "decodes of the head in it (catch-up and steps); verify - from the target decode to the first "
-                        "decode of the head",
-                    *table(["variant", "rounds", "period", "gpu", "mtp", "verify", "verify gpu"], rrows))
+                        "the number of decodes of the head in it (catch-up and steps), not ms; verify - from the target "
+                        "decode to the first decode of the head; lead - from the target decode to the first gpu span; "
+                        "sample - the sampling of the verified positions, tokens - the work on the accepted tokens "
+                        "(the server's \"spec accept\" and \"spec tokens\", builds since 10.11); gap - from the end of "
+                        "the catch-up to the first draft step, the gpu idle but for the tail of the catch-up",
+                    *table(["variant", "rounds", "period", "gpu", "mtp", "verify", "verify gpu", "lead", "sample",
+                            "tokens", "gap"], rrows))
     return run.finish()
 
 

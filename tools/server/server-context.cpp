@@ -5788,6 +5788,10 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // fork: the sampling of the verified positions and the work on the accepted tokens on the timeline
+            // (GGML_TIMELINE): "spec accept <drafted>", "spec tokens <accepted + 1>"
+            int64_t t_part_us = ggml_timeline_on() ? ggml_time_us() : 0;
+
             // batch indices of the draft tokens, used to get the token probabilities below
             auto spec_i_batch = std::move(slot.spec_i_batch);
 
@@ -5826,6 +5830,12 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                if (t_part_us != 0) {
+                    const std::string name = "spec accept " + std::to_string(n_draft);
+                    ggml_timeline_event("server", name.c_str(), t_part_us, ggml_time_us());
+                    t_part_us = ggml_time_us();
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -5940,6 +5950,11 @@ private:
 
             const size_t n_accepted = finish(ids.size() - 1);
             slot.print_timings_tg();
+
+            if (t_part_us != 0) {
+                const std::string name = "spec tokens " + std::to_string(ids.size());
+                ggml_timeline_event("server", name.c_str(), t_part_us, ggml_time_us());
+            }
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });

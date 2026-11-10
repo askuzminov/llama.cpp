@@ -13,6 +13,9 @@ llama_build_and_test(test-spec-auto-fork.cpp)
 # the fork's knobs of the environment: a value that is not a whole number gives the default, not the 0 of atoi
 llama_build_and_test(test-env-fork.cpp)
 
+# the k + 1 largest of the sampler's fast top-k (common/fork/top-k-fork.h): the same heap as one value at a time
+llama_build_and_test(test-top-k-fork.cpp)
+
 # the qwen4exp indexer timed on one device at the shapes of the model (lightning indexer, the head matmul of the Vulkan
 # graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines
 llama_build(test-micro-fork.cpp LINK ggml)
