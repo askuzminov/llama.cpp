@@ -13,6 +13,8 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
 
 // [TAG_QWEN4_REIMPLEMENT]
 // TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
@@ -61,6 +63,452 @@ struct llama_model_qwen4exp_fork::ple_warmer {
     ~ple_warmer() { finish(); }
 };
 
+// the LM head of the MTP head over a subset of the vocabulary (see mtp_vocab_for in the header). Slots 0..n_base-1 hold
+// the base, slots n_base..cap-1 a ring the tokens of the head's batches replace, CLOCK order: a token seen again while
+// in the ring sets its bit, and the hand passes a set bit once (clearing it) before it takes that slot
+struct llama_model_qwen4exp_fork::mtp_vocab {
+    const ggml_tensor * output = nullptr; // the LM head the subset is taken from
+    int32_t n_vocab   = 0;
+    int32_t n_base    = 0;
+    int32_t cap       = 0;
+    int32_t hand      = 0;                // the next ring slot the clock looks at, in [n_base, cap)
+    size_t  row_bytes = 0;
+
+    std::vector<uint8_t> rows;            // host copy of the LM head
+    std::vector<int32_t> slot_tok;        // the token of each slot
+    std::vector<int32_t> tok_slot;        // the slot of each token, -1 for none
+    std::vector<uint8_t> ref;             // the CLOCK bit of each slot
+
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         w   = nullptr;  // [n_embd, cap], the type of the LM head
+    ggml_tensor *         ids = nullptr;  // I32 [cap], the token of each slot
+
+    int64_t n_added   = 0;
+    int64_t n_written = 0;                // slots written to the device
+
+    // LLAMA_MTP_VOCAB_STATS: the token counts the base was taken from, with the tokens of the head's batches since then
+    // added; written back at the end when LLAMA_MTP_VOCAB_STATS_SAVE=1
+    std::vector<uint64_t> counts;
+    std::string           stats_path;
+    bool                  stats_save = false;
+    int64_t               n_counted  = 0;
+
+    std::mutex mtx;
+
+    // the counts as "llama-mtp-vocab-stats 1 <n_vocab>" and "<id> <count>" lines, through a temporary file
+    void save_stats() {
+        if (!stats_save || stats_path.empty() || n_counted == 0) {
+            return;
+        }
+        const std::string tmp = stats_path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            if (!f) {
+                LLAMA_LOG_WARN("%s: cannot write %s\n", __func__, tmp.c_str());
+                return;
+            }
+            f << "llama-mtp-vocab-stats 1 " << n_vocab << "\n";
+            for (int32_t t = 0; t < n_vocab; ++t) {
+                if (counts[t]) {
+                    f << t << " " << counts[t] << "\n";
+                }
+            }
+            if (!f) {
+                LLAMA_LOG_WARN("%s: cannot write %s\n", __func__, tmp.c_str());
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, stats_path, ec);
+        if (ec) {
+            LLAMA_LOG_WARN("%s: cannot replace %s: %s\n", __func__, stats_path.c_str(), ec.message().c_str());
+            return;
+        }
+        LLAMA_LOG_WARN("%s: %" PRId64 " tokens counted into %s\n", __func__, n_counted, stats_path.c_str());
+    }
+
+    ~mtp_vocab() {
+        save_stats();
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+        }
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
+
+    // slots [s0, s0 + n) of w and ids from the host copy
+    void write(int32_t s0, int32_t n) {
+        if (n <= 0) {
+            return;
+        }
+        std::vector<uint8_t> run_rows((size_t) n * row_bytes);
+        for (int32_t i = 0; i < n; ++i) {
+            std::memcpy(run_rows.data() + (size_t) i * row_bytes, rows.data() + (size_t) slot_tok[s0 + i] * row_bytes, row_bytes);
+        }
+        ggml_backend_tensor_set(w,   run_rows.data(),      (size_t) s0 * row_bytes,       run_rows.size());
+        ggml_backend_tensor_set(ids, slot_tok.data() + s0, (size_t) s0 * sizeof(int32_t), (size_t) n * sizeof(int32_t));
+        n_written += n;
+    }
+
+    // the tokens of a batch into the ring: the slots the hand passed are written to the device after the graphs of sched
+    // that may read them are done
+    void add(const llama_token * tokens, int64_t n, ggml_backend_sched_t sched) {
+        std::lock_guard<std::mutex> lock(mtx);
+        const int32_t n_ring = cap - n_base;
+        const int32_t h0     = hand;
+        int64_t       moved  = 0;      // slots the hand passed
+        int64_t       taken  = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const llama_token t = tokens[i];
+            if (t < 0 || t >= n_vocab) {
+                continue;
+            }
+            if (!counts.empty()) {
+                counts[t]++;
+                n_counted++;
+            }
+            const int32_t s = tok_slot[t];
+            if (s >= 0) {
+                if (s >= n_base) {
+                    ref[s] = 1;
+                }
+                continue;
+            }
+            // a set bit is passed once, so a full turn finds a slot
+            while (ref[hand]) {
+                ref[hand] = 0;
+                hand = hand + 1 == cap ? n_base : hand + 1;
+                moved++;
+            }
+            tok_slot[slot_tok[hand]] = -1;
+            slot_tok[hand] = t;
+            tok_slot[t]    = hand;
+            hand = hand + 1 == cap ? n_base : hand + 1;
+            moved++;
+            taken++;
+        }
+        if (taken == 0) {
+            return;
+        }
+        n_added += taken;
+        if (sched) {
+            ggml_backend_sched_synchronize(sched);
+        }
+        if (moved >= n_ring) {
+            write(n_base, n_ring);
+        } else if (h0 + moved <= cap) {
+            write(h0, (int32_t) moved);
+        } else {
+            write(h0, cap - h0);
+            write(n_base, (int32_t) (h0 + moved - cap));
+        }
+    }
+};
+
+// adds the tokens of each batch of the MTP head to the subset before its graph runs; no tensor of the graph comes from it
+class llm_graph_input_mtp_vocab_fork : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_vocab_fork(llama_model_qwen4exp_fork::mtp_vocab * v, ggml_backend_sched_t sched) : v(v), sched(sched) {}
+    void set_input(const llama_ubatch * ubatch) override {
+        if (ubatch->token) {
+            v->add(ubatch->token, ubatch->n_tokens, sched);
+        }
+    }
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.sched == sched;
+    }
+private:
+    llama_model_qwen4exp_fork::mtp_vocab * v;
+    ggml_backend_sched_t                   sched;
+};
+
+// the buffer type the subset is allocated in: the one of the LM head when its rows have the plain layout, a CPU buffer
+// for a mapped file, null for repacked or split rows
+static ggml_backend_buffer_type_t qwen4exp_mtp_vocab_buft(const ggml_tensor * output) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return ggml_backend_buft_is_host(buft) ? ggml_backend_cpu_buffer_type() : nullptr;
+    }
+    if (buft == ggml_backend_dev_buffer_type(dev) || ggml_backend_buft_is_host(buft)) {
+        return buft;
+    }
+    return nullptr;
+}
+
+// the scripts LLAMA_MTP_VOCAB_SCRIPTS names, as bits of qwen4exp_mtp_vocab_piece_scripts
+enum : uint32_t {
+    QWEN4EXP_SCRIPT_CYRILLIC = 1u << 0,
+    QWEN4EXP_SCRIPT_LATIN    = 1u << 1,   // Latin letters past ASCII
+    QWEN4EXP_SCRIPT_GREEK    = 1u << 2,
+    QWEN4EXP_SCRIPT_CJK      = 1u << 3,   // Han, kana, Hangul
+    QWEN4EXP_SCRIPT_ARABIC   = 1u << 4,
+    QWEN4EXP_SCRIPT_HEBREW   = 1u << 5,
+};
+
+static uint32_t qwen4exp_mtp_vocab_script_mask(const char * list) {
+    static const struct { const char * name; uint32_t bit; } names[] = {
+        { "cyrillic", QWEN4EXP_SCRIPT_CYRILLIC }, { "latin",  QWEN4EXP_SCRIPT_LATIN  }, { "greek",  QWEN4EXP_SCRIPT_GREEK  },
+        { "cjk",      QWEN4EXP_SCRIPT_CJK      }, { "arabic", QWEN4EXP_SCRIPT_ARABIC }, { "hebrew", QWEN4EXP_SCRIPT_HEBREW },
+    };
+    uint32_t mask = 0;
+    std::string s = list;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        const size_t end = std::min(s.find(',', pos), s.size());
+        const std::string name = s.substr(pos, end - pos);
+        bool known = name.empty() || name == "none";
+        for (const auto & n : names) {
+            if (name == n.name) {
+                mask |= n.bit;
+                known = true;
+            }
+        }
+        if (!known) {
+            LLAMA_LOG_WARN("%s: unknown script '%s' in LLAMA_MTP_VOCAB_SCRIPTS (cyrillic, latin, greek, cjk, arabic, hebrew, none)\n",
+                    __func__, name.c_str());
+        }
+        pos = end + 1;
+    }
+    return mask;
+}
+
+// the scripts of the code points of a piece; bytes that do not form a UTF-8 sequence count for none
+static uint32_t qwen4exp_mtp_vocab_piece_scripts(const std::string & piece) {
+    uint32_t mask = 0;
+    const auto * p = (const unsigned char *) piece.data();
+    const size_t n = piece.size();
+    for (size_t i = 0; i < n; ) {
+        uint32_t cp  = p[i];
+        size_t   len = 1;
+        if      (cp >= 0xF0 && cp < 0xF8) { len = 4; cp &= 0x07; }
+        else if (cp >= 0xE0)              { len = cp < 0xF0 ? 3 : 1; cp &= 0x0F; }
+        else if (cp >= 0xC0)              { len = 2; cp &= 0x1F; }
+        if (len > 1) {
+            if (i + len > n) {
+                break;
+            }
+            bool ok = true;
+            for (size_t k = 1; k < len; ++k) {
+                ok = ok && (p[i + k] & 0xC0) == 0x80;
+                cp = (cp << 6) | (p[i + k] & 0x3F);
+            }
+            if (!ok) {
+                i++;
+                continue;
+            }
+        } else if (cp >= 0x80) {
+            i++;
+            continue;
+        }
+        i += len;
+        if      (cp >= 0x0400 && cp <= 0x052F)                                          mask |= QWEN4EXP_SCRIPT_CYRILLIC;
+        else if ((cp >= 0x00C0 && cp <= 0x024F) || (cp >= 0x1E00 && cp <= 0x1EFF))      mask |= QWEN4EXP_SCRIPT_LATIN;
+        else if ((cp >= 0x0370 && cp <= 0x03FF) || (cp >= 0x1F00 && cp <= 0x1FFF))      mask |= QWEN4EXP_SCRIPT_GREEK;
+        else if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+                 (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7AF) ||
+                 (cp >= 0xF900 && cp <= 0xFAFF))                                        mask |= QWEN4EXP_SCRIPT_CJK;
+        else if ((cp >= 0x0600 && cp <= 0x06FF) || (cp >= 0x0750 && cp <= 0x077F))      mask |= QWEN4EXP_SCRIPT_ARABIC;
+        else if (cp >= 0x0590 && cp <= 0x05FF)                                          mask |= QWEN4EXP_SCRIPT_HEBREW;
+    }
+    return mask;
+}
+
+// the token counts of LLAMA_MTP_VOCAB_STATS ("llama-mtp-vocab-stats 1 <n_vocab>", then "<id> <count>" lines); false for
+// a missing file or another vocabulary size (the rows of the LM head or the tokens of the vocabulary), the counts stay
+// zero then
+static bool qwen4exp_mtp_vocab_load_stats(const std::string & path, int64_t n_vocab, int64_t n_tok, std::vector<uint64_t> & counts) {
+    std::ifstream f(path);
+    if (!f) {
+        return false;
+    }
+    std::string magic;
+    int     version = 0;
+    int64_t n       = 0;
+    if (!(f >> magic >> version >> n) || magic != "llama-mtp-vocab-stats" || version != 1) {
+        LLAMA_LOG_WARN("%s: %s is not a vocabulary statistics file, ignored\n", __func__, path.c_str());
+        return false;
+    }
+    if (n != n_vocab && n != n_tok) {
+        LLAMA_LOG_WARN("%s: %s counts %" PRId64 " tokens, the head has %" PRId64 " and the vocabulary %" PRId64 ", ignored\n",
+                __func__, path.c_str(), n, n_vocab, n_tok);
+        return false;
+    }
+    int64_t  id    = 0;
+    uint64_t count = 0;
+    while (f >> id >> count) {
+        if (id >= 0 && id < n_vocab) {
+            counts[id] += count;
+        }
+    }
+    return true;
+}
+
+llama_model_qwen4exp_fork::mtp_vocab * llama_model_qwen4exp_fork::mtp_vocab_for(const ggml_tensor * output, const ggml_tensor * output_s) const {
+    static const bool    on       = llama_fork_env_int("LLAMA_MTP_VOCAB", 0) != 0;
+    static const int64_t n_first  = llama_fork_env_int("LLAMA_MTP_VOCAB_BASE", 32768);
+    static const int64_t n_ring_e = llama_fork_env_int("LLAMA_MTP_VOCAB_RING", 16384);
+    // no data: a model loaded to measure memory (common_fit_params), the full head
+    if (!on || output == nullptr || output_s != nullptr || output->buffer == nullptr || output->data == nullptr ||
+        ggml_n_dims(output) != 2 || !ggml_is_contiguous(output)) {
+        return nullptr;
+    }
+
+    static std::mutex init_mtx;
+    std::lock_guard<std::mutex> lock(init_mtx);
+
+    if (mtp_vocab_sub) {
+        return mtp_vocab_sub->output == output ? mtp_vocab_sub.get() : nullptr;
+    }
+    if (mtp_vocab_failed) {
+        return nullptr;
+    }
+    // every return below without the subset warns once
+    mtp_vocab_failed = true;
+
+    const int64_t n_vocab = output->ne[1];
+    ggml_backend_buffer_type_t buft = qwen4exp_mtp_vocab_buft(output);
+    if (!buft) {
+        LLAMA_LOG_WARN("%s: the LM head of the MTP head is in a %s buffer the subset cannot copy rows from, the full head\n",
+                __func__, ggml_backend_buffer_name(output->buffer));
+        return nullptr;
+    }
+
+    // the base: the n_first most frequent tokens of LLAMA_MTP_VOCAB_STATS (the first ids without it, and after the
+    // counted tokens), the tokens of the scripts asked for, the control and user-defined tokens
+    const char *   scripts_env = getenv("LLAMA_MTP_VOCAB_SCRIPTS");
+    const uint32_t scripts     = qwen4exp_mtp_vocab_script_mask(scripts_env ? scripts_env : "cyrillic");
+    const char *   stats_env   = getenv("LLAMA_MTP_VOCAB_STATS");
+    const int64_t  n_freq      = std::min(std::max<int64_t>(n_first, 0), n_vocab);
+    std::vector<uint64_t> counts;
+    bool    stats_ok  = false;
+    int64_t n_counted = 0;
+    if (stats_env && *stats_env) {
+        counts.assign((size_t) n_vocab, 0);
+        stats_ok = qwen4exp_mtp_vocab_load_stats(stats_env, n_vocab, vocab.n_tokens(), counts);
+    }
+    std::vector<int32_t> base;
+    std::vector<uint8_t> in_base((size_t) n_vocab, 0);
+    if (stats_ok) {
+        std::vector<int32_t> seen;
+        for (int64_t t = 0; t < n_vocab; ++t) {
+            if (counts[t]) {
+                seen.push_back((int32_t) t);
+            }
+        }
+        std::stable_sort(seen.begin(), seen.end(), [&](int32_t a, int32_t b) { return counts[a] > counts[b]; });
+        for (size_t i = 0; i < seen.size() && (int64_t) base.size() < n_freq; ++i) {
+            base.push_back(seen[i]);
+            in_base[seen[i]] = 1;
+        }
+        n_counted = (int64_t) seen.size();
+    }
+    for (int64_t t = 0; t < n_vocab && (int64_t) base.size() < n_freq; ++t) {
+        if (!in_base[t]) {
+            base.push_back((int32_t) t);
+            in_base[t] = 1;
+        }
+    }
+    int64_t n_script  = 0;
+    int64_t n_special = 0;
+    const int64_t n_tok = std::min<int64_t>(vocab.n_tokens(), n_vocab);
+    for (int64_t t = 0; t < n_tok; ++t) {
+        if (in_base[t]) {
+            continue;
+        }
+        const llama_token tok = (llama_token) t;
+        bool add = false;
+        if (vocab.token_get_attr(tok) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+            add = true;
+            n_special++;
+        } else if (scripts && (qwen4exp_mtp_vocab_piece_scripts(vocab.token_to_piece(tok)) & scripts)) {
+            add = true;
+            n_script++;
+        }
+        if (add) {
+            base.push_back((int32_t) t);
+            in_base[t] = 1;
+        }
+    }
+    const int64_t n_base = (int64_t) base.size();
+    const int64_t n_ring = std::max<int64_t>(n_ring_e, 1);
+    const int64_t cap    = n_base + n_ring;
+    if (n_base < 1 || cap >= n_vocab) {
+        LLAMA_LOG_WARN("%s: a subset of %" PRId64 " base tokens and %" PRId64 " ring slots is not below the %" PRId64
+                " tokens of the vocabulary, the full head\n", __func__, n_base, n_ring, n_vocab);
+        return nullptr;
+    }
+
+    auto v = std::make_unique<mtp_vocab>();
+    v->output    = output;
+    v->n_vocab   = (int32_t) n_vocab;
+    v->n_base    = (int32_t) n_base;
+    v->cap       = (int32_t) cap;
+    v->hand      = (int32_t) n_base;
+    v->row_bytes = output->nb[1];
+
+    // the host copy of the LM head: the rows of new tokens come from here, not from the device
+    v->rows.resize(v->row_bytes * (size_t) n_vocab);
+    ggml_backend_tensor_get(output, v->rows.data(), 0, v->rows.size());
+
+    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+    v->ctx = ggml_init(ip);
+    v->w   = ggml_new_tensor_2d(v->ctx, output->type, output->ne[0], cap);
+    v->ids = ggml_new_tensor_1d(v->ctx, GGML_TYPE_I32, cap);
+    ggml_set_name(v->w,   "mtp_vocab_w");
+    ggml_set_name(v->ids, "mtp_vocab_ids");
+    v->buf = ggml_backend_alloc_ctx_tensors_from_buft(v->ctx, buft);
+    if (!v->buf) {
+        LLAMA_LOG_WARN("%s: no %s buffer for the vocabulary subset of the MTP head, the full head\n", __func__, ggml_backend_buft_name(buft));
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(v->buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // the base slots, then the ring with the lowest ids outside the base until batches bring tokens
+    v->slot_tok = base;
+    v->slot_tok.reserve((size_t) cap);
+    for (int64_t t = 0; t < n_vocab && (int64_t) v->slot_tok.size() < cap; ++t) {
+        if (!in_base[t]) {
+            v->slot_tok.push_back((int32_t) t);
+        }
+    }
+    v->tok_slot.assign((size_t) n_vocab, -1);
+    for (int32_t s = 0; s < (int32_t) cap; ++s) {
+        v->tok_slot[v->slot_tok[s]] = s;
+    }
+    v->ref.assign((size_t) cap, 0);
+    v->write(0, (int32_t) cap);
+    v->n_written = 0;
+
+    if (stats_env && *stats_env) {
+        v->counts     = std::move(counts);
+        v->stats_path = stats_env;
+        v->stats_save = llama_fork_env_int("LLAMA_MTP_VOCAB_STATS_SAVE", 0) != 0;
+    }
+
+    char freq_src[256];
+    if (stats_ok) {
+        snprintf(freq_src, sizeof(freq_src), "the %" PRId64 " most frequent tokens of %s (%" PRId64 " counted)", n_freq, stats_env, n_counted);
+    } else {
+        snprintf(freq_src, sizeof(freq_src), "ids below %" PRId64 "%s%s%s", n_freq, stats_env && *stats_env ? " (no statistics in " : "",
+                stats_env && *stats_env ? stats_env : "", stats_env && *stats_env ? " yet)" : "");
+    }
+    // a warning so that the server shows it at its default verbosity (06 logs)
+    LLAMA_LOG_WARN("%s: the LM head of the MTP head over %" PRId64 " of %" PRId64 " tokens (%.1f%%): %s, %" PRId64
+            " of the scripts %s, %" PRId64 " control, %" PRId64 " slots for the tokens of its batches (LLAMA_MTP_VOCAB_BASE, _STATS,"
+            " _SCRIPTS, _RING), %.1f MiB in %s, a %.0f MiB host copy%s\n", __func__,
+            cap, n_vocab, 100.0 * (double) cap / (double) n_vocab, freq_src, n_script,
+            scripts_env ? scripts_env : "cyrillic", n_special, n_ring,
+            (double) ggml_backend_buffer_get_size(v->buf) / (1024.0 * 1024.0), ggml_backend_buft_name(buft),
+            (double) v->rows.size() / (1024.0 * 1024.0), v->stats_save ? ", counts saved at the end" : "");
+
+    mtp_vocab_sub    = std::move(v);
+    mtp_vocab_failed = false;
+    return mtp_vocab_sub.get();
+}
+
 llama_model_qwen4exp_fork::llama_model_qwen4exp_fork(const struct llama_model_params & params) : llama_model_base(params) {}
 
 int64_t llama_model_qwen4exp_fork::mtp_window() {
@@ -86,6 +534,10 @@ bool llama_model_qwen4exp_fork::mtp_window_kv(const llama_cparams & cparams, uin
 }
 
 llama_model_qwen4exp_fork::~llama_model_qwen4exp_fork() {
+    if (mtp_vocab_sub) {
+        LLAMA_LOG_WARN("%s: the vocabulary subset of the MTP head took %" PRId64 " tokens from its batches, %" PRId64 " slots written\n",
+                __func__, mtp_vocab_sub->n_added, mtp_vocab_sub->n_written);
+    }
     if (ple_pf) {
         ple_pf->finish();
     }
@@ -1052,7 +1504,28 @@ llama_model_qwen4exp_fork::graph_mtp::graph_mtp(const llama_model & model, const
     // deliberately no res->t_embd: it would be n_embd wide while the context sizes its
     // embedding buffer by n_embd_out (the wide stream). The driver reads t_h_nextn instead.
 
-    cur = build_lora_mm(head_src.output, cur, head_src.output_s);
+    // LLAMA_MTP_VOCAB: the logits of the subset, -inf for the other tokens (see mtp_vocab_for). not with an adapter on
+    // the LM head, which the copy of its rows would leave out
+    auto * sub = (loras && !loras->empty()) ? nullptr :
+            static_cast<const llama_model_qwen4exp_fork &>(model).mtp_vocab_for(head_src.output, head_src.output_s);
+    if (sub) {
+        ggml_tensor * logits_sub = build_lora_mm(sub->w, cur);
+        cb(logits_sub, "mtp_vocab_logits", -1);
+
+        const int64_t n_vocab = head_src.output->ne[1];
+        const int64_t n_out   = logits_sub->ne[1];
+
+        // in place: one [n_vocab, n_out] tensor, as the full head has
+        ggml_tensor * logits = ggml_fill_inplace(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, logits_sub, 1,        sub->cap, n_out),
+                ggml_reshape_3d(ctx0, sub->ids,   sub->cap, 1,        1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_out);
+
+        res->add_input(std::make_unique<llm_graph_input_mtp_vocab_fork>(sub, sched));
+    } else {
+        cur = build_lora_mm(head_src.output, cur, head_src.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

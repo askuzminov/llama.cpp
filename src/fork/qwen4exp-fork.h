@@ -55,6 +55,21 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
     // LLAMA_MTP_WINDOW: the cells the dense MTP head attends to, 0 for the whole context
     static int64_t mtp_window();
 
+    // the LM head of the MTP head over a subset of the vocabulary (LLAMA_MTP_VOCAB=1, 09.11): the head's LM head was
+    // 2.29 of its 2.43 ms a draft step on the 395 (248320 rows). The base is the first LLAMA_MTP_VOCAB_BASE ids (32768:
+    // byte-level BPE gives the earlier merges, the frequent pieces, the lower ids; 31860 of them are ASCII, 142 Cyrillic),
+    // the tokens of the scripts in LLAMA_MTP_VOCAB_SCRIPTS (cyrillic: 18580 tokens of the Qwen vocabulary) and the
+    // control tokens; LLAMA_MTP_VOCAB_RING slots (16384) hold the tokens the head's batches bring - every prompt token on
+    // the catch-up and every accepted one - that the base has not, in CLOCK order. LLAMA_MTP_VOCAB_STATS=<file>: the
+    // first part of the base is the LLAMA_MTP_VOCAB_BASE most frequent tokens of its counts (then the first ids), the
+    // tokens of the head's batches are counted on, and LLAMA_MTP_VOCAB_STATS_SAVE=1 writes the counts back when the model
+    // is freed (a killed server writes nothing). The draft logits are -inf outside the subset, as an EAGLE3 draft
+    // vocabulary; the target verifies every draft. null when off or for a head it cannot take
+    struct mtp_vocab;
+    mutable std::unique_ptr<mtp_vocab> mtp_vocab_sub;
+    mutable bool                       mtp_vocab_failed = false; // the subset could not be made: once, not per graph
+    mtp_vocab * mtp_vocab_for(const ggml_tensor * output, const ggml_tensor * output_s) const;
+
     // whether the draft context keeps the KV of the dense MTP head as a window of mtp_window() positions per sequence
     // (a SWA cache of window*n_seq + n_ubatch cells). with several slots the last cells of a shared cache are not
     // the last positions of each slot, which the window over the last cells needs; with one slot it is the exact window

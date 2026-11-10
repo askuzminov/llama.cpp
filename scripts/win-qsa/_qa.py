@@ -1953,8 +1953,8 @@ def cmd_long():
 
 # ---------------------------------------------------------------- decode speed by kind of text
 
-def decode_tasks():
-    """the requests of 06-decode (QA_DEC_SET): prose about a corpus part, new code in two languages, an edit of a source
+def decode_tasks(names=None):
+    """the requests of 06-decode (QA_DEC_SET, or names): prose about a corpus part, prose in Russian, new code in two languages, an edit of a source
     file of the repository (QA_DEC_SOURCE; the reply copies most of it, as a coding agent rewriting a file does, and long
     drafts pay there), JSON records; on request a long prompt with a short reply (long)"""
     text = corpus_text()
@@ -1982,9 +1982,22 @@ def decode_tasks():
         "json": "Generate a JSON array of 40 objects that describe fictional employees. Every object has the fields id "
                 "(integer), name, department, title, salary (integer), start_date (YYYY-MM-DD) and skills (a list of "
                 "three strings). Output only the JSON.",
+        # prose in Russian (09.11): the drafts of a Cyrillic text, which the vocabulary subset of the MTP head keeps
+        # in its base (LLAMA_MTP_VOCAB_SCRIPTS)
+        "ru": "\u041e\u0431\u044a\u044f\u0441\u043d\u0438 \u043f\u043e\u0434\u0440\u043e\u0431\u043d\u043e, "
+              "\u043a\u0430\u043a \u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442 \u0441\u043f\u0435\u043a\u0443\u043b\u044f\u0442\u0438\u0432\u043d\u043e\u0435 "
+              "\u0434\u0435\u043a\u043e\u0434\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435 \u0432 \u0431\u043e\u043b\u044c\u0448\u0438\u0445 "
+              "\u044f\u0437\u044b\u043a\u043e\u0432\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u044f\u0445: "
+              "\u0447\u0435\u0440\u043d\u043e\u0432\u0430\u044f \u043c\u043e\u0434\u0435\u043b\u044c, \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 "
+              "\u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043c\u043e\u0434\u0435\u043b\u044c\u044e, \u043f\u0440\u0438\u043d\u044f\u0442\u0438\u0435 "
+              "\u0442\u043e\u043a\u0435\u043d\u043e\u0432, \u043f\u043e\u0447\u0435\u043c\u0443 \u043e\u0442\u0432\u0435\u0442 \u043d\u0435 "
+              "\u043c\u0435\u043d\u044f\u0435\u0442\u0441\u044f \u0438 \u043a\u0430\u043a\u0438\u0435 \u0435\u0441\u0442\u044c "
+              "\u0441\u043f\u043e\u0441\u043e\u0431\u044b \u0443\u0441\u043a\u043e\u0440\u0438\u0442\u044c \u0433\u0435\u043d\u0435\u0440\u0430\u0446\u0438\u044e. "
+              "\u041f\u0438\u0448\u0438 \u043f\u043e-\u0440\u0443\u0441\u0441\u043a\u0438, \u0440\u0430\u0437\u0432\u0451\u0440\u043d\u0443\u0442\u043e, "
+              "\u0441 \u043f\u0440\u0438\u043c\u0435\u0440\u0430\u043c\u0438.",
         "long": long_part + "\n\nSummarize this text in one short paragraph.",
     }
-    names = env("QA_DEC_SET", "prose code-py code-cpp edit json").split()
+    names = env("QA_DEC_SET", "prose ru code-py code-cpp edit json").split() if names is None else names
     unknown = [n for n in names if n not in tasks]
     if unknown:
         raise Fail(f"QA_DEC_SET: no task {' '.join(unknown)} (tasks: {' '.join(tasks)})")
@@ -2049,6 +2062,160 @@ def decode_run(url, tasks, ntok, temp, log, par):
     return sorted(rows, key=lambda x: (x["stream"], x["t0"]))
 
 
+def gguf_token_count(path):
+    """the length of tokenizer.ggml.tokens in the header of a GGUF file, None without it"""
+    import struct
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            return None
+        f.read(4)
+        _, n_kv = struct.unpack("<QQ", f.read(16))
+
+        def skip(t):
+            if t == 8:
+                n, = struct.unpack("<Q", f.read(8))
+                f.seek(n, 1)
+            elif t == 9:
+                st, n = struct.unpack("<IQ", f.read(12))
+                if st in sizes:
+                    f.seek(sizes[st] * n, 1)
+                else:
+                    for _ in range(n):
+                        skip(st)
+            else:
+                f.seek(sizes[t], 1)
+
+        for _ in range(n_kv):
+            n, = struct.unpack("<Q", f.read(8))
+            key = f.read(n).decode("utf-8", "replace")
+            t, = struct.unpack("<I", f.read(4))
+            if key == "tokenizer.ggml.tokens" and t == 9:
+                _, count = struct.unpack("<IQ", f.read(12))
+                return count
+            skip(t)
+    return None
+
+
+def vocab_history(model):
+    """LLAMA_MTP_VOCAB_STATS=history in a variant: the token counts of texts of the repository that the tasks of 06 do not
+    use (QA_VOCAB_HISTORY: globs under the repository root; Russian notes, the fork's code, English docs), as a history
+    of conversations would count them. Returns the file in cache/ (by the digest of the texts and the model; it may not
+    exist yet, vocab_history_build writes it) and the texts"""
+    globs = env("QA_VOCAB_HISTORY", "FORK.md RESEARCH.md scripts/win-qsa/*.md src/fork/*.cpp src/fork/*.h common/fork/*.cpp "
+                "common/fork/*.h tools/server/fork/*.cpp ggml/src/ggml-vulkan/fork/*.cpp scripts/win-qsa/_qa.py "
+                "src/llama-*.cpp docs/*.md README.md tools/server/README.md").split()
+    files = sorted({q for g in globs for q in ROOT.glob(g) if q.is_file()})
+    if not files:
+        raise Fail(f"QA_VOCAB_HISTORY: no files for {' '.join(globs)}")
+    texts = [q.read_text(encoding="utf-8", errors="replace") for q in files]
+    digest = text_digest("\x00".join(texts) + "\x00" + json.dumps(model_identity(model), sort_keys=True))[:12]
+    return CACHE / f"vocab-stats-{digest}.txt", texts
+
+
+def vocab_history_build(url, out, texts, model):
+    """the counts of the texts of vocab_history, tokenized by /tokenize of the server at url (the vocabulary of the
+    model; llama-tokenize makes a context, which a qwen4exp file with an MTP block refuses without its target)"""
+    n_vocab = gguf_token_count(model)
+    if not n_vocab:
+        raise Fail(f"{model.name}: no tokenizer.ggml.tokens for the vocabulary statistics")
+    counts, total = {}, 0
+    for text in texts:
+        # parts of about 64K characters at line ends: a token across a cut is counted as its two pieces
+        lines, part, size = text.splitlines(keepends=True), [], 0
+        for i, line in enumerate(lines + [None]):
+            if line is not None:
+                part.append(line)
+                size += len(line)
+            if part and (line is None or size >= 65536):
+                _, raw = http(url + "/tokenize", {"content": "".join(part), "add_special": False}, 600)
+                for t in json.loads(raw)["tokens"]:
+                    counts[t] = counts.get(t, 0) + 1
+                    total += 1
+                part, size = [], 0
+    CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".tmp")
+    with open(tmp, "w", encoding="ascii", newline="\n") as f:
+        f.write(f"llama-mtp-vocab-stats 1 {n_vocab}\n")
+        for t in sorted(counts):
+            f.write(f"{t} {counts[t]}\n")
+    tmp.replace(out)
+    print(f"decode: vocabulary statistics of {len(texts)} files, {total} tokens ({len(counts)} distinct): {out.name}",
+          flush=True)
+
+
+def decode_trace(path):
+    """the draft steps and rounds of a GGML_TIMELINE trace of one request (QA_DEC_TRACE): a step is a decode of the MTP
+    head (track "llama mtp": graph, inputs, submit) followed by another within 20 ms; its period runs to the start of the
+    next one and splits into graph (build or reuse), inputs, submit (graph_compute) and after (from the return of the
+    decode to the next one: readback, sampling, the draft gate, the next batch); gpu - the time of the gpu spans in the
+    period. A round runs from one decode of the target (track "llama") to the next"""
+    tracks, ev = {}, []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip().rstrip(",")
+                if not line.startswith("{"):
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("ph") == "M":
+                    tracks[e.get("tid")] = e.get("args", {}).get("name", "")
+                elif e.get("ph") == "X":
+                    ev.append(e)
+    except OSError:
+        return None
+    gpu = sorted((e["ts"], e["ts"] + e["dur"]) for e in ev if e.get("name") == "gpu")
+
+    def gpu_in(t0, t1):
+        busy, last = 0.0, t0
+        for a, b in gpu:
+            if b <= last:
+                continue
+            if a >= t1:
+                break
+            busy += min(b, t1) - max(a, last)
+            last = min(b, t1)
+        return busy
+
+    def decodes(track):
+        out, cur = [], None
+        for e in sorted((e for e in ev if tracks.get(e.get("tid")) == track), key=lambda e: e["ts"]):
+            kind, _, n = e["name"].partition(" ")
+            if kind == "graph":
+                cur = {"n": int(n) if n.isdigit() else 0, "t0": e["ts"], "graph": e["dur"]}
+            elif cur is not None and kind in ("inputs", "submit"):
+                cur[kind] = e["dur"]
+                if kind == "submit":
+                    cur["t1"] = e["ts"] + e["dur"]
+                    out.append(cur)
+                    cur = None
+        return out
+
+    mtp, tgt = decodes("llama mtp"), decodes("llama")
+    steps = []
+    for a, b in zip(mtp, mtp[1:]):
+        if b["t0"] - a["t1"] > 20000:
+            continue
+        # a decode of the target in between ends the round: the next mtp decode is a catch-up, not a step
+        if any(a["t0"] < t["t0"] < b["t0"] for t in tgt):
+            continue
+        period = b["t0"] - a["t0"]
+        steps.append({"period": period, "gpu": gpu_in(a["t0"], b["t0"]), "graph": a["graph"], "inputs": a.get("inputs", 0),
+                      "submit": a.get("submit", 0), "after": b["t0"] - a["t1"]})
+    rounds = []
+    for a, b in zip(tgt, tgt[1:]):
+        if b["t0"] - a["t0"] > 1e6:
+            continue
+        inner = [m for m in mtp if a["t0"] < m["t0"] < b["t0"]]
+        rounds.append({"period": b["t0"] - a["t0"], "gpu": gpu_in(a["t0"], b["t0"]), "mtp": len(inner),
+                       "verify": (inner[0]["t0"] if inner else b["t0"]) - a["t0"],
+                       "verify_gpu": gpu_in(a["t0"], inner[0]["t0"] if inner else b["t0"])})
+    return {"steps": steps, "rounds": rounds, "n_gpu": len(gpu)}
+
+
 def cmd_decode():
     """Decode speed on the server as serve.bat runs it (SPECDRAFT, QA_SPEC), by kind of text (09.11): one request per
     task of QA_DEC_SET in a conversation of its own, up to QA_DEC_TOKENS tokens at temperature QA_DEC_TEMP (0), TG t/s
@@ -2068,6 +2235,13 @@ def cmd_decode():
     pars = env_ints("QA_DEC_PAR", "1")
     tasks = decode_tasks()
     arms = variants("QA_DARMS", "default")
+    # LLAMA_MTP_VOCAB_STATS=history: the counts of the repository texts (vocab_history), built once by the warm-up server
+    hist, hist_texts = (vocab_history(model) if any(e.get("LLAMA_MTP_VOCAB_STATS") == "history" for _, e in arms)
+                        else (None, None))
+    hist_build = hist is not None and not hist.is_file()
+    if hist is not None:
+        arms = [(n, {k: (str(hist) if k == "LLAMA_MTP_VOCAB_STATS" and v == "history" else v) for k, v in e.items()})
+                for n, e in arms]
     run.add(f"decode: llama-server, tasks {' '.join(n for n, _ in tasks)}, up to {ntok} tokens each at temperature {temp}"
             f"{', streams ' + ' '.join(map(str, pars)) if pars != [1] else ''}, {model.name}, build {current_build()}" +
             (", variants " + "; ".join(f"{name} {' '.join(f'{k}={v}' for k, v in e.items())}".strip() for name, e in arms)
@@ -2076,21 +2250,43 @@ def cmd_decode():
     # pipelines in its first replies (the driver has no cache of the new shaders yet): prose of the first variant of
     # decode-20261109-203021 34.5 t/s against 42.7 for the same settings later. The first variant with the most
     # streams, every task with 32 tokens, nothing kept
-    if env("QA_DEC_WARM", "1") != "0":
-        warm_par = max(1, max(pars))
+    warm = env("QA_DEC_WARM", "1") != "0"
+    if warm or hist_build:
+        warm_par = max(1, max(pars)) if warm else 1
         warm_args = server_args(model, ctx, warm_par, port)
-        proc, warm_log = start_server(exe, warm_args, dict(os.environ, **arms[0][1]), run.dir / "decode_warmup.log")
+        # the first variant without the statistics it may name: they are written here
+        warm_env = {k: v for k, v in arms[0][1].items() if not (hist is not None and k == "LLAMA_MTP_VOCAB_STATS")}
+        proc, warm_log = start_server(exe, warm_args, dict(os.environ, **warm_env), run.dir / "decode_warmup.log")
         try:
-            print(f"decode: warm-up, {warm_par} stream(s), every task with 32 tokens, decode_warmup.log", flush=True)
-            decode_run(f"http://127.0.0.1:{port}", tasks, 32, temp, warm_log, warm_par)
+            if hist_build:
+                vocab_history_build(f"http://127.0.0.1:{port}", hist, hist_texts, model)
+            if warm:
+                print(f"decode: warm-up, {warm_par} stream(s), every task with 32 tokens, decode_warmup.log", flush=True)
+                decode_run(f"http://127.0.0.1:{port}", tasks, 32, temp, warm_log, warm_par)
         finally:
             proc.kill()
             proc.wait()
             mark_end()
     results = []   # (name, par, rows)
+    # QA_DEC_TRACE=<n>: a GGML_TIMELINE trace of the n-th chat request of every one-stream variant (1 is the short reply
+    # before the tasks, 2 the first task), trace-<variant>.json in the run folder, and its draft steps in a table.
+    # QA_DEC_TRACE=<task>: one more request of that task after the measured ones, traced and left out of the results
+    trace_env = env("QA_DEC_TRACE", "")
+    trace_extra = None
+    if trace_env and not trace_env.isdigit():
+        trace_extra = decode_tasks([trace_env])[0]
+        trace_req = len(tasks) + 2
+    else:
+        trace_req = int(trace_env or 0)
+    traces = []    # (name, path)
     for name, arm_env in arms:
         for par in pars:
             run_env = dict(os.environ, **arm_env)
+            if trace_req > 0 and par == 1:
+                trace_path = run.dir / f"trace-{name}.json"
+                run_env["GGML_TIMELINE"] = str(trace_path)
+                run_env["LLAMA_TRACE_REQUESTS"] = str(trace_req)
+                traces.append((name, trace_path))
             args = server_args(model, ctx, max(1, par), port)
             identity = {"v": VERSION, "kind": "decode", "build": build_id(exe.parent), "args": args,
                         "env": env_identity(run_env), "model": model_identity(model),
@@ -2104,7 +2300,10 @@ def cmd_decode():
                 try:
                     # the first use of a pipeline compiles it: a short reply before the measured ones
                     decode_ask(url, "Say hello in one sentence.", 16, temp, log)
-                    return {"rows": decode_run(url, tasks, ntok, temp, log, par)}
+                    rows = decode_run(url, tasks, ntok, temp, log, par)
+                    if trace_extra and par == 1:
+                        decode_ask(url, trace_extra[1], ntok, temp, log)
+                    return {"rows": rows}
                 finally:
                     proc.kill()
                     proc.wait()
@@ -2132,7 +2331,7 @@ def cmd_decode():
     if len(single) > 1:
         base_name, base = single[0]
         groups = [(x["task"], [x["task"]]) for x in base] + [
-            ("code", [t for t, _ in tasks if t not in ("prose", "long")]), ("all", [t for t, _ in tasks])]
+            ("code", [t for t, _ in tasks if t not in ("prose", "ru", "long")]), ("all", [t for t, _ in tasks])]
         rows = []
         for gname, members in groups:
             row = [gname]
@@ -2170,6 +2369,36 @@ def cmd_decode():
                     "wall time the prompts took, if one after another",
                 *table(["variant", "streams", "replies", "tokens", "wall s", "total t/s", "vs 1", "per stream t/s",
                         "accepted", "prompts"], rows))
+    if traces:
+        srows, rrows = [], []
+        for name, path in traces:
+            tr = decode_trace(path)
+            if not tr or not tr["steps"]:
+                srows.append([name, "no steps" if tr else "no trace"])
+                continue
+            st, rd = tr["steps"], tr["rounds"]
+
+            def ms(rows, key):
+                return f"{statistics.mean(x[key] for x in rows) / 1000:.3f}"
+
+            srows.append([name, len(st), ms(st, "period"), ms(st, "gpu"),
+                          f"{statistics.mean(x['period'] - x['gpu'] for x in st) / 1000:.3f}",
+                          ms(st, "graph"), ms(st, "inputs"), ms(st, "submit"), ms(st, "after"), tr["n_gpu"]])
+            if rd:
+                rrows.append([name, len(rd), ms(rd, "period"), ms(rd, "gpu"), f"{statistics.mean(x['mtp'] for x in rd):.2f}",
+                              ms(rd, "verify"), ms(rd, "verify_gpu")])
+        run.add("", f"decode: draft steps of the traced request "
+                    f"{trace_req if not trace_extra else trace_extra[0] + ' after the measured ones'} "
+                    "(GGML_TIMELINE, ms per step): period - to the "
+                    "start of the next step, gpu - gpu spans in it, host - the rest; graph, inputs, submit - the parts "
+                    "of the decode; after - from its return to the next step (readback, sampling, gate)",
+                *table(["variant", "steps", "period", "gpu", "host", "graph", "inputs", "submit", "after", "gpu spans"],
+                       srows))
+        if rrows:
+            run.add("", "decode: rounds of the traced request (ms): from one decode of the target to the next; mtp - "
+                        "decodes of the head in it (catch-up and steps); verify - from the target decode to the first "
+                        "decode of the head",
+                    *table(["variant", "rounds", "period", "gpu", "mtp", "verify", "verify gpu"], rrows))
     return run.finish()
 
 
