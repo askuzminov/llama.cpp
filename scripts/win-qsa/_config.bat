@@ -75,6 +75,12 @@ rem test-elastic-buffer-fork fails when it tested no device (a skip must not cou
 if not defined TEST_ELASTIC_REQUIRE set "TEST_ELASTIC_REQUIRE=1"
 if not defined WARMUP set "WARMUP=0"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
+rem the vocabulary subset of the MTP head is on by default since 10.11 and takes its base from a counts file in the
+rem llama.cpp cache that every server adds to: the runs keep the base of a new install (the first ids) and write
+rem nothing, so a result does not depend on what the machine served before. an arm that sets LLAMA_MTP_VOCAB_STATS
+rem (06: history) measures a frequency base
+if not defined LLAMA_MTP_VOCAB_STATS set "LLAMA_MTP_VOCAB_STATS=none"
+if not defined LLAMA_MTP_VOCAB_STATS_SAVE set "LLAMA_MTP_VOCAB_STATS_SAVE=0"
 
 set "BIN=%BUILD%\bin\Release"
 if not exist "%BIN%" set "BIN=%BUILD%\bin"

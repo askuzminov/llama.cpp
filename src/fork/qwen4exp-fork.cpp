@@ -2,6 +2,7 @@
 #include "llama-fork.h"
 #include "llama-impl.h"
 #include "llama-mtp-window-fork.h"
+#include "llama-mtp-vocab-stats-fork.h"
 #include "llama-memory-hybrid-idx-fork.h"
 #include "llama-memory-recurrent.h"
 
@@ -87,45 +88,28 @@ struct llama_model_qwen4exp_fork::mtp_vocab {
     int64_t n_added   = 0;
     int64_t n_written = 0;                // slots written to the device
 
-    // LLAMA_MTP_VOCAB_STATS: the token counts the base was taken from, with the tokens of the head's batches since then
-    // added; written back at the end when LLAMA_MTP_VOCAB_STATS_SAVE=1
+    // the file of the token counts (LLAMA_MTP_VOCAB_STATS, src/fork/llama-mtp-vocab-stats-fork.h) and the tokens of
+    // the head's batches counted in this run; they are added to what the file holds when the model goes away, unless
+    // LLAMA_MTP_VOCAB_STATS_SAVE=0
     std::vector<uint64_t> counts;
-    std::string           stats_path;
+    std::filesystem::path stats_path;
     bool                  stats_save = false;
+    int64_t               n_tok      = 0;
     int64_t               n_counted  = 0;
 
     std::mutex mtx;
 
-    // the counts as "llama-mtp-vocab-stats 1 <n_vocab>" and "<id> <count>" lines, through a temporary file
     void save_stats() {
         if (!stats_save || stats_path.empty() || n_counted == 0) {
             return;
         }
-        const std::string tmp = stats_path + ".tmp";
-        {
-            std::ofstream f(tmp, std::ios::trunc);
-            if (!f) {
-                LLAMA_LOG_WARN("%s: cannot write %s\n", __func__, tmp.c_str());
-                return;
-            }
-            f << "llama-mtp-vocab-stats 1 " << n_vocab << "\n";
-            for (int32_t t = 0; t < n_vocab; ++t) {
-                if (counts[t]) {
-                    f << t << " " << counts[t] << "\n";
-                }
-            }
-            if (!f) {
-                LLAMA_LOG_WARN("%s: cannot write %s\n", __func__, tmp.c_str());
-                return;
-            }
-        }
-        std::error_code ec;
-        std::filesystem::rename(tmp, stats_path, ec);
-        if (ec) {
-            LLAMA_LOG_WARN("%s: cannot replace %s: %s\n", __func__, stats_path.c_str(), ec.message().c_str());
+        const std::string path = llama_mtp_vocab_stats_text_fork(stats_path);
+        std::string err;
+        if (!llama_mtp_vocab_stats_save_fork(stats_path, n_vocab, n_tok, counts, err)) {
+            LLAMA_LOG_WARN("%s: %s: %s\n", __func__, path.c_str(), err.c_str());
             return;
         }
-        LLAMA_LOG_WARN("%s: %" PRId64 " tokens counted into %s\n", __func__, n_counted, stats_path.c_str());
+        LLAMA_LOG_WARN("%s: %" PRId64 " tokens counted into %s\n", __func__, n_counted, path.c_str());
     }
 
     ~mtp_vocab() {
@@ -316,38 +300,19 @@ static uint32_t qwen4exp_mtp_vocab_piece_scripts(const std::string & piece) {
     return mask;
 }
 
-// the token counts of LLAMA_MTP_VOCAB_STATS ("llama-mtp-vocab-stats 1 <n_vocab>", then "<id> <count>" lines); false for
-// a missing file or another vocabulary size (the rows of the LM head or the tokens of the vocabulary), the counts stay
-// zero then
-static bool qwen4exp_mtp_vocab_load_stats(const std::string & path, int64_t n_vocab, int64_t n_tok, std::vector<uint64_t> & counts) {
-    std::ifstream f(path);
-    if (!f) {
-        return false;
+// the name of the default counts file: the tokens of the vocabulary, so models with one tokenizer share it
+static uint64_t qwen4exp_mtp_vocab_hash(const llama_vocab & vocab) {
+    const uint32_t n_tok = vocab.n_tokens();
+    uint64_t h = llama_mtp_vocab_stats_hash_fork(LLAMA_MTP_VOCAB_STATS_HASH0_FORK, &n_tok, sizeof(n_tok));
+    for (uint32_t t = 0; t < n_tok; ++t) {
+        const char * text = vocab.token_get_text((llama_token) t);
+        h = llama_mtp_vocab_stats_hash_fork(h, text, strlen(text) + 1);
     }
-    std::string magic;
-    int     version = 0;
-    int64_t n       = 0;
-    if (!(f >> magic >> version >> n) || magic != "llama-mtp-vocab-stats" || version != 1) {
-        LLAMA_LOG_WARN("%s: %s is not a vocabulary statistics file, ignored\n", __func__, path.c_str());
-        return false;
-    }
-    if (n != n_vocab && n != n_tok) {
-        LLAMA_LOG_WARN("%s: %s counts %" PRId64 " tokens, the head has %" PRId64 " and the vocabulary %" PRId64 ", ignored\n",
-                __func__, path.c_str(), n, n_vocab, n_tok);
-        return false;
-    }
-    int64_t  id    = 0;
-    uint64_t count = 0;
-    while (f >> id >> count) {
-        if (id >= 0 && id < n_vocab) {
-            counts[id] += count;
-        }
-    }
-    return true;
+    return h;
 }
 
 llama_model_qwen4exp_fork::mtp_vocab * llama_model_qwen4exp_fork::mtp_vocab_for(const ggml_tensor * output, const ggml_tensor * output_s) const {
-    static const bool    on       = llama_fork_env_int("LLAMA_MTP_VOCAB", 0) != 0;
+    static const bool    on       = llama_fork_env_int("LLAMA_MTP_VOCAB", 1) != 0;
     static const int64_t n_first  = llama_fork_env_int("LLAMA_MTP_VOCAB_BASE", 32768);
     static const int64_t n_ring_e = llama_fork_env_int("LLAMA_MTP_VOCAB_RING", 16384);
     // no data: a model loaded to measure memory (common_fit_params), the full head
@@ -376,18 +341,34 @@ llama_model_qwen4exp_fork::mtp_vocab * llama_model_qwen4exp_fork::mtp_vocab_for(
         return nullptr;
     }
 
-    // the base: the n_first most frequent tokens of LLAMA_MTP_VOCAB_STATS (the first ids without it, and after the
-    // counted tokens), the tokens of the scripts asked for, the control and user-defined tokens
+    // the base: the n_first most frequent tokens of the counts file (the first ids without it, and after the counted
+    // tokens), the tokens of the scripts asked for, the control and user-defined tokens. the file: LLAMA_MTP_VOCAB_STATS,
+    // by default one per vocabulary in the llama.cpp cache (llama_mtp_vocab_stats_path_fork)
     const char *   scripts_env = getenv("LLAMA_MTP_VOCAB_SCRIPTS");
     const uint32_t scripts     = qwen4exp_mtp_vocab_script_mask(scripts_env ? scripts_env : "cyrillic");
     const char *   stats_env   = getenv("LLAMA_MTP_VOCAB_STATS");
     const int64_t  n_freq      = std::min(std::max<int64_t>(n_first, 0), n_vocab);
+    const std::filesystem::path stats_path = llama_mtp_vocab_stats_path_fork(stats_env, stats_env ? 0 : qwen4exp_mtp_vocab_hash(vocab));
+    const std::string           stats_text = llama_mtp_vocab_stats_text_fork(stats_path);
     std::vector<uint64_t> counts;
     bool    stats_ok  = false;
     int64_t n_counted = 0;
-    if (stats_env && *stats_env) {
+    if (!stats_path.empty()) {
         counts.assign((size_t) n_vocab, 0);
-        stats_ok = qwen4exp_mtp_vocab_load_stats(stats_env, n_vocab, vocab.n_tokens(), counts);
+        switch (llama_mtp_vocab_stats_read_fork(stats_path, n_vocab, vocab.n_tokens(), counts)) {
+            case LLAMA_MTP_VOCAB_STATS_READ_FORK:
+                stats_ok = true;
+                break;
+            case LLAMA_MTP_VOCAB_STATS_MISSING_FORK:
+                break;
+            case LLAMA_MTP_VOCAB_STATS_FOREIGN_FORK:
+                LLAMA_LOG_WARN("%s: %s is not a vocabulary statistics file, ignored and left as it is\n", __func__, stats_text.c_str());
+                break;
+            case LLAMA_MTP_VOCAB_STATS_OTHER_FORK:
+                LLAMA_LOG_WARN("%s: %s counts another vocabulary (not %" PRId64 " or %" PRId64 " tokens), ignored and left as it is\n",
+                        __func__, stats_text.c_str(), n_vocab, (int64_t) vocab.n_tokens());
+                break;
+        }
     }
     std::vector<int32_t> base;
     std::vector<uint8_t> in_base((size_t) n_vocab, 0);
@@ -482,27 +463,29 @@ llama_model_qwen4exp_fork::mtp_vocab * llama_model_qwen4exp_fork::mtp_vocab_for(
     v->write(0, (int32_t) cap);
     v->n_written = 0;
 
-    if (stats_env && *stats_env) {
+    // the counts of this run start from zero: the save adds them to the file as it is then
+    if (!stats_path.empty()) {
+        counts.assign((size_t) n_vocab, 0);
         v->counts     = std::move(counts);
-        v->stats_path = stats_env;
-        v->stats_save = llama_fork_env_int("LLAMA_MTP_VOCAB_STATS_SAVE", 0) != 0;
+        v->stats_path = stats_path;
+        v->n_tok      = (int64_t) vocab.n_tokens();
+        v->stats_save = llama_fork_env_int("LLAMA_MTP_VOCAB_STATS_SAVE", 1) != 0;
     }
 
-    char freq_src[256];
+    std::string freq_src;
     if (stats_ok) {
-        snprintf(freq_src, sizeof(freq_src), "the %" PRId64 " most frequent tokens of %s (%" PRId64 " counted)", n_freq, stats_env, n_counted);
+        freq_src = "the " + std::to_string(n_freq) + " most frequent tokens of " + stats_text + " (" + std::to_string(n_counted) + " counted)";
     } else {
-        snprintf(freq_src, sizeof(freq_src), "ids below %" PRId64 "%s%s%s", n_freq, stats_env && *stats_env ? " (no statistics in " : "",
-                stats_env && *stats_env ? stats_env : "", stats_env && *stats_env ? " yet)" : "");
+        freq_src = "ids below " + std::to_string(n_freq) + (stats_path.empty() ? std::string() : " (no statistics in " + stats_text + " yet)");
     }
     // a warning so that the server shows it at its default verbosity (06 logs)
     LLAMA_LOG_WARN("%s: the LM head of the MTP head over %" PRId64 " of %" PRId64 " tokens (%.1f%%): %s, %" PRId64
             " of the scripts %s, %" PRId64 " control, %" PRId64 " slots for the tokens of its batches (LLAMA_MTP_VOCAB_BASE, _STATS,"
-            " _SCRIPTS, _RING), %.1f MiB in %s, a %.0f MiB host copy%s\n", __func__,
-            cap, n_vocab, 100.0 * (double) cap / (double) n_vocab, freq_src, n_script,
+            " _SCRIPTS, _RING), %.1f MiB in %s, a %.0f MiB host copy%s; LLAMA_MTP_VOCAB=0 for the whole head\n", __func__,
+            cap, n_vocab, 100.0 * (double) cap / (double) n_vocab, freq_src.c_str(), n_script,
             scripts_env ? scripts_env : "cyrillic", n_special, n_ring,
             (double) ggml_backend_buffer_get_size(v->buf) / (1024.0 * 1024.0), ggml_backend_buft_name(buft),
-            (double) v->rows.size() / (1024.0 * 1024.0), v->stats_save ? ", counts saved at the end" : "");
+            (double) v->rows.size() / (1024.0 * 1024.0), v->stats_save ? ", counts added to the file at the end" : "");
 
     mtp_vocab_sub    = std::move(v);
     mtp_vocab_failed = false;

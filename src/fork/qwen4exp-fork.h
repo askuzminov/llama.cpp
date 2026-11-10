@@ -55,16 +55,17 @@ struct llama_model_qwen4exp_fork : public llama_model_base {
     // LLAMA_MTP_WINDOW: the cells the dense MTP head attends to, 0 for the whole context
     static int64_t mtp_window();
 
-    // the LM head of the MTP head over a subset of the vocabulary (LLAMA_MTP_VOCAB=1, 09.11): the head's LM head was
-    // 2.29 of its 2.43 ms a draft step on the 395 (248320 rows). The base is the first LLAMA_MTP_VOCAB_BASE ids (32768:
-    // byte-level BPE gives the earlier merges, the frequent pieces, the lower ids; 31860 of them are ASCII, 142 Cyrillic),
-    // the tokens of the scripts in LLAMA_MTP_VOCAB_SCRIPTS (cyrillic: 18580 tokens of the Qwen vocabulary) and the
-    // control tokens; LLAMA_MTP_VOCAB_RING slots (16384) hold the tokens the head's batches bring - every prompt token on
-    // the catch-up and every accepted one - that the base has not, in CLOCK order. LLAMA_MTP_VOCAB_STATS=<file>: the
-    // first part of the base is the LLAMA_MTP_VOCAB_BASE most frequent tokens of its counts (then the first ids), the
-    // tokens of the head's batches are counted on, and LLAMA_MTP_VOCAB_STATS_SAVE=1 writes the counts back when the model
-    // is freed (a killed server writes nothing). The draft logits are -inf outside the subset, as an EAGLE3 draft
-    // vocabulary; the target verifies every draft. null when off or for a head it cannot take
+    // the LM head of the MTP head over a subset of the vocabulary (09.11, on by default since 10.11, LLAMA_MTP_VOCAB=0
+    // for the whole head): the head's LM head was 2.29 of its 2.43 ms a draft step on the 395 (248320 rows). The base is
+    // the LLAMA_MTP_VOCAB_BASE (32768) most frequent tokens of a counts file, then the first ids (byte-level BPE gives
+    // the earlier merges, the frequent pieces, the lower ids; 31860 of the first 32768 are ASCII, 142 Cyrillic), the
+    // tokens of the scripts in LLAMA_MTP_VOCAB_SCRIPTS (cyrillic: 18580 tokens of the Qwen vocabulary) and the control
+    // tokens; LLAMA_MTP_VOCAB_RING slots (16384) hold the tokens the head's batches bring - every prompt token on the
+    // catch-up and every accepted one - that the base has not, in CLOCK order. The counts file (LLAMA_MTP_VOCAB_STATS,
+    // src/fork/llama-mtp-vocab-stats-fork.h): by default mtp-vocab-stats-<hash of the vocabulary>.txt in the llama.cpp
+    // cache, "none" for no file; the tokens of the head's batches are counted and added to it when the model is freed
+    // (a killed server writes nothing; LLAMA_MTP_VOCAB_STATS_SAVE=0: never). The draft logits are -inf outside the
+    // subset, as an EAGLE3 draft vocabulary; the target verifies every draft. null when off or for a head it cannot take
     struct mtp_vocab;
     mutable std::unique_ptr<mtp_vocab> mtp_vocab_sub;
     mutable bool                       mtp_vocab_failed = false; // the subset could not be made: once, not per graph

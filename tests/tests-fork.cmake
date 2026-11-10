@@ -7,6 +7,11 @@ llama_build(test-checkpoint-partial.cpp)
 llama_build_and_test(test-mtp-window-fork.cpp)
 target_include_directories(test-mtp-window-fork PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# the counts file of the vocabulary subset of the MTP head (LLAMA_MTP_VOCAB_STATS): the save that adds to the file, the
+# files it leaves alone, the default place in the llama.cpp cache; header-only, every platform builds this
+llama_build_and_test(test-mtp-vocab-stats-fork.cpp)
+target_include_directories(test-mtp-vocab-stats-fork PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # the gate of --spec-auto: a calibration per draft type, probabilities that are not a number (common/fork)
 llama_build_and_test(test-spec-auto-fork.cpp)
 

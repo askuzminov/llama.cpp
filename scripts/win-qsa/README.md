@@ -418,12 +418,16 @@ export QA_DARMS="default;cap7 LLAMA_ARG_SPEC_DRAFT_N_MAX=7;cap7pool LLAMA_ARG_SP
 unset QA_DARMS
 ```
 
-LM head головы MTP по подмножеству словаря (09.11, `LLAMA_MTP_VOCAB=1`, FORK.md): база - первые 32768 id, все
-кириллические и служебные токены, плюс кольцо 16384 токенов промпта и принятых; 27% строк головы. Ответ при
-temperature 0 тот же (столбец `text`), меняются шаг черновика и приём, в первую очередь на `ru` и `prose`:
+LM head головы MTP по подмножеству словаря (09.11, по умолчанию с 10.11, FORK.md): база - 32768 самых частых
+токенов файла счётчиков (без него первые id), все кириллические и служебные токены, плюс кольцо 16384 токенов
+промпта и принятых; 25-27% строк головы. Ответ при temperature 0 тот же (столбец `text`), меняются шаг черновика и
+приём. Сервер по умолчанию берёт файл в кэше llama.cpp и дописывает в него свои токены; прогоны (`_config.bat`)
+ставят `LLAMA_MTP_VOCAB_STATS=none` и `LLAMA_MTP_VOCAB_STATS_SAVE=0`: база как у новой установки (первые id), в кэш
+ничего не пишется. Плечо `default` - уже с подмножеством, полная голова - `LLAMA_MTP_VOCAB=0`. Сравнение на 3090
+(подмножество там не мерили):
 
 ```bash
-export QA_DARMS="default;vocab LLAMA_MTP_VOCAB=1"
+export QA_DARMS="full LLAMA_MTP_VOCAB=0;default"
 ./06-decode.bat
 unset QA_DARMS
 ```
@@ -434,8 +438,8 @@ unset QA_DARMS
 
 База по частотам (10.11): `LLAMA_MTP_VOCAB_STATS=<файл>` - счётчики токенов (`llama-mtp-vocab-stats 1 <словарь>`,
 затем строки `<id> <число>`); частая часть базы - `LLAMA_MTP_VOCAB_BASE` самых частых токенов файла, после них
-первые id. Сервер считает токены батчей головы дальше и с `LLAMA_MTP_VOCAB_STATS_SAVE=1` пишет файл при выгрузке
-модели (убитый сервер не пишет), так статистика копится от запуска к запуску. В 06 значение `history` строит
+первые id. Сервер считает токены батчей головы и при выгрузке модели прибавляет их к файлу (убитый сервер не пишет,
+`LLAMA_MTP_VOCAB_STATS_SAVE=0` - никогда), так статистика копится от запуска к запуску. В 06 значение `history` строит
 файл из текстов репозитория, которых задачи не касаются (`QA_VOCAB_HISTORY`, маски от корня: русские заметки,
 код форка, английская документация; ~1.1M токенов, ~21K различных), токенами `/tokenize` сервера разогрева;
 файл лежит в `cache/` по дайджесту текстов и модели. `QA_DEC_TRACE=<задача>` - ещё один запрос этой задачи после
@@ -453,6 +457,16 @@ unset QA_DEC_TRACE QA_DARMS
 
 Строка `mtp_vocab_for:` в логе каждого плеча называет состав подмножества (строк, источник базы).
 
+Размер базы по частотам (10.11, ~30 мин): 24K, 32K для сравнения внутри захода, 48K, 64K. В истории ~21K
+различных токенов, поэтому с 24K база - все они плюс первые id по порядку (24K: +3.5K, 48K: +28K, 64K: +44K), и 48K
+и 64K почти совпадают с базами по id того же размера; строк подмножества ~55K, 63K, 80K, 96K:
+
+```bash
+export QA_DARMS="freq24 LLAMA_MTP_VOCAB=1 LLAMA_MTP_VOCAB_BASE=24576 LLAMA_MTP_VOCAB_STATS=history;freq32 LLAMA_MTP_VOCAB=1 LLAMA_MTP_VOCAB_STATS=history;freq48 LLAMA_MTP_VOCAB=1 LLAMA_MTP_VOCAB_BASE=49152 LLAMA_MTP_VOCAB_STATS=history;freq64 LLAMA_MTP_VOCAB=1 LLAMA_MTP_VOCAB_BASE=65536 LLAMA_MTP_VOCAB_STATS=history"
+./06-decode.bat
+unset QA_DARMS
+```
+
 `QA_DEC_TRACE=<n>` - трасса `GGML_TIMELINE` n-го запроса чата в каждом варианте с одним потоком (1 - короткий
 ответ перед задачами, 2 - первая задача, 3 - вторая; задачи по `QA_DEC_SET`), `trace-<вариант>.json` в папке
 прогона. Таблицы в отчёте: шаги черновика (период до следующего шага, GPU в нём, остальное - хост; части декода:
@@ -467,7 +481,7 @@ graph - сборка или переиспользование графа, input
 
 ```bash
 export QA_DEC_SET="ru code-py" QA_DEC_TRACE=2
-export QA_DARMS="default;vocab LLAMA_MTP_VOCAB=1"
+export QA_DARMS="full LLAMA_MTP_VOCAB=0;default"
 ./06-decode.bat
 unset QA_DEC_SET QA_DEC_TRACE QA_DARMS
 ```
