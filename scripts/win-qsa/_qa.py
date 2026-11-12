@@ -3371,7 +3371,7 @@ KLD_EXACT_ENV = {
 def kld_arms():
     """QA_KARMS: "name [@upstream] [VAR=value ...];...", @upstream runs the upstream build. QA_ARM_UB=<n> in an arm sets
     its ubatch: 1 to 8 tokens take the decode kernels (mat-vec, the expert mat-vec of the fork), which a prompt-sized
-    ubatch never runs"""
+    ubatch never runs. "QA_ARM_ARGS=<args>" (quoted whole): arguments of the arm after the model arguments"""
     out = []
     for part in env("QA_KARMS", "fork;upstream @upstream").split(";"):
         tokens = split_args(part)
@@ -3470,14 +3470,22 @@ def cmd_kld():
         arm_margs = upstream_args(margs) if up else margs
         arm_env = dict(arm_env)
         arm_ub = arm_env.pop("QA_ARM_UB", None)
+        # QA_ARM_ARGS: arguments of this arm after the model arguments, a later value of an option wins (12.11: -lzm on
+        # for this build, as upstream reads the rows of the per-layer embeddings)
+        arm_extra = split_args(arm_env.pop("QA_ARM_ARGS", ""))
+        if up:
+            arm_extra = upstream_args(arm_extra)
         arm_args = args if arm_ub is None else [a if i == 0 or args[i - 1] != "-ub" else arm_ub for i, a in enumerate(args)]
         run_env = os.environ.copy()
         run_env.update(arm_env)
         identity = {"v": VERSION, "kind": "kld", "build": build_id(bfolder), "base": ident_base,
                     "env": env_identity(run_env), "args": [str(a) for a in arm_args]}
+        if arm_extra:
+            identity["arm_args"] = arm_extra
 
-        def measure(log, exe=exe, run_env=run_env, arm_args=arm_args, arm_margs=arm_margs):
-            execute([exe, *arm_margs, *arm_args, "--kl-divergence-base", base, "--kl-divergence"], log, run_env)
+        def measure(log, exe=exe, run_env=run_env, arm_args=arm_args, arm_margs=arm_margs, arm_extra=arm_extra):
+            execute([exe, *arm_margs, *arm_extra, *arm_args, "--kl-divergence-base", base, "--kl-divergence"], log,
+                    run_env)
             return dict(kld_read(log), ppl_up=ppl_up)
 
         result, kept = run.measure(f"kld {name}", identity, measure)
