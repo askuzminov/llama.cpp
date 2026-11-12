@@ -739,6 +739,96 @@ static void test_truncated(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
+// a file whose header has another uid than its name (a copied or edited directory) is removed at the start: adopted
+// under the uid of its header, a hit of its entry would open, and drop, the file of that uid
+static void test_name_uid(const std::string & dir) {
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        fill(cache);
+    }
+    std::vector<uint64_t> uids;
+    std::filesystem::path from;
+    std::filesystem::path to;
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        for (const auto & st : cache.states) {
+            uids.push_back(st.uid);
+        }
+        assert(uids.size() >= 2);
+        from = cache.spill_path(uids[0]);
+        to   = cache.spill_path(uids[1]);
+    }
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing);
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        assert(cache.states.size() == uids.size() - 1);
+        for (auto & st : cache.states) {
+            assert(st.uid != uids[1]);
+            assert(cache.unspill_state(st));
+        }
+        assert(!std::filesystem::exists(to));
+        clear_cache(cache);
+    }
+    assert(dir_empty(dir));
+}
+
+// a byte that changed on disk (or in a copy) is caught by the sums of the sections (SPILL_VERSION 5): the hit drops the
+// state and its file instead of loading wrong blobs; the other files stay
+static void test_damaged(const std::string & dir) {
+    // one state with a byte of its main blob changed, one with a byte of a checkpoint changed, one intact
+    std::vector<uint64_t> uids;
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        for (int i = 0; i < 3; ++i) {
+            server_prompt_cache_state st = make_state(16, 700 + 10*i, 100000, 5000);
+            common_prompt_checkpoint cp;
+            cp.n_tokens = 8;
+            cp.pos_min  = 0;
+            cp.pos_max  = 7;
+            const server_state_buf blob = make_blob(8192, 900 + i); // whole blocks: the file ends with it, no padding
+            cp.data_tgt.assign(blob.begin(), blob.end());
+            st.prompt.checkpoints.push_back(std::move(cp));
+            cache.states.push_back(std::move(st));
+        }
+        for (auto & st : cache.states) {
+            assert(cache.spill_state(st));
+            uids.push_back(st.uid);
+        }
+    }
+    const auto flip = [](const std::filesystem::path & path, uint64_t off) {
+        std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        assert(f.good());
+        f.seekg((std::streamoff) off);
+        char c = 0;
+        f.read(&c, 1);
+        c ^= 0x10;
+        f.seekp((std::streamoff) off);
+        f.write(&c, 1);
+        assert(f.good());
+    };
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        assert(cache.states.size() == 3);
+        // the header block, the prompt block (16 tokens), then the main blob
+        flip(cache.spill_path(uids[0]), 2*4096 + 500);
+        flip(cache.spill_path(uids[1]), std::filesystem::file_size(cache.spill_path(uids[1])) - 100);
+        size_t n_ok = 0;
+        for (auto & st : cache.states) {
+            const bool damaged = st.uid == uids[0] || st.uid == uids[1];
+            assert(cache.unspill_state(st) == !damaged);
+            assert(std::filesystem::exists(cache.spill_path(st.uid)) == !damaged);
+            if (!damaged) {
+                assert(st.data.main == make_blob(100000, 700 + 20 + 1));
+                assert(st.prompt.checkpoints.size() == 1 && st.prompt.checkpoints.front().data_tgt.size() == 8192);
+                ++n_ok;
+            }
+        }
+        assert(n_ok == 1);
+        clear_cache(cache);
+    }
+    assert(dir_empty(dir));
+}
+
 static void test_shared_budget(const std::string & dir) {
     server_prompt_cache a(0, 0, 0, dir, 60000, SIG, 1);
     server_prompt_cache b(0, 0, 0, dir, 60000, SIG ^ 1, 2);
@@ -987,6 +1077,8 @@ int main(int argc, char ** argv) {
         { "signature-mismatch", test_signature_mismatch },
         { "legacy-names",       test_legacy_names       },
         { "truncated",          test_truncated          },
+        { "name-uid",           test_name_uid           },
+        { "damaged",            test_damaged            },
         { "shared-budget",      test_shared_budget      },
         { "shared-writers",     test_shared_writers     },
         { "shared-lru",         test_shared_lru         },

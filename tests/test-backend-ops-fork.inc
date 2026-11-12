@@ -50,6 +50,68 @@ struct test_mul_mat_id_repeat : public test_mul_mat_id {
     }
 };
 
+// activations above the f16 range (|x| > 65504) in a few tokens. The Vulkan f16reg matmuls read f16 activations (the
+// f16 copy, cpy_f16_sat_fork.comp, or the conversion in the tile, f16sat2): saturated there, 7e4 is read as 65504 and the
+// result stays finite, 6% off in the columns of those tokens; an unsaturated conversion gives inf and NaN, which fail the
+// compare. The weights stay within 0.25, so that the results stay within the f16 range of the upstream paths that sum in
+// f16 (MoltenVK). The values come in pairs +7e4, -7e4 within a block of 32: the q8_1 activations of the CPU reference
+// (q4_1, q5_1) keep d * sum of the block in f16, and a block that sums above 65504 makes the reference itself inf (the same
+// holds for the q8_1 paths of Vulkan and CUDA). An upstream path that converts to f16 without saturation fails here
+static void init_f16_range(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (strcmp(t->name, "a") == 0 || strcmp(t->name, "as") == 0) {
+            init_tensor_uniform(t, -0.25f, 0.25f);
+            continue;
+        }
+        if (strcmp(t->name, "b") != 0 || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            continue;
+        }
+        std::vector<float> v(ggml_nelements(t));
+        ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+        for (size_t i = 7; i + 1 < v.size(); i += 32*128 + 32) {
+            v[i]     =  7.0e4f;
+            v[i + 1] = -7.0e4f;
+        }
+        ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+    }
+}
+
+struct test_mul_mat_f16_range : public test_mul_mat {
+    test_mul_mat_f16_range(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_F16_RANGE";
+    }
+
+    double max_nmse_err() override { return 0.02; }
+    double max_nmse_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return max_nmse_err(); }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat::initialize_tensors(ctx);
+        init_f16_range(ctx);
+    }
+};
+
+struct test_mul_mat_id_f16_range : public test_mul_mat_id {
+    test_mul_mat_id_f16_range(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_F16_RANGE";
+    }
+
+    double max_nmse_err() override { return 0.02; }
+    double max_nmse_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return max_nmse_err(); }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        init_f16_range(ctx);
+    }
+};
+
 // MUL_MAT_ID and the MUL by the router weights of each token's slots ([1, n_used, n_tokens]), as build_moe_ffn has it
 // after the down projection. Vulkan fuses the MUL into the mat-vec of up to 8 tokens of the fork (GGML_VK_MMV_ID_FORK
 // reads the weights per token and slot; the upstream mat-vec fuses it at one token only). Few experts: the tokens of a
@@ -291,9 +353,10 @@ struct test_mul_mat_headsum : public test_case {
     const int64_t heads;
     const bool bias;
     const ggml_type type_a; // the key pool: f16 by default since 09.10, f32 with LLAMA_QSA_POOL_F32
+    const bool relu;        // false: the same chain without the RELU, which the fused head matmul must not take
 
     std::string vars() override {
-        return VARS_TO_STR6(type_a, m, n, k, heads, bias);
+        return VARS_TO_STR7(type_a, m, n, k, heads, bias, relu);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -308,8 +371,8 @@ struct test_mul_mat_headsum : public test_case {
     bool run_whole_graph() override { return true; }
 
     test_mul_mat_headsum(int64_t m = 64, int64_t n = 32, int64_t k = 128, int64_t heads = 4, bool bias = true,
-                         ggml_type type_a = GGML_TYPE_F32)
-        : m(m), n(n), k(k), heads(heads), bias(bias), type_a(type_a) {}
+                         ggml_type type_a = GGML_TYPE_F32, bool relu = true)
+        : m(m), n(n), k(k), heads(heads), bias(bias), type_a(type_a), relu(relu) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
@@ -321,7 +384,10 @@ struct test_mul_mat_headsum : public test_case {
         ggml_tensor * out = nullptr;
         for (int64_t h = 0; h < heads; ++h) {
             ggml_tensor * qh = ggml_view_2d(ctx, q, k, n, heads*q->nb[1], h*q->nb[1]);
-            ggml_tensor * score = ggml_relu(ctx, ggml_mul_mat(ctx, a, qh));
+            ggml_tensor * score = ggml_mul_mat(ctx, a, qh);
+            if (relu) {
+                score = ggml_relu(ctx, score);
+            }
             out = out ? ggml_add(ctx, out, score) : score;
         }
 
@@ -987,6 +1053,13 @@ struct test_gated_delta_net_replay_layers : public test_case {
 };
 
 static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // the f16 range of the f16reg matmuls: dense q8_0 through the f16 copy (K <= 4096) and through the conversion in the
+    // tile (K above), MUL_MAT_ID through the conversion in the tile
+    test_cases.emplace_back(new test_mul_mat_f16_range(GGML_TYPE_Q8_0, 512, 129, 256));
+    test_cases.emplace_back(new test_mul_mat_f16_range(GGML_TYPE_Q8_0, 512, 129, 4160));
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_f16_range(type_a, 4, 4, 256, 256, 256));
+    }
     // the delta net with deferred rollback: the qwen4exp head sizes, grouped keys and not, a decode step and a verify
     for (int64_t S : {16, 32, 64, 128}) {
         for (auto hk : std::vector<std::array<int64_t, 2>>{{4, 2}, {2, 2}}) {
@@ -1078,6 +1151,10 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
             }
             test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 2, bias, type_a));
             test_cases.emplace_back(new test_mul_mat_headsum(1000, 300, 128, 8, bias, type_a));
+            // review 10.11: the epilogue of the fused head matmul always rectifies, the chain check must refuse these
+            for (auto mn : std::vector<std::array<int64_t, 2>>{{1000, 300}, {1000, 3}}) {
+                test_cases.emplace_back(new test_mul_mat_headsum(mn[0], mn[1], 128, 4, bias, type_a, false));
+            }
         }
     }
     // 4 heads take the fused head matmul on Vulkan at every token count, 64 heads the indexer shader

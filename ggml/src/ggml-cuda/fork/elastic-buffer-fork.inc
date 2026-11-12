@@ -16,6 +16,9 @@ struct ggml_cuda_elastic_fork {
 };
 
 static void ggml_cuda_elastic_free_fork(ggml_cuda_elastic_fork * el) {
+    // as decommit: no kernel may still read the range (cudaFree of an ordinary buffer waits for the device itself);
+    // the caller set the device
+    CUDA_CHECK(cudaDeviceSynchronize());
     for (size_t i = 0; i < el->mapped.size(); ++i) {
         if (el->mapped[i]) {
             CU_CHECK(cuMemUnmap(el->base + i*el->granularity, el->granularity));

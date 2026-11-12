@@ -13,6 +13,7 @@
 #include <vector>
 
 struct common_params;
+struct common_preset;
 struct server_routes;
 struct server_models_routes;
 
@@ -41,6 +42,12 @@ struct server_pool_fork {
 
 // the node side; server_routes in server-context.cpp has the handlers (*_pool_*_fork)
 
+// the routes of the node side (/pool/node, /pool/export*, /pool/import*, /pool/probe) are only on an instance that a
+// router started for a model with pool = on: the router sets LLAMA_SERVER_POOL_NODE=1 in its environment
+// (server_pool_child_env_fork). any other server does not have them (404)
+bool server_pool_node_fork();
+void server_pool_child_env_fork(const common_preset & preset, std::vector<std::string> & env);
+
 // GET /pool/node: the devices with their memory, for the dashboard of a pool
 json server_pool_node_devices_fork();
 
@@ -59,7 +66,8 @@ void server_pool_xfer_plan_fork(const std::string & id, server_pool_plan_fork pl
 void server_pool_xfer_forget_fork(const std::string & id);
 // up to `size` bytes of export `id` from `offset`, fewer at the end
 bool server_pool_xfer_read_fork(const std::string & id, uint64_t offset, uint64_t size, std::string & out, std::string & error);
-// the chunks of import `id` come in order, offset 0 starts it. max_bytes: the largest state the node takes, 0 = any
+// the chunks of import `id` come in order, offset 0 starts it. max_bytes: the largest state the node takes
+// (server_context_meta::pool_import_max_fork), 0 = any
 bool server_pool_inbox_write_fork(const std::string & id, uint64_t offset, const std::string & data, uint64_t max_bytes,
                                   std::string & error);
 // the import `id`, no longer kept here; nullptr when there is none

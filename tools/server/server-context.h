@@ -61,6 +61,9 @@ struct server_context_meta {
     uint64_t    pool_signature_fork = 0; // the portable signature of the prompt cache, 0 = no cache
     std::string pool_spill_dir_fork;     // --cache-spill-dir, where the links of the exports go (UTF-8)
     uint64_t    pool_cache_ram_fork = 0; // the RAM limit of the prompt cache in bytes, 0 = none: the largest state taken
+    // the largest state an import allocates: the RAM limit of the prompt cache, without one (--cache-ram -1, the
+    // default) the host RAM above the reserve, which no state can exceed and still join the cache. 0 = any (no RAM size)
+    uint64_t    pool_import_max_fork = 0;
 };
 
 using server_state_callback_t = std::function<void(server_state, json /* payload */)>;

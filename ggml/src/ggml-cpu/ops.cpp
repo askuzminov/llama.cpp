@@ -11349,6 +11349,8 @@ static void ggml_compute_forward_gated_delta_net_lazy_rows(
         int64_t ir0,
         int64_t ir1) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    // 1: the net with records, 2: the replay; graph_plan gives the work buffer to mode 1 only
+    GGML_ASSERT(mode == 1 || mode == 2);
 
     const ggml_tensor * src_state = dst->src[5];
     const ggml_tensor * src_rec   = dst->src[6];

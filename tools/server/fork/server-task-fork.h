@@ -38,7 +38,8 @@ struct server_pool_inbox_fork {
     server_pool_inbox_fork();
     ~server_pool_inbox_fork();
 
-    // the chunks come in order. max_bytes: the largest state this node takes, 0 = any
+    // the chunks come in order. max_bytes: the largest state this node takes
+    // (server_context_meta::pool_import_max_fork), 0 = any
     bool write(uint64_t offset, const char * data, size_t n, uint64_t max_bytes, std::string & error);
 
     struct impl;

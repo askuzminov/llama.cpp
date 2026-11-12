@@ -46,6 +46,8 @@ target_sources(${TARGET} PRIVATE
     fork/server-role-fork.cpp
     fork/server-role-fork.h
 )
+# fork: the sums of the prompt-cache spill files (XXH3)
+target_link_libraries(${TARGET} PRIVATE vendor::hash)
 
 # llama-server-impl: server logic, reusable by app
 

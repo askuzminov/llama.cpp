@@ -119,6 +119,7 @@ def test_prompt_cache_spill_written_on_shutdown():
         })
         assert res.status_code == 200, res.body
         cold_prompt_n = res.body["timings"]["prompt_n"]
+        cold_content  = res.body["content"]
         assert cold_prompt_n > 1
 
         # nothing else is sent: the prompt lives only in the slot
@@ -138,6 +139,8 @@ def test_prompt_cache_spill_written_on_shutdown():
         assert res.status_code == 200, res.body
         assert res.body["timings"]["cache_n"] > 0, "expected reuse of the spilled prompt after a restart"
         assert res.body["timings"]["prompt_n"] < cold_prompt_n
+        # the state from the disk is the state that was computed: the same answer
+        assert res.body["content"] == cold_content, (res.body["content"], cold_content)
     finally:
         server.stop()
         try:

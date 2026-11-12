@@ -1280,26 +1280,34 @@ static bool alloc_tensor_range_fork(struct ggml_context * ctx,
     if (!ok) {
         GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);
     } else {
-        *buffers = realloc(*buffers, sizeof(ggml_backend_buffer_t) * (*n_buffers + 1));
-        (*buffers)[(*n_buffers)++] = buffer;
+        // fork: the list grows with realloc, which can fail as the buffer can
+        ggml_backend_buffer_t * grown = (ggml_backend_buffer_t *) realloc(*buffers, sizeof(ggml_backend_buffer_t) * (*n_buffers + 1));
+        if (grown == NULL) {
+            GGML_LOG_ERROR("%s: out of memory for a list of %zu buffers\n", __func__, *n_buffers + 1);
+            ggml_backend_buffer_free(buffer);
+            ok = false;
+        } else {
+            *buffers = grown;
+            (*buffers)[(*n_buffers)++] = buffer;
 
-        struct ggml_tallocr tallocr = ggml_tallocr_new(buffer);
+            struct ggml_tallocr tallocr = ggml_tallocr_new(buffer);
 
-        for (struct ggml_tensor * t = first; t != last && ok; t = ggml_get_next_tensor(ctx, t)) {
-            enum ggml_status status = GGML_STATUS_SUCCESS;
-            if (t->data == NULL) {
-                if (t->view_src == NULL) {
-                    status = ggml_tallocr_alloc(&tallocr, t);
-                } else if (t->buffer == NULL) {
+            for (struct ggml_tensor * t = first; t != last && ok; t = ggml_get_next_tensor(ctx, t)) {
+                enum ggml_status status = GGML_STATUS_SUCCESS;
+                if (t->data == NULL) {
+                    if (t->view_src == NULL) {
+                        status = ggml_tallocr_alloc(&tallocr, t);
+                    } else if (t->buffer == NULL) {
+                        status = ggml_backend_view_init(t);
+                    }
+                } else if (t->view_src != NULL && t->buffer == NULL) {
+                    // view of a pre-allocated tensor
                     status = ggml_backend_view_init(t);
                 }
-            } else if (t->view_src != NULL && t->buffer == NULL) {
-                // view of a pre-allocated tensor
-                status = ggml_backend_view_init(t);
-            }
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, t->name);
-                ok = false;
+                if (status != GGML_STATUS_SUCCESS) {
+                    GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, t->name);
+                    ok = false;
+                }
             }
         }
     }

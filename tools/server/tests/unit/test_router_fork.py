@@ -74,7 +74,9 @@ def test_router_stop_does_not_wait_for_load(monkeypatch):
     server.process.terminate()
     server.process.wait(timeout=10)
     _wait_pids_gone(children, timeout=10)
-    pending.join(30)  # it fails, the router went away
+    pending.join(30)
+    # it fails, the router went away
+    assert pending.error is not None or pending.result.status_code != 200, pending.result.body
 
 
 @pytest.mark.skipif(os.name == "nt", reason="uses POSIX signals and ps")

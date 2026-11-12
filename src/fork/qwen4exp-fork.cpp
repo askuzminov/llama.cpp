@@ -2235,6 +2235,10 @@ ggml_tensor * llama_model_qwen4exp_fork::graph::build_attn_qsa(
     }();
     bool use_list = false;
     // A partial final block can need repeated live cells when every cache cell is occupied.
+    // the gate looks at the backend only. Vulkan refuses FLASH_ATTN_LIST on coopmat2 devices (NVIDIA,
+    // ggml_backend_vk_device_supports_op: only the scalar and coopmat1 paths walk the list), and the scheduler then
+    // runs the attention of every such layer on the CPU: right, but slow. TODO: a coopmat2 list path, or ask
+    // ggml_backend_dev_supports_op() with a probe node here and keep the mask when the device refuses
     if (list_mode == 1 && from_pos && cparams.flash_attn && n_kv_m % hparams.dsv4_compress_ratios[il] == 0) {
         ggml_backend_dev_t dev_l = model.dev_layer(il);
         const bool vk_l = qwen4exp_dev_is_vulkan(dev_l);
@@ -3003,6 +3007,12 @@ void llama_model_qwen4exp_fork::ple_warm(const llama_ubatch & next, const llama_
     {
         std::lock_guard<std::mutex> lock(ple_wm->mutex);
         if (!ple_wm->stop) {
+            // a worker behind the drafts (a slow disk): the oldest reads are for tokens verified by now, and they would
+            // hold the row cache (one lock) from the gather a verify waits for. more than a round of drafts is kept
+            static constexpr size_t QUEUE_MAX = 8;
+            if (ple_wm->queue.size() >= QUEUE_MAX) {
+                ple_wm->queue.erase(ple_wm->queue.begin());
+            }
             ple_wm->queue.push_back(std::move(idx));
         }
     }

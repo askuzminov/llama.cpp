@@ -430,6 +430,19 @@ static void pool_read_options(pool_config & cfg, const common_preset & preset) {
     });
 }
 
+// runs f when the scope ends, on an exception too: the threads of a move end and are joined before their std::thread
+// goes (a joinable std::thread destroyed calls std::terminate)
+template <typename F>
+struct pool_scope_exit {
+    F f;
+    ~pool_scope_exit() { f(); }
+};
+
+template <typename F>
+static pool_scope_exit<F> pool_on_exit(F f) {
+    return { std::move(f) };
+}
+
 // a chunk of the move of a conversation, and of the probe of a link
 static constexpr uint64_t POOL_CHUNK = 16ull << 20;
 // the end of an answer the pool keeps for its timings (the last event of a stream, the end of a JSON body). at file
@@ -1558,6 +1571,12 @@ struct server_pool_fork::impl {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         });
+        auto end_watch = pool_on_exit([&]() {
+            pulled = true;
+            if (watch.joinable()) {
+                watch.join();
+            }
+        });
         const json req_pull = {{"from", nf.id}, {"id", xid}, {"size", size}, {"signature", sig},
                                {"source_model", nf.model}, {"model", nt.model}};
         auto rp = ct.Post("/pool/pull", hdrs, req_pull.dump(), "application/json");
@@ -1669,6 +1688,17 @@ struct server_pool_fork::impl {
             std::lock_guard<std::mutex> lk(m);
             read_done = true;
             cq.notify_all();
+        });
+        // an exception in the writer below: the reader stops after its chunk and is joined
+        auto end_reader = pool_on_exit([&]() {
+            if (reader.joinable()) {
+                {
+                    std::lock_guard<std::mutex> lk(m);
+                    failed = true;
+                }
+                cq.notify_all();
+                reader.join();
+            }
         });
 
         const int64_t t0 = ggml_time_ms();
@@ -2917,6 +2947,11 @@ struct server_pool_fork::discovery_t {
     }
 
     void start() {
+        // as impl::start_poller: no thread after a stop, which would not join it (server.cpp starts the pool before
+        // it sets the shutdown handler, so this is a guard, not a path)
+        if (stopping.load()) {
+            return;
+        }
         sock_reply = pool_udp_socket(0, false);
         if (discover) {
             sock_bcast = pool_udp_socket(port, true);
@@ -3355,6 +3390,18 @@ void server_pool_xfer_clean_fork(const std::string & spill_dir, int idle_s) {
         if (!ec_file && now - t > std::chrono::seconds(idle_s)) {
             std::filesystem::remove(it->path(), ec_file);
         }
+    }
+}
+
+bool server_pool_node_fork() {
+    const char * v = getenv("LLAMA_SERVER_POOL_NODE");
+    return v != nullptr && common_arg_utils::is_truthy(v);
+}
+
+void server_pool_child_env_fork(const common_preset & preset, std::vector<std::string> & env) {
+    std::string val;
+    if (preset.get_option(COMMON_ARG_PRESET_POOL_FORK, val) && common_arg_utils::is_truthy(val)) {
+        env.push_back("LLAMA_SERVER_POOL_NODE=1");
     }
 }
 

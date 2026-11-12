@@ -28,3 +28,9 @@ set(TARGET llama-quality-fork)
 add_executable(${TARGET} fork/quality-fork.cpp)
 target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# fork: the largest activations the matmuls read, against the f16 range of the Vulkan f16reg paths
+set(TARGET llama-actmax-fork)
+add_executable(${TARGET} fork/actmax-fork.cpp)
+target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

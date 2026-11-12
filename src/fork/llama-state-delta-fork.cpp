@@ -47,6 +47,21 @@ bool llama_memory_i::state_read_delta(
 // a delta checkpoint starts with this, so a full state can never be mistaken for one
 static constexpr uint32_t KV_DELTA_MAGIC = 0x4B56444C; // "KVdL"
 
+// the magic and the base position open the delta of every cache: of a plain one, of the first of an iSWA pair
+llama_pos llama_state_seq_delta_base_pos(const uint8_t * src, size_t size) {
+    uint32_t  magic    = 0;
+    llama_pos base_pos = -1;
+    if (src == nullptr || size < sizeof(magic) + sizeof(base_pos)) {
+        return -1;
+    }
+    memcpy(&magic, src, sizeof(magic));
+    if (magic != KV_DELTA_MAGIC) {
+        return -1;
+    }
+    memcpy(&base_pos, src + sizeof(magic), sizeof(base_pos));
+    return base_pos >= 0 ? base_pos : -1;
+}
+
 size_t llama_kv_cache::state_write_delta(
         llama_io_write_i & io,
         llama_seq_id seq_id,
@@ -153,7 +168,8 @@ bool llama_kv_cache::state_read_delta(
         if (cell_count == 0) {
             continue;
         }
-        if (n_stream_cur != n_stream && ++n_filled > 1) {
+        // also with the same stream count (review 10.11): the cells of several streams would all go into strm
+        if (++n_filled > 1) {
             LLAMA_LOG_ERROR("%s: the delta of one sequence holds cells of several streams\n", __func__);
             return false;
         }

@@ -2097,6 +2097,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // fork: the PLE n-gram embeddings (qwen4exp) take the preceding tokens of one sequence, and the input of both graph
+    // copies asserts n_seq_id == 1 (an abort of the process). a token shared by sequences is refused here instead
+    if (model.hparams.ple_ngram_size > 0) {
+        const llama_batch & b = balloc->get_batch();
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            if (b.n_seq_id[i] > 1) {
+                LLAMA_LOG_ERROR("%s: token %d belongs to %d sequences, the PLE n-gram embeddings of this model take one\n",
+                        __func__, i, b.n_seq_id[i]);
+                return -1;
+            }
+        }
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 

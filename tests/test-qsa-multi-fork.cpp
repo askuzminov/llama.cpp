@@ -593,6 +593,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // the runs are compared bit for bit: Metal on an AMD GPU (the 5500M of a MacBook) computes run-to-run different
+    // values with concurrent dispatch, upstream as well (1.5e-8 apart there); ordered dispatch, no effect elsewhere
+    if (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nullptr) {
+        set_env("GGML_METAL_CONCURRENCY_DISABLE", "1");
+    }
+
     // read once, before the first context
     set_env("LLAMA_QSA_CHECK", "1");
     set_env("LLAMA_QSA_MASK_POS", dense_out ? "0" : "1");

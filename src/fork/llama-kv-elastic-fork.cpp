@@ -432,10 +432,6 @@ uint32_t llama_kv_cache::elastic_set_capacity_fork(uint32_t strm, uint32_t n_cap
     return n_cap;
 }
 
-bool llama_kv_cache::elastic_zero_reads_fork() const {
-    return elastic_fork && elastic_fork->zero_reads;
-}
-
 uint32_t llama_kv_cache::elastic_cells_fork(uint32_t strm) const {
     const uint32_t cap = elastic_capacity_fork(strm);
     return cap > 0 ? std::min(cap, get_size()) : get_size();

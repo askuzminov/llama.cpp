@@ -190,11 +190,14 @@ def test_no_pause_below_ram_reserve(monkeypatch):
 
     n_predict = 200
     prompts = [STORY_A * 2, STORY_B * 2]
-    parallel_function_calls([(complete, (p, n_predict)) for p in prompts])
+    res = parallel_function_calls([(complete, (p, n_predict)) for p in prompts])
     text = log.drain()
 
     assert "no pause for room" in text
     assert "paused for room in the unified KV cache" not in text
+    # the upstream path: the running slots of a full cache fail
+    assert all(r.status_code in (200, 500) for r in res), [r.status_code for r in res]
+    assert any(r.status_code == 500 and "Context size has been exceeded" in str(r.body) for r in res), [r.body for r in res]
 
 
 def test_generation_progress_during_another_prompt(monkeypatch):

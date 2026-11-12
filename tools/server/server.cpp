@@ -577,14 +577,6 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.get_models                  = models_routes->get_router_models;
 
     ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
-    // fork: this router as a node of a pool (pool = on in models.ini): the device memory and the move of a conversation
-    // go to the instance (?model= or "model" in the body; the chunks of an import are not JSON)
-    ctx_http.get ("/pool/node",            ex_wrapper(models_routes->proxy_get));
-    ctx_http.post("/pool/export",          ex_wrapper(models_routes->proxy_post));
-    ctx_http.get ("/pool/export/data",     ex_wrapper(models_routes->proxy_get));
-    ctx_http.post("/pool/export/done",     ex_wrapper(models_routes->proxy_post));
-    ctx_http.post("/pool/import/data",     ex_wrapper(server_pool_router_post_fork(*models_routes)));
-    ctx_http.post("/pool/import/done",     ex_wrapper(models_routes->proxy_post));
     ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
     ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
@@ -601,6 +593,15 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     }
     if (pool) {
         pool->attach(ctx_http, routes);
+        // fork: this router as a node of a pool: the device memory and the move of a conversation go to the instance
+        // (?model= or "model" in the body; the chunks of an import are not JSON), which has these routes only when its
+        // model has pool = on (server_pool_node_fork)
+        ctx_http.get ("/pool/node",        ex_wrapper(models_routes->proxy_get));
+        ctx_http.post("/pool/export",      ex_wrapper(models_routes->proxy_post));
+        ctx_http.get ("/pool/export/data", ex_wrapper(models_routes->proxy_get));
+        ctx_http.post("/pool/export/done", ex_wrapper(models_routes->proxy_post));
+        ctx_http.post("/pool/import/data", ex_wrapper(server_pool_router_post_fork(*models_routes)));
+        ctx_http.post("/pool/import/done", ex_wrapper(models_routes->proxy_post));
     }
 
     server_register_routes(ctx_http, routes);
@@ -721,15 +722,18 @@ static int server_run_instance(common_params & params, server_role & role, commo
     }
 
     server_register_routes(ctx_http, routes);
-    // fork: the node side of a pool (--pool): the device memory for its dashboard, the move of a conversation
-    ctx_http.get ("/pool/node",        ex_wrapper(routes.get_pool_node_fork));
-    ctx_http.post("/pool/export",      ex_wrapper(routes.post_pool_export_fork));
-    ctx_http.get ("/pool/export/data", ex_wrapper(routes.get_pool_export_data_fork));
-    ctx_http.post("/pool/export/done", ex_wrapper(routes.post_pool_export_done_fork));
-    ctx_http.post("/pool/import/data", ex_wrapper(routes.post_pool_import_data_fork));
-    ctx_http.post("/pool/import/done", ex_wrapper(routes.post_pool_import_done_fork));
-    ctx_http.get ("/pool/probe",       ex_wrapper(routes.get_pool_probe_fork));
-    ctx_http.post("/pool/probe",       ex_wrapper(routes.post_pool_probe_fork));
+    // fork: the node side of a pool, on an instance a router of a pool started (server_pool_node_fork): the device
+    // memory for its dashboard, the move of a conversation
+    if (server_pool_node_fork()) {
+        ctx_http.get ("/pool/node",        ex_wrapper(routes.get_pool_node_fork));
+        ctx_http.post("/pool/export",      ex_wrapper(routes.post_pool_export_fork));
+        ctx_http.get ("/pool/export/data", ex_wrapper(routes.get_pool_export_data_fork));
+        ctx_http.post("/pool/export/done", ex_wrapper(routes.post_pool_export_done_fork));
+        ctx_http.post("/pool/import/data", ex_wrapper(routes.post_pool_import_data_fork));
+        ctx_http.post("/pool/import/done", ex_wrapper(routes.post_pool_import_done_fork));
+        ctx_http.get ("/pool/probe",       ex_wrapper(routes.get_pool_probe_fork));
+        ctx_http.post("/pool/probe",       ex_wrapper(routes.post_pool_probe_fork));
+    }
     server_register_stream_routes(ctx_http,
         server_stream_make_get_handler(),
         server_stream_make_lookup_handler(),

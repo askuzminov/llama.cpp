@@ -232,6 +232,10 @@ bool ggml_vk_topk_use_radix(uint32_t k, uint32_t ncols, uint32_t nrows, uint32_t
 // TOP_K radix-select with an output in index order and the ties from the lowest index (GGML_VK_TOPK_RADIX_STABLE):
 // 1 with subgroups where the device has them (else upstream), 2 without subgroups, 0 the upstream atomic compaction
 int ggml_vk_topk_radix_stable();
+// the copy of f32 src to f16 (dst: the layout of the copy, nullptr = contiguous) for the f16reg matmuls: the upstream
+// pipeline ggml_vk_get_cpy_pipeline picks, its saturating twin for the f32 -> f16 ones (cpy_f16_sat_fork.comp)
+vk_pipeline ggml_vk_fork_cpy_f16_sat(ggml_backend_vk_context * ctx, const ggml_tensor * src, const ggml_tensor * dst);
+
 // MUL_MAT_ID: the mul_mmid_f16reg.comp pipeline for these operands, or nullptr for the upstream choice
 // (y_in_place: src1 can be read where it is; b16: set when the pipeline reads f16 activations - src1 when it is f16,
 // else an f16 copy that the caller makes in prealloc_y; d16: the fused gate/up writes its result as f16)

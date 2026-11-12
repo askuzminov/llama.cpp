@@ -999,6 +999,10 @@ extern "C" {
            llama_state_seq_flags   flags,
                      llama_pos   base_pos);
 
+    // fork: the base position a delta state of llama_state_seq_get_delta_ext was taken on (it carries it in its
+    // header), -1 when src is not a delta state (a full state of llama_state_seq_get_data_ext)
+    LLAMA_API llama_pos llama_state_seq_delta_base_pos(const uint8_t * src, size_t size);
+
     //
     // Decoding
     //

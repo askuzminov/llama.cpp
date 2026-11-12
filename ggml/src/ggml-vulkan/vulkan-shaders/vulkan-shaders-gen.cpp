@@ -893,6 +893,9 @@ void process_shaders() {
     string_to_spv("contig_cpy_f32_bf16","contig_copy.comp",{{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
     string_to_spv("contig_cpy_bf16_f32","contig_copy.comp",{{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
     string_to_spv("contig_cpy_bf16_f16","contig_copy.comp",{{"A_TYPE", "uint16_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_BF16", "1"}});
+    // fork: the f16 copies of the activations for the f16reg matmuls, saturating (cpy_f16_sat_fork.comp)
+    string_to_spv("cpy_f32_f16_sat_fork", "cpy_f16_sat_fork.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("contig_cpy_f32_f16_sat_fork", "cpy_f16_sat_fork.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"CONTIG", "1"}});
     string_to_spv("cpy_f32_i32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
     string_to_spv("cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
 

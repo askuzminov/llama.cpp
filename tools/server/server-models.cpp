@@ -1240,6 +1240,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back(std::string(SERVER_ENV_ROUTER_PORT) + "=" + std::to_string(base_params.port));
         child_env.push_back("LLAMA_SERVER_STOP_TIMEOUT=" + std::to_string(inst.meta.stop_timeout)); // fork
+        server_pool_child_env_fork(inst.meta.preset, child_env); // fork: the node routes of a pool
 
         if (opts.role == SERVER_ROLE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;

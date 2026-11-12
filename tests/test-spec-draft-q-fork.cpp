@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -108,6 +109,17 @@ int main(int argc, char ** argv) {
     params.speculative.draft.n_max           = 2;
     params.speculative.draft.n_min           = 0;
     params.speculative.draft.p_min           = 0.0f;
+
+    // the q of every trial has to be the same: Metal on an AMD GPU (the 5500M of a MacBook) computes run-to-run
+    // different values with concurrent dispatch, upstream as well, which moved 2000-4000 of 12000 drafts out of q.
+    // ordered dispatch there (no effect on other backends)
+    if (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nullptr) {
+#ifdef _WIN32
+        _putenv_s("GGML_METAL_CONCURRENCY_DISABLE", "1");
+#else
+        setenv("GGML_METAL_CONCURRENCY_DISABLE", "1", 1);
+#endif
+    }
 
     common_init();
     llama_backend_init();

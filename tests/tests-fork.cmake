@@ -21,6 +21,10 @@ llama_build_and_test(test-env-fork.cpp)
 # the k + 1 largest of the sampler's fast top-k (common/fork/top-k-fork.h): the same heap as one value at a time
 llama_build_and_test(test-top-k-fork.cpp)
 
+# the F16 activations the fork's CPU backend takes against quantized weights (MUL_MAT, MUL_MAT_ID) against the same
+# values in F32, as a model runs them (the tiled K-quant kernels of x86 builds included); no model
+llama_build_and_test(test-cpu-f16-src1-fork.cpp LINK ggml)
+
 # the qwen4exp indexer timed on one device at the shapes of the model (lightning indexer, the head matmul of the Vulkan
 # graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines
 llama_build(test-micro-fork.cpp LINK ggml)
@@ -132,7 +136,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
-    # which memories verify drafts of different lengths in one pass: the even drafts of the server depend on it
+    # a token in two sequences on the PLE n-gram embeddings of qwen4exp: llama_decode refuses it, no abort (review 10.11)
+    llama_build_and_test(test-ple-shared-token-fork.cpp LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-ple-shared-token-fork PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_test(test-graph-cache-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-graph-cache-fork PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # the graph cache: graphs of 1 and 64 tokens alternate, the logits equal those without graph reuse (review 10.11). on the
+# CPU alone; with a device and part of the layers on it, by hand: -dev <device> -ngl <n>
+llama_build(test-graph-cache-fork.cpp)
+
+# which memories verify drafts of different lengths in one pass: the even drafts of the server depend on it
     llama_test(test-split-equal-fork LABEL main ARGS --models "${MODEL_DIR}")
     set_tests_properties(test-split-equal-fork PROPERTIES FIXTURES_REQUIRED generate-models)
 
@@ -207,10 +222,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --out "${MOE_CACHE_REF}"
     )
+    # alone: the plan of the phases takes the free memory of the GPU (llama_context::phase_prompt), which another test
+    # on the GPU changes, and keep / upload compare bit for bit
     set_tests_properties(test-moe-cache-fork-ref PROPERTIES
         FIXTURES_REQUIRED generate-models
         FIXTURES_SETUP moe-cache-ref
         SKIP_REGULAR_EXPRESSION "test-moe-cache-fork: SKIPPED"
+        RUN_SERIAL TRUE
     )
     foreach(MOE_CACHE_MODE keep fill kv upload state)
         llama_test(
@@ -222,6 +240,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set_tests_properties(test-moe-cache-fork-${MOE_CACHE_MODE} PROPERTIES
             FIXTURES_REQUIRED "generate-models;moe-cache-ref"
             SKIP_REGULAR_EXPRESSION "test-moe-cache-fork: SKIPPED"
+            RUN_SERIAL TRUE
         )
     endforeach()
 endif()

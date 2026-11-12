@@ -95,10 +95,12 @@ def wait_nodes(slots: int | None = None) -> dict:
     raise AssertionError(f"the routers did not see the pool: {[[(n['name'], n['status'], n['error']) for n in st['nodes']] for st in sts]}")
 
 
-def chat(messages: list, n_predict: int = 8, timings: dict | None = None, model: str = "tiny", via: int = 0) -> str:
+def chat(messages: list, n_predict: int = 8, timings: dict | None = None, model: str = "tiny", via: int = 0,
+         timeout: float | None = None) -> str:
+    kw = {} if timeout is None else {"timeout": timeout}
     res = routers[via].make_request("POST", "/v1/chat/completions", headers=headers(), data={
         "model": model, "messages": messages, "max_tokens": n_predict, "temperature": 0,
-    })
+    }, **kw)
     assert res.status_code == 200, res.body
     if timings is not None:
         timings.update(res.body["timings"])
@@ -796,6 +798,56 @@ def test_pool_moves_the_state_of_a_conversation(spill: bool, min_tokens: int | N
     assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
 
 
+def test_pool_moves_the_state_with_one_http_thread():
+    # review 10.11: POST /pool/pull holds an HTTP worker for the whole move and posts the chunks to its own router, which
+    # needs another worker. with one fixed worker the import still goes: httplib starts a dynamic thread whenever the
+    # queued requests outnumber the idle threads (ThreadPool::enqueue, up to n_threads_http + 1024). a blocked import would
+    # end in the 60 s read timeout of the pull, and the request would compute the conversation again
+    for r in routers:
+        r.n_threads_http = 1
+    start_pool("move_tokens=16 wait_max=0 prefill_tps=1")
+    msgs = [{"role": "user", "content": "once upon a time there was a little girl who " * 12}]
+    t1 = {}
+    msgs.append({"role": "assistant", "content": chat(msgs, timings=t1)})
+    msgs.append({"role": "user", "content": "and then?"})
+    first = events("new")[0]["node"]
+    drain(first)
+    t2 = {}
+    # with no dynamic threads the router hangs (a mutation of 11.11 ran past 10 minutes): the bound makes that a failure
+    chat(msgs, timings=t2, timeout=30)
+    moved = events("migrate")
+    assert len(moved) == 1 and moved[0]["node"] != first, events("recompute")
+    assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
+
+
+def test_pool_moved_state_reaches_the_disk_of_its_new_node():
+    # review 10.11 (B1.4 #3): the import marks the state disk_evicted (write_behind leaves it alone until its request
+    # takes it), the request it came for clears that (unspill_state), and what the slot keeps afterwards goes to the
+    # disk of the new node like any other state: here by the write while idle
+    dirs = [tempfile.mkdtemp() for _ in routers]
+    for r, d in zip(routers, dirs):
+        r.cache_spill_dir = d
+        r.cache_idle_write = True
+        r.cache_min_tokens = 16
+    start_pool("move_tokens=16 wait_max=0 prefill_tps=1")
+    msgs = [{"role": "user", "content": "once upon a time there was a little girl who " * 12}]
+    msgs.append({"role": "assistant", "content": chat(msgs)})
+    msgs.append({"role": "user", "content": "and then?"})
+    first = events("new")[0]["node"]
+    other = 1 - int(first[1:])
+    states = lambda d: [f for f in os.listdir(d) if f.startswith("state-") and f.endswith(".bin")]
+    assert states(dirs[other]) == []
+    drain(first)
+    t2 = {}
+    chat(msgs, timings=t2)
+    moved = events("migrate")
+    assert len(moved) == 1 and moved[0]["node"] == f"n{other}", events("recompute")
+    deadline = time.time() + 30
+    while not states(dirs[other]):
+        assert time.time() < deadline, os.listdir(dirs[other])
+        time.sleep(0.2)
+
+
 def test_pool_drain_hands_the_conversations_over():
     # 07.11 (user: a drain should hand the active conversations over): the conversation of a drained node goes to the
     # other node with its state before its next request comes; that request stays there (keep) and computes only the
@@ -1130,18 +1182,40 @@ def test_pool_leaves_out_another_model(same_model: bool):
 # the node side: the instance moves the state of a conversation, plain instances without a pool
 #
 
-def plain_nodes(preset_fn=ServerPreset.tinyllama2, **opts) -> list:
+def plain_nodes(preset_fn=ServerPreset.tinyllama2, node: bool = True, **opts) -> list:
     nodes = []
     for i in range(2):
         n = preset_fn()
-        n.server_port = routers[0].server_port + 10 + i
+        # inside the 10 ports of this pytest worker (conftest.py): the routers take PORT+1 and +2
+        n.server_port = routers[0].server_port + 3 + i
         n.n_slots = 1
+        # as a router of a pool starts the instance of a model with pool = on (server_pool_child_env_fork)
+        if node:
+            n.env_fork = {**(n.env_fork or {}), "LLAMA_SERVER_POOL_NODE": "1"}
         for k, v in opts.items():
             setattr(n, k, v)
         nodes.append(n)
         routers.append(n)  # stopped with the routers
         n.start()
     return nodes
+
+
+def test_pool_routes_only_on_a_node_of_a_pool():
+    # a server that no router of a pool started has no /pool/* routes (/pool/probe allocates up to 64 MiB per call), a
+    # router without a pool does not proxy them
+    plain, _ = plain_nodes(node=False)
+    url = f"http://{plain.server_host}:{plain.server_port}"
+    for method, path in (("GET", "/pool/node"), ("GET", "/pool/probe?size=1000"), ("POST", "/pool/probe"),
+                         ("POST", "/pool/export"), ("GET", "/pool/export/data?id=00ff&offset=0&size=16"),
+                         ("POST", "/pool/export/done"), ("POST", "/pool/import/data?id=00ff&offset=0"),
+                         ("POST", "/pool/import/done")):
+        res = requests.request(method, url + path, data=b"x" * 16 if method == "POST" else None)
+        assert res.status_code == 404, (path, res.status_code, res.text)
+    routers[0].models_preset = preset("r0", body=TINY.replace("pool = on\n", "") + "alias = tiny-alias\n")
+    routers[0].start()
+    for path in ("/pool/node?model=tiny", "/pool/status", "/pool/probe?size=1000"):
+        res = routers[0].make_request("GET", path)
+        assert res.status_code == 404, (path, res.status_code, res.body)
 
 
 def test_pool_node_checks_what_comes_in():
@@ -1162,6 +1236,12 @@ def test_pool_node_checks_what_comes_in():
     assert ex["n_reuse"] > 0 and not ex["from_disk"], ex
     data = requests.get(f"http://{src.server_host}:{src.server_port}/pool/export/data?id={ex['id']}&offset=0&size={1 << 26}").content
     assert len(data) == ex["size"]
+    # its header with a main state of 512 GiB: refused before anything is allocated, also without a RAM limit of the
+    # prompt cache (--cache-ram -1, the default of these nodes): the host RAM above the reserve bounds it then
+    head = bytearray(data[:80])  # sizeof(spill_header)
+    head[40:48] = (1 << 39).to_bytes(8, "little")  # spill_header::n_main
+    res = requests.post(f"{url}/pool/import/data?id=00fe&offset=0", data=bytes(head))
+    assert res.status_code == 400 and "larger than this node takes" in res.text, res.text
     res = requests.post(f"{url}/pool/import/data?id={ex['id']}&offset=0", data=data[:8192])
     assert res.status_code == 200, res.text
     res = requests.post(f"{url}/pool/import/data?id={ex['id']}&offset=4096", data=data[4096:8192])
@@ -1169,6 +1249,19 @@ def test_pool_node_checks_what_comes_in():
     requests.post(f"{url}/pool/import/data?id={ex['id']}&offset=0", data=data)
     res = requests.post(f"{url}/pool/import/done", json={"id": ex["id"], "signature": "0123456789abcdef"})
     assert res.status_code == 400 and "signatures differ" in res.text, res.text
+    # one byte of the main state changed on the way (the sums of the sections, SPILL_VERSION 5): refused, the request
+    # computes its prompt again. the header block and the prompt block come first
+    bad = bytearray(data)
+    bad[2*4096 + 100] ^= 0x10
+    res = requests.post(f"{url}/pool/import/data?id=00fd&offset=0", data=bytes(bad))
+    assert res.status_code == 200, res.text
+    res = requests.post(f"{url}/pool/import/done", json={"id": "00fd", "signature": ex["signature"]})
+    assert res.status_code == 400 and "came damaged" in res.text, res.text
+    # the same bytes intact are taken
+    res = requests.post(f"{url}/pool/import/data?id=00fc&offset=0", data=data)
+    assert res.status_code == 200, res.text
+    res = requests.post(f"{url}/pool/import/done", json={"id": "00fc", "signature": ex["signature"]})
+    assert res.status_code == 200, res.text
     src.make_request("POST", "/pool/export/done", data={"id": ex["id"]})
 
 
@@ -1213,6 +1306,11 @@ def test_pool_node_sends_the_checkpoint_the_request_needs():
     res = dst.make_request("POST", "/completion", data=body)
     assert res.status_code == 200, res.body
     assert res.body["timings"]["cache_n"] == ex["n_reuse"], (ex, res.body["timings"])
+    # the node it came from goes on from the same checkpoints: the same text, so the moved state is the same state
+    res_src = src.make_request("POST", "/completion", data=body)
+    assert res_src.status_code == 200, res_src.body
+    assert res_src.body["timings"]["cache_n"] == ex["n_reuse"], (ex, res_src.body["timings"])
+    assert res_src.body["content"] == res.body["content"], (res_src.body["content"], res.body["content"])
 
 
 def test_pool_node_tells_what_it_holds():
@@ -1297,6 +1395,61 @@ def test_pool_moves_the_state_onto_a_node_that_lost_its_copy(lost: bool):
         assert t3["cache_n"] >= 30 and t3["prompt_n"] < t3["cache_n"], t3
     else:
         assert mine["kind"] == "switch" and "there in fact" in mine["detail"], mine
+
+
+def test_pool_node_refuses_bad_input_with_400():
+    # review 10.11 (B3 #12): malformed input to the node routes is the client's error (400), not the server's (500)
+    src, _ = plain_nodes()
+    url = f"http://{src.server_host}:{src.server_port}"
+    cases = [
+        ("POST", "/pool/export", b"not json"),
+        ("POST", "/pool/export", b"{}"),
+        ("POST", "/pool/export", b'{"kind": "completion", "body": {"prompt": []}}'),
+        ("POST", "/pool/export", b'{"kind": "completion", "body": {}}'),
+        ("POST", "/pool/export/done", b"not json"),
+        ("POST", "/pool/import/done", b"not json"),
+        ("GET", "/pool/export/data?id=00ff&offset=x&size=1", None),
+        ("GET", "/pool/export/data?id=00ff&offset=99999999999999999999999&size=1", None),
+        ("POST", "/pool/import/data?id=00ff&offset=x", b"x"),
+        ("GET", "/pool/probe?size=x", None),
+    ]
+    got = []
+    for method, path, data in cases:
+        res = requests.request(method, url + path, data=data)
+        got.append((method, path, data, res.status_code, res.text[:80]))
+    assert all(g[3] == 400 for g in got), [g for g in got if g[3] != 400]
+
+
+def test_pool_export_done_ends_the_transfer():
+    # review 10.11 (B3 #4): POST /pool/export/done before the last chunk ends the transfer. a read in progress keeps the
+    # plan (shared_ptr) and finishes; the reads after it fail cleanly; an export from disk loses its link (on Windows
+    # an open read keeps it until the cleaner of the transfers), the state file itself stays
+    spill = tempfile.mkdtemp()
+    src, _ = plain_nodes(cache_spill_dir=spill, cache_idle_write=True, cache_min_tokens=16)
+    msgs = [{"role": "user", "content": "a story about a lighthouse keeper " * 8}]
+    res = src.make_request("POST", "/v1/chat/completions", data={"messages": msgs, "max_tokens": 8, "temperature": 0})
+    assert res.status_code == 200, res.body
+    msgs.append({"role": "assistant", "content": res.body["choices"][0]["message"]["content"]})
+    deadline = time.time() + 20
+    while not [f for f in os.listdir(spill) if f.startswith("state-") and f.endswith(".bin")]:
+        assert time.time() < deadline, os.listdir(spill)
+        time.sleep(0.2)
+    states = sorted(f for f in os.listdir(spill) if f.startswith("state-"))
+    body = {"messages": msgs + [{"role": "user", "content": "and then?"}], "max_tokens": 4}
+    ex = src.make_request("POST", "/pool/export", data={"kind": "chat", "body": body}).body
+    assert ex["from_disk"] and ex["size"] > 8192, ex
+    url = f"http://{src.server_host}:{src.server_port}"
+    link = os.path.join(spill, f"pool-export-{ex['id']}.bin")
+    res = requests.get(f"{url}/pool/export/data?id={ex['id']}&offset=0&size=4096")
+    assert res.status_code == 200 and len(res.content) == 4096, res.text
+    assert os.path.exists(link)
+    res = src.make_request("POST", "/pool/export/done", data={"id": ex["id"]})
+    assert res.status_code == 200, res.body
+    # "no such transfer" as ERROR_TYPE_NOT_FOUND; the 404 handler of the server replaces the text with "File Not Found"
+    res = requests.get(f"{url}/pool/export/data?id={ex['id']}&offset=4096&size=4096")
+    assert res.status_code == 404, (res.status_code, res.text)
+    assert not os.path.exists(link)
+    assert sorted(f for f in os.listdir(spill) if f.startswith("state-")) == states
 
 
 def test_pool_node_without_a_prompt_cache_moves_nothing():

@@ -1504,6 +1504,15 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              ntx_fd);
         return;
     }
+ 
+    // fork: the kbc bound in 64 bits before upstream's own check below, whose int * uint32_t product wraps past 2^32
+    // and then passes. GGML_HINT_IDS_REPEAT (the expert cache graph, at most llama_moe_cache_fork::N_TOKENS_MAX = 128
+    // tokens) sets ncols_max to n_tokens * n_expert_used, so ntx grows up to n_expert_used times. NVIDIA picks J from
+    // the token count (J 128 at 128 tokens): ntx stays near n_expert_used, 10 x 112 x 257 x 224 = 6.4e7 for 10 used
+    // experts, 256 slots and a 7168-wide q8_0 matrix. RDNA3/4 picks J from the tokens per expert (J 8): ntx 160 at
+    // 128 x 10, the same matrix comes to 1.03e9, just under 2^30 = 1.07e9. Past it the launch stops here, it never
+    // computes wrong tiles.
+    GGML_ASSERT((int64_t) ntx * nty * ntzw * blocks_per_ne00_fd.z < (1 << 30));
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.

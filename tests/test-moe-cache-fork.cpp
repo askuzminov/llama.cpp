@@ -17,7 +17,11 @@
 // the model is the qwen4exp of test-llama-archs with 32 experts instead of 2 and without the per-expert scales, which
 // the cache does not take; its memory takes the elastic KV. each run checks in the log that its path ran
 //
-// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)
+// the device is the first GPU, or the one of -dev (a name of ggml_backend_dev_by_name, as Vulkan0); the reference and the
+// modes must run on the same one. every logprob must be a number: a run that gives NaN fails, the reference too (the
+// comparison alone takes NaN against NaN as equal)
+//
+// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf [-dev <name>] (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)
 
 #include "llama.h"
 
@@ -356,11 +360,24 @@ static int state_test(const std::string & model, ggml_backend_dev_t gpu, const s
     return n_fail == 0 ? 0 : 1;
 }
 
+// the logprobs that are not numbers
+static size_t count_nonfinite(const std::vector<record> & recs) {
+    size_t n = 0;
+    for (const auto & r : recs) {
+        for (int k = 0; k < 8; ++k) {
+            n += std::isfinite(r.logprob[k]) ? 0 : 1;
+        }
+    }
+    return n;
+}
+
 int main(int argc, char ** argv) {
     const char * model_in = nullptr;
     const char * out      = nullptr;
     const char * ref      = nullptr;
+    const char * dev_name = nullptr;
     std::string  mode     = "ref";
+    bool         bad_arg  = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             model_in = argv[++i];
@@ -370,11 +387,15 @@ int main(int argc, char ** argv) {
             ref = argv[++i];
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             mode = argv[++i];
+        } else if ((strcmp(argv[i], "-dev") == 0 || strcmp(argv[i], "--device") == 0) && i + 1 < argc) {
+            dev_name = argv[++i];
+        } else {
+            bad_arg = true;
         }
     }
-    if (model_in == nullptr || (out == nullptr) == (ref == nullptr) ||
+    if (bad_arg || model_in == nullptr || (out == nullptr) == (ref == nullptr) ||
             (ref != nullptr && mode != "keep" && mode != "fill" && mode != "kv" && mode != "upload" && mode != "state")) {
-        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)\n", argv[0]);
+        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> [-dev <name>] (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)\n", argv[0]);
         return 1;
     }
 
@@ -384,6 +405,12 @@ int main(int argc, char ** argv) {
     set_env("LLAMA_MOE_CACHE_POLICY", "lru");
     set_env("LLAMA_KV_ELASTIC", "1");
     set_env("LLAMA_KV_ELASTIC_STEP", "256");
+    // Metal on an AMD GPU (the 5500M of a MacBook) computes wrong, run-to-run different values with concurrent
+    // dispatch, upstream as well: NaN logprobs of this model, other tokens in every run. the modes compare with the
+    // reference bit for bit, so the dispatch goes in order (no effect on other backends)
+    if (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nullptr) {
+        set_env("GGML_METAL_CONCURRENCY_DISABLE", "1");
+    }
     if (out != nullptr || mode == "state") {
         set_env("LLAMA_MOE_CACHE_KEEP", "0");
         set_env("LLAMA_MOE_CACHE_COPY", "0");
@@ -408,6 +435,15 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     ggml_backend_dev_t gpu = nullptr;
+    if (dev_name != nullptr) {
+        gpu = ggml_backend_dev_by_name(dev_name);
+        const auto type = gpu != nullptr ? ggml_backend_dev_type(gpu) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            fprintf(stderr, "%s: %s is not a GPU device\n", argv[0], dev_name);
+            llama_backend_free();
+            return 1;
+        }
+    }
     for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; ++i) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
         const auto type = ggml_backend_dev_type(d);
@@ -415,6 +451,7 @@ int main(int argc, char ** argv) {
             gpu = d;
         }
     }
+    printf("%s: device %s\n", argv[0], ggml_backend_dev_name(gpu != nullptr ? gpu : ggml_backend_dev_get(0)));
 
     const std::string base     = out != nullptr ? out : ref;
     const std::string model    = base + ".gguf";
@@ -456,6 +493,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // a run of NaN compares equal with a reference of NaN, so neither may have one
+    const size_t n_nonfinite = count_nonfinite(recs);
+    if (n_nonfinite > 0) {
+        fprintf(stderr, "%zu of %zu logprobs of this run are not numbers\n", n_nonfinite, 8*recs.size());
+        n_fail++;
+    }
+
     if (out != nullptr) {
         FILE * f = fopen(recs_out.c_str(), "wb");
         CHECK(f != nullptr);
@@ -491,23 +535,35 @@ int main(int argc, char ** argv) {
     // all slots through the prompts, so the 1-token MoE of the last layer reads them there (4.8e-7)
     const double tol = mode == "keep" || mode == "upload" ? 0.0 : mode == "fill" ? 1e-4 : 1e-5;
 
+    const size_t want_nonfinite = count_nonfinite(want);
+    if (want_nonfinite > 0) {
+        fprintf(stderr, "%zu of %zu logprobs of the reference are not numbers\n", want_nonfinite, 8*want.size());
+        n_fail++;
+    }
+
+    // the logprobs of a token come from the same context as long as the tokens before it are the same: the first
+    // token that differs is compared too, the ones after it are not
     CHECK(recs.size() == want.size());
     double max_diff = 0.0;
+    size_t n_cmp    = 0;
     for (size_t i = 0; i < std::min(recs.size(), want.size()); ++i) {
-        if (recs[i].token != want[i].token) {
-            fprintf(stderr, "token %zu: %d against %d of the reference\n", i, recs[i].token, want[i].token);
-            n_fail++;
-            break;
-        }
         for (int a = 0; a < 8; ++a) {
             for (int b = 0; b < 8; ++b) {
                 if (recs[i].id[a] == want[i].id[b]) {
-                    max_diff = std::max(max_diff, (double) std::fabs(recs[i].logprob[a] - want[i].logprob[b]));
+                    const double d = std::fabs((double) recs[i].logprob[a] - (double) want[i].logprob[b]);
+                    max_diff = std::isfinite(d) ? std::max(max_diff, d) : INFINITY;
                 }
             }
         }
+        n_cmp = i + 1;
+        if (recs[i].token != want[i].token) {
+            fprintf(stderr, "token %zu: %d against %d of the reference, the tokens after it not compared\n",
+                    i, recs[i].token, want[i].token);
+            n_fail++;
+            break;
+        }
     }
-    if (max_diff > tol) {
+    if (!(max_diff <= tol)) {
         fprintf(stderr, "logprobs %.3g apart, more than %.3g\n", max_diff, tol);
         n_fail++;
     }
@@ -529,7 +585,8 @@ int main(int argc, char ** argv) {
         CHECK(log_has("kv_elastic: 512 -> 768 cells"));
     }
 
-    printf("%s %s: %zu tokens, logprobs %.3g apart%s\n", argv[0], mode.c_str(), recs.size(), max_diff, n_fail == 0 ? "" : ", FAILED");
+    printf("%s %s: %zu tokens, logprobs of %zu compared, %.3g apart%s\n", argv[0], mode.c_str(), recs.size(), n_cmp, max_diff,
+           n_fail == 0 ? "" : ", FAILED");
     llama_backend_free();
     return n_fail == 0 ? 0 : 1;
 }

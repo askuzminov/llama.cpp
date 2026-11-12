@@ -111,8 +111,15 @@ def build_folder(build):
     build = Path(build)
     return build / "bin" / "Release" if (build / "bin" / "Release").is_dir() else build / "bin"
 
+# builds of other refs in their own worktrees (00-build.bat stable | upstream): the git ref (None: UPSTREAMREF, default
+# master), the variables of the source and build folders
+REF_BUILDS = {"stable": ("stable", "STABLESRC", "STABLEBUILD"), "upstream": (None, "UPSTREAMSRC", "UPSTREAMBUILD")}
+
+def ref_folder(kind):
+    return build_folder(Path(env(REF_BUILDS[kind][2], str(ROOT / f"build-{kind}"))))
+
 def stable_folder():
-    return build_folder(Path(env("STABLEBUILD", str(ROOT / "build-stable"))))
+    return ref_folder("stable")
 
 def model_path(name="MODEL"):
     path = Path(env(name))
@@ -749,22 +756,30 @@ def baseline_perplexity(commit):
         source = source.replace(old, new)
     return source
 
-def cmd_build_stable():
-    """Build the tag stable in its own worktree, with the smaller perplexity buffers."""
-    run = Run("build-stable")
-    source = Path(env("STABLESRC", str(ROOT / "build-stable-src"))).resolve()
-    build = Path(env("STABLEBUILD", str(ROOT / "build-stable"))).resolve()
-    commit = git("rev-parse", "stable^{commit}").decode().strip()
+def build_ref(kind):
+    """Build a ref (REF_BUILDS) in its own worktree, with the smaller perplexity buffers."""
+    ref, src_var, build_var = REF_BUILDS[kind]
+    ref = ref or env("UPSTREAMREF", "master")
+    run = Run(f"build-{kind}")
+    source = Path(env(src_var, str(ROOT / f"build-{kind}-src"))).resolve()
+    build = Path(env(build_var, str(ROOT / f"build-{kind}"))).resolve()
+    commit = git("rev-parse", f"{ref}^{{commit}}").decode().strip()
     ppl = Path("tools/perplexity/perplexity.cpp")
-    marker = source / ".qsa-stable-source"
+    marker = source / f".qsa-{kind}-source"
     if source.exists():
         if not marker.is_file():
-            raise Fail(f"{source} exists and is not a worktree of this script, set STABLESRC to another folder")
+            raise Fail(f"{source} exists and is not a worktree of this script, set {src_var} to another folder")
         subprocess.run(["git", "-C", str(source), "checkout", "--force", "--detach", commit], check=True)
     else:
         subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(source), commit], check=True)
     marker.write_text(commit + "\n")
-    (source / ppl).write_bytes(baseline_perplexity(commit))
+    try:
+        (source / ppl).write_bytes(baseline_perplexity(commit))
+    except Fail as e:
+        if kind == "stable":
+            raise
+        # upstream moves on: its perplexity keeps its buffers, which the context of 07-kld (QA_KLD_CTX) allows
+        run.add(f"{e}: the perplexity of {ref} as it is")
     log = run.dir / "build.log"
     if os.name == "nt":
         scripts = source / "scripts" / "win-qsa"
@@ -782,11 +797,20 @@ def cmd_build_stable():
                 log.with_name("build2.log"), os.environ.copy(), model=False)
     folder = build_folder(build)
     patch = hashlib.sha256((source / ppl).read_bytes()).hexdigest()[:8]
-    sid = f"stable-{commit[:12]}-{patch}"
+    sid = f"{kind}-{commit[:12]}-{patch}"
     (folder / BUILD_RECORD).write_text(json.dumps({"id": sid, "head": commit[:12], "time": now()}) + "\n",
                                        encoding="utf-8")
-    run.add(f"stable {commit[:12]} built in {folder}, id {sid}. arms with @stable run it")
+    run.add(f"{kind} {ref} {commit[:12]} built in {folder}, id {sid}" +
+            (": 07-kld.bat compares this build with it" if kind == "upstream" else ""))
     return run.finish()
+
+
+def cmd_build_stable():
+    return build_ref("stable")
+
+
+def cmd_build_upstream():
+    return build_ref("upstream")
 
 
 # ---------------------------------------------------------------- runs
@@ -2930,10 +2954,132 @@ def cmd_mm():
     return run.finish()
 
 
+# ---------------------------------------------------------------- kld: this build against upstream
+
+# the lines of llama-perplexity --kl-divergence (tools/perplexity/perplexity.cpp)
+# (a mean KLD of equal logits rounds to -0.000001). PPL(base) there comes from the log-probs of the base stored in 16
+# bits with a floor, and a token below it counts as more likely than it was: the ratio takes the PPL that upstream
+# itself printed when it wrote the base (Final estimate)
+KLD_STATS = {"ppl": r"Mean PPL\(Q\)\s*:\s*(-?[0-9.]+)", "kld_mean": r"Mean\s+KLD:\s*(-?[0-9.]+)",
+             "kld_median": r"Median\s+KLD:\s*(-?[0-9.]+)", "kld_p99": r"99\.0%\s+KLD:\s*(-?[0-9.]+)",
+             "kld_max": r"Maximum KLD:\s*(-?[0-9.]+)", "top1": r"Same top p:\s*(-?[0-9.]+)"}
+KLD_BASE_PPL = r"Final estimate: PPL = ([0-9.]+)"
+
+
+def kld_read(log):
+    text = read_log(log)
+    out = {}
+    for key, pattern in KLD_STATS.items():
+        m = re.search(pattern, text)
+        if m is None:
+            raise Fail(f"no {key} in {log}: {last_error(text)}")
+        out[key] = float(m[1])
+    return out
+
+
+def kld_arms():
+    """QA_KARMS: "name [@upstream] [VAR=value ...];...", @upstream runs the upstream build"""
+    out = []
+    for part in env("QA_KARMS", "fork;upstream @upstream").split(";"):
+        tokens = split_args(part)
+        if not tokens:
+            continue
+        up = "@upstream" in tokens[1:]
+        out.append((tokens[0], up, env_pairs(" ".join(t for t in tokens[1:] if t != "@upstream"), "QA_KARMS")))
+    return out
+
+
+def kld_before(run, arm, bid):
+    """the last result of this arm in history-qa.csv from another build: the state before a merge"""
+    path = run.dir.parent / "history-qa.csv"
+    last = {}
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row["test"] == "kld" and row["point"] == arm and row["build"] != bid and row["host"] == platform.node():
+                    if last.get("build") != row["build"]:
+                        last = {"build": row["build"], "head": row["head"]}
+                    last[row["metric"]] = float(row["value"])
+    except (OSError, ValueError, KeyError):
+        return {}
+    return last
+
+
+def cmd_kld():
+    """The logits of this build against those of upstream (00-build.bat upstream, UPSTREAMREF, default master) on the
+    same model, text and arguments: llama-perplexity of upstream writes the base, each arm of QA_KARMS compares with it.
+    The default arms: this build as it runs, and upstream again (the noise of the base: 0 when upstream repeats itself)"""
+    run = Run("kld")
+    model = model_path()
+    text = Path(env("PPLFILE"))
+    if not text.is_file():
+        raise Fail(f"no text {text}: run get-wikitext.bat or set PPLFILE")
+    up_folder = ref_folder("upstream")
+    up_exe = up_folder / ("llama-perplexity" + EXE)
+    if not up_exe.is_file():
+        raise Skip(f"no {up_exe}: build upstream with 00-build.bat upstream")
+    ctx = env_int("QA_KLD_CTX", 8192)
+    chunks = env_int("QA_KLD_CHUNKS", 2)
+    ub = env("QA_KLD_UB", "8192" if env("BACKEND") == "cuda" else "4096")
+    args = ["-f", str(text), "-c", str(ctx), "-b", str(ctx), "-ub", ub, "--chunks", str(chunks),
+            *split_args(env("QA_KLD_ARGS"))]
+    margs = model_args(model)
+    base_env = os.environ.copy()
+    base_env.update(env_pairs(env("QA_KLD_BASE_ENV"), "QA_KLD_BASE_ENV"))
+    ident_base = {"v": VERSION, "kind": "kld-base", "build": build_id(up_folder), "model": model_identity(model),
+                  "text": digest(text), "args": [str(a) for a in margs + args], "env": env_identity(base_env)}
+    folder = CACHE / "qa"
+    folder.mkdir(parents=True, exist_ok=True)
+    base = folder / (identity_key(ident_base)[:24] + ".kld")
+    head_up, _ = build_head(up_folder)
+    run.add(f"base: upstream {head_up or build_id(up_folder)}, {chunks} chunks of {ctx} tokens of {text.name} "
+            f"(the second half of each is compared), {' '.join(map(str, margs[2:]))}")
+    base_ppl = base.with_suffix(".ppl")
+    if forced("kld base") or not base.is_file() or not base_ppl.is_file():
+        part = base.with_suffix(".part")
+        print(f"kld base: running upstream, {base.name}", flush=True)
+        execute([up_exe, *margs, *args, "--kl-divergence-base", part], run.dir / "base.log", base_env)
+        m = re.search(KLD_BASE_PPL, read_log(run.dir / "base.log"))
+        if m is None:
+            raise Fail(f"no PPL in {run.dir / 'base.log'}")
+        part.replace(base)
+        base_ppl.write_text(m[1] + "\n", encoding="utf-8")
+    ppl_up = float(base_ppl.read_text(encoding="utf-8"))
+    run.add(f"upstream PPL {ppl_up:.4f}")
+    rows = []
+    for name, up, arm_env in kld_arms():
+        exe = up_exe if up else binary("llama-perplexity")
+        bfolder = up_folder if up else Path(env("BIN"))
+        run_env = os.environ.copy()
+        run_env.update(arm_env)
+        identity = {"v": VERSION, "kind": "kld", "build": build_id(bfolder), "base": ident_base,
+                    "env": env_identity(run_env)}
+
+        def measure(log, exe=exe, run_env=run_env):
+            execute([exe, *margs, *args, "--kl-divergence-base", base, "--kl-divergence"], log, run_env)
+            return dict(kld_read(log), ppl_up=ppl_up)
+
+        result, kept = run.measure(f"kld {name}", identity, measure)
+        result["ppl_ratio"] = result["ppl"] / result["ppl_up"]
+        run.record("kld", name, result, kept, bfolder)
+        before = kld_before(run, name, build_id(bfolder))
+        prev = (f"{before['kld_mean']:.6f} {before['ppl_ratio']:.4f} ({before['head'] or before['build']})"
+                if "kld_mean" in before and "ppl_ratio" in before else "-")
+        rows.append([name + (" (k)" if kept else ""), f"{result['ppl']:.4f}", f"{result['ppl_ratio']:.4f}",
+                     f"{result['kld_mean']:.6f}", f"{result['kld_median']:.6f}", f"{result['kld_p99']:.5f}",
+                     f"{result['kld_max']:.3f}", f"{result['top1']:.2f}", prev])
+    run.add("", *table(["arm", "PPL", "PPL/upstream", "KLD mean", "KLD median", "KLD p99", "KLD max", "top-1 %",
+                        "before: KLD mean, PPL/upstream (build)"], rows),
+            "", "KLD to the logits of upstream on the same model and text; PPL/upstream above 1 is worse than upstream. "
+                "before: the last result of the arm from another build on this machine (history-qa.csv)")
+    return run.finish()
+
+
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"check": cmd_check, "long": cmd_long, "profile": cmd_profile, "micro": cmd_micro, "mm": cmd_mm, "decode": cmd_decode,
-            "build-begin": cmd_build_begin, "build-end": cmd_build_end, "build-stable": cmd_build_stable}
+            "kld": cmd_kld, "build-begin": cmd_build_begin, "build-end": cmd_build_end, "build-stable": cmd_build_stable,
+            "build-upstream": cmd_build_upstream}
 
 
 def main():

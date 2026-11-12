@@ -1,0 +1,51 @@
+#version 450
+
+// fork: the f32 -> f16 copy of the activations that the f16reg matmuls read (mul_mm_f16reg.comp, mul_mmid_f16reg.comp),
+// with saturation: a finite |x| above 65504 becomes +-65504 instead of inf, which would make the sums of its column inf
+// or NaN. inf and NaN stay, as the f32 path keeps them. a value in range converts as in copy.comp / contig_copy.comp,
+// bit for bit. CONTIG: contig_copy.comp (4 values per invocation), else copy.comp (strided)
+
+#include "types.glsl"
+#include "generic_unary_head.glsl"
+
+#extension GL_EXT_control_flow_attributes : require
+
+float16_t f16_sat(const float x) {
+    return float16_t(isinf(x) || isnan(x) ? x : clamp(x, -65504.0, 65504.0));
+}
+
+#ifdef CONTIG
+
+const uint num_threads = 128;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint idx = get_idx();
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+    const uint num_iter = 4;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx < p.ne) {
+            data_d[get_doffset() + idx] = f16_sat(float(data_a[get_aoffset() + idx]));
+        }
+        idx += num_threads;
+    }
+}
+
+#else
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = get_idx();
+
+    if (idx >= p.ne) {
+        return;
+    }
+
+    data_d[get_doffset() + dst_idx(idx)] = f16_sat(float(data_a[get_aoffset() + src0_idx(idx)]));
+}
+
+#endif

@@ -221,8 +221,9 @@ void load_a_tile(const uint m, const uint expert, const uint ir, const uint k0) 
     const uint grow = ir * BMW + row;
 #endif
 
-    // first element of the row in blocks
-    const uint row_blk = (expert * p.batch_stride_a + grow * p.stride_a) / A_QK;
+    // first element of the row in blocks; the strides go to blocks first (ne[0] % A_QK == 0, the host checks), as
+    // upstream does: in elements the product wraps 32 bits at 2^32 elements (a q4_K tensor of 2.4 GB)
+    const uint row_blk = expert * (p.batch_stride_a / A_QK) + grow * (p.stride_a / A_QK);
 
 #if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
     const uint j  = (k0 % 256) / 64;       // the 64-column chunk of the super-block
@@ -337,6 +338,13 @@ void write_a_tile(const uint m, const uint buf) {
 #endif
 }
 
+// f32 -> f16 of the activations with saturation: a finite |x| above 65504 becomes +-65504 instead of inf (which makes
+// the sums of its column inf or NaN), inf and NaN stay as the f32 path keeps them; in range bit for bit f16vec2(v)
+f16vec2 f16sat2(const vec2 v) {
+    const bvec2 keep = bvec2(isinf(v.x) || isnan(v.x), isinf(v.y) || isnan(v.y));
+    return f16vec2(mix(clamp(v, vec2(-65504.0), vec2(65504.0)), v, keep));
+}
+
 // ---- B tile: BN tokens x 64 columns of f32 activations as f16, four invocations per token, 16 columns each
 
 const uint B_ITERS = (BN * 4 + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -381,8 +389,8 @@ void write_b_tile(const uint buf) {
                 if (B_F16 != 0) {
                     sh_b[o + j] = rbh[it][j];
                 } else {
-                    sh_b[o + j] = uvec4(packFloat2x16(f16vec2(rb[it][2 * j].xy)), packFloat2x16(f16vec2(rb[it][2 * j].zw)),
-                                        packFloat2x16(f16vec2(rb[it][2 * j + 1].xy)), packFloat2x16(f16vec2(rb[it][2 * j + 1].zw)));
+                    sh_b[o + j] = uvec4(packFloat2x16(f16sat2(rb[it][2 * j].xy)), packFloat2x16(f16sat2(rb[it][2 * j].zw)),
+                                        packFloat2x16(f16sat2(rb[it][2 * j + 1].xy)), packFloat2x16(f16sat2(rb[it][2 * j + 1].zw)));
                 }
             }
         }

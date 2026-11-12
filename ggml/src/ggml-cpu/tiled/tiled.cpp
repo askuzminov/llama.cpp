@@ -1216,6 +1216,12 @@ bool ggml_compute_forward_mul_mat_tiled(
     if (!ggml_tiled_supported(dst->src[0], dst->src[1])) {
         return false;
     }
+    // fork: the src1 check of ggml_tiled_supported sits after its type switch and never runs. the fork's CPU takes an
+    // F16 src1 with a quantized vec_dot_type (ggml_compute_forward_mul_mat packs it through F32), and the driver here
+    // converts F32 only (GGML_ASSERT): that src1 takes the stock path. MUL_MAT_ID converts src1 before its tiled call
+    if (dst->src[1]->type != GGML_TYPE_F32 && dst->src[1]->type != GGML_TYPE_Q8_K) {
+        return false;
+    }
     if (!ggml_tiled_min_batch(dst->src[1]->ne[1])) {
         return false;
     }

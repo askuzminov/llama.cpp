@@ -115,6 +115,17 @@ bool ggml_vk_set_tensor_mapped(vk_context & cpy_ctx, const ggml_tensor * tensor,
 // does (GGML_VK_MMID_F16REG_ROWS2): unset - q5_1 only (q5_1 down 445.4 -> 398.2, the q8_0 down lost, 52.6 -> 63.0:
 // 144 VGPR against 92 for a cheap decode), 0 - none, 1 - every type. without a pipeline (the shared memory of the
 // device) the 64-token tile and the plain one
+vk_pipeline ggml_vk_fork_cpy_f16_sat(ggml_backend_vk_context * ctx, const ggml_tensor * src, const ggml_tensor * dst) {
+    const vk_pipeline p = ggml_vk_get_cpy_pipeline(ctx, src, dst, GGML_TYPE_F16);
+    if (p == ctx->device->pipeline_contig_cpy_f32_f16) {
+        return ctx->device->pipeline_contig_cpy_f32_f16_sat_fork;
+    }
+    if (p == ctx->device->pipeline_cpy_f32_f16) {
+        return ctx->device->pipeline_cpy_f32_f16_sat_fork;
+    }
+    return p;
+}
+
 vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * glu_up,
                                      bool y_in_place, uint64_t n_per_expert, bool * b16, bool d16) {
     if (b16 != nullptr) {
@@ -296,7 +307,7 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
         return true;
     }
     if (to_f16) {
-        vk_pipeline cpy = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, GGML_TYPE_F16);
+        vk_pipeline cpy = ggml_vk_fork_cpy_f16_sat(ctx, src1, nullptr);
         if (!cpy) {
             return false;
         }

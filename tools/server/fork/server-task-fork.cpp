@@ -7,11 +7,15 @@
 #include "llama.h"
 #include "server-common.h"
 
+#include "hash/xxhash/xxhash.h"
+
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 #if defined(_WIN32)
 #   ifndef NOMINMAX
@@ -48,9 +52,10 @@ struct spill_header {
     uint64_t n_drft;
     uint64_t n_ckpt;       // context checkpoints, i.e. spill_ckpt records in the index
     uint64_t n_ckpt_bytes; // their blobs, padding included
+    uint64_t sum;          // XXH3-64 of the prompt, main and drft sections, without the padding (spill_sum)
 };
 
-static_assert(sizeof(spill_header) == 72, "unexpected spill_header layout");
+static_assert(sizeof(spill_header) == 80, "unexpected spill_header layout");
 
 // one context checkpoint in the index; its blobs follow in the same order, each padded
 struct spill_ckpt {
@@ -62,12 +67,59 @@ struct spill_ckpt {
     uint64_t n_tgt;
     uint64_t n_dft;
     uint64_t n_spec;
+    uint64_t sum; // XXH3-64 of the fields above and of the tgt, dft and spec blobs (spill_ckpt_sum)
 };
 
-static_assert(sizeof(spill_ckpt) == 48, "unexpected spill_ckpt layout");
+static_assert(sizeof(spill_ckpt) == 56, "unexpected spill_ckpt layout");
 
 constexpr char     SPILL_MAGIC[8] = { 'L', 'C', 'P', 'C', 'A', 'C', 'H', 'E' };
-constexpr uint32_t SPILL_VERSION  = 4;
+// 5 (11.11): the sums of the sections, a damaged file (the disk, a copy, the network of a pool) is not loaded as a state
+constexpr uint32_t SPILL_VERSION  = 5;
+
+// the sums are per section, so that the export of a pool, which sends the header with a part of the checkpoints, keeps
+// the sums of the file. XXH3 over the bytes a state holds: 12.5 GB/s on one core of the i9-9980HK (the vendored build is
+// SSE2), the disk gives 2-7 GB/s. a write sums first (it runs in the background), a read sums each piece while it reads
+// the next one (spill_file::read_summed)
+struct spill_sum {
+    XXH3_state_t * state = XXH3_createState();
+
+    spill_sum() {
+        GGML_ASSERT(state != nullptr);
+        XXH3_64bits_reset(state);
+    }
+    ~spill_sum() {
+        XXH3_freeState(state);
+    }
+    spill_sum(const spill_sum &) = delete;
+    spill_sum & operator=(const spill_sum &) = delete;
+
+    spill_sum & add(const void * data, size_t n) {
+        if (n > 0) {
+            XXH3_64bits_update(state, data, n);
+        }
+        return *this;
+    }
+    uint64_t get() const {
+        return XXH3_64bits_digest(state);
+    }
+};
+
+uint64_t spill_head_sum(const void * prompt, size_t n_prompt, const void * main, size_t n_main, const void * drft, size_t n_drft) {
+    return spill_sum().add(prompt, n_prompt).add(main, n_main).add(drft, n_drft).get();
+}
+
+uint64_t spill_ckpt_sum(const spill_ckpt & e, const void * tgt, const void * dft, const void * spec) {
+    return spill_sum().add(&e, offsetof(spill_ckpt, sum)).add(tgt, e.n_tgt).add(dft, e.n_dft).add(spec, e.n_spec).get();
+}
+
+spill_ckpt spill_ckpt_of(const common_prompt_checkpoint & cp) {
+    spill_ckpt e = {
+        cp.n_tokens, cp.id_task, cp.pos_min, cp.pos_max, cp.base_pos,
+        cp.data_tgt.size(), cp.data_dft.size(), cp.data_spec.size(), 0,
+    };
+    e.sum = spill_ckpt_sum(e, cp.data_tgt.data(), cp.data_dft.data(), cp.data_spec.data());
+    return e;
+}
 
 // Spill files bypass the OS file cache. A spilled state is written once and read back at most
 // once, so caching it buys nothing and costs memory - on a host sized for a large model those
@@ -484,6 +536,29 @@ public:
         return true;
     }
 
+    // read_at with the sum of the bytes: the sum of a piece runs on another thread while the next piece is read, so the
+    // check costs the sum of the last piece, not a second pass after the read
+    bool read_summed(uint64_t offset, void * dst, size_t n, spill_sum & sum) {
+        constexpr size_t PIECE = 4*SPILL_REQUEST; // aligned: a whole piece into an aligned buffer goes straight there
+        uint8_t * p = (uint8_t *) dst;
+        std::thread th;
+        bool ok = true;
+        for (size_t done = 0; done < n && ok; done += PIECE) {
+            const size_t len = std::min(PIECE, n - done);
+            ok = read_at(offset + done, p + done, len);
+            if (th.joinable()) {
+                th.join();
+            }
+            if (ok) {
+                th = std::thread([&sum, q = p + done, len] { sum.add(q, len); });
+            }
+        }
+        if (th.joinable()) {
+            th.join();
+        }
+        return ok;
+    }
+
 private:
     bool check_cancel() {
         if (cancel && *cancel && (*cancel)()) {
@@ -839,9 +914,12 @@ size_t server_prompt_cache::restore_spilled() {
             continue;
         }
 
-        // the header disagrees with the name, or the file is truncated - the state cannot be restored
+        // the header disagrees with the name, or the file is truncated - the state cannot be restored. a uid of the
+        // header that is not the one of the name (a copied or edited directory) would make the hit of this entry
+        // open, and drop, the file of that other uid: spill_entries binds the two the same way
         const spill_layout lay = spill_header_sane(h) ? spill_layout_of(h) : spill_layout{};
-        if (h.signature != signature || lay.size == 0 || lay.size != f.size()) {
+        if (h.signature != signature || lay.size == 0 || lay.size != f.size() ||
+                spill_name_of(owner, signature, h.uid) != spill_fs_utf8(path.filename())) {
             SRV_WRN(" - removing broken prompt-cache spill file '%s'\n", spill_fs_utf8(path).c_str());
             f.close();
             std::filesystem::remove(path, ec);
@@ -994,6 +1072,7 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     h.n_prompt  = prompt.size()/sizeof(llama_token);
     h.n_main    = st.data.main.size();
     h.n_drft    = st.data.drft.size();
+    h.sum       = spill_head_sum(prompt.data(), prompt.size(), st.data.main.data(), h.n_main, st.data.drft.data(), h.n_drft);
 
     // the context checkpoints go out with the state: after a restart they are what lets a prompt
     // that matches only a prefix roll back, instead of being processed from the start again
@@ -1001,10 +1080,7 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     index.reserve(st.prompt.checkpoints.size());
 
     for (const auto & cp : st.prompt.checkpoints) {
-        index.push_back({
-            cp.n_tokens, cp.id_task, cp.pos_min, cp.pos_max, cp.base_pos,
-            cp.data_tgt.size(), cp.data_dft.size(), cp.data_spec.size(),
-        });
+        index.push_back(spill_ckpt_of(cp));
 
         h.n_ckpt_bytes += spill_align_up(cp.data_tgt.size())
                         + spill_align_up(cp.data_dft.size())
@@ -1144,7 +1220,9 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
     std::vector<spill_ckpt> findex;
     if (on_disk) {
         std::ifstream f(spill_path(st.uid), std::ios::binary);
-        if (!f.read((char *) &fh, sizeof(fh)) || !spill_header_sane(fh)) {
+        // the checks of unspill_state: a file of another layout or another state is not this state
+        if (!f.read((char *) &fh, sizeof(fh)) || memcmp(fh.magic, SPILL_MAGIC, sizeof(fh.magic)) != 0 ||
+                fh.version != SPILL_VERSION || !spill_header_sane(fh) || fh.uid != st.uid || fh.signature != signature) {
             error = "cannot read the state file";
             return false;
         }
@@ -1232,7 +1310,9 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
         h.n_prompt  = prompt.size()/sizeof(llama_token);
         h.n_main    = st.data.main.size();
         h.n_drft    = st.data.drft.size();
+        h.sum       = spill_head_sum(prompt.data(), prompt.size(), st.data.main.data(), h.n_main, st.data.drft.data(), h.n_drft);
     }
+    // the records of the file keep their sums, those of RAM get them here
     std::vector<spill_ckpt> index;
     if (ckpt_file) {
         index.assign(findex.begin() + k_first, findex.begin() + k_end);
@@ -1240,10 +1320,7 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
         size_t k = 0;
         for (const auto & cp : st.prompt.checkpoints) {
             if (k >= k_first && k < k_end) {
-                index.push_back({
-                    cp.n_tokens, cp.id_task, cp.pos_min, cp.pos_max, cp.base_pos,
-                    cp.data_tgt.size(), cp.data_dft.size(), cp.data_spec.size(),
-                });
+                index.push_back(spill_ckpt_of(cp));
             }
             ++k;
         }
@@ -1311,6 +1388,12 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
             std::filesystem::remove(link, ec);
             ec.clear();
             std::filesystem::create_hard_link(spill_path(st.uid), link, ec);
+            // a link shares the time of the state it links, which can be older than the idle time of the transfer
+            // cleaner (server_pool_xfer_clean_fork): until the plan is registered, it would remove the new link
+            if (!ec) {
+                std::error_code ec_time;
+                std::filesystem::last_write_time(link, std::filesystem::file_time_type::clock::now(), ec_time);
+            }
         }
         plan.file      = link.empty() || ec ? spill_path(st.uid) : link;
         plan.file_link = !link.empty() && !ec;
@@ -1362,7 +1445,8 @@ struct server_pool_inbox_fork::impl {
         }
         lay = spill_layout_of(h);
         if (max_bytes > 0 && lay.size > max_bytes) {
-            error = string_format("the state (%.0f MiB) is larger than the prompt cache of this node (%.0f MiB)",
+            error = string_format("the state (%.0f MiB) is larger than this node takes (%.0f MiB: the RAM limit of its "
+                                  "prompt cache, or without one its host RAM above the reserve)",
                                   lay.size / (1024.0 * 1024.0), max_bytes / (1024.0 * 1024.0));
             return false;
         }
@@ -1480,6 +1564,20 @@ bool server_prompt_cache::pool_import(server_pool_inbox_fork & inbox, uint64_t s
     if (!in.has_index || in.received != in.lay.size) {
         error = "the state came short";
         return false;
+    }
+    if (spill_head_sum(in.prompt.data(), in.prompt.size(), in.main.data(), in.main.size(), in.drft.data(), in.drft.size()) != in.h.sum) {
+        error = "the state came damaged (its sum differs)";
+        return false;
+    }
+    {
+        size_t k = 0;
+        for (const auto & cp : in.ckpts) {
+            if (spill_ckpt_sum(in.index[k], cp.data_tgt.data(), cp.data_dft.data(), cp.data_spec.data()) != in.index[k].sum) {
+                error = "a checkpoint of the state came damaged (its sum differs)";
+                return false;
+            }
+            ++k;
+        }
     }
 
     llama_tokens packed(in.h.n_prompt);
@@ -1629,15 +1727,24 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
         return drop();
     }
 
-    const auto rd = [&](server_state_buf & v, uint64_t off, uint64_t n) -> bool {
+    // a resident state keeps its blobs, the file only gives the checkpoints then
+    const auto rd = [&](server_state_buf & v, uint64_t off, uint64_t n, spill_sum & sum) -> bool {
         v.resize(n);
-        return n == 0 || f.read_at(off, v.data(), n);
+        return n == 0 || f.read_summed(off, v.data(), n, sum);
     };
     server_prompt_data loaded;
     const bool resident = st.data.size() > 0;
-    if (!resident && (!rd(loaded.main, lay.off_main, h.n_main) || !rd(loaded.drft, lay.off_drft, h.n_drft))) {
-        SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
-        return drop();
+    if (!resident) {
+        spill_sum sum;
+        sum.add(stored.data(), stored.size());
+        if (!rd(loaded.main, lay.off_main, h.n_main, sum) || !rd(loaded.drft, lay.off_drft, h.n_drft, sum)) {
+            SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+            return drop();
+        }
+        if (sum.get() != h.sum) {
+            SRV_ERR(" - damaged spilled prompt-cache state '%s': the sum of its blobs differs\n", spill_fs_utf8(path).c_str());
+            return drop();
+        }
     }
 
     if (h.n_ckpt > 0) {
@@ -1670,9 +1777,9 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
 
         uint64_t off = lay.off_ckpt;
 
-        const auto rd_ckpt = [&](std::vector<uint8_t> & v, uint64_t n) -> bool {
+        const auto rd_ckpt = [&](std::vector<uint8_t> & v, uint64_t n, spill_sum & sum) -> bool {
             v.resize(n);
-            if (n > 0 && !f.read_at(off, v.data(), n)) {
+            if (n > 0 && !f.read_summed(off, v.data(), n, sum)) {
                 return false;
             }
             off += spill_align_up(n);
@@ -1687,8 +1794,15 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
             cp.pos_max  = e.pos_max;
             cp.base_pos = e.base_pos;
 
-            if (!rd_ckpt(cp.data_tgt, e.n_tgt) || !rd_ckpt(cp.data_dft, e.n_dft) || !rd_ckpt(cp.data_spec, e.n_spec)) {
+            // the sum of spill_ckpt_sum: the fields of the record, then its blobs
+            spill_sum sum;
+            sum.add(&e, offsetof(spill_ckpt, sum));
+            if (!rd_ckpt(cp.data_tgt, e.n_tgt, sum) || !rd_ckpt(cp.data_dft, e.n_dft, sum) || !rd_ckpt(cp.data_spec, e.n_spec, sum)) {
                 SRV_ERR(" - corrupt spilled prompt-cache state '%s'\n", spill_fs_utf8(path).c_str());
+                return drop();
+            }
+            if (sum.get() != e.sum) {
+                SRV_ERR(" - damaged spilled prompt-cache state '%s': the sum of a checkpoint differs\n", spill_fs_utf8(path).c_str());
                 return drop();
             }
 

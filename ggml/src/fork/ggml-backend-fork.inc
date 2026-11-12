@@ -28,7 +28,8 @@ static void ggml_backend_sched_prof_gpu_init(ggml_backend_sched_t sched) {
         return;
     }
     for (int b = 0; b < sched->n_backends; b++) {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(sched->prof_devs[b]);
+        // a backend without a device has no registry to ask
+        ggml_backend_reg_t reg = sched->prof_devs[b] ? ggml_backend_dev_backend_reg(sched->prof_devs[b]) : nullptr;
         if (reg == nullptr) {
             continue;
         }

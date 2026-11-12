@@ -1518,6 +1518,11 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
+        // fork: a slot takes a request only when it goes on with its conversation (LLAMA_SLOT_CONTINUE, see FORK.md),
+        // the selection by similarity runs for requests with an id_slot only
+        if (server_slot_continue_fork() && slot_prompt_similarity != 0.0f) {
+            SRV_INF("%s", "slots are selected by continuation (LLAMA_SLOT_CONTINUE=1): --slot-prompt-similarity applies to requests with an id_slot only\n");
+        }
 
         // resolve the host-RAM reserve that bounds context-checkpoint memory
         ckpt_limits.init_reserve(params_base);
@@ -2328,6 +2333,18 @@ private:
     // cache (--cache-ram), which counts them and gives way to them (ram_outside), and the host RAM reserve holds with
     // them, the cache dropping what it cannot free without a disk write: other slots run. no pause otherwise, else
     // the pauses trade a full KV cache for a full host RAM
+    // fork: --pool. the largest state an import allocates (server_pool_inbox_fork::write checks the header against it
+    // before it allocates anything): the RAM limit of the prompt cache; without one (--cache-ram -1, the default) the
+    // host RAM above the reserve, as a larger state cannot join the cache. 0 (any) only when the host RAM is unknown
+    uint64_t pool_import_max_fork() const {
+        const uint64_t limit = prompt_cache ? (uint64_t) prompt_cache->limit_size : 0;
+        if (limit > 0) {
+            return limit;
+        }
+        const size_t total = common_host_mem_total();
+        return total > ckpt_limits.reserve_bytes ? (uint64_t) (total - ckpt_limits.reserve_bytes) : 0;
+    }
+
     bool room_ram_fork(size_t bytes) {
         const size_t held = room_ram_held_fork();
         if (prompt_cache && prompt_cache->limit_size > 0) {
@@ -2366,13 +2383,26 @@ private:
             return false;
         }
 
-        slot.room_tgt.resize(n_tgt);
+        // a state that does not fit in host memory leaves the slot running, as create_checkpoint skips a checkpoint
+        // then: room_fork runs outside any try, a bad_alloc there would stop the server
+        try {
+            slot.room_tgt.resize(n_tgt);
+            if (slot.ctx_dft) {
+                slot.room_dft.resize(n_dft);
+            }
+        } catch (const std::bad_alloc &) {
+            slot.room_tgt = {};
+            slot.room_dft = {};
+            SLT_WRN(slot, "no host memory for a pause for room (%.1f MiB of state), the slot goes on\n",
+                    (n_tgt + n_dft) / (1024.0 * 1024.0));
+            return false;
+        }
         if (llama_state_seq_get_data_ext(slot.ctx_tgt, slot.room_tgt.data(), n_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt) {
             slot.room_tgt = {};
+            slot.room_dft = {};
             return false;
         }
         if (slot.ctx_dft) {
-            slot.room_dft.resize(n_dft);
             if (llama_state_seq_get_data_ext(slot.ctx_dft, slot.room_dft.data(), n_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
                 slot.room_tgt = {};
                 slot.room_dft = {};
@@ -3430,6 +3460,15 @@ private:
                     slot.prompt.checkpoints.size(), common_host_mem_available() >> 20);
             return;
         }
+        // fork: update_tgt leaves no state when it could not take one (a size it measured and the one written differ,
+        // where upstream aborts): the entry goes as after a bad_alloc, so that no later delta takes its pos_max for
+        // the end of its base
+        if (cur.data_tgt.empty()) {
+            const int64_t n_tokens_cp = cur.n_tokens;
+            slot.prompt.checkpoints.pop_back();
+            SLT_WRN(slot, "no state for a context checkpoint at n_tokens = %" PRId64 ", skipped\n", n_tokens_cp);
+            return;
+        }
 
         // Byte budget: the real size is known only now that the checkpoint has been built, and the
         // host is probed now too, so the budget follows the memory that is free at this moment.
@@ -3560,9 +3599,29 @@ private:
                 SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
                 return 0;
             }
+            // fork: a delta checkpoint (common_prompt_checkpoint::is_delta) loads only on top of its base. the
+            // appendix keeps upstream's layout, which has no base_pos: the delta state carries it in its header
+            cur.base_pos = llama_state_seq_delta_base_pos(cur.data_tgt.data(), cur.data_tgt.size());
             checkpoints.push_back(std::move(cur));
             if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
                 checkpoints.pop_front();
+                // fork: the deltas of that base go with it, none of them loads without it
+                while (!checkpoints.empty() && checkpoints.front().is_delta()) {
+                    checkpoints.pop_front();
+                }
+            }
+        }
+        // fork: a delta hangs off the checkpoint before it, its base_pos is that pos_max (server_ckpt_next_base_pos);
+        // a delta without it (first in the list, a damaged or edited file) cannot load, nor the deltas after it
+        for (auto it = checkpoints.begin(); it != checkpoints.end(); ) {
+            if (it->is_delta() && (it == checkpoints.begin() || std::prev(it)->pos_max != it->base_pos)) {
+                SLT_WRN(slot, "context checkpoint at n_tokens = %" PRId64 " in '%s' misses the state it was taken on - dropped with its chain\n",
+                        it->n_tokens, filepath.c_str());
+                do {
+                    it = checkpoints.erase(it);
+                } while (it != checkpoints.end() && it->is_delta());
+            } else {
+                ++it;
             }
         }
         // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
@@ -6256,6 +6315,7 @@ server_context_meta server_context::get_meta() const {
         /* pool_signature_fork     */ impl->prompt_cache ? impl->prompt_cache->signature_portable : 0,
         /* pool_spill_dir_fork     */ impl->prompt_cache ? impl->prompt_cache->spill_dir : std::string(),
         /* pool_cache_ram_fork     */ impl->prompt_cache ? (uint64_t) impl->prompt_cache->limit_size : 0,
+        /* pool_import_max_fork    */ impl->pool_import_max_fork(),
     };
 }
 
@@ -7937,7 +7997,7 @@ void server_routes::init_routes() {
             server_pool_xfer_clean_fork(meta->pool_spill_dir_fork, POOL_XFER_IDLE_S_FORK);
         }
         std::string error;
-        if (!server_pool_inbox_write_fork(req.get_param("id"), offset, req.body, meta->pool_cache_ram_fork, error)) {
+        if (!server_pool_inbox_write_fork(req.get_param("id"), offset, req.body, meta->pool_import_max_fork, error)) {
             res->error(format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
             return res;
         }

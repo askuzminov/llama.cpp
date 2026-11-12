@@ -12,6 +12,10 @@ void ggml_compute_forward_flash_attn_list(const struct ggml_compute_params * par
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+    // the rows are read as DK / DV contiguous elements, as ggml_compute_forward_flash_attn_ext asserts too
+    GGML_ASSERT(q->nb[0] == sizeof(float));
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type));
+    GGML_ASSERT(v->nb[0] == ggml_type_size(v->type));
 
     const int64_t DK      = q->ne[0];
     const int64_t DV      = v->ne[0];
@@ -117,6 +121,18 @@ void ggml_compute_forward_dsv4_hc_pre_f16_fork(const struct ggml_compute_params 
 
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    // the shapes ggml_compute_forward_dsv4_hc_pre_f32 checks
+    GGML_ASSERT(dst->ne[0] == n_embd);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+    if (gated) {
+        GGML_ASSERT(weights->ne[0] == n_embd);
+        GGML_ASSERT(weights->ne[1] == hc);
+        GGML_ASSERT(weights->ne[2] == n_tokens);
+    } else {
+        GGML_ASSERT(weights->ne[0] == hc);
+        GGML_ASSERT(weights->ne[1] == n_tokens);
+    }
 
     const int64_t nr  = n_embd * n_tokens;
     const int64_t dr  = (nr + params->nth - 1) / params->nth;

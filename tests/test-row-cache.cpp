@@ -161,9 +161,12 @@ int main() {
     // reads. In a real run llama_backend_init() does this, the test has to do it itself
     ggml_time_init();
 
-    // every shape is run twice: once with each block read on its own, once with adjacent blocks
-    // merged into one request. both paths must return exactly the same rows
+    // every shape is run on both gathers, the slices of the row list (LLAMA_ROW_CACHE_SLICES=1, the default) and the
+    // chunks of the block pool (=0), and on each twice: once with each block read on its own, once with adjacent blocks
+    // merged into one request. all paths must return exactly the same rows
+    for (const char * slices : { "1", "0" })
     for (const char * run : { "1", "64" }) {
+        set_env("LLAMA_ROW_CACHE_SLICES", slices);
         set_env("LLAMA_ROW_CACHE_RUN", run);
 
         // a block is one row long and the header is not aligned to it, so in every shape a row
@@ -184,6 +187,7 @@ int main() {
         // reader count picked by the cache itself
         test_type(GGML_TYPE_Q8_0, 4096, 400, 0);
     }
+    set_env("LLAMA_ROW_CACHE_SLICES", "1");
 
     // a table that does not fit in its file is refused at once: its last rows would read as zeros. the exact fit is fine
     {

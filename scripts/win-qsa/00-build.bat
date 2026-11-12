@@ -2,7 +2,9 @@
 setlocal
 call "%~dp0_config.bat"
 rem 00-build.bat stable: the tag stable in its own worktree, an old build to compare with by hand (README)
+rem 00-build.bat upstream: UPSTREAMREF (default master) in its own worktree, the base of 07-kld.bat
 if /i "%~1"=="stable" goto :stable
+if /i "%~1"=="upstream" goto :upstream
 
 rem msbuild does not build cuda on its own: it needs the integration files that the toolkit
 rem ships in extras\visual_studio_integration. the cuda installer copies them into a visual
@@ -164,4 +166,12 @@ if not defined PY (
     exit /b 1
 )
 %PY% "%~dp0_qa.py" build-stable
+exit /b %ERRORLEVEL%
+
+:upstream
+if not defined PY (
+    echo Python 3 is required: py -3 or python on PATH
+    exit /b 1
+)
+%PY% "%~dp0_qa.py" build-upstream
 exit /b %ERRORLEVEL%

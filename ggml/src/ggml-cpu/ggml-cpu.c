@@ -1378,7 +1378,8 @@ UseGgmlGemm1:;
                     const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
 
                     if (src1->type == GGML_TYPE_F16 && vec_dot_type != GGML_TYPE_F32) {
-                        // fork: through F32 in pieces of whole blocks
+                        // fork: through F32 in pieces of whole blocks (supports_op takes a block size dividing 1024)
+                        GGML_ASSERT(1024 % bs == 0);
                         float tmp[1024];
                         for (int64_t k = 0; k < ne10_block_size; k += 1024) {
                             const int64_t nk = MIN(1024, ne10_block_size - k);
@@ -1666,6 +1667,9 @@ static void ggml_compute_forward_mul_mat_id(
                     if (src1->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F32) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else if (src1->type == GGML_TYPE_F16) {
+                        // fork: through F32 in pieces of whole blocks; supports_op has no MUL_MAT_ID case, every
+                        // vec_dot_type today has a block size dividing 1024
+                        GGML_ASSERT(1024 % bs == 0);
                         float tmp[1024];
                         for (int64_t k = 0; k < ne10_block_size; k += 1024) {
                             const int64_t nk = MIN(1024, ne10_block_size - k);

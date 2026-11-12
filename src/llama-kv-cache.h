@@ -204,14 +204,13 @@ public:
     // buffers, for tests where the backend has none), elastic_commit_fork maps memory to n_cap cells of a stream (false
     // if the device has none left), elastic_set_capacity_fork sets the capacity of a stream (not below its cells in use,
     // mapping what it lacks, unmapping the rest) and returns it - the old one when the device cannot map the new.
-    // elastic_zero_reads_fork: the device reads memory it has not mapped as zeros, so a stream may be read past its
-    // capacity (the streams of a ubatch read the same n_kv cells); else find_slot maps those cells (elastic_cover_fork)
+    // a device that reads memory it has not mapped as zeros lets a stream be read past its capacity (the streams of a
+    // ubatch read the same n_kv cells); else find_slot maps those cells (elastic_cover_fork)
     bool     elastic_init_fork(bool emulate);
     bool     elastic_commit_fork(uint32_t strm, uint32_t n_cap);
     uint32_t elastic_set_capacity_fork(uint32_t strm, uint32_t n_cap);
     uint32_t elastic_capacity_fork(uint32_t strm) const { return strm < v_cap_fork.size() ? v_cap_fork[strm] : 0; }
     size_t   elastic_cell_bytes_fork() const;
-    bool     elastic_zero_reads_fork() const;
 
     // fork: the buffers of a cache built without memory (llama_kv_defer_scope_fork) that elastic_init_fork did not
     // replace, allocated and cleared as the constructor does; nothing for the others

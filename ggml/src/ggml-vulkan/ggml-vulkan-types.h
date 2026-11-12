@@ -1077,6 +1077,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_mm_f16reg[2];
     // the same matmul with the DSV4_HC_PRE that follows it in the store (MUL_MAT_DSV4_HC_PRE): [f16 activations][f16 streams]
     vk_pipeline pipeline_mm_f16reg_hcpre[2][2];
+    // the f16 copies of the activations these matmuls read, saturating (ggml_vk_fork_cpy_f16_sat)
+    vk_pipeline pipeline_cpy_f32_f16_sat_fork, pipeline_contig_cpy_f32_f16_sat_fork;
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)
     ggml_backend_buffer_type buffer_type_shared;
     ggml_backend_buffer_type_t extra_bufts[2] = {};

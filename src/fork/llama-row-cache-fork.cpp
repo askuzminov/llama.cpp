@@ -581,7 +581,8 @@ void llama_row_cache::impl::gather_slices(const int32_t * rows, int64_t n, float
     if (n <= 0) {
         return;
     }
-    if (n > (int64_t) UINT32_MAX) {
+    // the entries are uint32_t, and so is the end mark of the last row (plan_first takes n itself)
+    if (n >= (int64_t) UINT32_MAX) {
         throw std::runtime_error(format("row cache: a gather of %" PRId64 " rows", n));
     }
 

@@ -126,7 +126,9 @@ static bool ggml_vk_can_fuse_hc_post_norm(const struct ggml_cgraph * cgraph, int
     // the shader runs a workgroup per token and stream: on a decode batch it took TG down 1.6 percent (07.10, the
     // 395), the two shaders apart are faster there
     static const int64_t min_tokens = [] { const char * env = getenv("GGML_VK_HC_POST_NORM_MIN_TOKENS"); return env ? (int64_t) atoi(env) : 32; }();
-    if (!enabled || hc_post->ne[2] < min_tokens) {
+    // a workgroup row per token (the grid is {4, n_tokens, 1}): 65535 rows, the Vulkan minimum of
+    // maxComputeWorkGroupCount[1], take every device; a larger ubatch keeps the two shaders apart
+    if (!enabled || hc_post->ne[2] < min_tokens || hc_post->ne[2] > 65535) {
         return false;
     }
 
@@ -656,7 +658,8 @@ static bool ggml_vk_rms_norm_rows_enabled() {
 }
 
 // what rms_norm_rows.comp takes: f32 rows of up to 512 columns read with unit stride, a dst of the rms_norm shape with
-// unit-stride rows, a weight of one row repeated over all rows, a gate of the rms_norm shape
+// unit-stride rows, a weight of one row repeated over all rows, a gate of the rms_norm shape. 512 = 32*16: ROW_THREADS
+// (the spec constant of the pipeline in ggml-vulkan.cpp) times MAX_ITERS of the shader, which drops the columns past it
 static bool ggml_vk_rms_norm_rows_ok(const ggml_tensor * rms, const ggml_tensor * w, const ggml_tensor * gate, const ggml_tensor * dst) {
     const ggml_tensor * a = rms->src[0];
     const auto f32_rows = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float); };
