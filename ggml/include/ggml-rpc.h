@@ -6,9 +6,9 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+#define RPC_PROTO_MAJOR_VERSION    9
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    5 // fork: GGML_OP_FLASH_ATTN_LIST, GGML_OP_GATED_DELTA_NET_LAZY after upstream's GGML_OP_TOP_K_MASK (1); 4 had no GGML_OP_FLASH_ATTN_LIST
+#define RPC_PROTO_PATCH_VERSION    5 // fork: GGML_OP_FLASH_ATTN_LIST, GGML_OP_GATED_DELTA_NET_LAZY after upstream's last op GGML_OP_TOP_K_MASK (upstream patch 0 of major 9); 4 had no GGML_OP_FLASH_ATTN_LIST
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

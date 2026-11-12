@@ -66,6 +66,7 @@ if (Vulkan_FOUND)
                              ggml-vulkan-push-constants.h
                              ggml-vulkan-common.h
                              ggml-vulkan-buffers.cpp
+                             ggml-vulkan-comm.cpp
                              ggml-vulkan-debug.cpp
                             )
 
@@ -264,9 +265,14 @@ if (Vulkan_FOUND)
     target_sources(ggml-vulkan PRIVATE
                    fork/ggml-vulkan-fork.h
                    fork/ggml-vulkan-fork.cpp
+                   fork/ggml-vulkan-host-fork.cpp
                    fork/ggml-vulkan-fusion-fork.cpp
                    fork/ggml-vulkan-ops-fork.cpp
                   )
+    if (WIN32)
+        # fork: the performance counters of the video memory (ggml_vk_fork_adapter_dedicated_usage)
+        target_link_libraries(ggml-vulkan PRIVATE pdh)
+    endif()
 else()
     message(WARNING "Vulkan not found")
 endif()

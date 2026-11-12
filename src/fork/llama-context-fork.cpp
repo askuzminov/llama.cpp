@@ -59,14 +59,21 @@ uint32_t llama_context::n_ubatch_split() const {
 void llama_context::sched_free() {
     synchronize();
 
-    const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+    const size_t max_nodes = graph_max_nodes();
 
     gf_res_prev.clear();
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_reserve->set_max_nodes(max_nodes);
+    gf_res_reserve->reset();
     gf_res_prev_active = nullptr;
 
-    // the old scheduler frees its buffers, the new one allocates them only in a reserve
-    sched_new(max_nodes, cparams.pipeline_parallel);
+    // the old scheduler frees its buffers, the new one allocates them only in a reserve. sched_new reuses a compatible
+    // scheduler (upstream 3e86ce2c2), which would keep the buffers: drop it first
+    sched.reset();
+    sched_new({
+        /*.max_nodes  =*/ max_nodes,
+        /*.parallel   =*/ cparams.pipeline_parallel,
+        /*.op_offload =*/ cparams.op_offload,
+    });
 
     sched_need_reserve = true;
 }

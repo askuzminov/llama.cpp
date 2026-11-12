@@ -8,18 +8,20 @@
 #include "fork/server-context-fork.h"
 
 #include <cstdio>
+#include <memory>
 #include <cstdlib>
 
 static int n_fail = 0;
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); n_fail++; } } while (0)
 
-static common_prompt_checkpoint ckpt(int64_t n_tokens, size_t bytes, bool delta = false) {
-    common_prompt_checkpoint cp;
-    cp.n_tokens = n_tokens;
-    cp.pos_max  = (llama_pos) n_tokens - 1;
-    cp.base_pos = delta ? 0 : -1;
-    cp.data_tgt.assign(bytes, 1);
+// the lists hold shared immutable checkpoints (upstream e152332a1)
+static std::shared_ptr<const common_prompt_checkpoint> ckpt(int64_t n_tokens, size_t bytes, bool delta = false) {
+    auto cp = std::make_shared<common_prompt_checkpoint>();
+    cp->n_tokens = n_tokens;
+    cp->pos_max  = (llama_pos) n_tokens - 1;
+    cp->base_pos = delta ? 0 : -1;
+    cp->data_tgt.assign(bytes, 1);
     return cp;
 }
 
@@ -34,7 +36,7 @@ static common_chat_msg_spans spans_of(std::initializer_list<std::pair<common_cha
 static std::vector<int64_t> tokens_of(const server_ckpt_list & l) {
     std::vector<int64_t> out;
     for (const auto & cp : l) {
-        out.push_back(cp.n_tokens);
+        out.push_back(cp->n_tokens);
     }
     return out;
 }

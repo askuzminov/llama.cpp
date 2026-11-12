@@ -949,8 +949,13 @@ void llama_moe_stats_fork::report() {
 
 #define MOE_CACHE_LOG "moe_cache"
 
-// device memory that the automatic slot count leaves free
-static const size_t MOE_CACHE_MARGIN = 1024ull*1024*1024;
+// device memory that the automatic slot count leaves free: the pool of the CUDA ops grows into it while the work runs,
+// and the display takes some. LLAMA_MOE_CACHE_MARGIN_MIB (1024): another size, for a run that measures the cost of a
+// smaller one (12.11: the 3090 kept 1058 MiB free next to 98 slots of 143.46 MiB)
+static size_t moe_cache_margin() {
+    static const size_t v = (size_t) std::max<int64_t>(0, llama_fork_env_int("LLAMA_MOE_CACHE_MARGIN_MIB", 1024))*1024*1024;
+    return v;
+}
 
 llama_moe_cache_fork::llama_moe_cache_fork(const llama_model & model, int32_t n_slots_req) : model(model), n_slots_req(n_slots_req) {
     // lfu: a missing expert evicts the least recent one only when it was routed more often (windowed counts). the
@@ -1180,7 +1185,7 @@ void llama_moe_cache_fork::alloc() {
     int64_t n = n_slots_req;
     if (n < 0) {
         // one more slot covers the zero slot and the padding
-        const size_t need = MOE_CACHE_MARGIN + b_todo;
+        const size_t need = moe_cache_margin() + b_todo;
         n = free > need ? (int64_t) ((free - need) / b_todo) : 0;
         // a layer that gets slots again takes no more than the layers that kept theirs have, the counts even out when
         // those give theirs up (release_bytes() takes the layers with the most slots first)
@@ -1196,7 +1201,7 @@ void llama_moe_cache_fork::alloc() {
 
     if (n <= 0) {
         llama_log_internal(log_level, "%s: %s has %.0f MiB free, one slot on %d layers takes %.2f MiB and %.0f MiB stay free, no slots\n",
-                MOE_CACHE_LOG, ggml_backend_dev_name(dev), free/mib, (int) todo.size(), b_todo/mib, MOE_CACHE_MARGIN/mib);
+                MOE_CACHE_LOG, ggml_backend_dev_name(dev), free/mib, (int) todo.size(), b_todo/mib, moe_cache_margin()/mib);
         return;
     }
 

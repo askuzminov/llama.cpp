@@ -18,14 +18,14 @@
 | Скрипт | Время на 395 | Что делает |
 |---|---|---|
 | `00-build.bat` | | сборка в `build-win`; `00-build.bat stable` - тег `stable` в своей папке; `00-build.bat upstream` - `UPSTREAMREF` (по умолчанию `master`) в своей папке, эталон `07` |
-| `01-check.bat` | ~20 мин | операции модели на устройстве против CPU (`CHECKOPS` x `CHECKARMS`), юнит-тесты форка, логиты на глубинах одного контекста 32768 через путь промпта и путь генерации против эталона, восстановление частичного чекпойнта против непрерывного прогона (`QA_CHECK_CKPT=0` - без него), спекуляция сервера с головой MTP (~10 мин, `QA_CHECK_SPEC=0` - без неё) |
+| `01-check.bat` | ~25 мин | операции модели на устройстве против CPU (`CHECKOPS` x `CHECKARMS`), защиты памяти (веса не уходят в RAM, `QA_CHECK_GUARDS=0` - без них), юнит-тесты форка, логиты на глубинах одного контекста 32768 через путь промпта и путь генерации против эталона, восстановление частичного чекпойнта против непрерывного прогона (`QA_CHECK_CKPT=0` - без него), спекуляция сервера с головой MTP (~10 мин, `QA_CHECK_SPEC=0` - без неё) |
 | `02-long.bat` | ~40 мин | весь контекст модели: логиты на глубинах до конца; один разговор до конца контекста с фактами и вопросами по ним и длинным ответом в конце; четыре разговора сразу |
 | `03-profile.bat` | ~15 мин | куда уходит время на глубинах до конца: GPU по видам операций для ubatch промпта и шага генерации, шаги хоста, голова MTP |
 | `04-micro.bat` | ~3 мин | индексатор QSA отдельно: LID и матмулы голов на числе токенов генерации, проверки черновика и промпта, глубины до конца |
 | `05-mm.bat` | ~20 мин | плотные матмулы q8_0 промпта: путь по умолчанию и варианты тайла `mul_mm_f16reg.comp` - тесты через каждый вариант, TFLOP/s на формах модели, регистры и сброс в память у драйвера |
 | `06-decode.bat` | ~6 мин на вариант | скорость генерации по видам текста: проза, проза на русском, новый код (Python, C++), правка файла (ответ переписывает файл, как агент), JSON; TG по часам сервера, черновые и принятые, варианты `QA_DARMS` рядом; `QA_DEC_TRACE` - трасса шагов черновика |
-| `07-kld.bat` | ~10 мин | логиты этой сборки против сборки upstream на той же модели и тексте: KLD, совпадение top-1, отношение PPL, рядом прошлый результат того же варианта с другой сборки (после слияния upstream) |
-| `run-all.bat` | ~2.5 ч | сборка и все шаги с вариантами открытых вопросов (ниже) |
+| `07-kld.bat` | ~10 мин | логиты этой сборки против сборки upstream (или точного f32-эталона, `QA_KLD_BASE=exact`) на той же модели и тексте: KLD, совпадение top-1, отношение PPL, рядом прошлый результат того же варианта с другой сборки (после слияния upstream) |
+| `run-all.bat` | ~3 ч, на 3090 дольше | сборка своя и upstream, все шаги с вариантами открытых вопросов (ниже) |
 | `serve.bat` | | повседневный сервер (router и `models.ini`), не проверка. `pool = on` у модели в `models.ini` делает пул из машин с этой моделью: запросы агентов делятся между ними, разговоры переезжают с состоянием, дашборд `/pool` (`POOL.md`) |
 | `get-wikitext.bat` | | скачивает wikitext-2 (`PPLFILE`) |
 
@@ -35,29 +35,57 @@
 модели (от `COOL_RUN` секунд, 300); после короткого (вариант профиля на глубине 0) - нет.
 
 Итог каждого запуска - в `logs/<скрипт>-<время>/summary.txt`, рядом журналы и ответы; числа каждого нового
-результата добавляются в `logs/history-qa.csv`.
+результата добавляются в `logs/history-qa.csv`. В конце итога (12.11) - строки из журналов новых замеров этого
+запуска (`from the logs of this run`): предел памяти устройства 395 и сколько держат другие процессы, отказы в памяти
+устройства, перелив KV в общую память, остановка KV на пороге RAM, списки блоков QSA, слоты кеша экспертов, сколько
+раз кеш промптов отдавал память, отказ fit.
 
 ## Всё сразу (run-all)
 
-`run-all.bat`: `00-build`, `04-micro`, `01-check`, `03-profile`, `02-long`. После неудачной сборки останавливается, после
-неудачи шага идёт дальше; в конце коды выхода всех шагов. Варианты подставляются, если их нет в `_local.bat`.
-Плечи 395 `mm LLAMA_QSA_LID=0` (матмул голов) и `radix0 GGML_VK_TOPK_RADIX_STABLE=0` (radix апстрима) сняты после
-прогонов 01.11 и 02.11: `mm` дал те же биты и время при compute-буфере на 1.4 ГиБ больше, `radix0` - то же время и
-другие биты от прогона к прогону. Плечо 3090 `nowin LLAMA_MTP_WINDOW_KV=-1` снято 02.11: время операций GPU в профиле
-не включает экспертов на CPU, и разницу окна KV головы MTP профиль на 3090 не показывает. Плечо 3090
-`radix0 GGML_CUDA_TOPK_RADIX_STABLE=0` (сбор upstream) снято 03.11: TOP_K на глубине 252K - 10.6 мс за вызов против
-8.6 мс у стабильного.
+`run-all.bat` (12.11): `00-build`, `00-build upstream`, `01-check`, `06-decode`, `03-profile`, `07-kld`, на 395 ещё
+`07-kld` против точного f32-эталона (`07-exact`), `02-long`; `04-micro` - только по `RUN_MICRO=1`. После неудачной
+своей сборки останавливается, после неудачи шага идёт дальше; в конце коды выхода всех шагов. Варианты
+подставляются, если их нет в `_local.bat`. `RUN_BUILD`, `RUN_UPSTREAM`, `RUN_MICRO`, `RUN_CHECK`, `RUN_DECODE`,
+`RUN_PROFILE`, `RUN_KLD`, `RUN_EXACT`, `RUN_LONG` = 0 в `_local.bat` убирают шаг (без `07-kld` не собирается и
+upstream). Повторный запуск без изменений исходников печатает сохранённые результаты (`k`) и меряет только новые
+варианты; защита sysmem на 3090 идёт каждый раз (её ответ зависит от настройки драйвера, которой не видно в описании
+результата).
 
+Перед запуском: закоммитить слияние master 12.11 и подтянуть ветку на обеих машинах (`UPSTREAMREF=0d69255c5` - это
+слияние, у 07 оно должно быть в истории). На 3090 сначала выставить в панели NVIDIA для `llama-server.exe` (или
+глобально) «CUDA - Sysmem Fallback Policy» = «Prefer No Sysmem Fallback»: защита в 01 проверяет именно это, а варианты
+запаса кеша `m512`/`m256` без неё могут молча уйти в системную память вместо ошибки.
 
 | Шаг | 395 (Vulkan) | 3090 (CUDA) | Вопрос |
 |---|---|---|---|
-| 04 `QA_MARMS` | не запускается (`RUN_MICRO=1` - запустить) | не запускается | ядра индексатора не менялись с 31.10 |
-| 01 `QA_QARMS` | `default;again LLAMA_QA_AGAIN=1` | `default;again LLAMA_QA_AGAIN=1` | повторяет ли себя прогон (395: да с 01.11; 3090: стабильный radix CUDA с 02.11) |
-| 03 `QA_PARMS` | `default` | `default` | где идёт время с текущими умолчаниями |
-| 02 `LONG_QARMS` | `default` | `default` | весь контекст с новыми умолчаниями |
+| 00 upstream | `UPSTREAMREF=0d69255c5` | то же | эталон 07: master слияния 12.11 |
+| 01 `QA_QARMS` | `default;again LLAMA_QA_AGAIN=1` | то же | слияние: операции, юнит-тесты, точность, чекпойнт, спекуляция; повторяет ли себя прогон |
+| 01 защиты | нет места (отказ с числами кучи), fit (отказ, всё на GPU), строка предела памяти | sysmem fallback (`-ncmoe 30` больше карты: ошибка, а не RAM) | ничего не уходит в RAM молча |
+| 06 `QA_DARMS` | `default` | `default`, `cap7` (`--spec-draft-n-max 7`), `full LLAMA_MTP_VOCAB=0`, `m512`/`m256` (`LLAMA_MOE_CACHE_MARGIN_MIB`), `upmoe0`/`upmoe3`/`upmoe5` (кеш экспертов upstream 6500 МиБ, доля промахов на CPU 0, 0.3, 0.5) | слияние; 3090: потолок черновика 7 (на 3090 закреплён 3, не мерили с 12.10), подмножество словаря головы MTP (ждёт с 10.11), запас кеша экспертов, кеш upstream против нашего |
+| 06 `QA_DEC_SET` | задачи и `long` (промпт ~24K) | то же | скорость промпта рядом с генерацией |
+| 03 `QA_PARMS` | `default` | `default`, `radix-up GGML_CUDA_TOPK_RADIX_STABLE=0` | слияние; 3090: radix top-k upstream (57d04820d) против стабильного, время TOP_K на глубинах |
+| 07 `QA_KARMS` | `fork;upstream @upstream` | то же и `radix-up` | слияние не отодвинуло форк от upstream (столбец before); 3090: точность radix upstream |
+| 07-exact `EXACT_KARMS` | `prompt`, `decode4 QA_ARM_UB=4`, `decode4f32` (то же на f32-матвеках) | не идёт (у CUDA нет режима f32) | цена 8- и 16-битных активаций против точной математики, в т.ч. ядер декода |
+| 02 `LONG_QARMS` | `default` | то же | весь контекст после слияния |
+| 02 `QA_PAR_ARMS` | `default;rows0 LLAMA_QSA_ROWS=0` | то же | списки блоков QSA по слотам: время шага par и ответы |
 
-`RUN_BUILD`, `RUN_MICRO`, `RUN_CHECK`, `RUN_PROFILE`, `RUN_LONG` = 0 в `_local.bat` убирают шаг. Повторный запуск без
-изменений исходников печатает сохранённые результаты (`k`) и меряет только новые варианты.
+Где смотреть ответы:
+
+- слияние: коды выхода всех шагов 0; в `07` KLD `fork` и столбец before (прошлая сборка) рядом; скорость 06/03
+  против прошлых итогов в `logs`;
+- защиты: блок `guards` в итоге 01; на 395 строка `device memory: ... this process up to ... MiB (+... MiB over the
+  budget)` - сколько памяти устройства теперь берёт процесс сверх прежних 95%;
+- списки QSA: таблица `par: the variants side by side` в итоге 02 (время всего шага, PP запросов, ответы, строка
+  `QSA scores`);
+- 3090: таблица `decode: TG t/s by task and variant` в 06 и столбец `prompt s` задачи `long`, строки `expert cache`
+  внизу итога 06 (слоты на слой у каждого варианта); TOP_K в профиле 03 и `radix-up` в 07.
+
+Сняты раньше: плечи 395 `mm LLAMA_QSA_LID=0` (матмул голов) и `radix0 GGML_VK_TOPK_RADIX_STABLE=0` (radix апстрима) -
+после прогонов 01.11 и 02.11: `mm` дал те же биты и время при compute-буфере на 1.4 ГиБ больше, `radix0` - то же время
+и другие биты от прогона к прогону. Плечо 3090 `nowin LLAMA_MTP_WINDOW_KV=-1` - 02.11: время операций GPU в профиле не
+включает экспертов на CPU. Прежний сбор top-k на 3090 (`GGML_CUDA_TOPK_RADIX_STABLE=0` до слияния 12.11) - 03.11:
+10.6 мс за вызов на 252K против 8.6 у стабильного; после слияния под тем же ключом radix upstream 57d04820d, его и
+меряет `radix-up`.
 
 ## Настройка машины
 
@@ -66,6 +94,28 @@
 лишнее драйвер молча кладёт в системную память, и пробы идут в десятки раз медленнее). Текст для проб и разговоров -
 `PPLFILE` (wikitext-2, около 300 тысяч токенов, хватает на 262144); другой длинный текст - `QA_CORPUS`. Текст не
 повторяется: короткий файл - ошибка, а не укороченный тест.
+
+## Защиты памяти (01)
+
+12.11 загрузка на 395 ушла в RAM, система ушла в своп и замерла, пока сервер не упал. С тех пор веса не уходят в
+системную память без явного ключа, и 01 проверяет это на самой машине (`QA_CHECK_GUARDS`, около 3 минут):
+
+- **395, нет места**: сервер с `GGML_VK_DEVICE_MARGIN_MIB=1048576` (ни одно выделение в памяти устройства не
+  помещается) должен упасть со строкой `... MiB in use of a limit of ... MiB` (до 12.11 запасной путь UMA брал
+  системную память и модель грузилась в RAM). Загрузилась - `FAIL`.
+- **395, fit**: `-fit on -fitt 1048576` без `-ngl`: fit разместил бы все слои на хосте, такое размещение
+  отклоняется (`refused (LLAMA_FIT_ALLOW_HOST=1 allows it)`), модель грузится как задано - все слои на GPU.
+- **395, предел памяти**: строка `device memory heap 0 of ... MiB, other processes hold ... MiB of it, the driver
+  budgets ... MiB: this process takes up to ... MiB` в журнале. Предел - куча минус то, что держат другие процессы
+  (счётчик Windows `\GPU Adapter Memory(*)\Dedicated Usage`, как в диспетчере задач), а не 95% кучи, которые сообщает
+  драйвер. Нет строки на Windows - счётчик не нашёлся, действует бюджет драйвера: `FAIL`.
+  `GGML_VK_DEVICE_LIMIT=budget` возвращает бюджет.
+- **3090, sysmem fallback**: сервер с `-ncmoe 30` (`QA_GUARD_NCMOE`): слои экспертов на карте занимают больше 24 ГБ.
+  Без системной памяти загрузка падает на памяти устройства - так и должно быть. Загрузился - драйвер добирает
+  системной памятью (02.11 пробы шли в 25 раз медленнее): `FAIL` с подсказкой про «Prefer No Sysmem Fallback». Не
+  кешируется: ответ зависит от настройки драйвера.
+
+Результаты 395 хранятся до новой сборки, как остальные; `FORCE=guard` - заново.
 
 ## Точность на глубине (01 и 02)
 
@@ -160,7 +210,8 @@ radix-select выбора блоков на Vulkan складывал выбор
   оборван в начале и не повторяется (доля повторённых 4-грамм слов выше 35%). В таблице каждого хода - глубина, PP,
   TG и приёмка черновиков.
 - **par**: `QA_PAR` разговоров сразу (`-np 4 --kv-unified`, общий KV на весь контекст), по `QA_PAR_TOKENS` токенов,
-  в конце каждого вопросы о первом и последнем факте.
+  в конце каждого вопросы о первом и последнем факте. `QA_PAR_ARMS` (12.11) - варианты (`имя VAR=значение ...;...`),
+  сервер на каждый, в конце таблица рядом: время шага против первого, PP запросов, ответы, строка списков блоков QSA.
 - **quality**: точность на глубинах `QA_LONG_DEPTHS` и в конце контекста, как в 01.
 
 Выборка `QA_SAMP` (1.0 20 0.95), размышления выключены (`enable_thinking: false`). Части выбираются `QA_LONG_STAGES`.
@@ -197,7 +248,7 @@ MTP графы цели (проверка черновика) и головы (�
 
 ```bash
 export QA_CHECK_QUALITY=0 QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none
-export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_ID_FUSION type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1"
+export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_ID_FUSION type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_FUSION type=q(4|5)_K,.*use_id=1"
 export CHECKARMS="default GGML_VK_MMID_GLU_MIN_TOKENS=0;bn128 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMID_F16REG_BN=128 GGML_VK_MMID_F16REG_GLU_BN=128;r2 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMID_F16REG_ROWS2=1;r2bn128 GGML_VK_MMID_GLU_MIN_TOKENS=0 GGML_VK_MMID_F16REG_ROWS2=1 GGML_VK_MMID_F16REG_BN=128 GGML_VK_MMID_F16REG_GLU_BN=128"
 ./01-check.bat
 unset QA_CHECK_QUALITY QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS
@@ -222,8 +273,8 @@ unset QA_PROF_DEPTHS QA_PARMS
 
 ```bash
 export QA_CHECK_QUALITY=0 QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none
-export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_ID_FUSION type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1;MUL_MAT type_a=q8_0,"
-E="GGML_VK_MMID_GLU_MIN_TOKENS=0"; O="@o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION"; K="GGML_VK_MM_F16REG_MIN_N=1 GGML_VK_MM_F16REG_MIN_M=1 GGML_VK_MM_F16REG_MIN_K=1 @o=MUL_MAT"
+export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_ID_FUSION type_a=(q4_K|q5_K|q5_1|q8_0),;MUL_MAT_FUSION type=q(4|5)_K,.*use_id=1;MUL_MAT type_a=q8_0,"
+E="GGML_VK_MMID_GLU_MIN_TOKENS=0"; O="@o=MUL_MAT_ID,MUL_MAT_ID_FUSION,MUL_MAT_FUSION"; K="GGML_VK_MM_F16REG_MIN_N=1 GGML_VK_MM_F16REG_MIN_M=1 GGML_VK_MM_F16REG_MIN_K=1 @o=MUL_MAT"
 export CHECKARMS="epi $E GGML_VK_MMID_F16REG_EPI=1 $O;bpf0 $E GGML_VK_MMID_F16REG_BPF=0 $O;bn32 $E GGML_VK_MMID_F16REG_BN=32 GGML_VK_MMID_F16REG_GLU_BN=32 $O;split $E GGML_VK_MMID_F16REG_GLU_SPLIT=1 $O;splitepi $E GGML_VK_MMID_F16REG_GLU_SPLIT=1 GGML_VK_MMID_F16REG_EPI=1 $O;b16 $E GGML_VK_MMID_F16REG_B16=1 GGML_VK_MMID_F16REG_GLU_B16=1 $O;r2epi $E GGML_VK_MMID_F16REG_ROWS2=1 GGML_VK_MMID_F16REG_EPI=1 $O;mmb16 GGML_VK_MM_F16REG=r16x64/8x1 GGML_VK_MM_F16REG_B16=1 $K;mm3232 GGML_VK_MM_F16REG=r32x32/4x2 $K;mm1632 GGML_VK_MM_F16REG=r16x32/8x1 $K"
 ./01-check.bat
 unset QA_CHECK_QUALITY QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS CHECKOPS CHECKARMS E O K
@@ -267,7 +318,7 @@ unset QA_PROF_DEPTHS QA_PARMS S
 
 ```bash
 export QA_CHECK_CKPT=0 QA_CHECK_SPEC=0 CHECKUNITS=none QA_CHECK_QUALITY=0
-export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_1),;MUL_MAT_ID_SCALE;MUL_MAT_ID_REPEAT type_a=(q4_K|q5_1),;MUL_MAT_VEC_FUSION type=q(4|5)_K,.*use_id=1;MOE_GLU_F16_DOWN"
+export CHECKOPS="MUL_MAT_ID type_a=(q4_K|q5_1),;MUL_MAT_ID_SCALE;MUL_MAT_ID_REPEAT type_a=(q4_K|q5_1),;MUL_MAT_FUSION type=q(4|5)_K,.*use_id=1;MOE_GLU_F16_DOWN"
 export CHECKARMS="default GGML_VK_MMV_ID_FORK_LOG=1"
 ./01-check.bat
 unset QA_CHECK_CKPT QA_CHECK_SPEC CHECKUNITS QA_CHECK_QUALITY CHECKOPS CHECKARMS
@@ -513,7 +564,37 @@ PPL(base) самой perplexity не берётся: она восстановл
 занижена), средний, медианный, 99-й процентиль и максимум KLD, совпадение top-1. Последний столбец - прошлый результат
 того же варианта на этой машине с другой сборки (`history-qa.csv`): после слияния upstream - `00-build.bat`,
 `00-build.bat upstream`, затем `07`. Рост KLD или отношения PPL против прошлого результата значит, что после слияния
-форк дальше от upstream, чем был до него.
+форк дальше от upstream, чем был до него. С 12.11 `07` проверяет, что сборка upstream - это `UPSTREAMREF`: сборка
+другого коммита (прошлое слияние, старые файлы после неудачной сборки нового) - ошибка с подсказкой
+`00-build.bat upstream`.
+
+Точный эталон (12.11): `QA_KLD_BASE=exact` пишет логиты этой же сборкой, где все матмулы считаются в f32 (Vulkan: без
+int8, без f16-шейдеров и coopmat, пути f16 форка выключены, список - `KLD_EXACT_ENV` в `_qa.py`). Тогда KLD каждого
+варианта - цена его собственных 8- и 16-битных активаций и порядка сумм, а не расстояние до upstream (у upstream на RDNA3
+свои q8_1-активации). На CUDA режима f32 пока нет, `07` тогда пропускается. `QA_ARM_UB=<n>` в варианте задаёт его ubatch:
+1-8 токенов запускают ядра декода (мат-векторы, матвек экспертов форка), которых батч промпта не касается. Пример для
+395 - путь промпта, путь декода на 4 токенах и он же на f32-матвеках:
+`QA_KLD_BASE=exact QA_KARMS="prompt;decode4 QA_ARM_UB=4;decode4f32 QA_ARM_UB=4 GGML_VK_DISABLE_MMVQ=1 GGML_VK_MMV_ID_FORK=0"`.
+Декод на 4 токенах идёт медленно: 16K токенов по 4 - около 4000 графов.
+
+## Аргументы сервера в варианте (12.11)
+
+`QA_ARM_ARGS` в окружении варианта (`QA_DARMS`, `QA_PARMS`) - аргументы сервера только этого варианта, они идут после
+общих (`DECARGS`), и более позднее значение опции побеждает. Значение с пробелами - в кавычках целиком. Сравнения на
+3090:
+
+- кеш экспертов апстрима с долей промахов на CPU (e95426f16) против нашего `--moe-cache auto`, скорость декода и
+  промпта: `export QA_DARMS='default;upmoe "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.3"'`,
+  затем `06-decode.bat`; то же в `QA_PARMS` для `03-profile.bat` (6500 МиБ - около наших ~46 слотов на слой; доля 0,
+  0.3, 0.5 - отдельными вариантами);
+- детерминированный radix top-k апстрима (57d04820d) против нашего стабильного:
+  `export QA_PARMS="default;radix-up GGML_CUDA_TOPK_RADIX_STABLE=0"` для `03-profile.bat` (время TOP_K на глубинах) и
+  `QA_KARMS="fork;radix-up GGML_CUDA_TOPK_RADIX_STABLE=0"` для `07-kld.bat`.
+
+Списки блоков QSA по слотам (12.11, `LLAMA_QSA_ROWS`, FORK.md, раздел qwen4exp), обе машины: шаг `par` из 02 - четыре
+разговора в общем кеше, промпты кусками по 12288, пока остальные держат свой контекст. Отдельно от run-all:
+`export QA_LONG_STAGES=par QA_PAR_ARMS="default;rows0 LLAMA_QSA_ROWS=0"`, затем `./02-long.bat`; таблица
+`par: the variants side by side` в итоге.
 
 ## Микробенчмарк (04)
 
@@ -599,7 +680,7 @@ set "QA_PARMS=default;r16x64 GGML_VK_MM_F16REG=r16x64/8x1"
 | `QA_DECODE_RATIO` | 2 | во сколько раз 90-й процентиль KL пути генерации к пути промпта может быть выше, чем у эталона (`DECODE DIFFERS`) |
 | `QA_REF_DECODE` | 1 | 0 - эталон без прогона пути генерации, `DECODE DIFFERS` не ставится |
 | `QA_REF_ENV` | `LLAMA_UPSTREAM=qwen4exp` | настройки эталона |
-| `UPSTREAMREF` | `master` | что собирает `00-build.bat upstream` |
+| `UPSTREAMREF` | `master` (run-all: `0d69255c5`) | что собирает `00-build.bat upstream` и с чем сверяет сборку upstream `07` |
 | `QA_KARMS` | `fork;upstream @upstream` | варианты `07`: имя, `@upstream` - сборка upstream, переменные |
 | `QA_KLD_CTX`, `QA_KLD_CHUNKS` | `8192`, `2` | куски текста `07` |
 | `QA_QARMS` | `default` | варианты проб: `имя VAR=значение ...;...` |
@@ -613,6 +694,7 @@ set "QA_PARMS=default;r16x64 GGML_VK_MM_F16REG=r16x64/8x1"
 | `QA_LONG_FINAL` | 600 | токенов итогового ответа |
 | `QA_ASK_TOKENS` | 64 | токенов ответа на вопрос |
 | `QA_PAR`, `QA_PAR_TOKENS`, `QA_PAR_CHUNK` | 4, 49152, 12288 | разговоры сразу в 02 |
+| `QA_PAR_ARMS` | `default` | варианты шага par: `имя VAR=значение ...;...` |
 | `QA_SAMP` | 1.0 20 0.95 | temperature, top_k, top_p разговоров |
 | `QA_SPEC` | `--spec-auto` | спекуляция сервера с `SPECDRAFT`; `none` - без головы MTP (и без пробы спекуляции в 01) |
 | `QA_CHECK_SPEC` | 1 | 0 - 01 без пробы спекуляции |
@@ -620,6 +702,8 @@ set "QA_PARMS=default;r16x64 GGML_VK_MM_F16REG=r16x64/8x1"
 | `QA_SPEC_GREEDY`, `QA_SPEC_MARGIN` | 64, 1.0 | токенов temperature 0 на часть; разница log p, выше которой расхождение - отметка |
 | `QA_SPEC_TOKENS`, `QA_SPEC_PROBS`, `QA_SPEC_ALPHA` | 2048, 20, 1e-4 | токенов temperature 1 на часть и вариант; вероятностей на токен; порог p |
 | `QA_CHECK_CKPT` | 1 | 0 - 01 без проверки чекпойнта |
+| `QA_CHECK_GUARDS` | 1 | 0 - 01 без защит памяти |
+| `QA_GUARD_NCMOE` | 30 | 3090: `-ncmoe` защиты sysmem, слоёв экспертов на карте больше, чем она вмещает |
 | `QA_CKPT_TOKENS` | 8192 | токенов корпуса в проверке чекпойнта, чекпойнт после половины |
 | `QA_PROMPT_RATIO` | 2 | во сколько раз 90-й процентиль KL пути промпта к эталону может быть выше шума эталона (`PROMPT DIFFERS`) |
 | `QA_PROF_DEPTHS` | 0 65536 131072 и около конца | глубины профиля |

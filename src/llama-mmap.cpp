@@ -30,6 +30,7 @@
     #ifndef NOMINMAX
         #define NOMINMAX
     #endif
+    #include <malloc.h>
     #include <windows.h>
     #ifndef PATH_MAX
         #define PATH_MAX MAX_PATH
@@ -104,7 +105,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fname(fname) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -122,7 +123,7 @@ struct llama_file::impl {
         }
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -405,15 +406,18 @@ struct llama_file::impl {
             std::fclose(fp);
         }
     }
+    std::string fname;
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
             if (init_fd()) {
+                LLAMA_LOG_INFO("%s: file '%s' opened with direct I/O (alignment: %zu bytes)\n",
+                               __func__, fname, alignment);
                 return;
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
+            LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O\n",
                            fname, strerror(errno));
         }
 #endif
@@ -493,8 +497,8 @@ struct llama_file::impl {
         }
         errno = 0;
         if (fd == -1) {
-            const size_t curr_off = tell();
-            const size_t to_read = std::min(len, size - curr_off);
+            const size_t read_offset = tell();
+            const size_t to_read = std::min(len, size - read_offset);
 
             std::size_t ret = std::fread(ptr, to_read, 1, fp);
             if (ferror(fp)) {
@@ -511,24 +515,23 @@ struct llama_file::impl {
 
                 if (ret == -1) {
                     if (errno == EINTR) {
-                        continue;  // Interrupted by signal, retry
+                        continue;
                     }
-                    // Fallback to std::fread in case the DMA controller cannot access the buffer
                     if (errno == EFAULT || errno == EINVAL) {
-                        LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
-                        auto curr_off = tell();
+                        LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
+                                       __func__, fname.c_str(), strerror(errno));
+                        const size_t read_offset = tell();
                         close(fd);
                         fd = -1;
                         alignment = 1;
                         init_fp("rb");
-                        seek(curr_off, SEEK_SET);
+                        seek(read_offset, SEEK_SET);
                         read_raw_unsafe(ptr, len);
                         return;
                     }
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
                 }
                 if (ret == 0) {
-                    // EOF: allow if this read was only pulling alignment padding past file end
                     off_t pos = lseek(fd, 0, SEEK_CUR);
                     if (pos != -1 && (size_t) pos == size) {
                         std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
@@ -558,7 +561,15 @@ struct llama_file::impl {
         void * raw_buffer = nullptr;
         int ret = posix_memalign(&raw_buffer, alignment, buf_size);
         if (ret != 0) {
-            throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+            LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
+                           __func__, fname.c_str(), strerror(ret));
+            close(fd);
+            fd = -1;
+            alignment = 1;
+            init_fp("rb");
+            seek(offset, SEEK_SET);
+            read_raw_unsafe(dest, len);
+            return;
         }
 
         struct aligned_buffer_deleter {
@@ -626,7 +637,7 @@ struct llama_file::impl {
     ~impl() {
         if (fd != -1) {
             close(fd);
-        } else if (owns_fp) {
+        } else if (fp && owns_fp) {
             std::fclose(fp);
         }
     }

@@ -148,7 +148,7 @@ uint64_t server_prompt_cache_signature_portable(
         const llama_context * ctx_dft);
 
 // context checkpoints of a slot: a base and the deltas after it form a chain
-using server_ckpt_list = std::list<common_prompt_checkpoint>;
+using server_ckpt_list = std::list<std::shared_ptr<const common_prompt_checkpoint>>; // shared since upstream e152332a1
 
 // the checkpoint after `it` is a delta that depends on it, so `it` cannot be dropped
 bool server_ckpt_has_dependent_delta(const server_ckpt_list & ckpts, server_ckpt_list::const_iterator it);

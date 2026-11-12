@@ -1229,29 +1229,29 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
     // same, with the finite entries in aligned runs of 4 cells as the QSA block compression leaves them.
     // the last one has whole groups of query rows share a selection, which is what leaves a mask tile
     // entirely -inf and lets a backend skip it - that skip stays untested otherwise
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4, 64));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 0, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 0, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 0, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 0, 4, 64));
 
     // sparse prefill with few query rows: the heads of a group share the exact list of each row,
     // and the device is not full, so the list is also split over several workgroups
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 8192, 12, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2052, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2052, 0, 4));
 
     // sparse mask where the rows of a tile pick different cells, so a tile cannot share one list
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024, 4,  8));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024, 4,  8));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512, 1, 16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024, 0, 4,  8));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024, 0, 4,  8));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512, 0, 1, 16));
 
     // the depth the model is measured at: a 64k cache and a per-token selection of 2048 cells.
     // The Vulkan backend folds the 12 heads of a group into one tile here; without the fold the tile
     // walks the union of its rows, and without the union it re-tunes to a one-row tile
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 0, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 0, 4));
     // the budget the model really asks for: top_k 2048 plus the tail of the last block, so 2052
     // cells, which is not a multiple of the 64-cell tile the backends walk
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2052, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2052, 0, 4));
 
     // prefill-sized batches go to matmul_id; on the Vulkan int8 coopmat path the experts' gate and up projections
     // and the swiglu run as one shader there (FUSED_GLU). q6_K has no fused shader and checks the plain path
@@ -1259,14 +1259,14 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
                            GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (bool b : {false, true}) {
             for (int64_t m_batch : {16, 64, 200}) {
-                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 96, 256,
+                test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 96, 256,
                     true, 16, 8, b, false, true, false, {1, 1}));
             }
         }
     }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_K}) {
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 32, 32, 256,
+        test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, 32, 32, 256,
             true, 8, 2, false, false, true, false, {1, 1}, true));
     }
 
@@ -1298,7 +1298,7 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 16, 4, false, 256, 64, 512, 1, true));
     }
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 200, 256, 512,
+        test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_SWIGLU, 200, 256, 512,
             true, 8, 4, true, false, true, false, {1, 1}));
     }
     // the hc up projection and the DSV4_HC_PRE in one store (MUL_MAT_DSV4_HC_PRE; GGML_VK_MM_F16REG_MIN_N/_MIN_M=1 take
@@ -1326,7 +1326,7 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 8, 4, false, 512, 300, k, 1, true));
     }
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 300, 256, 512,
+        test_cases.emplace_back(new test_mul_mat_fusion(type_a, GGML_GLU_OP_SWIGLU, 300, 256, 512,
             true, 4, 2, true, false, true, false, {1, 1}));
     }
 
@@ -1414,7 +1414,7 @@ static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & 
     // the same gate and up with the swiglu as one graph, which Vulkan fuses into one shader (FUSED_GLU) from
     // GGML_VK_MMID_GLU_MIN_TOKENS tokens on: a short prompt and -ub 4096
     for (int64_t bs : {512, 4096}) {
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
+        test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
             true, 512, 10, true, false, true, false, {1, 1}));
     }
 
@@ -1431,7 +1431,7 @@ static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & 
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0));
         for (int64_t grp : {1, 16, 64}) {
             for (int64_t blk : {1, 4}) {
-                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, blk, grp));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048, 0, blk, grp));
             }
         }
     }

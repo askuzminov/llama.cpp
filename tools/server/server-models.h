@@ -172,6 +172,7 @@ private:
         server_model_meta meta;
         int req_count = 0; // number of active proxy requests
         int64_t t_idle_fork = 0; // fork: when its last proxy request ended (meta.last_used is when one started)
+        bool download_stop_requested = false; // a client asked the download to stop (pause or cancel)
 
         // ask the child to exit (it handles the command on its stdin, see server_role::setup)
         void request_exit() const;

@@ -994,7 +994,8 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
         bool blk_bias,
         uint32_t s0,
         uint32_t ns,
-        const llama_kv_cache::slot_info * sinfo) const {
+        const llama_kv_cache::slot_info * sinfo,
+        uint32_t max_slices) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -1002,7 +1003,7 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
 
     // the graph asks once to size its inputs and once more to check it can be reused
     if (st.epoch == qsa_epoch && st.n_kv == n_kv_arg && st.blk_bias == blk_bias) {
-        return { st.n_dirty, st.warm };
+        return { st.n_dirty, st.warm, st.n_slices, st.n_own_max };
     }
 
     const int64_t n_kv     = n_kv_arg;
@@ -1505,7 +1506,95 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
     st.warm    = need <= cap;
     st.n_dirty = st.warm ? std::min<uint32_t>(cap, (uint32_t) n_blocks) : (uint32_t) n_blocks;
 
-    return { st.n_dirty, st.warm };
+    qsa_slices(st, ubatch, n_tokens, n_blocks, max_slices);
+
+    return { st.n_dirty, st.warm, st.n_slices, st.n_own_max };
+}
+
+// 12.11: the block lists of set_input_qsa rows. the indexer of one unified stream scored every token against the blocks
+// of all the sequences there, and the per block bias hid those of the other sequences: with the slots of a server, a
+// prompt of one slot paid for the long contexts of the others in the indexer, its top-k and the bias the host fills.
+// the slices of the ubatch are those of kv_rows upstream (llama_kv_cache::get_n_kv_slices), the graph decides whether
+// the lists pay (qsa_rows_width in qwen4exp-fork.cpp). one pass over the blocks; nothing when the cache holds no
+// sequence outside the ubatch. LLAMA_QSA_ROWS=0: no lists
+void llama_memory_hybrid_idx_fork::qsa_slices(qsa_state & st, const llama_ubatch * ubatch, int64_t n_tokens, int64_t n_blocks,
+        uint32_t max_slices) const {
+    st.n_slices  = 0;
+    st.n_own_max = 0;
+    st.own.clear();
+
+    static const bool rows_on = llama_fork_env_int("LLAMA_QSA_ROWS", 1) != 0;
+    if (!rows_on || !st.blk_bias || st.grp.size() != 1 || ubatch->n_seqs_unq < 1) {
+        return;
+    }
+
+    const qsa_group & g     = st.grp[0];
+    const auto &      cells = get_mem_idx()->get_cells(ubatch->seq_id[0][0]);
+
+    // the sequences of the ubatch, and whether the cache holds another one
+    llama_kv_cells::seq_set_t in_ubatch;
+    for (uint32_t i = 0; i < ubatch->n_seqs_unq; ++i) {
+        in_ubatch.set((size_t) ubatch->seq_id_unq[i]);
+    }
+    bool other = false;
+    for (int q = 0; q < LLAMA_MAX_SEQ && !other; ++q) {
+        other = !in_ubatch.test((size_t) q) && cells.seq_pos_min(q) >= 0;
+    }
+    if (!other) {
+        return;
+    }
+
+    const uint32_t n_sl     = llama_kv_cache::get_n_kv_slices(*ubatch);
+    const int64_t  n_tps_sl = n_tokens/n_sl;
+    if (n_sl > max_slices) {
+        return;
+    }
+
+    // a slice of several is one sequence (get_n_kv_slices); a single slice takes all of them
+    std::vector<llama_seq_id> seq_of(n_sl, -1);
+    if (n_sl > 1) {
+        for (uint32_t sl = 0; sl < n_sl; ++sl) {
+            seq_of[sl] = ubatch->seq_id[sl*n_tps_sl][0];
+        }
+    }
+
+    auto mine = [&](const llama_kv_cells::seq_set_t & set, uint32_t sl) {
+        return n_sl == 1 ? (set & in_ubatch).any() : set.test((size_t) seq_of[sl]);
+    };
+
+    st.own.assign(n_sl, {});
+
+    for (uint32_t sl = 0; sl < n_sl; ++sl) {
+        std::vector<int32_t> & own = st.own[sl];
+
+        if (g.inc_ok) {
+            // one sequence holds every pooled block (qsa_group_update)
+            const bool all = n_sl == 1 ? in_ubatch.test((size_t) g.seq) : seq_of[sl] == g.seq;
+            if (all) {
+                own.resize((size_t) g.n_bid);
+                for (int32_t b = 0; b < g.n_bid; ++b) {
+                    own[b] = b;
+                }
+            }
+        } else {
+            for (int32_t b = 0; b < g.n_bid; ++b) {
+                if (mine(cells.seq_get_all((uint32_t) g.bid_cell[b]), sl)) {
+                    own.push_back(b);
+                }
+            }
+        }
+
+        for (int64_t b = g.n_bid; b < n_blocks; ++b) {
+            const auto & set = g.spare_seq[b - g.n_bid];
+            if (set.any() && mine(set, sl)) {
+                own.push_back((int32_t) b);
+            }
+        }
+
+        st.n_own_max = std::max<uint32_t>(st.n_own_max, (uint32_t) own.size());
+    }
+
+    st.n_slices = n_sl;
 }
 
 // the stride of the ranges of several sequences in one stream (set_input_qsa_pos). LLAMA_QSA_POS_STRIDE_LOG2 lowers it,
@@ -1643,6 +1732,7 @@ void llama_memory_hybrid_idx_fork::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * bias,
+        ggml_tensor * rows,
         const llama_ubatch * ubatch,
         uint32_t n_kv_arg,
         uint32_t ratio,
@@ -1659,10 +1749,39 @@ void llama_memory_hybrid_idx_fork::set_input_qsa(
     const qsa_state & st = it->second;
 
     const int64_t n_kv     = n_kv_arg;
-    const int64_t n_ns     = bias->ne[2];            // streams in this ubatch
+    const int64_t n_ns     = rows ? 1 : bias->ne[2]; // streams in this ubatch; with rows ne[2] counts the slices
     const int64_t n_blocks = st.n_blocks;
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
+
+    // rows: the list of each slice, its blocks then blocks of other sequences, distinct, so that a pick of the padding
+    // names cells hidden from the token and no cell twice
+    const int64_t n_rows = rows ? rows->ne[0] : 0;
+    if (rows) {
+        GGML_ASSERT(blk_bias && st.n_slices > 0 && rows->ne[1] == (int64_t) st.n_slices && bias->ne[0] == n_rows &&
+                    bias->ne[2] == (int64_t) st.n_slices && n_rows <= n_blocks && rows->buffer &&
+                    ggml_backend_buffer_is_host(rows->buffer));
+
+        int32_t * dst_rows = (int32_t *) rows->data;
+        for (uint32_t sl = 0; sl < st.n_slices; ++sl) {
+            const std::vector<int32_t> & own = st.own[sl];
+            GGML_ASSERT((int64_t) own.size() <= n_rows);
+
+            int32_t * dst = dst_rows + sl*n_rows;
+            std::copy(own.begin(), own.end(), dst);
+
+            int64_t j = (int64_t) own.size();
+            size_t  k = 0;
+            for (int32_t b = 0; b < n_blocks && j < n_rows; ++b) {
+                if (k < own.size() && own[k] == b) {
+                    ++k;
+                    continue;
+                }
+                dst[j++] = b;
+            }
+            GGML_ASSERT(j == n_rows);
+        }
+    }
 
     GGML_ASSERT(!cell_blk || (cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns));
     GGML_ASSERT(!blk_cells || (blk_cells->ne[0] == r*n_blocks && blk_cells->ne[1] == n_ns));
@@ -1754,7 +1873,7 @@ void llama_memory_hybrid_idx_fork::set_input_qsa(
         }
 
         // the rows are independent, so they are filled in parts, in parallel for a large ubatch
-        llama_parallel_for(n_tps, n_tps*(blk_bias ? n_blocks : n_kv), [&](int64_t ii0, int64_t ii1) {
+        llama_parallel_for(n_tps, n_tps*(rows ? n_rows : blk_bias ? n_blocks : n_kv), [&](int64_t ii0, int64_t ii1) {
             std::vector<float> row_f32(bias_f16 ? n_blocks : 0);
 
             for (int64_t ii = ii0; ii < ii1; ++ii) {
@@ -1788,6 +1907,35 @@ void llama_memory_hybrid_idx_fork::set_input_qsa(
 
                 // the tail is an incomplete block and is always visible, as in the reference
                 const int64_t tail_start = (q + 1)/r*r;
+
+                if (rows) {
+                    // the blocks of the list of the token's slice, valued as below; the padding stays hidden
+                    const int64_t                sl     = i/(n_tokens/(int64_t) st.n_slices);
+                    const int32_t *              lst    = (const int32_t *) rows->data + sl*n_rows;
+                    const int64_t                n_own  = (int64_t) st.own[sl].size();
+                    const uint8_t *              in_seq = blk_in_seq.at(seq_id).data();
+                    const int64_t *              sm     = spare_min.at(seq_id).data();
+                    float *                      cur    = bias_f16 ? row_f32.data() : dst_bias + i*n_rows;
+
+                    for (int64_t e = 0; e < n_rows; ++e) {
+                        const int64_t b = lst[e];
+                        if (e >= n_own) {
+                            cur[e] = -INFINITY;
+                        } else if (b < g.n_bid) {
+                            cur[e] = !in_seq[b] || (causal_attn && g.bid_idx[b] > q) ? -INFINITY :
+                                     causal_attn && g.bid_idx[b] >= tail_start ? forced : 0.0f;
+                        } else {
+                            const bool live = g.spare_seq[b - g.n_bid].test((size_t) seq_id) && !(causal_attn && sm[b - g.n_bid] > q);
+                            cur[e] = live ? forced : -INFINITY;
+                        }
+                    }
+
+                    if (bias_f16) {
+                        ggml_fp32_to_fp16_row(cur, dst_bias_f16 + i*n_rows, n_rows);
+                    }
+
+                    continue;
+                }
 
                 if (blk_bias) {
                     // a block sits wholly inside or outside the tail, so one value covers it.
@@ -2020,6 +2168,7 @@ void llama_memory_hybrid_idx_fork_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * bias,
+        ggml_tensor * rows,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
@@ -2027,13 +2176,14 @@ void llama_memory_hybrid_idx_fork_context::set_input_qsa(
     GGML_ASSERT(mem != nullptr);
     GGML_ASSERT(get_idx() != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, bias, ubatch, get_idx()->get_n_kv(), ratio, blk_bias, causal_attn);
+    mem->set_input_qsa(cell_blk, blk_cells, bias, rows, ubatch, get_idx()->get_n_kv(), ratio, blk_bias, causal_attn);
 }
 
 llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork_context::qsa_prepare(
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        uint32_t max_slices) const {
     GGML_ASSERT(mem != nullptr);
     GGML_ASSERT(get_idx() != nullptr);
     GGML_ASSERT(ratio > 0);
@@ -2044,7 +2194,7 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork_context::qsa
         return { (n_kv + ratio - 1)/ratio, false };
     }
 
-    return mem->qsa_prepare(ubatch, n_kv, ratio, blk_bias, get_idx()->get_s0(), get_n_stream(), get_idx()->get_sinfo());
+    return mem->qsa_prepare(ubatch, n_kv, ratio, blk_bias, get_idx()->get_s0(), get_n_stream(), get_idx()->get_sinfo(), max_slices);
 }
 
 void llama_memory_hybrid_idx_fork_context::set_input_qsa_pos(ggml_tensor * cell_pos, ggml_tensor * tok_pos, ggml_tensor * tok_half,

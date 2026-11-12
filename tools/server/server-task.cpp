@@ -1513,7 +1513,7 @@ json server_task_result_rerank::to_json() {
 //
 json server_task_result_realtime::to_json() {
     return json {
-        {"text",          text},
+        {"text",          content.text},
         {"n_samples",     audio.size()},
         {"response_done", response_done},
         {"cancelled",     cancelled},
@@ -1775,7 +1775,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+        checkpoints_size += ckpt->size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1829,8 +1829,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    server_state_buf state_data_tgt;
-    server_state_buf state_data_dft;
+    common_state_data state_data_tgt;
+    common_state_data state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
@@ -1864,7 +1864,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new) {
-    const int lcp_best = tokens_cur.get_common_prefix(tokens_new);
+    int lcp_best = tokens_cur.get_common_prefix(tokens_new);
 
     float f_keep_best = tokens_cur.size() > 0 ? float(lcp_best) / tokens_cur.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
@@ -1890,6 +1890,7 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(co
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
+            lcp_best    = lcp_cur;
 
             it_best = it;
         }
@@ -1963,6 +1964,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.clear();
                 data.shrink_to_fit();
             }
+        }
+
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+
+        // the whole cached prompt is a prefix of the new one (fork: find_best picked the entry)
+        if (it_best->prompt.tokens.get_common_prefix(tokens_new) == it_best->prompt.tokens.size()) {
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
         }
 
         prompt = std::move(it_best->prompt);

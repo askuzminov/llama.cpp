@@ -19,9 +19,11 @@ rem set "QA_CORPUS=C:\data\long-text.txt"
 rem ---- a switch measured against the default in the probes of 01 and 02 ----
 rem set "QA_QARMS=default;pool32 LLAMA_QSA_POOL_F32=1"
 rem set "QA_PARMS=default;nolist LLAMA_QSA_FA_LIST=0"
-rem run-all.bat: a step out, and the variants of the probes of 02-long
+rem run-all.bat: a step out (RUN_BUILD, RUN_UPSTREAM, RUN_MICRO, RUN_CHECK, RUN_DECODE, RUN_PROFILE, RUN_KLD,
+rem RUN_EXACT, RUN_LONG), the variants of the probes of 02-long and of its four conversations at once
 rem set "RUN_LONG=0"
 rem set "LONG_QARMS=default"
+rem set "QA_PAR_ARMS=default"
 
 rem ---- only some parts of 02 ----
 rem set "QA_LONG_STAGES=chat par"

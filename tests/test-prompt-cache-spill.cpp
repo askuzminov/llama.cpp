@@ -787,7 +787,7 @@ static void test_damaged(const std::string & dir) {
             cp.pos_max  = 7;
             const server_state_buf blob = make_blob(8192, 900 + i); // whole blocks: the file ends with it, no padding
             cp.data_tgt.assign(blob.begin(), blob.end());
-            st.prompt.checkpoints.push_back(std::move(cp));
+            st.prompt.checkpoints.push_back(std::make_shared<common_prompt_checkpoint>(std::move(cp)));
             cache.states.push_back(std::move(st));
         }
         for (auto & st : cache.states) {
@@ -819,7 +819,7 @@ static void test_damaged(const std::string & dir) {
             assert(std::filesystem::exists(cache.spill_path(st.uid)) == !damaged);
             if (!damaged) {
                 assert(st.data.main == make_blob(100000, 700 + 20 + 1));
-                assert(st.prompt.checkpoints.size() == 1 && st.prompt.checkpoints.front().data_tgt.size() == 8192);
+                assert(st.prompt.checkpoints.size() == 1 && st.prompt.checkpoints.front()->data_tgt.size() == 8192);
                 ++n_ok;
             }
         }

@@ -1079,7 +1079,8 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
     std::vector<spill_ckpt> index;
     index.reserve(st.prompt.checkpoints.size());
 
-    for (const auto & cp : st.prompt.checkpoints) {
+    for (const auto & cp_ptr : st.prompt.checkpoints) {
+        const common_prompt_checkpoint & cp = *cp_ptr;
         index.push_back(spill_ckpt_of(cp));
 
         h.n_ckpt_bytes += spill_align_up(cp.data_tgt.size())
@@ -1138,7 +1139,8 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
         (h.n_ckpt   == 0 || f.write_section(index.data(), index.size()*sizeof(spill_ckpt)));
 
     if (ok && h.n_ckpt > 0) {
-        for (const auto & cp : st.prompt.checkpoints) {
+        for (const auto & cp_ptr : st.prompt.checkpoints) {
+            const common_prompt_checkpoint & cp = *cp_ptr;
             ok = (cp.data_tgt.empty()  || f.write_section(cp.data_tgt.data(),  cp.data_tgt.size())) &&
                  (cp.data_dft.empty()  || f.write_section(cp.data_dft.data(),  cp.data_dft.size())) &&
                  (cp.data_spec.empty() || f.write_section(cp.data_spec.data(), cp.data_spec.size()));
@@ -1249,7 +1251,8 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
             ckpts.push_back({e.n_tokens, e.pos_min, e.pos_max, e.base_pos >= 0, e.n_tgt > 0});
         }
     } else {
-        for (const auto & cp : st.prompt.checkpoints) {
+        for (const auto & cp_ptr : st.prompt.checkpoints) {
+            const common_prompt_checkpoint & cp = *cp_ptr;
             ckpts.push_back({cp.n_tokens, cp.pos_min, cp.pos_max, cp.is_delta(), !cp.data_tgt.empty()});
         }
     }
@@ -1318,7 +1321,8 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
         index.assign(findex.begin() + k_first, findex.begin() + k_end);
     } else {
         size_t k = 0;
-        for (const auto & cp : st.prompt.checkpoints) {
+        for (const auto & cp_ptr : st.prompt.checkpoints) {
+            const common_prompt_checkpoint & cp = *cp_ptr;
             if (k >= k_first && k < k_end) {
                 index.push_back(spill_ckpt_of(cp));
             }
@@ -1366,7 +1370,8 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
             }
         } else {
             size_t k = 0;
-            for (const auto & cp : st.prompt.checkpoints) {
+            for (const auto & cp_ptr : st.prompt.checkpoints) {
+                const common_prompt_checkpoint & cp = *cp_ptr;
                 if (k >= k_first && k < k_end) {
                     add_mem(cp.data_tgt.data(),  cp.data_tgt.size());
                     add_mem(cp.data_dft.data(),  cp.data_dft.size());
@@ -1622,7 +1627,10 @@ bool server_prompt_cache::pool_import(server_pool_inbox_fork & inbox, uint64_t s
     }
     st->data.main          = std::move(in.main);
     st->data.drft          = std::move(in.drft);
-    st->prompt.checkpoints = std::move(in.ckpts);
+    st->prompt.checkpoints.clear();
+    for (auto & cp : in.ckpts) {
+        st->prompt.checkpoints.push_back(std::make_shared<common_prompt_checkpoint>(std::move(cp)));
+    }
     // the request it came for takes it into a slot right away: write_behind does not write it out meanwhile
     st->disk_evicted = true;
     return true;
@@ -1777,7 +1785,7 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
 
         uint64_t off = lay.off_ckpt;
 
-        const auto rd_ckpt = [&](std::vector<uint8_t> & v, uint64_t n, spill_sum & sum) -> bool {
+        const auto rd_ckpt = [&](auto & v, uint64_t n, spill_sum & sum) -> bool {
             v.resize(n);
             if (n > 0 && !f.read_summed(off, v.data(), n, sum)) {
                 return false;
@@ -1806,7 +1814,7 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
                 return drop();
             }
 
-            st.prompt.checkpoints.push_back(std::move(cp));
+            st.prompt.checkpoints.push_back(std::make_shared<common_prompt_checkpoint>(std::move(cp)));
         }
     }
 
@@ -1898,7 +1906,8 @@ size_t server_prompt_cache::free_ram(size_t need, bool may_write) {
                 continue;
             }
             size_t big = 0;
-            for (const auto & ckpt : st.prompt.checkpoints) {
+            for (const auto & ckpt_ptr : st.prompt.checkpoints) {
+                const common_prompt_checkpoint & ckpt = *ckpt_ptr;
                 big += ckpt.size();
             }
             st.prompt.checkpoints.clear();
@@ -2074,6 +2083,7 @@ bool server_prompt_cache::evict_for_reserve(size_t extra, bool may_write) {
 
     const size_t want = reserve_size + extra;
     if (avail >= want) {
+        reserve_short = false;
         return true;
     }
 
@@ -2081,8 +2091,23 @@ bool server_prompt_cache::evict_for_reserve(size_t extra, bool may_write) {
     // available RAM here would over-evict). free_ram spills cold states to disk when a spill dir
     // is configured, and only drops them outright as a last resort.
     const size_t need = want - avail;
-    SRV_WRN(" - host memory pressure, relieving %.3f MiB from the prompt cache (available %.3f MiB < reserve %.3f MiB)\n",
-            need / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
+
+    // 12.11: with nothing in RAM to give back the memory is taken elsewhere (the KV cells an elastic cache took from the
+    // system memory, another program), and this ran on every update, twice a second, each line saying it relieves 2 GB
+    // it did not have. said once when that starts and then once a minute
+    const size_t held = size();
+    if (held == 0) {
+        const int64_t t_us = ggml_time_us();
+        if (!reserve_short || t_us - t_reserve_log_us >= 60ll*1000*1000) {
+            SRV_WRN(" - host memory is short (available %.3f MiB < reserve %.3f MiB) and the prompt cache holds nothing in RAM: "
+                    "the memory is taken outside the cache\n", avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
+            t_reserve_log_us = t_us;
+        }
+        reserve_short = true;
+        return false;
+    }
+    reserve_short = false;
+
     size_t freed = free_ram(need, may_write);
 
     // 07.11: the writes wait while other slots run (defer_writes), and with requests in the queue they always run, so the
@@ -2097,6 +2122,10 @@ bool server_prompt_cache::evict_for_reserve(size_t extra, bool may_write) {
     if (freed < need) {
         freed += drop_resident(need - freed);
     }
+
+    SRV_WRN(" - host memory pressure: %.3f of %.3f MiB given back by the prompt cache, which held %.3f MiB (available %.3f "
+            "MiB < reserve %.3f MiB)\n", freed / (1024.0 * 1024.0), need / (1024.0 * 1024.0), held / (1024.0 * 1024.0),
+            avail / (1024.0 * 1024.0), reserve_size / (1024.0 * 1024.0));
 
     return freed >= need;
 }

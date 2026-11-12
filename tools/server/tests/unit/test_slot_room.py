@@ -243,3 +243,21 @@ def test_generation_progress_during_another_prompt(monkeypatch):
     # One token may be batched after the other prompt finishes; more proves interleaving.
     n_decode = len(re.findall(r"slot .*id\s+0 \|.*slot decode token", during))
     assert n_decode > 1, f"only {n_decode} decode steps during the other prompt"
+
+
+def test_reserve_short_logged_once():
+    global server
+    # 12.11: with the host RAM below the reserve and nothing in the prompt cache to give back (on the 395 the KV cells
+    # had taken the system memory), the cache warned on every update, twice a second, each line "relieving" 2 GB it did
+    # not have. now it says so once while that lasts, and a line says what was given back when there was something
+    server.cache_ram_reserve = 1 << 30
+    server.no_cache_idle_slots = False
+    server.start()
+    log = LogReader(server.log_path)
+    for p in (STORY_A, STORY_B, STORY_C, STORY_A, STORY_B, STORY_C):
+        res = complete(p, 8)
+        assert res.status_code == 200
+    text = log.drain()
+    assert "relieving" not in text
+    n_short = text.count("the prompt cache holds nothing in RAM")
+    assert n_short == 1, n_short

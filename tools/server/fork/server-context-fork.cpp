@@ -314,16 +314,16 @@ uint64_t server_prompt_cache_signature_portable(
 //
 
 bool server_ckpt_has_dependent_delta(const server_ckpt_list & ckpts, server_ckpt_list::const_iterator it) {
-    return std::next(it) != ckpts.end() && std::next(it)->is_delta();
+    return std::next(it) != ckpts.end() && (*std::next(it))->is_delta();
 }
 
 // the chain eviction takes: the front one, or the one after it when the front one is the checkpoint at `keep` (the end of
 // a long system prompt) and another chain follows
 static server_ckpt_list::iterator server_ckpt_evictable(server_ckpt_list & ckpts, int64_t keep) {
     auto it = ckpts.begin();
-    if (keep >= 0 && it != ckpts.end() && !it->is_delta() && it->n_tokens == keep) {
+    if (keep >= 0 && it != ckpts.end() && !(*it)->is_delta() && (*it)->n_tokens == keep) {
         auto next = std::next(it);
-        while (next != ckpts.end() && next->is_delta()) {
+        while (next != ckpts.end() && (*next)->is_delta()) {
             ++next;
         }
         if (next != ckpts.end()) {
@@ -338,12 +338,12 @@ size_t server_ckpt_evict_front_chain(server_ckpt_list & ckpts, int64_t keep) {
     if (it == ckpts.end()) {
         return 0;
     }
-    size_t freed = it->size();
-    const bool erased_base = !it->is_delta();
+    size_t freed = (*it)->size();
+    const bool erased_base = !(*it)->is_delta();
     it = ckpts.erase(it);
     if (erased_base) {
-        while (it != ckpts.end() && it->is_delta()) {
-            freed += it->size();
+        while (it != ckpts.end() && (*it)->is_delta()) {
+            freed += (*it)->size();
             it = ckpts.erase(it);
         }
     }
@@ -358,18 +358,18 @@ llama_pos server_ckpt_next_base_pos(const server_ckpt_list & ckpts, const llama_
 
     for (auto it = ckpts.rbegin(); it != ckpts.rend(); ++it) {
         // a failed capture holds no data, so it cannot serve as a base
-        if (!it->is_delta() && !it->data_tgt.empty()) {
+        if (!(*it)->is_delta() && !(*it)->data_tgt.empty()) {
             has_base         = true;
-            chain_base_bytes = it->size();
+            chain_base_bytes = (*it)->size();
             // fork: no delta hangs off the checkpoint at the end of a long system prompt, so that it stays a chain of
             // its own, which eviction keeps (server_ckpt_evict_front_chain)
-            if (keep >= 0 && it->n_tokens == keep) {
+            if (keep >= 0 && (*it)->n_tokens == keep) {
                 return -1;
             }
             break;
         }
 
-        chain_delta_bytes += it->size();
+        chain_delta_bytes += (*it)->size();
     }
 
     // Re-anchor once the deltas cost as much as the base they hang off. Eviction drops a chain
@@ -388,13 +388,13 @@ llama_pos server_ckpt_next_base_pos(const server_ckpt_list & ckpts, const llama_
         return -1;
     }
 
-    return ckpts.back().pos_max;
+    return ckpts.back()->pos_max;
 }
 
 size_t server_ckpt_evict_over_budget(server_ckpt_list & ckpts, size_t budget, int64_t keep) {
     size_t total = 0;
-    for (const common_prompt_checkpoint & cp : ckpts) {
-        total += cp.size();
+    for (const auto & cp : ckpts) {
+        total += cp->size();
     }
 
     size_t freed = 0;
@@ -406,7 +406,7 @@ size_t server_ckpt_evict_over_budget(server_ckpt_list & ckpts, size_t budget, in
             break;
         }
         auto end = std::next(it);
-        while (end != ckpts.end() && end->is_delta()) {
+        while (end != ckpts.end() && (*end)->is_delta()) {
             ++end;
         }
         if (end == ckpts.end()) {
@@ -432,14 +432,14 @@ const common_prompt_checkpoint * server_ckpt_restore(
         llama_seq_id seq_id) {
     auto it_base = it_cur;
     while (it_base != ckpts.begin() &&
-            (it_base->is_delta() || it_base->data_tgt.empty())) {
+            ((*it_base)->is_delta() || (*it_base)->data_tgt.empty())) {
         --it_base;
     }
 
     // a failed capture holds no data: restore the base before it and process the
     // tokens after that base again
-    const common_prompt_checkpoint & cur_cp = *it_cur;
-    const common_prompt_checkpoint & base_cp = *it_base;
+    const common_prompt_checkpoint & cur_cp = **it_cur;
+    const common_prompt_checkpoint & base_cp = **it_base;
     const bool not_captured = cur_cp.data_tgt.empty();
     const common_prompt_checkpoint & restored_cp = not_captured ? base_cp : cur_cp;
 
@@ -450,7 +450,7 @@ const common_prompt_checkpoint * server_ckpt_restore(
     }
     if (ok && !not_captured) {
         for (auto it_delta = std::next(it_base); ok && it_delta != std::next(it_cur); ++it_delta) {
-            ok = it_delta->apply(
+            ok = (*it_delta)->apply(
                     ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
     }

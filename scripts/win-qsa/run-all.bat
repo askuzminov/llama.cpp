@@ -1,52 +1,84 @@
 @echo off
-rem the build and every step with the variants of the open questions, in order: 00-build, 04-micro, 01-check,
-rem 03-profile, 02-long (about two and a half hours on the 395). each step runs only what the same sources have not
-rem measured yet, so after a change of the code everything runs and after a change of the variants only the new
-rem ones. the variants below are set only where _local.bat has none; RUN_BUILD, RUN_MICRO, RUN_CHECK, RUN_PROFILE,
-rem RUN_LONG=0 there leave a step out. serve.bat is not part of it and has to be stopped
+rem the build, the upstream build of 07 and every step with the variants of the open questions, in order: 00-build,
+rem 00-build upstream, 04-micro (off), 01-check, 06-decode, 03-profile, 07-kld, 07-kld against the exact f32 base
+rem (the 395 only), 02-long. about 3 hours on the 395, more on the 3090 (two CUDA builds, more variants; README).
+rem each step runs only what the same sources have not measured yet, so after a change of the code everything runs
+rem and after a change of the variants only the new ones. the variants below are set only where _local.bat has none;
+rem RUN_BUILD, RUN_UPSTREAM, RUN_MICRO, RUN_CHECK, RUN_DECODE, RUN_PROFILE, RUN_KLD, RUN_EXACT, RUN_LONG=0 there
+rem leave a step out. serve.bat is not part of it and has to be stopped
 setlocal enabledelayedexpansion
-call "%~dp0_config.bat"
+rem the folder of this file, for the subroutine below: there the zeroth argument is the label, not this file
+set "HERE=%~dp0"
+call "%HERE%_config.bat"
 
-rem the questions (README): again (a second default, an unread variable) gives the logits of default bit for bit,
-rem on the 395 since 01.11, on the 3090 since the stable radix-select of CUDA top-k.cu (02.11,
-rem GGML_CUDA_TOPK_RADIX_STABLE; before it the probes parted at 16256). settled and left out: on the 395 mm (the head
-rem matmul in the graph: the same bits and time, 1.4 GiB more compute buffer) and radix0 (the radix-select of upstream:
-rem the same time, not repeatable) by the runs of 01.11 and 02.11; on the 3090 nowin (the MTP window KV off: the GPU op
-rem time of the profile leaves out the CPU experts) and radix0 (the gather of upstream: TOP_K 10.6 against 8.6 ms of
-rem the stable one per call at 252K, 03.11)
+rem the questions of 12.11 (README, run-all): the merge of master 0d69255c5 on both machines (every step, 07 against
+rem that master), the guards of the device memory (01), the QSA block lists of the slots (02 par, rows0); on the 395
+rem the cost of the 8- and 16-bit activations against the exact f32 math (07-exact: the prompt path, the decode
+rem kernels at 4 tokens, the same on f32 mat-vecs); on the 3090 the radix top-k of upstream (radix-up: 03, 07), the
+rem expert cache of upstream with a CPU share of the misses (upmoe0/3/5: 06), the margin of our expert cache (m512,
+rem m256: 06; with the sysmem fallback of the driver off, see the guards of 01), the vocabulary subset of the MTP
+rem head against the whole vocabulary (full: 06, pending since 10.11) and the draft cap 7 (cap7: 06). settled and left out: on the 395 mm and radix0
+rem (01.11, 02.11), on the 3090 nowin (02.11); again (a second default) stays: the logits of default bit for bit
+if not defined UPSTREAMREF set "UPSTREAMREF=0d69255c5"
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
-if not defined QA_PARMS set "QA_PARMS=default"
-rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
-if not defined RUN_MICRO set "RUN_MICRO=0"
+if not defined QA_PAR_ARMS set "QA_PAR_ARMS=default;rows0 LLAMA_QSA_ROWS=0"
+rem the decode tasks with a long prompt (about 24K tokens) and a short reply: the prompt speed of each variant too
+if not defined QA_DEC_SET set "QA_DEC_SET=prose ru code-py code-cpp edit json long"
 rem the probes of 02-long take the default only, the variants of the probes are a question for 01-check
 if not defined LONG_QARMS set "LONG_QARMS=default"
+rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
+if not defined RUN_MICRO set "RUN_MICRO=0"
+if /i "%BACKEND%"=="cuda" goto :arms_cuda
+if not defined QA_PARMS set "QA_PARMS=default"
+if not defined QA_DARMS set "QA_DARMS=default"
+if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
+if not defined EXACT_KARMS set "EXACT_KARMS=prompt;decode4 QA_ARM_UB=4;decode4f32 QA_ARM_UB=4 GGML_VK_DISABLE_MMVQ=1 GGML_VK_MMV_ID_FORK=0"
+goto :arms_done
+:arms_cuda
+if not defined QA_PARMS set "QA_PARMS=default;radix-up GGML_CUDA_TOPK_RADIX_STABLE=0"
+rem cap7: the draft cap of --spec-auto at 7 as on the 395 since 09.11 (the 3090 keeps 3, QA_SPEC in _config.bat, not
+rem measured since 12.10). upmoe: 6500 MiB, about the ~46 slots a layer of our cache at full depth (RESEARCH.md);
+rem --moe-cache 0 turns ours off
+if not defined QA_DARMS set "QA_DARMS=default;cap7 "QA_ARM_ARGS=--spec-draft-n-max 7";full LLAMA_MTP_VOCAB=0;m512 LLAMA_MOE_CACHE_MARGIN_MIB=512;m256 LLAMA_MOE_CACHE_MARGIN_MIB=256;upmoe0 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0";upmoe3 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.3";upmoe5 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.5""
+if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream;radix-up GGML_CUDA_TOPK_RADIX_STABLE=0"
+rem the CUDA matmuls have no f32 mode: 07 against the exact base runs on the 395 only
+if not defined RUN_EXACT set "RUN_EXACT=0"
+:arms_done
 
-for %%v in (BUILD MICRO CHECK PROFILE LONG) do if not defined RUN_%%v set "RUN_%%v=1"
+for %%v in (BUILD MICRO CHECK DECODE PROFILE KLD EXACT LONG) do if not defined RUN_%%v set "RUN_%%v=1"
+rem the upstream build is the base of 07 against upstream
+if not defined RUN_UPSTREAM set "RUN_UPSTREAM=%RUN_KLD%"
 set "STEPS="
-if "%RUN_BUILD%"=="1"   set "STEPS=!STEPS! 00-build"
-if "%RUN_MICRO%"=="1"   set "STEPS=!STEPS! 04-micro"
-if "%RUN_CHECK%"=="1"   set "STEPS=!STEPS! 01-check"
-if "%RUN_PROFILE%"=="1" set "STEPS=!STEPS! 03-profile"
-if "%RUN_LONG%"=="1"    set "STEPS=!STEPS! 02-long"
+if "%RUN_BUILD%"=="1"    set "STEPS=!STEPS! 00-build"
+if "%RUN_UPSTREAM%"=="1" set "STEPS=!STEPS! 00-upstream"
+if "%RUN_MICRO%"=="1"    set "STEPS=!STEPS! 04-micro"
+if "%RUN_CHECK%"=="1"    set "STEPS=!STEPS! 01-check"
+if "%RUN_DECODE%"=="1"   set "STEPS=!STEPS! 06-decode"
+if "%RUN_PROFILE%"=="1"  set "STEPS=!STEPS! 03-profile"
+if "%RUN_KLD%"=="1"      set "STEPS=!STEPS! 07-kld"
+if "%RUN_EXACT%"=="1"    set "STEPS=!STEPS! 07-exact"
+if "%RUN_LONG%"=="1"     set "STEPS=!STEPS! 02-long"
 if "%STEPS%"=="" (
     echo every RUN_ step is 0, nothing to do
     exit /b 1
 )
 
-rem the probes of 01 and 02 read a long text
-if not defined QA_CORPUS if not exist "%PPLFILE%" call "%~dp0get-wikitext.bat"
+rem the probes of 01 and 02, the decode tasks and 07 read a long text
+if not defined QA_CORPUS if not exist "%PPLFILE%" call "%HERE%get-wikitext.bat"
 
-echo variants: micro [%QA_MARMS%] check [%QA_QARMS%] profile [%QA_PARMS%] long [%LONG_QARMS%]
+echo steps:%STEPS%
+echo variants: micro [%QA_MARMS%] check [%QA_QARMS%] decode [%QA_DARMS%] profile [%QA_PARMS%] kld [%QA_KARMS%]
+echo   exact [%EXACT_KARMS%] long [%LONG_QARMS%] par [%QA_PAR_ARMS%], upstream %UPSTREAMREF%
 rem 00-build waits for a key after a failure, run-all goes on by itself
 set "QSA_UNATTENDED=1"
 rem not RC: cmake takes RC from the environment as the resource compiler of a fresh configure
 set "STEPRC=0"
 set "RESULTS="
 set "CHECK_QARMS=%QA_QARMS%"
+set "KLD_KARMS=%QA_KARMS%"
 for %%s in (%STEPS%) do (
     echo === %%s
-    if "%%s"=="02-long" (set "QA_QARMS=%LONG_QARMS%") else (set "QA_QARMS=%CHECK_QARMS%")
-    call "%~dp0%%s.bat"
+    call :step %%s
     set "EC=!ERRORLEVEL!"
     if not "!EC!"=="0" set "STEPRC=!EC!"
     set "RESULTS=!RESULTS! %%s=!EC!"
@@ -59,3 +91,23 @@ for %%s in (%STEPS%) do (
 echo === exit codes:%RESULTS%
 echo the summary of each step is in its folder in %LOGS%
 exit /b %STEPRC%
+
+rem one step with its variants: 02-long reads the probes of LONG_QARMS, 07-exact compares with the exact f32 base. a
+rem failed 00-upstream leaves 07 against upstream to its check of the build (UPSTREAMREF), the other steps go on
+:step
+set "QA_QARMS=%CHECK_QARMS%"
+set "QA_KARMS=%KLD_KARMS%"
+set "QA_KLD_BASE=upstream"
+if "%~1"=="00-upstream" goto :step_upstream
+if "%~1"=="07-exact" goto :step_exact
+if "%~1"=="02-long" set "QA_QARMS=%LONG_QARMS%"
+call "%HERE%%~1.bat"
+exit /b %ERRORLEVEL%
+:step_upstream
+call "%HERE%00-build.bat" upstream
+exit /b %ERRORLEVEL%
+:step_exact
+set "QA_KLD_BASE=exact"
+set "QA_KARMS=%EXACT_KARMS%"
+call "%HERE%07-kld.bat"
+exit /b %ERRORLEVEL%

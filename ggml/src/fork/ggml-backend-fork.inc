@@ -136,6 +136,8 @@ struct ggml_backend_sched_snapshot {
     std::vector<ggml_backend_sched_split> splits; // the inputs of each split point into inputs
     std::vector<ggml_tensor *> inputs;            // inputs of all splits
     std::vector<ggml_tensor>   copies;            // copy of each input in the backend of its split, the nodes use these copies
+    std::vector<uint8_t>       requires_copy;     // hv_tensor_requires_copy of each input (upstream 806b3c2be): an input only
+                                                  // the nodes that are not computed read is not copied
 
     // backends of the graph tensors
     struct ggml_hash_set hash_set;
@@ -205,6 +207,7 @@ ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_save(ggml_backend_sche
     snapshot->splits.assign(sched->splits, sched->splits + sched->n_splits);
     snapshot->inputs.resize(n_inputs);
     snapshot->copies.resize(n_inputs);
+    snapshot->requires_copy.resize(n_inputs);
 
     // the copies of the scheduler are in its context, the next split reuses that memory
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> copies;
@@ -228,6 +231,7 @@ ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_save(ggml_backend_sche
             struct ggml_tensor ** cpy = &tensor_copy(input, split->backend_id, 0);
             snapshot->inputs[k] = input;
             snapshot->copies[k] = **cpy;
+            snapshot->requires_copy[k] = sched->hv_tensor_requires_copy[hash_id(input)] ? 1 : 0;
             copies[*cpy] = &snapshot->copies[k];
             *cpy = &snapshot->copies[k];
         }
@@ -297,6 +301,8 @@ bool ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backen
                 memset(&tensor_id_copy(id, 0, 0), 0, sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
             }
             tensor_id_copy(id, src->backend_id, 0) = &snapshot->copies[k];
+            // the slots of the hash set moved with the reset above, so the flag goes with the input
+            sched->hv_tensor_requires_copy[id] = snapshot->requires_copy[k] != 0;
         }
         dst->backend_id  = src->backend_id;
         dst->i_start     = src->i_start;

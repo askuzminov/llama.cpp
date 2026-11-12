@@ -1,8 +1,8 @@
-// the fork's KQ mask fill, included by llama-kv-cache.cpp after the upstream set_input_kq_mask_impl: the rows of
+// the fork's KQ mask fill, included by llama-kv-cache.cpp after the upstream set_input_attn_mask_impl: the rows of
 // the ubatch are filled in parallel (llama_parallel_for). LLAMA_UPSTREAM=kq-mask runs the upstream function
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
-static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T * data) {
+static void set_input_kq_mask_impl_fork(const args_set_input_attn_mask & args, T * data) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
 
@@ -16,6 +16,8 @@ static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T *
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
 
+    const int32_t * rows_all = args.rows;
+
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
@@ -23,13 +25,20 @@ static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T *
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
     std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
 
+    // first token of each sequence, used when the mask rows are shared within a sequence
+    uint32_t seq_first[LLAMA_MAX_SEQ];
+    std::fill(seq_first, seq_first + LLAMA_MAX_SEQ, ubatch->n_tokens);
+
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+        seq_first[seq_id]   = std::min(seq_first[seq_id],   i);
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
+        const int32_t * rows = rows_all ? rows_all + s*n_kv : nullptr;
+
         // the rows are filled in parts, in parallel for a large mask. each part keeps its own bookkeeping, so it
         // fills its first row of a sequence in full and the next rows of that sequence copy it
         llama_parallel_for(n_tps, (int64_t) n_tps*n_kv, [&](int64_t ii0, int64_t ii1) {
@@ -44,12 +53,15 @@ static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T *
 
                 const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
+                // shared mask rows: every query of the sequence uses the row of its first token
+                const uint32_t iq = args.block_uniform ? seq_first[seq_id] : i;
+
                       llama_pos p0 = -1;
-                const llama_pos p1 = ubatch->pos[i];
+                const llama_pos p1 = ubatch->pos[iq];
 
                 // for M-RoPE
-                const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
-                const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+                const llama_pos p1_x = is_2d ? ubatch->pos[iq + ubatch->n_tokens*2] : 0;
+                const llama_pos p1_y = is_2d ? ubatch->pos[iq + ubatch->n_tokens]   : 0;
 
                 const uint64_t idst = n_kv*i;
 
@@ -81,7 +93,8 @@ static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T *
                 }
 
                 for (uint32_t jj = 0; jj < n_kv; ++jj) {
-                    uint32_t j = jj;
+                    // column of the mask
+                    uint32_t c = jj;
 
                     // we have an exiting mask for this sequence -> update just seq_idxs
                     if (!alibi) {
@@ -90,11 +103,14 @@ static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T *
                                 break;
                             }
 
-                            j = idxs[jj];
+                            c = idxs[jj];
                         }
                     }
 
-                    if (cells.is_empty(j)) {
+                    // cell of the column, negative for padding
+                    const int32_t j = rows ? rows[c] : (int32_t) c;
+
+                    if (j < 0 || cells.is_empty(j)) {
                         goto skip;
                     }
 
@@ -109,7 +125,7 @@ static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T *
                         if (!prev) {
                             // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
                             if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                                idxs.push_back(j);
+                                idxs.push_back(c);
                             }
                         }
                     }
@@ -142,14 +158,14 @@ static void set_input_kq_mask_impl_fork(const args_set_input_kq_mask & args, T *
                     }
 
                     if (alibi) {
-                        data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                        data[idst + c] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
                     } else {
-                        data[idst + j] = mask_keep;
+                        data[idst + c] = mask_keep;
                     }
 
                     continue;
-    skip:
-                    data[idst + j] = mask_drop;
+skip:
+                    data[idst + c] = mask_drop;
                 }
             }
         });

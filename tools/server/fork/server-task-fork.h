@@ -46,28 +46,8 @@ struct server_pool_inbox_fork {
     std::unique_ptr<impl> pimpl;
 };
 
-// the spill writes the state blobs with the OS cache bypassed, which needs a sector-aligned source.
-// allocating them aligned lets the spill move them without a bounce buffer
-constexpr size_t SERVER_STATE_ALIGN = 4096;
+// the spill writes the state blobs with the OS cache bypassed, which needs a sector-aligned source: common_state_data
+// (common.h) allocates its storage aligned, so the spill moves them without a bounce buffer
+constexpr size_t SERVER_STATE_ALIGN = COMMON_STATE_ALIGN;
 
-template <typename T>
-struct server_state_alloc {
-    using value_type = T;
-
-    server_state_alloc() = default;
-
-    template <typename U> server_state_alloc(const server_state_alloc<U> &) {}
-
-    T * allocate(size_t n) {
-        return (T *) ::operator new(n*sizeof(T), std::align_val_t(SERVER_STATE_ALIGN));
-    }
-
-    void deallocate(T * p, size_t) noexcept {
-        ::operator delete(p, std::align_val_t(SERVER_STATE_ALIGN));
-    }
-
-    template <typename U> bool operator==(const server_state_alloc<U> &) const { return true;  }
-    template <typename U> bool operator!=(const server_state_alloc<U> &) const { return false; }
-};
-
-using server_state_buf = std::vector<uint8_t, server_state_alloc<uint8_t>>;
+using server_state_buf = common_state_data;

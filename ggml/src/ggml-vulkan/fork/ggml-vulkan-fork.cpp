@@ -6,6 +6,9 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstring>
+#include <map>
+#include <mutex>
 
 // runs a probe shader with one storage buffer of `words` 32-bit words, zeroed, on n_wg workgroups and copies the
 // buffer to `out`. spec: the specialization constants 0.., subgroup_size: a required subgroup size or 0. false when
@@ -940,6 +943,111 @@ static void ggml_vk_fork_profiler(bool start) {
     }
 }
 
+// the bytes of a heap this process may hold (12.11). a device local heap: the heap less what the other processes hold in
+// it, where the system counts that (ggml_vk_fork_adapter_dedicated_usage, the counter Task Manager shows; Windows only),
+// else the budget of the driver. the AMD driver of the 395 budgets 95 percent of the carve-out whatever the others hold
+// (93389 of 98304 MiB in every log), so the elastic cache went to the shared memory with ~3 GB of the carve-out free
+// (user, 12.11); the heap itself stays the bound, past it the driver backs the memory with system memory and stalls on
+// its first use (98.8 GB of buffers, 11.10). only a device with one device local heap, as the counter adds up the
+// adapter. the others are read again at most once a second. GGML_VK_DEVICE_LIMIT=budget: the budget of the driver
+static uint64_t ggml_vk_fork_heap_limit(const vk_device & device, uint32_t heap,
+        const vk::PhysicalDeviceMemoryBudgetPropertiesEXT & bp, const vk::PhysicalDeviceMemoryProperties & mp) {
+    const uint64_t size   = mp.memoryHeaps[heap].size;
+    const uint64_t budget = std::min<uint64_t>(bp.heapBudget[heap], size);
+
+    static const bool use_budget = [] {
+        const char * e = getenv("GGML_VK_DEVICE_LIMIT");
+        return e != nullptr && strcmp(e, "budget") == 0;
+    }();
+    if (use_budget || !(mp.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+        return budget;
+    }
+    uint32_t n_local = 0;
+    for (uint32_t h = 0; h < mp.memoryHeapCount; ++h) {
+        n_local += (mp.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? 1 : 0;
+    }
+    if (n_local != 1) {
+        return budget;
+    }
+
+    struct others_state {
+        bool     id_read  = false;
+        bool     id_valid = false;
+        uint8_t  luid[8]  = {};
+        int64_t  t_us     = 0;
+        bool     known    = false;
+        uint64_t others   = 0;
+        bool     logged   = false;
+    };
+    static std::mutex                     mtx;
+    static std::map<size_t, others_state> states;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    others_state & st = states[device->idx];
+    if (!st.id_read) {
+        vk::PhysicalDeviceIDProperties id;
+        vk::PhysicalDeviceProperties2  props2;
+        props2.pNext = &id;
+        device->physical_device.getProperties2(&props2);
+        st.id_read  = true;
+        st.id_valid = id.deviceLUIDValid;
+        memcpy(st.luid, id.deviceLUID.data(), sizeof(st.luid));
+    }
+    if (!st.id_valid) {
+        return budget;
+    }
+    const int64_t t_us = ggml_time_us();
+    if (st.t_us == 0 || t_us - st.t_us >= 1000000) {
+        uint64_t sys = 0;
+        st.known  = ggml_vk_fork_adapter_dedicated_usage(st.luid, &sys);
+        st.others = st.known && sys > bp.heapUsage[heap] ? sys - bp.heapUsage[heap] : 0;
+        st.t_us   = t_us;
+    }
+    if (!st.known) {
+        return budget;
+    }
+    const uint64_t limit = size > st.others ? size - st.others : 0;
+    if (!st.logged) {
+        st.logged = true;
+        GGML_LOG_WARN("ggml_vulkan: %s: device memory heap %u of %.0f MiB, other processes hold %.0f MiB of it, the driver "
+                "budgets %.0f MiB: this process takes up to %.0f MiB (GGML_VK_DEVICE_LIMIT=budget: the budget)\n",
+                device->name.c_str(), heap, size/1048576.0, st.others/1048576.0, budget/1048576.0, limit/1048576.0);
+    }
+    return limit;
+}
+
+bool ggml_vk_fork_heap_has_room(const vk_device & device, uint32_t type, uint64_t size) {
+    // GGML_VK_ALLOW_SYSMEM_FALLBACK=1: system memory allowed, so the driver may also back device memory with it
+    if (device->allow_sysmem_fallback ||
+            device->idx >= vk_instance.device_supports_membudget.size() || !vk_instance.device_supports_membudget[device->idx]) {
+        return true;
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget_props;
+    vk::PhysicalDeviceMemoryProperties2 props2;
+    props2.pNext = &budget_props;
+    device->physical_device.getMemoryProperties2(&props2);
+    if (type >= props2.memoryProperties.memoryTypeCount) {
+        return true;
+    }
+    const vk::MemoryType & mt = props2.memoryProperties.memoryTypes[type];
+    if (!(mt.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+        return true;
+    }
+    static const uint64_t margin = (uint64_t) std::max<int64_t>(0, getenv("GGML_VK_DEVICE_MARGIN_MIB") != nullptr ?
+                                       atoll(getenv("GGML_VK_DEVICE_MARGIN_MIB")) : 0)*1024*1024;
+    const uint32_t heap  = mt.heapIndex;
+    const uint64_t limit = ggml_vk_fork_heap_limit(device, heap, budget_props, props2.memoryProperties);
+    const uint64_t usage = budget_props.heapUsage[heap];
+    if (usage + size + margin <= limit) {
+        return true;
+    }
+    GGML_LOG_ERROR("ggml_vulkan: device memory heap %u: %.0f MiB in use of a limit of %.0f MiB, %.0f MiB more asked (%.0f MiB "
+            "kept free): not allocated there, the driver would back it with system memory (GGML_VK_DEVICE_MARGIN_MIB; "
+            "GGML_VK_ALLOW_SYSMEM_FALLBACK=1 allows system memory)\n",
+            heap, usage/1048576.0, limit/1048576.0, size/1048576.0, margin/1048576.0);
+    return false;
+}
+
 // elastic buffers (26.10): the elastic KV cache of llama (LLAMA_KV_ELASTIC, src/fork/llama-kv-elastic-fork.cpp) places its
 // tensors in a buffer that reserves the range of the whole cache and binds device memory to the cells in use, per
 // granule, as the CUDA one maps VMM granules (ggml-cuda/fork/elastic-buffer-fork.inc). Here a sparse buffer: the device
@@ -974,6 +1082,8 @@ struct ggml_vk_elastic_fork {
     uint64_t                margin        = 0;     // bytes each heap keeps free
     bool                    device_full   = false; // the device memory had no room for a slab in this commit
     bool                    spilled       = false; // logged
+    uint64_t                host_floor    = 0;     // the system memory a spill slab leaves free (GGML_VK_ELASTIC_SPILL_HOST_MIN_MIB)
+    bool                    host_full     = false; // logged: the floor stopped the spill
     vk::MemoryAllocateFlags alloc_flags;       // the device address flag where the buffers have addresses
     std::vector<int32_t>    granule_slab;      // per granule of the buffer: its slab, -1 while unbound
     std::vector<uint32_t>   granule_piece;     // and its place in the slab
@@ -1008,7 +1118,7 @@ struct ggml_vk_elastic_fork {
         props2.pNext = &budget_props;
         device->physical_device.getMemoryProperties2(&props2);
         const uint32_t heap = props2.memoryProperties.memoryTypes[type].heapIndex;
-        const uint64_t lim  = std::min<uint64_t>(budget_props.heapBudget[heap], props2.memoryProperties.memoryHeaps[heap].size);
+        const uint64_t lim  = ggml_vk_fork_heap_limit(device, heap, budget_props, props2.memoryProperties);
         if (usage) {
             *usage = budget_props.heapUsage[heap];
         }
@@ -1016,6 +1126,23 @@ struct ggml_vk_elastic_fork {
             *limit = lim;
         }
         return budget_props.heapUsage[heap] + slab_granules*granularity + margin <= lim;
+    }
+
+    // whether a spill slab leaves the system the floor of free physical memory; true when the system cannot tell. the
+    // budget of the shared heap is not that: on the 395 it let the slabs take the system down to tens of MiB free, the
+    // system paged and the prompt cache of the server tried to give back 2 GB every second (11-12.11)
+    bool host_room() {
+        const uint64_t avail = ggml_vk_fork_host_avail_bytes();
+        if (avail == 0 || avail >= host_floor + slab_granules*granularity) {
+            return true;
+        }
+        if (!host_full) {
+            GGML_LOG_WARN("ggml_vulkan: elastic buffer: the device memory is full and the system has %.0f MiB free (floor %.0f MiB, "
+                    "GGML_VK_ELASTIC_SPILL_HOST_MIN_MIB): no more KV cells, a sequence that needs them fails instead of "
+                    "swapping\n", avail/1048576.0, host_floor/1048576.0);
+            host_full = true;
+        }
+        return false;
     }
 
     bool alloc_slab(uint32_t type, vk::DeviceMemory & mem) const {
@@ -1039,7 +1166,7 @@ struct ggml_vk_elastic_fork {
                 device_full = true;
                 k = spill_type >= 0 ? open_slab(true) : slabs.size();
                 if (k == slabs.size()) {
-                    if (spill_type < 0 || !heap_room((uint32_t) spill_type) || !alloc_slab((uint32_t) spill_type, mem)) {
+                    if (spill_type < 0 || !heap_room((uint32_t) spill_type) || !host_room() || !alloc_slab((uint32_t) spill_type, mem)) {
                         return false;
                     }
                     spill = true;
@@ -1047,14 +1174,14 @@ struct ggml_vk_elastic_fork {
                         uint64_t usage = 0;
                         uint64_t limit = 0;
                         if (spill_only) {
-                            GGML_LOG_INFO("ggml_vulkan: elastic buffer: granules from the shared memory (type %d, "
+                            GGML_LOG_WARN("ggml_vulkan: elastic buffer: granules from the shared memory (type %d, "
                                     "GGML_VK_ELASTIC_SPILL=2)\n", spill_type);
                         } else if (budget && !heap_room(memory_type, &usage, &limit)) {
-                            GGML_LOG_INFO("ggml_vulkan: elastic buffer: the device memory is full (%.0f of %.0f MiB in "
+                            GGML_LOG_WARN("ggml_vulkan: elastic buffer: the device memory is full (%.0f of %.0f MiB in "
                                     "use, %.0f kept free), granules from the shared memory (type %d)\n",
                                     usage/1048576.0, limit/1048576.0, margin/1048576.0, spill_type);
                         } else {
-                            GGML_LOG_INFO("ggml_vulkan: elastic buffer: the device memory is full (an allocation failed), "
+                            GGML_LOG_WARN("ggml_vulkan: elastic buffer: the device memory is full (an allocation failed), "
                                     "granules from the shared memory (type %d)\n", spill_type);
                         }
                         spilled = true;
@@ -1246,6 +1373,10 @@ static ggml_backend_buffer_t ggml_backend_vk_buft_alloc_elastic_fork(ggml_backen
     el->budget      = device->idx < vk_instance.device_supports_membudget.size() && vk_instance.device_supports_membudget[device->idx];
     el->margin      = (uint64_t) std::max<int64_t>(0, getenv("GGML_VK_ELASTIC_MARGIN_MIB") != nullptr ?
                           atoll(getenv("GGML_VK_ELASTIC_MARGIN_MIB")) : 512)*1024*1024;
+    // 1.5 GiB: under the 2 GiB the prompt cache of the server keeps free on a 32 GB system (--cache-ram-reserve auto), so
+    // the cache gives its RAM back to the cells first and the spill stops only when there is nothing left to give
+    el->host_floor  = (uint64_t) std::max<int64_t>(0, getenv("GGML_VK_ELASTIC_SPILL_HOST_MIN_MIB") != nullptr ?
+                          atoll(getenv("GGML_VK_ELASTIC_SPILL_HOST_MIN_MIB")) : 1536)*1024*1024;
     if (device->buffer_device_address) {
         el->alloc_flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
     }
@@ -1408,7 +1539,7 @@ bool ggml_vk_fork_elastic_clear(ggml_backend_vk_buffer_context * ctx, uint8_t va
     return true;
 }
 
-void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+void * ggml_backend_vk_reg_get_proc_address_fork(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         return (void *) ggml_backend_vk_device_get_extra_bufts;

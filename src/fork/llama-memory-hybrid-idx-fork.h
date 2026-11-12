@@ -105,7 +105,12 @@ public:
     // the query cannot see at all. a block the query sees only in part stays finite, so the caller
     // still has to add the attention mask.
     // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * bias,
+    // rows (12.11, per block bias of one unified stream only): the indexer scores each slice of the ubatch (qsa_plan) against
+    // a list of blocks instead of all of them:
+    //   rows      I32 [n_rows, n_slices]       the blocks of the slice's sequences in ascending order, then blocks of other
+    //                                          sequences, -inf for every token, up to n_rows
+    //   bias      [n_rows, n_tokens/n_slices, n_slices] over the blocks of the list
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * bias, ggml_tensor * rows,
                        const llama_ubatch * ubatch, uint32_t n_kv, uint32_t ratio, bool blk_bias,
                        bool causal_attn) const;
 
@@ -134,16 +139,22 @@ public:
 
     // what one pass has to rebuild of the pooled block keys
     struct qsa_plan {
-        uint32_t n_dirty = 0;   // rows the graph writes; the list is padded to this size
-        bool     warm    = false;
+        uint32_t n_dirty   = 0;   // rows the graph writes; the list is padded to this size
+        bool     warm      = false;
+        // the slices of the ubatch (llama_kv_cache::get_n_kv_slices) that can score a block list of their own sequences
+        // (set_input_qsa rows): a unified cache with blocks of another sequence, per block bias. 0: no lists
+        uint32_t n_slices  = 0;
+        uint32_t n_own_max = 0;   // the most blocks the sequences of a slice hold
     };
 
     // group the cells into blocks and compare them with the blocks the pool already holds.
     // this runs at graph build time, so the graph can size its dirty list before set_input_qsa
     // fills it. the result is kept until the next ubatch, so a second call costs nothing.
-    // sinfo names the cells of this ubatch, so that the grouping of the last ubatch can be carried forward
+    // sinfo names the cells of this ubatch, so that the grouping of the last ubatch can be carried forward.
+    // max_slices: no block lists for a ubatch of more slices (the caller would not take them)
     qsa_plan qsa_prepare(const llama_ubatch * ubatch, uint32_t n_kv, uint32_t ratio, bool blk_bias,
-                         uint32_t s0, uint32_t ns, const llama_kv_cache::slot_info * sinfo = nullptr) const;
+                         uint32_t s0, uint32_t ns, const llama_kv_cache::slot_info * sinfo = nullptr,
+                         uint32_t max_slices = UINT32_MAX) const;
 
     // cells and rows of the blocks qsa_prepare marked dirty, and their mrope positions
     //   dirty_cells I32 [ratio*n_dirty, ns]
@@ -254,7 +265,13 @@ private:
         bool     blk_bias = false;
         bool     warm     = false;
         std::vector<qsa_group> grp;       // per ubatch stream
+        uint32_t n_slices  = 0;           // see qsa_plan
+        uint32_t n_own_max = 0;
+        std::vector<std::vector<int32_t>> own; // per slice: the blocks of its sequences, ascending
     };
+
+    // the slices of the ubatch and their block lists (qsa_plan, set_input_qsa rows), after the grouping of st
+    void qsa_slices(qsa_state & st, const llama_ubatch * ubatch, int64_t n_tokens, int64_t n_blocks, uint32_t max_slices) const;
 
     // the block tables each cache stream's pool rows were built from. a trim keeps the rows past n: several
     // sequences order their blocks by them (group_full)
@@ -331,12 +348,13 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * bias,
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * bias, ggml_tensor * rows,
                        const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias, bool causal_attn) const;
 
     // see llama_memory_hybrid_idx_fork::qsa_prepare. a context with no ubatch of its own asks for the
     // worst case, so that the reserved graph covers every later one
-    llama_memory_hybrid_idx_fork::qsa_plan qsa_prepare(const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+    llama_memory_hybrid_idx_fork::qsa_plan qsa_prepare(const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias,
+                                                       uint32_t max_slices = UINT32_MAX) const;
 
     void set_input_qsa_dirty(ggml_tensor * dirty_cells, ggml_tensor * dirty_pos, ggml_tensor * dirty_rows,
                              uint32_t ratio) const;

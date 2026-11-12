@@ -54,8 +54,8 @@ class ServerProcess(ServerProcessFork):
     debug: bool = False
     server_port: int = 8080
     server_host: str = "127.0.0.1"
-    model_hf_repo: str | None = "ggml-org/models"
-    model_hf_file: str | None = "tinyllamas/stories260K.gguf"
+    model_hf_repo: str | None = "ggml-org-dev/stories260K"
+    model_hf_file: str | None = "stories260K.gguf"
     model_alias: str = "tinyllama-2"
     temperature: float = 0.8
     seed: int = 42
@@ -105,6 +105,7 @@ class ServerProcess(ServerProcessFork):
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     spec_draft_n_ubatch: int | None = None
+    spec_draft_n_gpu_layer: int | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
     no_ui: bool | None = None
@@ -264,6 +265,8 @@ class ServerProcess(ServerProcessFork):
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
         if self.spec_draft_n_ubatch:
             server_args.extend(["--spec-draft-n-ubatch", self.spec_draft_n_ubatch])
+        if self.spec_draft_n_gpu_layer:
+            server_args.extend(["--spec-draft-ngl", self.spec_draft_n_gpu_layer])
         if self.spec_synth_len is not None:
             server_args.extend(["--spec-synth-len", self.spec_synth_len])
         if self.spec_synth_rates is not None:
@@ -565,7 +568,7 @@ class ServerPreset:
     def tinyllama2() -> ServerProcess:
         server = ServerProcess()
         server.offline = True # will be downloaded by load_all()
-        server.model_hf_repo = "ggml-org/test-model-stories260K"
+        server.model_hf_repo = "ggml-org-dev/test-model-stories260K"
         server.model_hf_file = None
         server.model_alias = "tinyllama-2"
         server.n_ctx = 512
@@ -579,8 +582,8 @@ class ServerPreset:
     def bert_bge_small() -> ServerProcess:
         server = ServerProcess()
         server.offline = True # will be downloaded by load_all()
-        server.model_hf_repo = "ggml-org/models"
-        server.model_hf_file = "bert-bge-small/ggml-model-f16.gguf"
+        server.model_hf_repo = "ggml-org-dev/bert-bge-small-GGUF"
+        server.model_hf_file = "ggml-model-f16.gguf"
         server.model_alias = "bert-bge-small"
         server.n_ctx = 512
         server.n_batch = 128
@@ -594,8 +597,8 @@ class ServerPreset:
     def bert_bge_small_with_fa() -> ServerProcess:
         server = ServerProcess()
         server.offline = True # will be downloaded by load_all()
-        server.model_hf_repo = "ggml-org/models"
-        server.model_hf_file = "bert-bge-small/ggml-model-f16.gguf"
+        server.model_hf_repo = "ggml-org-dev/bert-bge-small-GGUF"
+        server.model_hf_file = "ggml-model-f16.gguf"
         server.model_alias = "bert-bge-small"
         server.n_ctx = 1024
         server.n_batch = 300
@@ -610,7 +613,7 @@ class ServerPreset:
     def tinyllama_infill() -> ServerProcess:
         server = ServerProcess()
         server.offline = True # will be downloaded by load_all()
-        server.model_hf_repo = "ggml-org/test-model-stories260K-infill"
+        server.model_hf_repo = "ggml-org-dev/test-model-stories260K-infill"
         server.model_hf_file = None
         server.model_alias = "tinyllama-infill"
         server.n_ctx = 2048
@@ -625,7 +628,7 @@ class ServerPreset:
     def stories15m_moe() -> ServerProcess:
         server = ServerProcess()
         server.offline = True # will be downloaded by load_all()
-        server.model_hf_repo = "ggml-org/stories15M_MOE"
+        server.model_hf_repo = "ggml-org-dev/stories15M_MOE"
         server.model_hf_file = "stories15M_MOE-F16.gguf"
         server.model_alias = "stories15m-moe"
         server.n_ctx = 2048
@@ -640,8 +643,8 @@ class ServerPreset:
     def jina_reranker_tiny() -> ServerProcess:
         server = ServerProcess()
         server.offline = True # will be downloaded by load_all()
-        server.model_hf_repo = "ggml-org/models"
-        server.model_hf_file = "jina-reranker-v1-tiny-en/ggml-model-f16.gguf"
+        server.model_hf_repo = "ggml-org-dev/jina-reranker-v1-tiny-en-GGUF"
+        server.model_hf_file = "ggml-model-f16.gguf"
         server.model_alias = "jina-reranker"
         server.n_ctx = 512
         server.n_batch = 512
@@ -660,7 +663,7 @@ class ServerPreset:
             server.model_file = local_model
             server.model_hf_repo = None
         else:
-            server.model_hf_repo = "ggml-org/tinylaya-for-testing-gguf"
+            server.model_hf_repo = "ggml-org-dev/tinylaya-for-testing-gguf"
         server.n_ctx = 1024
         server.n_batch = 512
         server.n_ubatch = 512
@@ -674,7 +677,7 @@ class ServerPreset:
         server.offline = True # will be downloaded by load_all()
         # mmproj is already provided by HF registry API
         server.model_hf_file = None
-        server.model_hf_repo = "ggml-org/tinyopenjev-for-testing-gguf:Q8_0"
+        server.model_hf_repo = "ggml-org-dev/tinyopenjev-for-testing-gguf:Q8_0"
         server.n_ctx = 4096
         server.n_batch = 512
         server.n_slots = 4
@@ -687,12 +690,26 @@ class ServerPreset:
         server.offline = True # will be downloaded by load_all()
         # mmproj is already provided by HF registry API
         server.model_hf_file = None
-        server.model_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"
+        server.model_hf_repo = "ggml-org-dev/tinygemma3-GGUF:Q8_0"
         server.model_alias = "tinygemma3"
         server.n_ctx = 1024
         server.n_batch = 512
         server.n_slots = 2
         server.n_predict = 4
+        server.seed = 42
+        return server
+
+    @staticmethod
+    def tinylfm3omni() -> ServerProcess:
+        server = ServerProcess()
+        server.offline = True # will be downloaded by load_all()
+        # mmproj is already provided by HF registry API
+        server.model_hf_file = None
+        server.model_hf_repo = "ggml-org-dev/tinyLFM3-Omni-for-testing-gguf:Q2_K"
+        server.model_alias = "tinylfm3omni"
+        server.n_ctx = 1024
+        server.n_batch = 512
+        server.n_slots = 1
         server.seed = 42
         return server
 
@@ -779,6 +796,18 @@ def download_file(url: str, output_file_path: str | None = None) -> str:
     else:
         print(f"File already exists at {output_file}")
     return output_file
+
+
+def get_lan_ip() -> str | None:
+    # address of the interface that routes outside, no packet is sent
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))
+            ip = s.getsockname()[0]
+    except OSError:
+        return None
+    return None if ip.startswith("127.") else ip
 
 
 def is_slow_test_allowed():

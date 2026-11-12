@@ -201,7 +201,7 @@ void ggml_vk_fork_int_tiles(vk_device & device, const vk_pipeline & requested, u
                             uint32_t itk, std::vector<uint32_t> & l_warptile_mmq_cm1_int, vk_fork_int_tiles & tiles);
 
 // get_proc_address of the backend reg: ggml_backend_dev_get_extra_bufts (the <name>_Shared buffer type)
-void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name);
+void * ggml_backend_vk_reg_get_proc_address_fork(ggml_backend_reg_t reg, const char * name);
 
 // GGML_TIMELINE (ggml_timeline_on): the gpu span of each command buffer of a compute queue, timestamps at its begin
 // (ggml_vk_ctx_begin) and its end (ggml_vk_ctx_end), read back at the syncs (ggml_vk_synchronize) and written to the
@@ -243,6 +243,17 @@ vk_pipeline ggml_vk_fork_mmid_f16reg(ggml_backend_vk_context * ctx, const ggml_t
                                      bool y_in_place, uint64_t n_per_expert, bool * b16 = nullptr, bool d16 = false);
 // MUL_MAT: the matmuls that stay off the int8 path (GGML_VK_INT_COOPMAT=3, graph outputs, K under 512)
 bool ggml_vk_mul_mat_int8_off(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint64_t ne10);
+// the physical memory the system can still hand out without paging, 0 when unknown (fork/ggml-vulkan-host-fork.cpp)
+uint64_t ggml_vk_fork_host_avail_bytes();
+// the local video memory all processes hold on the adapter with this LUID, by the system's counter (Windows); false when
+// unknown (fork/ggml-vulkan-host-fork.cpp)
+bool ggml_vk_fork_adapter_dedicated_usage(const uint8_t luid[8], uint64_t * bytes);
+// whether `size` more bytes of device local memory type `type` stay within the limit of its heap (less
+// GGML_VK_DEVICE_MARGIN_MIB): the heap less what other processes hold where the system counts that, else the
+// VK_EXT_memory_budget (ggml_vk_fork_heap_limit); true for other memory and without the extension. ggml_vk_create_buffer
+// skips a type that has no room: the AMD driver of the 395 hands out device memory past the carve-out and backs it with
+// system memory
+bool ggml_vk_fork_heap_has_room(const vk_device & device, uint32_t type, uint64_t size);
 // MUL_MAT: whether ggml_vk_mul_mat quantizes its f16 src1 into prealloc_y as q8_1 x4 blocks (in ggml-vulkan.cpp)
 bool ggml_vk_fork_mul_mat_quantizes_y_x4(ggml_backend_vk_context * ctx, const ggml_tensor * dst);
 // MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK): the mode and pipelines at device

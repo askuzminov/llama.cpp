@@ -165,9 +165,10 @@ def machine():
 
 def env_identity(run_env):
     # a secret ends in one of these words. a substring test dropped GGML_VK_HEADSUM_MIN_TOKENS on 06.10, so the arm
-    # that set it and the default shared one result
+    # that set it and the default shared one result. QA_ARM_ARGS: the server arguments of a variant (start_server),
+    # without it every such variant shared the result of the default
     return {k: v for k, v in sorted(run_env.items())
-            if k.upper().startswith(ENV_PREFIXES) and k.upper() not in ENV_IGNORED
+            if (k.upper().startswith(ENV_PREFIXES) or k.upper() == "QA_ARM_ARGS") and k.upper() not in ENV_IGNORED
             and not re.search(r"(^|_)(TOKEN|SECRET|PASSWORD|PASS|KEY)$", k.upper())}
 
 def source_id(backend):
@@ -540,7 +541,14 @@ def no_server_running():
 
 def start_server(exe, args, run_env, log):
     """Start llama-server and wait for /health, with the retries of a load that fails on memory or stalls; returns the
-    process and the log it writes (a retry writes log-tryN)"""
+    process and the log it writes (a retry writes log-tryN). QA_ARM_ARGS in the environment of a variant: server
+    arguments of that variant only, put after the common ones (a later option wins: QA_ARM_ARGS="--moe-cache 0
+    --moe-cache-mib 6500 --moe-cache-cpu-share 0.3" runs the expert cache of upstream in place of the fork's)"""
+    run_env = dict(run_env)
+    arm_extra = split_args(run_env.pop("QA_ARM_ARGS", ""))
+    if arm_extra:
+        i_host = args.index("--host") if "--host" in args else len(args)
+        args = [*args[:i_host], *arm_extra, *args[i_host:]]
     wait = env_int("DECWAIT", 900)
     port = args[args.index("--port") + 1]
     url = f"http://127.0.0.1:{port}"
@@ -813,6 +821,105 @@ def cmd_build_upstream():
     return build_ref("upstream")
 
 
+# ---------------------------------------------------------------- notes from the logs of a run
+#
+# the lines of the server and tool logs that the summary of a run names (12.11): the device memory limit of the 395
+# (ggml_vk_fork_heap_limit: the heap less what other processes hold, in place of the 95% budget of the driver), a device
+# allocation refused at that limit, the KV cache spilled to shared memory or stopped at the RAM floor, the QSA block
+# lists of the slots, the slots of the expert cache, the prompt cache giving memory back, a fit refused
+
+NOTE_LIMIT = re.compile(r"device memory heap \d+ of ([\d.]+) MiB, other processes hold ([\d.]+) MiB of it, the driver "
+                        r"budgets ([\d.]+) MiB: this process takes up to ([\d.]+) MiB")
+NOTE_REFUSED = re.compile(r"device memory heap \d+: ([\d.]+) MiB in use of a limit of ([\d.]+) MiB, ([\d.]+) MiB more asked")
+NOTE_SPILL = re.compile(r"elastic buffer: (?:the device memory is full \((?:([\d.]+) of ([\d.]+) MiB in use|an allocation "
+                        r"failed)|granules from the shared memory)")
+NOTE_FLOOR = re.compile(r"elastic buffer: the device memory is full and the system has ([\d.]+) MiB free")
+NOTE_QSA = re.compile(r"QSA scores the blocks of each slice's own sequences: (\d+) slices, lists of (\d+) of (\d+) blocks")
+NOTE_MOE = re.compile(r"moe_cache: (\S+), \d+ of \d+ MoE layers(?: \(\d+ kept their slots\))?, (\d+) slots per layer, "
+                      r"[\d.]+ MiB per slot, ([\d.]+) MiB total, (\d+) MiB were free")
+NOTE_MOE_NONE = re.compile(r"moe_cache: (\S+) has (\d+) MiB free, one slot on \d+ layers takes [\d.]+ MiB and (\d+) MiB "
+                           r"stay free, no slots")
+NOTE_RELIEF = re.compile(r"relieving [\d.]+ MiB from the prompt cache")
+NOTE_FIT = re.compile(r"would go to host memory, refused")
+NOTE_KEYS = (b"device memory heap", b"elastic buffer", b"QSA scores", b"moe_cache: ", b"relieving", b"refused")
+
+
+def log_first(log, pattern):
+    """the groups of the first match of pattern in a log, None without one"""
+    try:
+        with Path(log).open("rb") as f:
+            for raw in f:
+                m = pattern.search(raw.decode("utf-8", errors="replace"))
+                if m:
+                    return list(m.groups())
+    except OSError:
+        pass
+    return None
+
+
+def log_notes(folder):
+    """the notes of the logs in folder (NOTE_*), as lines for the summary"""
+    limits, refused, spills, floors, qsa, moe, relief, fits = [], [], [], [], [], [], [], []
+    for log in sorted(Path(folder).glob("*.log")):
+        first, n_relief = {}, 0
+        try:
+            with log.open("rb") as f:
+                for raw in f:
+                    if not any(k in raw for k in NOTE_KEYS):
+                        continue
+                    line = raw.decode("utf-8", errors="replace")
+                    if NOTE_RELIEF.search(line):
+                        n_relief += 1
+                    for key, pattern in (("limit", NOTE_LIMIT), ("refused", NOTE_REFUSED), ("spill", NOTE_SPILL),
+                                         ("floor", NOTE_FLOOR), ("qsa", NOTE_QSA), ("moe", NOTE_MOE),
+                                         ("moe0", NOTE_MOE_NONE), ("fit", NOTE_FIT)):
+                        if key not in first:
+                            m = pattern.search(line)
+                            if m:
+                                first[key] = m.groups()
+        except OSError:
+            continue
+        name = log.name
+        if "limit" in first:
+            limits.append([float(x) for x in first["limit"]])
+        if "refused" in first:
+            use, lim, ask = first["refused"]
+            refused.append(f"{name} ({use} MiB in use of {lim}, {ask} more asked)")
+        if "spill" in first:
+            use, lim = first["spill"]
+            spills.append(name + (f" (at {use} of {lim} MiB)" if use else ""))
+        if "floor" in first:
+            floors.append(f"{name} ({first['floor'][0]} MiB of RAM free)")
+        if "qsa" in first:
+            qsa.append(f"{name} {first['qsa'][0]} slices, {first['qsa'][1]} of {first['qsa'][2]} blocks")
+        if "moe" in first:
+            dev, n, total, free = first["moe"]
+            moe.append(f"{name} {n} slots per layer on {dev}, {total} MiB, {free} MiB were free")
+        elif "moe0" in first:
+            dev, free, margin = first["moe0"]
+            moe.append(f"{name} no slots on {dev}: {free} MiB free, {margin} MiB kept free")
+        if n_relief:
+            relief.append(f"{name} {n_relief}")
+        if "fit" in first:
+            fits.append(name)
+    out = []
+    if limits:
+        heap = limits[0][0]
+        others, budget, limit = ([x[i] for x in limits] for i in (1, 2, 3))
+        span = lambda v: f"{min(v):.0f}" if min(v) == max(v) else f"{min(v):.0f}-{max(v):.0f}"
+        out.append(f"device memory: a heap of {heap:.0f} MiB, other processes {span(others)} MiB, the driver budget "
+                   f"{span(budget)} MiB: this process up to {span(limit)} MiB ({min(limit) - max(budget):+.0f} MiB over the "
+                   f"budget at least), {len(limits)} log(s)")
+    for title, items in (("device allocations refused at the limit", refused),
+                         ("KV cache in shared memory (elastic spill)", spills),
+                         ("KV cache stopped at the RAM floor", floors), ("QSA block lists", qsa), ("expert cache", moe),
+                         ("the prompt cache gave memory back (times)", relief),
+                         ("fit refused, weights would go to host memory", fits)):
+        if items:
+            out.append(f"{title}: " + "; ".join(items[:8]) + (f"; {len(items) - 8} more" if len(items) > 8 else ""))
+    return out
+
+
 # ---------------------------------------------------------------- runs
 
 class Run:
@@ -867,6 +974,9 @@ class Run:
                             f"{value:.6g}" if isinstance(value, float) else value, bid, head, dirty])
 
     def finish(self):
+        notes = log_notes(self.dir)
+        if notes:
+            self.add("", "from the logs of this run:", *("  " + n for n in notes))
         if self.new or self.kept:
             self.add("", f"{self.new} new, {self.kept} kept (k): the same build measured them before. FORCE=1 runs "
                          f"them again, FORCE=<regex> the matching parts")
@@ -877,9 +987,14 @@ class Run:
 
 def env_pairs(text, where):
     """VAR=value VAR=value ... as a dict"""
+    return env_pairs_tokens(split_args(text), where)
+
+
+def env_pairs_tokens(tokens, where):
+    """the same of tokens already split: a quoted "VAR=a b" keeps its spaces (QA_ARM_ARGS)"""
     out = {}
-    for t in split_args(text):
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t):
+    for t in tokens:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t, re.S):
             raise Fail(f"{where}: {t!r} is not VAR=value")
         key, value = t.split("=", 1)
         out[key] = value
@@ -892,7 +1007,7 @@ def variants(name, default):
     for part in env(name, default).split(";"):
         tokens = split_args(part)
         if tokens:
-            out.append((tokens[0], env_pairs(" ".join(tokens[1:]), name)))
+            out.append((tokens[0], env_pairs_tokens(tokens[1:], name)))
     return out
 
 
@@ -1266,6 +1381,14 @@ def quality(run, label, ctx, depths, qargs=None):
 def cmd_check():
     run = Run("check")
     check_ops(run)
+    if env("QA_CHECK_GUARDS", "1") != "0":
+        try:
+            guards_probe(run, model_path())
+        except Skip as e:
+            run.add("", f"guards: skipped, {e}")
+        except Fail as e:
+            run.failed = True
+            run.add("", f"guards: FAIL {e}")
     if env("QA_CHECK_QUALITY", "1") != "0":
         try:
             quality(run, "quality", env_int("QA_CHECK_CTX", 32768), env_ints("QA_CHECK_DEPTHS", "4096 16384"))
@@ -1335,6 +1458,161 @@ def ckpt_probe(run, model):
                 f"half, the second half again after its restore: the logits of the last token {same} with the "
                 f"uninterrupted run" + (" k" if kept else ""))
     run.record("check", "ckpt", {"diff": r["diff"], "mib": r["bytes"] / 2**20}, kept, exe.parent)
+
+
+# ---------------------------------------------------------------- guards of the device memory (12.11)
+#
+# a model must not land in system memory unasked: on 12.11 a load of the 395 went to the RAM, the system swapped and froze
+# until the server fell over. 01 checks the guards on the machine. Vulkan: a load with no device memory allowed
+# (GGML_VK_DEVICE_MARGIN_MIB above the heap) fails with the heap numbers, where the UMA fallback took host memory before;
+# a fit that would put weights on the host is refused and the model loads on the device; the log has the limit line of
+# ggml_vk_fork_heap_limit (Windows). CUDA: a load larger than the card fails, where the sysmem fallback of the NVIDIA
+# driver (a setting of the driver) backs the rest with system memory and the runs go 25 times slower (02.11)
+
+GUARD_OFFLOAD = re.compile(r"offloaded (\d+)/(\d+) layers to GPU")
+GUARD_FREE = re.compile(r"using device (\S+) \(.*- (\d+) MiB free")
+GUARD_BUFFER = re.compile(r"(\S+) model buffer size =\s*([\d.]+) MiB")
+GUARD_SYSMEM_FIX = ("NVIDIA Control Panel, Manage 3D settings, Program settings: llama-server.exe (or Global settings), "
+                    "CUDA - Sysmem Fallback Policy = Prefer No Sysmem Fallback")
+
+
+def guard_server(exe, args, run_env, log):
+    """a server of a guard, once (no retries: a failed load is the answer): (healthy, exit code, log text). A server that
+    answers /health is stopped at once"""
+    args = [str(a) for a in args]
+    url = f"http://127.0.0.1:{args[args.index('--port') + 1]}"
+    no_server_running()
+    settle(timed=False)
+    with log.open("w", encoding="utf-8") as f:
+        f.write(json.dumps({"command": [str(exe), *args], "env": env_identity(run_env)}) + "\n")
+        f.flush()
+        proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
+    start, healthy = time.time(), False
+    if RUN_STARTED[0] is None:
+        RUN_STARTED[0] = start
+    try:
+        while proc.poll() is None and time.time() - start < env_int("DECWAIT", 900):
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                if http(url + "/health")[0] == 200:
+                    healthy = True
+                    break
+            except (urllib.error.URLError, OSError):
+                pass
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        mark_end()
+    return healthy, proc.returncode, read_log(log)
+
+
+def guard_read(healthy, code, text):
+    """what a guard needs from the log of its server"""
+    off, free = GUARD_OFFLOAD.search(text), GUARD_FREE.search(text)
+    refused, limit = NOTE_REFUSED.search(text), NOTE_LIMIT.search(text)
+    return {"healthy": healthy, "code": code, "error": "" if healthy else f"{last_error(text)}{crash_report(text)}",
+            "memory_error": any(s in text for s in MEMORY_ERRORS),
+            "refused": list(refused.groups()) if refused else None,
+            "fit_refused": bool(NOTE_FIT.search(text)),
+            "offload": [int(off[1]), int(off[2])] if off else None,
+            "limit": list(limit.groups()) if limit else None,
+            "free": [free[1], int(free[2])] if free else None,
+            "buffers": [[b, float(mib)] for b, mib in GUARD_BUFFER.findall(text)]}
+
+
+def guards_probe(run, model):
+    exe = binary("llama-server")
+    port = env_int("QA_PORT", 8097)
+    backend = env("BACKEND")
+    if backend not in ("vulkan", "cuda"):
+        raise Skip(f"no guards for the backend {backend}")
+    # -lv 4: the INFO lines of the library (the layers on the GPU, the buffers, the free memory) are TRACE in a server
+    head = ["-m", model, "-c", 4096, "-np", 1, "-fa", "on", *split_args(env("LOADMODE")), *warmup_args(), "-lv", 4]
+    tail = ["--host", "127.0.0.1", "--port", port]
+    run.add("", "guards: no weights in the system memory unless asked (12.11)")
+    if backend == "cuda":
+        # not kept: the answer depends on a setting of the driver, which the identity of a result cannot see
+        n_cpu = env("QA_GUARD_NCMOE", "30")
+        args = [str(a) for a in [*head, "-ngl", 99, "-ncmoe", n_cpu, "--no-repack", "-fit", "off", *tail]]
+        log = run.dir / "guard_sysmem.log"
+        print(f"guard sysmem: running, {log.name}", flush=True)
+        g = guard_read(*guard_server(exe, args, os.environ.copy(), log))
+        what = f"sysmem fallback (-ncmoe {n_cpu}: the expert layers on the card take more than it has, QA_GUARD_NCMOE)"
+        if not g["healthy"] and g["memory_error"]:
+            run.add(f"  {what}: the load failed on the device memory, the driver keeps CUDA memory on the card: ok")
+            return
+        run.failed = True
+        if not g["healthy"]:
+            run.add(f"  {what}: FAIL, the load failed otherwise: {g['error']} ({log.name})")
+            return
+        dev = g["free"][0] if g["free"] else "CUDA0"
+        on_card = sum(mib for b, mib in g["buffers"] if b == dev)
+        if g["free"] and on_card > g["free"][1]:
+            run.add(f"  {what}: FAIL, the weights on {dev} take {on_card:.0f} MiB with {g['free'][1]} MiB free and the "
+                    f"server loaded: the driver backs the rest with system memory. {GUARD_SYSMEM_FIX}")
+        elif g["free"] and g["buffers"]:
+            run.add(f"  {what}: FAIL, inconclusive: the weights on {dev} take {on_card:.0f} MiB of {g['free'][1]} MiB free, "
+                    f"they fit the card; a lower QA_GUARD_NCMOE puts more of them there")
+        else:
+            run.add(f"  {what}: FAIL, the server loaded (no buffer lines in {log.name}): most likely the driver backs the "
+                    f"card with system memory. {GUARD_SYSMEM_FIX}")
+        return
+    limit = None
+    for name, extra_env, extra_args in (("no room", {"GGML_VK_DEVICE_MARGIN_MIB": "1048576"}, ["-ngl", 99, "-fit", "off"]),
+                                        ("fit", {}, ["-fit", "on", "-fitt", 1048576])):
+        run_env = dict(os.environ, **extra_env)
+        args = [str(a) for a in [*head, *extra_args, *tail]]
+        identity = {"v": VERSION, "kind": "guard", "guard": name, "build": build_id(exe.parent), "args": args,
+                    "model": model_identity(model), "env": env_identity(run_env), "machine": machine()}
+        try:
+            g, kept = run.measure(f"guard {name}", identity,
+                                  lambda log, a=args, e=run_env: guard_read(*guard_server(exe, a, e, log)))
+        except Fail as e:
+            run.failed = True
+            run.add(f"  {name}: FAIL {e}")
+            continue
+        k = " k" if kept else ""
+        limit = limit or g["limit"]
+        if name == "no room":
+            what = "no room (GGML_VK_DEVICE_MARGIN_MIB=1048576: no device allocation fits)"
+            if g["healthy"]:
+                run.failed = True
+                run.add(f"  {what}: FAIL, the model loaded with no device memory allowed: it went to the system memory{k}")
+            elif g["refused"]:
+                use, lim, ask = g["refused"]
+                run.add(f"  {what}: the load failed at the limit ({use} MiB in use of {lim}, {ask} MiB more asked): ok{k}")
+            else:
+                run.failed = True
+                run.add(f"  {what}: FAIL, the load failed otherwise: {g['error']}{k}")
+            continue
+        what = "fit (-fit on -fitt 1048576: fit would put every layer on the host)"
+        off = g["offload"]
+        if not g["healthy"]:
+            run.failed = True
+            run.add(f"  {what}: FAIL, the load failed: {g['error']}{k}")
+        elif not g["fit_refused"]:
+            run.failed = True
+            run.add(f"  {what}: FAIL, no refusal of the fit in the log{k}")
+        elif not off or off[0] < off[1]:
+            run.failed = True
+            run.add(f"  {what}: FAIL, the fit was refused, but " +
+                    (f"{off[0]} of {off[1]} layers are on the GPU" if off else "no line of the layers on the GPU") + k)
+        else:
+            run.add(f"  {what}: refused, the model loaded as asked, {off[0]}/{off[1]} layers on the GPU: ok{k}")
+    if limit:
+        heap, others, budget, lim = (float(x) for x in limit)
+        run.add(f"  device memory: a heap of {heap:.0f} MiB, other processes {others:.0f} MiB, the driver budget "
+                f"{budget:.0f} MiB: this process up to {lim:.0f} MiB ({lim - budget:+.0f} MiB over the budget)")
+    elif os.name == "nt":
+        run.failed = True
+        run.add("  device memory: FAIL, no limit line: the counter of the adapter (\\GPU Adapter Memory(*)\\Dedicated "
+                "Usage) was not found, the budget of the driver (95% of the heap) applies")
+    else:
+        run.add("  device memory: no limit line (not Windows): the budget of the driver applies")
 
 
 # ---------------------------------------------------------------- speculative decoding
@@ -1879,7 +2157,9 @@ def long_chat(run, model, ctx, port):
 
 
 def long_par(run, model, ctx, port):
-    """several conversations at once in the shared KV of the slots, each with facts, asked at its end"""
+    """several conversations at once in the shared KV of the slots, each with facts, asked at its end. QA_PAR_ARMS:
+    variants (name VAR=value ...;...), a server each, side by side (12.11: the QSA block lists of the slots against
+    rows0 LLAMA_QSA_ROWS=0)"""
     exe = binary("llama-server")
     par, total = env_int("QA_PAR", 4), env_int("QA_PAR_TOKENS", 49152)
     chunk, reserve = env_int("QA_PAR_CHUNK", 12288), env_int("QA_LONG_RESERVE", 2048)
@@ -1887,62 +2167,92 @@ def long_par(run, model, ctx, port):
         return
     args = server_args(model, ctx, par, port)
     text = corpus_text()
-    identity = {"v": VERSION, "kind": "long-par", "build": build_id(exe.parent), "args": args, "model": model_identity(model),
-                "env": env_identity(os.environ), "corpus": text_digest(text), "par": par, "total": total, "chunk": chunk,
-                "samp": env("QA_SAMP", "1.0 20 0.95"), "machine": machine(),
-                "draft": model_identity(Path(env("SPECDRAFT"))) if "-md" in args else None}
+    done = []    # (name, result, kept)
+    for name, arm_env in variants("QA_PAR_ARMS", "default"):
+        run_env = dict(os.environ, **arm_env)
+        identity = {"v": VERSION, "kind": "long-par", "build": build_id(exe.parent), "args": args,
+                    "model": model_identity(model), "env": env_identity(run_env), "corpus": text_digest(text), "par": par,
+                    "total": total, "chunk": chunk, "samp": env("QA_SAMP", "1.0 20 0.95"), "machine": machine(),
+                    "draft": model_identity(Path(env("SPECDRAFT"))) if "-md" in args else None}
 
-    def go(log):
-        proc, log = start_server(exe, args, os.environ.copy(), log)
+        def go(log, run_env=run_env):
+            proc, log = start_server(exe, args, run_env, log)
+            try:
+                url = f"http://127.0.0.1:{port}"
+                ratio = token_ratio(url, text)
+                span = max(1, (len(text) - int(total / ratio)) // par)
+                results, errors = [None] * par, []
+
+                def one(i):
+                    try:
+                        chat = Chat(url, log, f"par{i}")
+                        facts = make_facts(total // max(chunk // 2, 1) + 8, 100 + i)
+                        _, _, depth = converse(chat, text, i * span, ratio, total, chunk, facts, random.Random(i), [],
+                                               reserve, ctx)
+                        placed = [t for t in chat.turns if t["kind"] == "part"]
+                        rec = []
+                        for fact in (facts[0], facts[len(placed) - 1]):
+                            t = chat.ask(question(fact), env_int("QA_ASK_TOKENS", 64), "question")
+                            rec.append({"name": fact["name"], "key": fact["key"], "answer": t["content"].strip()[:80],
+                                        "ok": fact["key"] in t["content"]})
+                        results[i] = {"turns": chat.turns, "recall": rec, "depth": chat.turns[-1]["depth"]}
+                    except Exception as e:  # noqa: BLE001 - reported below, the others go on
+                        errors.append(f"par{i}: {e}")
+
+                start = time.time()
+                threads = [threading.Thread(target=one, args=(i,)) for i in range(par)]
+                for th in threads:
+                    th.start()
+                for th in threads:
+                    th.join()
+                return {"results": results, "errors": errors, "wall": time.time() - start, "qsa": log_first(log, NOTE_QSA)}
+            finally:
+                proc.kill()
+                proc.wait()
+                mark_end()
+
+        label = "long-par" if name == "default" else f"long-par {name}"
         try:
-            url = f"http://127.0.0.1:{port}"
-            ratio = token_ratio(url, text)
-            span = max(1, (len(text) - int(total / ratio)) // par)
-            results, errors = [None] * par, []
-
-            def one(i):
-                try:
-                    chat = Chat(url, log, f"par{i}")
-                    facts = make_facts(total // max(chunk // 2, 1) + 8, 100 + i)
-                    _, _, depth = converse(chat, text, i * span, ratio, total, chunk, facts, random.Random(i), [], reserve, ctx)
-                    placed = [t for t in chat.turns if t["kind"] == "part"]
-                    rec = []
-                    for fact in (facts[0], facts[len(placed) - 1]):
-                        t = chat.ask(question(fact), env_int("QA_ASK_TOKENS", 64), "question")
-                        rec.append({"name": fact["name"], "key": fact["key"], "answer": t["content"].strip()[:80],
-                                    "ok": fact["key"] in t["content"]})
-                    results[i] = {"turns": chat.turns, "recall": rec, "depth": chat.turns[-1]["depth"]}
-                except Exception as e:  # noqa: BLE001 - reported below, the others go on
-                    errors.append(f"par{i}: {e}")
-
-            start = time.time()
-            threads = [threading.Thread(target=one, args=(i,)) for i in range(par)]
-            for th in threads:
-                th.start()
-            for th in threads:
-                th.join()
-            return {"results": results, "errors": errors, "wall": time.time() - start}
-        finally:
-            proc.kill()
-            proc.wait()
-            mark_end()
-
-    r, kept = run.measure("long-par", identity, go)
-    rows, all_ok = [], not r["errors"]
-    for i, x in enumerate(r["results"]):
-        if not x:
-            rows.append([f"par{i}", "", "", "FAIL"])
+            r, kept = run.measure(label, identity, go)
+        except Fail as e:
+            run.failed = True
+            run.add("", f"{label}: FAIL {e}")
             continue
-        ok = sum(y["ok"] for y in x["recall"])
-        all_ok &= ok == len(x["recall"])
-        n = sum(t["n"] for t in x["turns"])
-        rows.append([f"par{i}", x["depth"], n, f"{ok}/{len(x['recall'])}" + ("" if ok == len(x["recall"]) else " WRONG")])
-    run.add("", f"{par} conversations at once (-np {par} --kv-unified, -c {ctx}), {total} tokens each in parts of {chunk}, "
-                f"{r['wall']:.0f} s" + (" k" if kept else ""), *table(["slot", "depth", "generated", "recall"], rows))
-    for e in r["errors"]:
-        run.add(f"  {e}")
-    if not all_ok:
-        run.failed = True
+        rows, all_ok = [], not r["errors"]
+        for i, x in enumerate(r["results"]):
+            if not x:
+                rows.append([f"par{i}", "", "", "FAIL"])
+                continue
+            ok = sum(y["ok"] for y in x["recall"])
+            all_ok &= ok == len(x["recall"])
+            n = sum(t["n"] for t in x["turns"])
+            rows.append([f"par{i}", x["depth"], n, f"{ok}/{len(x['recall'])}" + ("" if ok == len(x["recall"]) else " WRONG")])
+        run.add("", f"{par} conversations at once (-np {par} --kv-unified, -c {ctx}{', ' + name if name != 'default' else ''}), "
+                    f"{total} tokens each in parts of {chunk}, {r['wall']:.0f} s" + (" k" if kept else ""),
+                *table(["slot", "depth", "generated", "recall"], rows))
+        for e in r["errors"]:
+            run.add(f"  {e}")
+        if not all_ok:
+            run.failed = True
+        done.append((name, r, kept))
+        run.record("long", "par" if name == "default" else f"par {name}", {"wall": r["wall"]}, kept, exe.parent)
+    if len(done) > 1:
+        rows, ref = [], None
+        for name, r, kept in done:
+            parts = [t for x in r["results"] if x for t in x["turns"] if t["kind"] == "part"]
+            pn, pms = sum(t["prompt_n"] for t in parts), sum(t["prompt_ms"] for t in parts)
+            ref = r["wall"] if ref is None else ref
+            ok = sum(y["ok"] for x in r["results"] if x for y in x["recall"])
+            n_rec = sum(len(x["recall"]) for x in r["results"] if x)
+            q = r.get("qsa")
+            rows.append([name + (" k" if kept else ""), f"{r['wall']:.0f}",
+                         "" if r["wall"] == ref else f"{(r['wall'] / ref - 1) * 100:+.1f}%",
+                         f"{rate(pn, pms):.1f}" if pms else "", f"{ok}/{n_rec}",
+                         f"{q[0]} slices, {q[1]} of {q[2]} blocks" if q else "all blocks"])
+        run.add("", "par: the variants side by side: the wall time of the whole step against the first, the prompt "
+                    "tokens of the parts over their prompt time (per request), the facts recalled, the QSA block lists "
+                    "(the first line of the server log)",
+                *table(["variant", "wall s", "vs first", "PP t/s", "recall", "QSA scores"], rows))
 
 
 def cmd_long():
@@ -2977,15 +3287,27 @@ def kld_read(log):
     return out
 
 
+# QA_KLD_BASE=exact: the base is this build with every matmul in f32 (Vulkan: no int8, no f16 shaders, no coopmat, the
+# f16 paths of the fork off), the exact math of the same weights, against which the 8-bit and 16-bit activations of an
+# arm show their own cost (12.11; the base of upstream carries the q8_1 activations of upstream itself)
+KLD_EXACT_ENV = {
+    "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT": "1", "GGML_VK_DISABLE_F16": "1", "GGML_VK_DISABLE_COOPMAT": "1",
+    "GGML_VK_DISABLE_COOPMAT2": "1", "GGML_VK_MM_F16REG": "0", "GGML_VK_MMID_F16REG": "0", "GGML_VK_MMV_ID_FORK": "0",
+    "LLAMA_HC_F16": "0", "LLAMA_MOE_DOWN_F16": "0",
+}
+
+
 def kld_arms():
-    """QA_KARMS: "name [@upstream] [VAR=value ...];...", @upstream runs the upstream build"""
+    """QA_KARMS: "name [@upstream] [VAR=value ...];...", @upstream runs the upstream build. QA_ARM_UB=<n> in an arm sets
+    its ubatch: 1 to 8 tokens take the decode kernels (mat-vec, the expert mat-vec of the fork), which a prompt-sized
+    ubatch never runs"""
     out = []
     for part in env("QA_KARMS", "fork;upstream @upstream").split(";"):
         tokens = split_args(part)
         if not tokens:
             continue
         up = "@upstream" in tokens[1:]
-        out.append((tokens[0], up, env_pairs(" ".join(t for t in tokens[1:] if t != "@upstream"), "QA_KARMS")))
+        out.append((tokens[0], up, env_pairs_tokens([t for t in tokens[1:] if t != "@upstream"], "QA_KARMS")))
     return out
 
 
@@ -3016,8 +3338,27 @@ def cmd_kld():
         raise Fail(f"no text {text}: run get-wikitext.bat or set PPLFILE")
     up_folder = ref_folder("upstream")
     up_exe = up_folder / ("llama-perplexity" + EXE)
-    if not up_exe.is_file():
+    base_kind = env("QA_KLD_BASE", "upstream")
+    if base_kind not in ("upstream", "exact"):
+        raise Fail(f"QA_KLD_BASE={base_kind}: upstream or exact")
+    if base_kind == "exact" and env("BACKEND") == "cuda":
+        raise Skip("QA_KLD_BASE=exact: no f32 mode of the CUDA matmuls yet")
+    uses_up = base_kind == "upstream" or any(up for _, up, _ in kld_arms())
+    if uses_up and not up_exe.is_file():
         raise Skip(f"no {up_exe}: build upstream with 00-build.bat upstream")
+    # the upstream of the comparison is UPSTREAMREF: a build of another commit (an older merge, a failed build of the
+    # new one that left the old binaries) would measure the distance to something else
+    if uses_up:
+        want = env("UPSTREAMREF", "master")
+        try:
+            commit = git("rev-parse", f"{want}^{{commit}}").decode().strip()
+        except (OSError, subprocess.CalledProcessError):
+            commit = ""
+        up_head, _ = build_head(up_folder)
+        if commit and up_head and not commit.startswith(up_head):
+            raise Fail(f"the upstream build is {up_head}, UPSTREAMREF {want} is {commit[:12]}: run 00-build.bat upstream")
+    base_folder = up_folder if base_kind == "upstream" else Path(env("BIN"))
+    base_exe = up_exe if base_kind == "upstream" else binary("llama-perplexity")
     ctx = env_int("QA_KLD_CTX", 8192)
     chunks = env_int("QA_KLD_CHUNKS", 2)
     ub = env("QA_KLD_UB", "8192" if env("BACKEND") == "cuda" else "4096")
@@ -3025,38 +3366,45 @@ def cmd_kld():
             *split_args(env("QA_KLD_ARGS"))]
     margs = model_args(model)
     base_env = os.environ.copy()
+    if base_kind == "exact":
+        base_env.update(KLD_EXACT_ENV)
     base_env.update(env_pairs(env("QA_KLD_BASE_ENV"), "QA_KLD_BASE_ENV"))
-    ident_base = {"v": VERSION, "kind": "kld-base", "build": build_id(up_folder), "model": model_identity(model),
-                  "text": digest(text), "args": [str(a) for a in margs + args], "env": env_identity(base_env)}
+    ident_base = {"v": VERSION, "kind": "kld-base", "base": base_kind, "build": build_id(base_folder),
+                  "model": model_identity(model), "text": digest(text), "args": [str(a) for a in margs + args],
+                  "env": env_identity(base_env)}
     folder = CACHE / "qa"
     folder.mkdir(parents=True, exist_ok=True)
     base = folder / (identity_key(ident_base)[:24] + ".kld")
-    head_up, _ = build_head(up_folder)
-    run.add(f"base: upstream {head_up or build_id(up_folder)}, {chunks} chunks of {ctx} tokens of {text.name} "
-            f"(the second half of each is compared), {' '.join(map(str, margs[2:]))}")
+    head_base, _ = build_head(base_folder)
+    base_desc = "upstream" if base_kind == "upstream" else "this build, every matmul in f32 (QA_KLD_BASE=exact)"
+    run.add(f"base: {base_desc} {head_base or build_id(base_folder)}, {chunks} chunks of {ctx} tokens of {text.name} "
+            f"(the second half of each is compared), ubatch {ub}, {' '.join(map(str, margs[2:]))}")
     base_ppl = base.with_suffix(".ppl")
     if forced("kld base") or not base.is_file() or not base_ppl.is_file():
         part = base.with_suffix(".part")
-        print(f"kld base: running upstream, {base.name}", flush=True)
-        execute([up_exe, *margs, *args, "--kl-divergence-base", part], run.dir / "base.log", base_env)
+        print(f"kld base: running {base_kind}, {base.name}", flush=True)
+        execute([base_exe, *margs, *args, "--kl-divergence-base", part], run.dir / "base.log", base_env)
         m = re.search(KLD_BASE_PPL, read_log(run.dir / "base.log"))
         if m is None:
             raise Fail(f"no PPL in {run.dir / 'base.log'}")
         part.replace(base)
         base_ppl.write_text(m[1] + "\n", encoding="utf-8")
     ppl_up = float(base_ppl.read_text(encoding="utf-8"))
-    run.add(f"upstream PPL {ppl_up:.4f}")
+    run.add(f"base PPL {ppl_up:.4f}")
     rows = []
     for name, up, arm_env in kld_arms():
         exe = up_exe if up else binary("llama-perplexity")
         bfolder = up_folder if up else Path(env("BIN"))
+        arm_env = dict(arm_env)
+        arm_ub = arm_env.pop("QA_ARM_UB", None)
+        arm_args = args if arm_ub is None else [a if i == 0 or args[i - 1] != "-ub" else arm_ub for i, a in enumerate(args)]
         run_env = os.environ.copy()
         run_env.update(arm_env)
         identity = {"v": VERSION, "kind": "kld", "build": build_id(bfolder), "base": ident_base,
-                    "env": env_identity(run_env)}
+                    "env": env_identity(run_env), "args": [str(a) for a in arm_args]}
 
-        def measure(log, exe=exe, run_env=run_env):
-            execute([exe, *margs, *args, "--kl-divergence-base", base, "--kl-divergence"], log, run_env)
+        def measure(log, exe=exe, run_env=run_env, arm_args=arm_args):
+            execute([exe, *margs, *arm_args, "--kl-divergence-base", base, "--kl-divergence"], log, run_env)
             return dict(kld_read(log), ppl_up=ppl_up)
 
         result, kept = run.measure(f"kld {name}", identity, measure)
@@ -3068,10 +3416,12 @@ def cmd_kld():
         rows.append([name + (" (k)" if kept else ""), f"{result['ppl']:.4f}", f"{result['ppl_ratio']:.4f}",
                      f"{result['kld_mean']:.6f}", f"{result['kld_median']:.6f}", f"{result['kld_p99']:.5f}",
                      f"{result['kld_max']:.3f}", f"{result['top1']:.2f}", prev])
-    run.add("", *table(["arm", "PPL", "PPL/upstream", "KLD mean", "KLD median", "KLD p99", "KLD max", "top-1 %",
-                        "before: KLD mean, PPL/upstream (build)"], rows),
-            "", "KLD to the logits of upstream on the same model and text; PPL/upstream above 1 is worse than upstream. "
-                "before: the last result of the arm from another build on this machine (history-qa.csv)")
+    base_name = "upstream" if base_kind == "upstream" else "exact"
+    run.add("", *table(["arm", "PPL", f"PPL/{base_name}", "KLD mean", "KLD median", "KLD p99", "KLD max", "top-1 %",
+                        f"before: KLD mean, PPL/{base_name} (build)"], rows),
+            "", f"KLD to the logits of the base ({base_desc}) on the same model and text; PPL/{base_name} above 1 is "
+                "worse than the base. before: the last result of the arm from another build on this machine "
+                "(history-qa.csv)")
     return run.finish()
 
 

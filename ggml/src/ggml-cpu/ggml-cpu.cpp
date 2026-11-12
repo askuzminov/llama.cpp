@@ -455,11 +455,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
             }
-            // BF16 in src1 is widened into the F32 work buffer
-            // fork: F16 in src1 is packed through F32 into a quantized vec_dot_type (the f16 hc read of qwen4exp)
+            // F16 or BF16 in src1 is widened into the F32 work buffer
+            // fork: F16 in src1 is also packed through F32 into a quantized vec_dot_type (the f16 hc read of qwen4exp)
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
-                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32) ||
+                   ((src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16) &&
+                    ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32) ||
                    (src1->type == GGML_TYPE_F16 && ggml_is_quantized(ggml_get_type_traits_cpu(src0->type)->vec_dot_type) &&
                     ggml_blck_size(ggml_get_type_traits_cpu(src0->type)->vec_dot_type) <= 1024 &&
                     1024 % ggml_blck_size(ggml_get_type_traits_cpu(src0->type)->vec_dot_type) == 0);

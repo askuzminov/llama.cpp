@@ -20,8 +20,12 @@
 // - no repeated cells in a selection: the padding of a partial block is empty cells hidden from every sequence (Vulkan
 //   FLASH_ATTN_LIST counts every entry of its list)
 // - a prompt copied to other sequences: shared cells, so the dense mask and nothing carried, the logits as alone
+// - the block lists of the slices (12.11, LLAMA_QSA_ROWS, set_input_qsa rows): the indexer of a slice scores the blocks
+//   of its own sequences only. the run with the dense mask scores all blocks (LLAMA_QSA_ROWS=0), the other one takes
+//   the lists wherever they fit (2, padded to 4 blocks), and the logits must be the same bit for bit; a scenario of
+//   steps of one sequence while the others keep their cells (a prompt of one slot) must take them
 //
-// usage: test-qsa-multi-fork -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>]
+// usage: test-qsa-multi-fork -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>] [-ngl <n>]
 
 #include "llama.h"
 #include "llama-ext.h"
@@ -98,6 +102,7 @@ static long long qsa_checked_since(size_t from) {
 
 // the nodes |cell - mid| of the graphs a context computed, see the top
 static int g_n_abs = 0;
+static int g_n_rows = 0; // the indexers that scored block lists (indexer_k_rows)
 static int g_n_selections = 0;
 static int g_n_duplicate_rows = 0;
 
@@ -105,6 +110,9 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * /*user_data*/) {
     if (ask && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_ABS && t->src[0] != nullptr &&
             t->src[0]->op == GGML_OP_SUB) {
         g_n_abs++;
+    }
+    if (ask && strncmp(t->name, "indexer_k_rows-", 15) == 0) {
+        g_n_rows++;
     }
     if (strncmp(t->name, "indexer_top_k-", 14) == 0 && strchr(t->name, ' ') == nullptr) {
         if (ask) {
@@ -142,6 +150,7 @@ enum scenario_kind {
     SC_INDEPENDENT, // every sequence from position 0
     SC_STRIDE,      // the last sequence from just below the stride, past it after some rounds
     SC_COPIES,      // sequence 0 decodes the prompt, sequences 1 and 2 copy its cells
+    SC_SINGLE,      // steps of one sequence while the others keep their cells, a round of all of them now and then
 };
 
 struct scenario {
@@ -182,6 +191,27 @@ static scenario make_scenario(const char * name, scenario_kind kind, int n_vocab
             st.keep.push_back(0);
         }
         sc.steps.push_back(st);
+    }
+
+    if (kind == SC_SINGLE) {
+        // a chunk of a prompt or the drafts of one sequence per step, each fifth step a round of all of them
+        for (int r = 0; r < 20; ++r) {
+            step st;
+            const bool all   = r % 5 == 4;
+            const bool chunk = !all && rng() % 2 == 0;
+            const int  n_tok = chunk ? 8 : 1 + (int) (rng() % N_DRAFT);
+            const int  s0    = all ? 0 : r % sc.n_seq;
+            for (int s = s0; s < (all ? sc.n_seq : s0 + 1); ++s) {
+                st.seqs.push_back(s);
+                st.tokens.emplace_back();
+                for (int i = 0; i < n_tok; ++i) {
+                    st.tokens.back().push_back(tok());
+                }
+                st.keep.push_back(chunk ? 0 : 1 + (int) (rng() % n_tok));
+            }
+            sc.steps.push_back(st);
+        }
+        return sc;
     }
 
     // the rounds of drafts, most of them rejected after the first token: some sequences sit a round out, at least two
@@ -438,6 +468,7 @@ struct multi_run {
     long long        n_checked = 0;
     int              n_multi   = 0; // rounds of several sequences
     int              n_abs     = 0; // of them, those with the mask from positions per sequence
+    int              n_rows    = 0; // indexers over block lists
 };
 
 static bool run_multi(llama_model * model, const scenario & sc, multi_run & res) {
@@ -447,8 +478,11 @@ static bool run_multi(llama_model * model, const scenario & sc, multi_run & res)
     }
     const int n_selections = g_n_selections;
     const int n_duplicates = g_n_duplicate_rows;
+    const int n_rows0      = g_n_rows;
     const bool ok = run(ctx, sc, -1, res.logits, &res.abs_steps);
-    printf("%s: %d QSA selections, %d rows with repeated cells\n", sc.name, g_n_selections - n_selections, g_n_duplicate_rows - n_duplicates);
+    res.n_rows = g_n_rows - n_rows0;
+    printf("%s: %d QSA selections, %d rows with repeated cells, %d indexers over block lists\n", sc.name,
+           g_n_selections - n_selections, g_n_duplicate_rows - n_duplicates, res.n_rows);
     CHECK(g_n_selections > n_selections);
     CHECK(g_n_duplicate_rows == n_duplicates);
 
@@ -503,6 +537,11 @@ static void test_scenario(llama_model * model, const scenario & sc, const logits
             // shared cells: every pass groups in full and the mask is the dense one
             CHECK(multi.n_checked == 0);
             CHECK(multi.n_abs == 0);
+            break;
+        case SC_SINGLE:
+            CHECK(n_below == multi.n_multi);
+            // the lists: forced in the run that compares with the dense one (LLAMA_QSA_ROWS=2)
+            CHECK(dense == nullptr || multi.n_rows > 0);
             break;
     }
 
@@ -579,6 +618,7 @@ int main(int argc, char ** argv) {
     const char * path      = nullptr;
     const char * dense_out = nullptr;
     const char * dense_in  = nullptr;
+    int          n_gpu_layers = 0; // -ngl: the layers on a GPU (a Vulkan build: GGML_VK_VISIBLE_DEVICES picks the device)
     for (int i = 1; i + 1 < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0) {
             path = argv[++i];
@@ -586,10 +626,12 @@ int main(int argc, char ** argv) {
             dense_out = argv[++i];
         } else if (strcmp(argv[i], "--dense-in") == 0) {
             dense_in = argv[++i];
+        } else if (strcmp(argv[i], "-ngl") == 0) {
+            n_gpu_layers = atoi(argv[++i]);
         }
     }
     if (path == nullptr) {
-        fprintf(stderr, "usage: %s -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>]\n", argv[0]);
+        fprintf(stderr, "usage: %s -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>] [-ngl <n>]\n", argv[0]);
         return 1;
     }
 
@@ -602,6 +644,8 @@ int main(int argc, char ** argv) {
     // read once, before the first context
     set_env("LLAMA_QSA_CHECK", "1");
     set_env("LLAMA_QSA_MASK_POS", dense_out ? "0" : "1");
+    set_env("LLAMA_QSA_ROWS", dense_out ? "0" : "2");
+    set_env("LLAMA_QSA_ROWS_PAD", "4");
     set_env("LLAMA_QSA_POS_STRIDE_LOG2", std::to_string(STRIDE_LOG2).c_str());
 
     llama_log_set(log_cb, nullptr);
@@ -613,7 +657,7 @@ int main(int argc, char ** argv) {
     }
 
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = n_gpu_layers;
 
     llama_model_kv_override kvo[2];
     memset(kvo, 0, sizeof(kvo));
@@ -634,6 +678,7 @@ int main(int argc, char ** argv) {
     const std::vector<scenario> compared = {
         make_scenario("independent",     SC_INDEPENDENT, n_vocab, 1234),
         make_scenario("past the stride", SC_STRIDE,      n_vocab, 5678),
+        make_scenario("one at a time",   SC_SINGLE,      n_vocab, 2468),
     };
 
     if (dense_out) {
