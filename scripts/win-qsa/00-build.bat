@@ -2,7 +2,7 @@
 setlocal
 call "%~dp0_config.bat"
 rem 00-build.bat stable: the tag stable in its own worktree, an old build to compare with by hand (README)
-rem 00-build.bat upstream: UPSTREAMREF (default master) in its own worktree, the base of 07-kld.bat
+rem 00-build.bat upstream: UPSTREAMREF (_config.bat: the master of the last merge) in its own worktree, the base of 07-kld.bat
 if /i "%~1"=="stable" goto :stable
 if /i "%~1"=="upstream" goto :upstream
 

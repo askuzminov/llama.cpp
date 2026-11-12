@@ -542,13 +542,45 @@ def wait_no_server(timeout=180):
             return
         time.sleep(2)
 
+# the llama-server processes this run started: one of them still listed after its kill is waited for, any other fails
+OWN_SERVER_PIDS = set()
+
+
+def server_pids():
+    """the process ids of the running llama-server.exe (tasklist, CSV without a header)"""
+    out = subprocess.run(["tasklist", "/fi", "imagename eq llama-server.exe", "/fo", "csv", "/nh"],
+                         capture_output=True).stdout.decode("utf-8", errors="replace")
+    pids = set()
+    for row in csv.reader(out.splitlines()):
+        if len(row) > 1 and row[0].lower() == "llama-server.exe" and row[1].strip().isdigit():
+            pids.add(int(row[1]))
+    return pids
+
+
 def no_server_running():
+    """no llama-server.exe may hold GPU memory during a measurement. One this run started and killed can stay listed for
+    a while: 12.11 on the 3090 a server that aborted stayed about 90 s (Windows Error Reporting writes the dump of a
+    crashed process of 70 GB), and 03 and 07 failed on it. Those are waited for up to QA_SERVER_EXIT_WAIT (300) s, any
+    other one fails at once"""
     if os.name != "nt":
         return
-    # bytes: the text of tasklist is in the console code page
-    out = subprocess.run(["tasklist", "/fi", "imagename eq llama-server.exe"], capture_output=True).stdout
-    if b"llama-server.exe" in out:
-        raise Fail("a llama-server.exe is running: it holds gpu memory and spoils the numbers, stop it first")
+    wait = env_int("QA_SERVER_EXIT_WAIT", 300)
+    start, told = time.time(), False
+    while True:
+        pids = server_pids()
+        if not pids:
+            return
+        foreign = pids - OWN_SERVER_PIDS
+        waited = int(time.time() - start)
+        if foreign or waited > wait:
+            raise Fail("a llama-server.exe is running: it holds gpu memory and spoils the numbers, stop it first" +
+                       ("" if foreign else f" (pid {' '.join(map(str, sorted(pids)))} of this run, still there {waited} s "
+                                           f"after its kill, QA_SERVER_EXIT_WAIT)"))
+        if not told:
+            print(f"waiting for llama-server.exe pid {' '.join(map(str, sorted(pids)))} of this run to exit (a crashed one "
+                  f"stays while Windows writes its dump)", flush=True)
+            told = True
+        time.sleep(5)
 
 def start_server(exe, args, run_env, log):
     """Start llama-server and wait for /health, with the retries of a load that fails on memory or stalls; returns the
@@ -573,6 +605,7 @@ def start_server(exe, args, run_env, log):
             f.write(json.dumps({"command": [str(exe), *args], "env": env_identity(run_env)}) + "\n")
             f.flush()
             proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
+        OWN_SERVER_PIDS.add(proc.pid)
         start = time.time()
         if RUN_STARTED[0] is None:
             RUN_STARTED[0] = start
@@ -1503,6 +1536,7 @@ def guard_server(exe, args, run_env, log):
         f.write(json.dumps({"command": [str(exe), *args], "env": env_identity(run_env)}) + "\n")
         f.flush()
         proc = subprocess.Popen([str(exe), *args], stdout=f, stderr=f, env=run_env)
+    OWN_SERVER_PIDS.add(proc.pid)
     start, healthy = time.time(), False
     if RUN_STARTED[0] is None:
         RUN_STARTED[0] = start

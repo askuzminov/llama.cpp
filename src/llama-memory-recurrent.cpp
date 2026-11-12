@@ -172,6 +172,15 @@ llama_memory_recurrent::llama_memory_recurrent(
             ggml_tensor * rc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rec_floats, 1 + n_rs_seq, 2 * mem_size);
             ggml_format_name(rc, "cache_rec_l%d", i);
             rec_l[i] = rc;
+
+            // fork: the info rows of rec_flatten on this buffer type, once
+            if (rec_info.find(buft) == rec_info.end()) {
+                ggml_tensor * snap = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 5, std::max<int64_t>(1, n_rs_seq));
+                ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 5, 1);
+                ggml_set_name(snap, "cache_rec_info_snap");
+                ggml_set_name(base, "cache_rec_info_base");
+                rec_info[buft] = { snap, base };
+            }
         }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
@@ -530,8 +539,13 @@ void llama_memory_recurrent::rec_flatten(uint32_t cell) {
         ggml_context_ptr ctx { ggml_init(params) };
         GGML_ASSERT(ctx);
 
-        ggml_tensor * info_snap = m > 0 ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 5, m) : nullptr;
-        ggml_tensor * info_base = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 5, 1);
+        // the info rows allocated with the RS buffers (rec_info): no device allocation here
+        const auto ri = rec_info.find(ggml_backend_buffer_get_type(s_l[ils[0]]->buffer));
+        GGML_ASSERT(ri != rec_info.end() && "no info rows for the deferred rollback replay");
+        GGML_ASSERT(m <= ri->second.first->ne[1]);
+
+        ggml_tensor * info_snap = m > 0 ? ggml_view_2d(ctx.get(), ri->second.first, 5, m, ri->second.first->nb[1], 0) : nullptr;
+        ggml_tensor * info_base = ri->second.second;
 
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), n_nodes, false);
         for (const int32_t il : ils) {
@@ -543,10 +557,14 @@ void llama_memory_recurrent::rec_flatten(uint32_t cell) {
             ggml_build_forward_expand(gf, ggml_gated_delta_net_replay(ctx.get(), s_l[il], rec_l[il], info_base, gdn_s, gdn_hv, gdn_hk));
         }
 
-        // the info rows are the only tensors of their own; the views of the rows get their buffers here, which a GPU
-        // backend needs
-        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_buffer_get_type(s_l[ils[0]]->buffer)) };
-        GGML_ASSERT(buf);
+        // every tensor of this graph is a view (the replay nodes of the state rows, info_snap of the info rows): their
+        // buffers, which a GPU backend needs (Vulkan skips a node without one)
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            GGML_ASSERT(t->view_src != nullptr);
+            if (t->buffer == nullptr) {
+                GGML_ASSERT(ggml_backend_view_init(t) == GGML_STATUS_SUCCESS);
+            }
+        }
         if (info_snap) {
             std::vector<int32_t> inf(5 * m);
             for (int32_t j = 1; j <= m; ++j) {

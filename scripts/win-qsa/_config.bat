@@ -82,6 +82,10 @@ rem nothing, so a result does not depend on what the machine served before. an a
 rem (06: history) measures a frequency base
 if not defined LLAMA_MTP_VOCAB_STATS set "LLAMA_MTP_VOCAB_STATS=none"
 if not defined LLAMA_MTP_VOCAB_STATS_SAVE set "LLAMA_MTP_VOCAB_STATS_SAVE=0"
+rem the upstream of 07 and of 00-build.bat upstream: the master of the last merge into cache, not the local branch
+rem master, which a test machine does not pull (12.11 the 395 had df1170213 of 20.10 there, and 07 started on its own
+rem refused the build of 0d69255c5). after a merge of master set it to that commit
+if not defined UPSTREAMREF set "UPSTREAMREF=0d69255c5"
 
 set "BIN=%BUILD%\bin\Release"
 if not exist "%BIN%" set "BIN=%BUILD%\bin"

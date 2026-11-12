@@ -111,6 +111,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-kv-window-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
     set_tests_properties(test-kv-window-fork PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # the flatten of the deferred rollback of the gated delta net against the plain net: the saved state after a short
+    # batch and a rollback, byte for byte, and the logits of the next token (rec_flatten, LLAMA_GDN_LAZY)
+    llama_build(test-gdn-flatten-fork.cpp)
+    llama_test(test-gdn-flatten-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-gdn-flatten-fork PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # partial (PARTIAL_ONLY) context checkpoints, one test per memory family:
     # plain attention, iSWA, hybrid (attention + recurrent), pure recurrent and the hybrid of qwen4exp (QSA + GDN)
     foreach(CKPT_MODEL llama-dense gemma2-dense phi3-dense granitehybrid-dense nemotron_h-dense falcon-h1-dense mamba2-dense qwen4exp-moe)

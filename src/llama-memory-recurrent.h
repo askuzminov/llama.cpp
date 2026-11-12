@@ -102,6 +102,11 @@ public:
     void rec_flatten(uint32_t cell);
     std::map<ggml_backend_dev_t, ggml_backend_ptr> rec_backends;
 
+    // the info rows of the replay per buffer type of the state rows, [5, n_rs_seq] and [5, 1], allocated with the RS
+    // buffers: a replay allocated them on each flatten, and a refused allocation of 256 bytes aborted the server on a
+    // full card (12.11, the 3090 with LLAMA_MOE_CACHE_MARGIN_MIB=512 and the CUDA guard of the free memory)
+    std::map<ggml_backend_buffer_type_t, std::pair<ggml_tensor *, ggml_tensor *>> rec_info;
+
     // computed before each graph build
     uint32_t n = 0;
 
