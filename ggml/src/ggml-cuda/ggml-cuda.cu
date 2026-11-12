@@ -191,6 +191,8 @@ static int ggml_cuda_op_offload_min_batch() {
     return min_batch;
 }
 
+#include "fork/device-room-fork.inc" // fork: no allocation past the free device memory
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -216,6 +218,9 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         }
 #endif // defined(GGML_USE_HIP)
     } else {
+        if (!ggml_cuda_device_has_room_fork(device, size, __func__)) { // fork
+            return cudaErrorMemoryAllocation;
+        }
         err = cudaMalloc(ptr, size);
     }
     return err;
@@ -650,6 +655,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
+            // fork: not past the free device memory (fork/device-room-fork.inc)
+            if (!ggml_cuda_device_has_room_fork(device, reserve_size, "ggml_cuda_pool_vmm")) {
+                GGML_ABORT(GGML_CUDA_NAME " pool[%d]: no device memory for %.2f MiB more of the pool "
+                           "(LLAMA_MOE_CACHE_MARGIN_MIB keeps memory free for it)", device, reserve_size/1024.0/1024.0);
+            }
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
             // map at the end of the pool

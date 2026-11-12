@@ -11,14 +11,16 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 12.11 (README, run-all): the merge of master 0d69255c5 on both machines (every step, 07 against
-rem that master), the guards of the device memory (01), the QSA block lists of the slots (02 par, rows0); on the 395
+rem the questions after the run of 12.11 (README, run-all): 07 against master 0d69255c5 on both machines (it failed
+rem on -lzm dio), the guards of the device memory (01), the QSA block lists of the slots (02 par, rows0); on the 395
 rem the cost of the 8- and 16-bit activations against the exact f32 math (07-exact: the prompt path, the decode
-rem kernels at 4 tokens, the same on f32 mat-vecs); on the 3090 the radix top-k of upstream (radix-up: 03, 07), the
-rem expert cache of upstream with a CPU share of the misses (upmoe0/3/5: 06), the margin of our expert cache (m512,
-rem m256: 06; with the sysmem fallback of the driver off, see the guards of 01), the vocabulary subset of the MTP
-rem head against the whole vocabulary (full: 06, pending since 10.11) and the draft cap 7 (cap7: 06). settled and left out: on the 395 mm and radix0
-rem (01.11, 02.11), on the 3090 nowin (02.11); again (a second default) stays: the logits of default bit for bit
+rem kernels at 4 tokens, the same on f32 mat-vecs, and at 8 tokens, the verify of the draft cap 7); on the 3090 the
+rem expert cache after the fix of the generation phase (12.11: it kept the buffers of the prompt phase), against the
+rem expert cache of upstream with a CPU share of the misses (upmoe5 +20% TG and upmoe8: 06), the margin of our expert
+rem cache (m512: 06; past the card the backend refuses, see the guards of 01), the radix top-k of upstream
+rem (radix-up: 07). settled and left out: on the 395 mm and radix0 (01.11, 02.11); on the 3090 nowin (02.11), and
+rem 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up
+rem in 03 (the prompt within 1.5%); again (a second default) stays: the logits of default bit for bit
 if not defined UPSTREAMREF set "UPSTREAMREF=0d69255c5"
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PAR_ARMS set "QA_PAR_ARMS=default;rows0 LLAMA_QSA_ROWS=0"
@@ -32,14 +34,14 @@ if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_PARMS set "QA_PARMS=default"
 if not defined QA_DARMS set "QA_DARMS=default"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
-if not defined EXACT_KARMS set "EXACT_KARMS=prompt;decode4 QA_ARM_UB=4;decode4f32 QA_ARM_UB=4 GGML_VK_DISABLE_MMVQ=1 GGML_VK_MMV_ID_FORK=0"
+if not defined EXACT_KARMS set "EXACT_KARMS=prompt;decode4 QA_ARM_UB=4;decode4f32 QA_ARM_UB=4 GGML_VK_DISABLE_MMVQ=1 GGML_VK_MMV_ID_FORK=0;decode8 QA_ARM_UB=8"
 goto :arms_done
 :arms_cuda
-if not defined QA_PARMS set "QA_PARMS=default;radix-up GGML_CUDA_TOPK_RADIX_STABLE=0"
-rem cap7: the draft cap of --spec-auto at 7 as on the 395 since 09.11 (the 3090 keeps 3, QA_SPEC in _config.bat, not
-rem measured since 12.10). upmoe: 6500 MiB, about the ~46 slots a layer of our cache at full depth (RESEARCH.md);
-rem --moe-cache 0 turns ours off
-if not defined QA_DARMS set "QA_DARMS=default;cap7 "QA_ARM_ARGS=--spec-draft-n-max 7";full LLAMA_MTP_VOCAB=0;m512 LLAMA_MOE_CACHE_MARGIN_MIB=512;m256 LLAMA_MOE_CACHE_MARGIN_MIB=256;upmoe0 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0";upmoe3 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.3";upmoe5 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.5""
+if not defined QA_PARMS set "QA_PARMS=default"
+rem upmoe: 6500 MiB, about the ~46 slots a layer of our cache at full depth (RESEARCH.md); --moe-cache 0 turns ours
+rem off. 12.11 the share of the misses on the CPU: 0 -1.6%, 0.3 +7.4%, 0.5 +20.3% TG, the 22K prompt 33% slower
+rem (all against our cache with the buffers of the prompt phase kept, before the fix)
+if not defined QA_DARMS set "QA_DARMS=default;m512 LLAMA_MOE_CACHE_MARGIN_MIB=512;upmoe5 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.5";upmoe8 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.8""
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream;radix-up GGML_CUDA_TOPK_RADIX_STABLE=0"
 rem the CUDA matmuls have no f32 mode: 07 against the exact base runs on the 395 only
 if not defined RUN_EXACT set "RUN_EXACT=0"

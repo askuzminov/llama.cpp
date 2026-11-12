@@ -578,6 +578,9 @@ private:
     // add the compute buffer size of each device for ubatches of n_ub tokens after n_tokens (+ n_pad) more tokens, return the graph splits
     int  phase_size(uint32_t n_ub, uint32_t n_tokens, uint32_t n_pad, std::map<ggml_backend_dev_t, size_t> & sizes);
 
+    // the compute buffers of the scheduler on the GPUs
+    size_t phase_compute_size() const;
+
     // replace the scheduler with one that has no compute buffers
     void sched_free();
 

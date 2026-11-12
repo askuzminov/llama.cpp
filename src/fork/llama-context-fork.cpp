@@ -357,23 +357,44 @@ void llama_context::phase_gen() {
         }
     }
 
-    // the followers first, so that the moe-cache gets all the memory that is left
+    // the followers first, so that the moe-cache gets all the memory that is left. sched_free() before each reserve:
+    // sched_reserve() keeps a compatible scheduler (upstream 3e86ce2c2) and its buffers only grow, so the generation
+    // phase kept the buffers of the prompt phase (12.11, the 3090: 7856 instead of 14614 MiB free for the moe-cache
+    // after a 25K prompt, 46 instead of 93 slots per layer)
     for (auto * f : phase_followers) {
-        f->phase_n_reserve     = std::max(f->phase_n_reserve, std::min(phase_n_reserve, f->phase_n_gen));
-        f->phase              = LLAMA_PHASE_GEN;
-        f->phase_n_tokens     = f->phase_n_reserve;
-        f->phase_n_kv         = 0;
-        f->sched_need_reserve = true;
+        f->phase_n_reserve = std::max(f->phase_n_reserve, std::min(phase_n_reserve, f->phase_n_gen));
+        f->phase           = LLAMA_PHASE_GEN;
+        f->phase_n_tokens  = f->phase_n_reserve;
+        f->phase_n_kv      = 0;
+        f->sched_free();
         f->sched_reserve();
     }
 
-    phase              = LLAMA_PHASE_GEN;
-    phase_n_tokens     = phase_n_reserve;
-    phase_n_kv         = 0;
-    sched_need_reserve = true;
+    phase          = LLAMA_PHASE_GEN;
+    phase_n_tokens = phase_n_reserve;
+    phase_n_kv     = 0;
+    sched_free();
     sched_reserve();
 
-    LLAMA_LOG_INFO("%s: phase_mem: generation, ubatch %u, %.2f s\n", __func__, phase_n_tokens, 1e-6*(ggml_time_us() - t_start_us));
+    size_t size_f = 0;
+    for (auto * f : phase_followers) {
+        size_f += f->phase_compute_size();
+    }
+
+    // test-moe-cache-fork reads the compute sizes of this line and of the prompt line
+    LLAMA_LOG_INFO("%s: phase_mem: generation, ubatch %u, compute %.1f + %.1f MiB (drafts), %.2f s\n", __func__, phase_n_tokens,
+            phase_compute_size()/1024.0/1024.0, size_f/1024.0/1024.0, 1e-6*(ggml_time_us() - t_start_us));
+}
+
+size_t llama_context::phase_compute_size() const {
+    size_t res = 0;
+    for (auto * b : backend_ptrs) {
+        const auto type = ggml_backend_dev_type(ggml_backend_get_device(b));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            res += ggml_backend_sched_get_buffer_size(sched.get(), b);
+        }
+    }
+    return res;
 }
 
 void llama_context::phase_prompt(uint32_t n_tokens) {
@@ -567,20 +588,9 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
         }
     }
 
-    // compute buffers on the devices
-    auto dev_size = [](const llama_context * c) {
-        size_t res = 0;
-        for (auto * b : c->backend_ptrs) {
-            const auto type = ggml_backend_dev_type(ggml_backend_get_device(b));
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                res += ggml_backend_sched_get_buffer_size(c->sched.get(), b);
-            }
-        }
-        return res;
-    };
     size_t size_f = 0;
     for (auto * f : phase_followers) {
-        size_f += dev_size(f);
+        size_f += f->phase_compute_size();
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -590,8 +600,8 @@ void llama_context::phase_prompt(uint32_t n_tokens) {
         snprintf(kept, sizeof(kept), " (moe-cache kept %.0f of %.0f MiB)", size_kept/1024.0/1024.0, size_cache/1024.0/1024.0);
     }
 
-    LLAMA_LOG_INFO("%s: phase_mem: prompt, batch %u tokens, KV cells %u, ubatch %u of %u, compute %.0f + %.0f MiB (drafts), %.0f MiB were free%s, %d queries, %.2f s (free %.2f, queries %.2f, reserve %.2f)\n",
-            __func__, n_tokens, phase_n_kv, n_lo, n_max, dev_size(this)/1024.0/1024.0, size_f/1024.0/1024.0, free_all/1024.0/1024.0,
+    LLAMA_LOG_INFO("%s: phase_mem: prompt, batch %u tokens, KV cells %u, ubatch %u of %u, compute %.1f + %.1f MiB (drafts), %.0f MiB were free%s, %d queries, %.2f s (free %.2f, queries %.2f, reserve %.2f)\n",
+            __func__, n_tokens, phase_n_kv, n_lo, n_max, phase_compute_size()/1024.0/1024.0, size_f/1024.0/1024.0, free_all/1024.0/1024.0,
             kept, n_query, 1e-6*(t_end_us - t_start_us), 1e-6*(t_free_us - t_start_us), 1e-6*(t_query_us - t_free_us), 1e-6*(t_end_us - t_query_us));
 }
 

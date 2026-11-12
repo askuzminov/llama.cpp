@@ -136,6 +136,17 @@ def warmup_args():
 def model_args(model):
     return ["-m", str(model), "-fa", "on", *split_args(env("LOADMODE")), *split_args(env("EXTRA")), *warmup_args()]
 
+# the values of the fork that upstream does not take, as upstream says them: -lzm dio (rows gathered through the row
+# cache of the fork) is on there (rows read on demand from a mapping of the file); 12.11 07 failed on both machines
+UPSTREAM_VALUES = {("-lzm", "dio"): "on", ("--lazy-mode", "dio"): "on"}
+
+def upstream_args(args):
+    """args for a binary of the upstream build"""
+    out = [str(a) for a in args]
+    for i in range(1, len(out)):
+        out[i] = UPSTREAM_VALUES.get((out[i - 1], out[i]), out[i])
+    return out
+
 def digest(path):
     path = Path(path)
     st = path.stat()
@@ -831,6 +842,9 @@ def cmd_build_upstream():
 NOTE_LIMIT = re.compile(r"device memory heap \d+ of ([\d.]+) MiB, other processes hold ([\d.]+) MiB of it, the driver "
                         r"budgets ([\d.]+) MiB: this process takes up to ([\d.]+) MiB")
 NOTE_REFUSED = re.compile(r"device memory heap \d+: ([\d.]+) MiB in use of a limit of ([\d.]+) MiB, ([\d.]+) MiB more asked")
+# the refusal of the CUDA backend on Windows (ggml-cuda/fork/device-room-fork.inc, 12.11): the driver would back it with
+# system memory
+NOTE_REFUSED_CUDA = re.compile(r"([\d.]+) MiB on device \d+ do not fit its free memory \(([\d.]+) MiB free of ([\d.]+) MiB")
 NOTE_SPILL = re.compile(r"elastic buffer: (?:the device memory is full \((?:([\d.]+) of ([\d.]+) MiB in use|an allocation "
                         r"failed)|granules from the shared memory)")
 NOTE_FLOOR = re.compile(r"elastic buffer: the device memory is full and the system has ([\d.]+) MiB free")
@@ -870,7 +884,8 @@ def log_notes(folder):
                     line = raw.decode("utf-8", errors="replace")
                     if NOTE_RELIEF.search(line):
                         n_relief += 1
-                    for key, pattern in (("limit", NOTE_LIMIT), ("refused", NOTE_REFUSED), ("spill", NOTE_SPILL),
+                    for key, pattern in (("limit", NOTE_LIMIT), ("refused", NOTE_REFUSED),
+                                         ("refused_cuda", NOTE_REFUSED_CUDA), ("spill", NOTE_SPILL),
                                          ("floor", NOTE_FLOOR), ("qsa", NOTE_QSA), ("moe", NOTE_MOE),
                                          ("moe0", NOTE_MOE_NONE), ("fit", NOTE_FIT)):
                         if key not in first:
@@ -885,6 +900,9 @@ def log_notes(folder):
         if "refused" in first:
             use, lim, ask = first["refused"]
             refused.append(f"{name} ({use} MiB in use of {lim}, {ask} more asked)")
+        if "refused_cuda" in first:
+            ask, free, total = first["refused_cuda"]
+            refused.append(f"{name} ({ask} MiB asked, {free} MiB free of {total})")
         if "spill" in first:
             use, lim = first["spill"]
             spills.append(name + (f" (at {use} of {lim} MiB)" if use else ""))
@@ -1472,8 +1490,6 @@ def ckpt_probe(run, model):
 GUARD_OFFLOAD = re.compile(r"offloaded (\d+)/(\d+) layers to GPU")
 GUARD_FREE = re.compile(r"using device (\S+) \(.*- (\d+) MiB free")
 GUARD_BUFFER = re.compile(r"(\S+) model buffer size =\s*([\d.]+) MiB")
-GUARD_SYSMEM_FIX = ("NVIDIA Control Panel, Manage 3D settings, Program settings: llama-server.exe (or Global settings), "
-                    "CUDA - Sysmem Fallback Policy = Prefer No Sysmem Fallback")
 
 
 def guard_server(exe, args, run_env, log):
@@ -1513,7 +1529,7 @@ def guard_server(exe, args, run_env, log):
 def guard_read(healthy, code, text):
     """what a guard needs from the log of its server"""
     off, free = GUARD_OFFLOAD.search(text), GUARD_FREE.search(text)
-    refused, limit = NOTE_REFUSED.search(text), NOTE_LIMIT.search(text)
+    refused, limit = NOTE_REFUSED.search(text) or NOTE_REFUSED_CUDA.search(text), NOTE_LIMIT.search(text)
     return {"healthy": healthy, "code": code, "error": "" if healthy else f"{last_error(text)}{crash_report(text)}",
             "memory_error": any(s in text for s in MEMORY_ERRORS),
             "refused": list(refused.groups()) if refused else None,
@@ -1535,31 +1551,45 @@ def guards_probe(run, model):
     tail = ["--host", "127.0.0.1", "--port", port]
     run.add("", "guards: no weights in the system memory unless asked (12.11)")
     if backend == "cuda":
-        # not kept: the answer depends on a setting of the driver, which the identity of a result cannot see
+        # the weights of -ncmoe QA_GUARD_NCMOE layers on the card take more than it has: the backend refuses them
+        # (ggml-cuda/fork/device-room-fork.inc) whatever the sysmem fallback policy of the driver, which stays as it is
         n_cpu = env("QA_GUARD_NCMOE", "30")
         args = [str(a) for a in [*head, "-ngl", 99, "-ncmoe", n_cpu, "--no-repack", "-fit", "off", *tail]]
-        log = run.dir / "guard_sysmem.log"
-        print(f"guard sysmem: running, {log.name}", flush=True)
-        g = guard_read(*guard_server(exe, args, os.environ.copy(), log))
-        what = f"sysmem fallback (-ncmoe {n_cpu}: the expert layers on the card take more than it has, QA_GUARD_NCMOE)"
+        identity = {"v": VERSION, "kind": "guard", "guard": "sysmem", "build": build_id(exe.parent), "args": args,
+                    "model": model_identity(model), "env": env_identity(os.environ), "machine": machine()}
+        what = f"no room (-ncmoe {n_cpu}: the expert layers on the card take more than it has, QA_GUARD_NCMOE)"
+        try:
+            g, kept = run.measure("guard sysmem", identity,
+                                  lambda log: guard_read(*guard_server(exe, args, os.environ.copy(), log)))
+        except Fail as e:
+            run.failed = True
+            run.add(f"  {what}: FAIL {e}")
+            return
+        k = " k" if kept else ""
+        if not g["healthy"] and g["refused"]:
+            ask, free, total = g["refused"]
+            run.add(f"  {what}: the backend refused {ask} MiB with {free} MiB free of {total}, the load failed: ok{k}")
+            return
         if not g["healthy"] and g["memory_error"]:
-            run.add(f"  {what}: the load failed on the device memory, the driver keeps CUDA memory on the card: ok")
+            run.add(f"  {what}: the load failed on the device memory without the refusal of the backend (the driver "
+                    f"refused it): ok{k}")
             return
         run.failed = True
         if not g["healthy"]:
-            run.add(f"  {what}: FAIL, the load failed otherwise: {g['error']} ({log.name})")
+            run.add(f"  {what}: FAIL, the load failed otherwise: {g['error']}{k}")
             return
         dev = g["free"][0] if g["free"] else "CUDA0"
         on_card = sum(mib for b, mib in g["buffers"] if b == dev)
         if g["free"] and on_card > g["free"][1]:
             run.add(f"  {what}: FAIL, the weights on {dev} take {on_card:.0f} MiB with {g['free'][1]} MiB free and the "
-                    f"server loaded: the driver backs the rest with system memory. {GUARD_SYSMEM_FIX}")
+                    f"server loaded: the driver backs the rest with system memory, the backend did not refuse it "
+                    f"(GGML_CUDA_ALLOW_SYSMEM_FALLBACK set, or a build before 12.11){k}")
         elif g["free"] and g["buffers"]:
             run.add(f"  {what}: FAIL, inconclusive: the weights on {dev} take {on_card:.0f} MiB of {g['free'][1]} MiB free, "
-                    f"they fit the card; a lower QA_GUARD_NCMOE puts more of them there")
+                    f"they fit the card; a lower QA_GUARD_NCMOE puts more of them there{k}")
         else:
-            run.add(f"  {what}: FAIL, the server loaded (no buffer lines in {log.name}): most likely the driver backs the "
-                    f"card with system memory. {GUARD_SYSMEM_FIX}")
+            run.add(f"  {what}: FAIL, the server loaded (no buffer lines in the log): most likely the driver backs the "
+                    f"card with system memory{k}")
         return
     limit = None
     for name, extra_env, extra_args in (("no room", {"GGML_VK_DEVICE_MARGIN_MIB": "1048576"}, ["-ngl", 99, "-fit", "off"]),
@@ -1715,26 +1745,54 @@ def spec_completion(url, body):
     return r
 
 
-def spec_greedy(url, prompts, n_predict):
+def logprob_of(top, tok):
+    """the logprob of token tok in a list of top_logprobs, None when the list lacks it"""
+    return next((e["logprob"] for e in top if e["id"] == tok), None)
+
+
+def gap_shift(top_a, top_b):
+    """the gap of the top two tokens of top_a, and that gap where top_b gives the same two tokens (nats; None when
+    top_b lacks one): at a position of the same context, how far the two paths part"""
+    if len(top_a) < 2:
+        return None, None
+    a = top_a[0]["logprob"] - top_a[1]["logprob"]
+    b1, b2 = logprob_of(top_b, top_a[0]["id"]), logprob_of(top_b, top_a[1]["id"])
+    return a, None if b1 is None or b2 is None else b1 - b2
+
+
+def spec_greedy(url, prompts, n_predict, n_probs):
     """temperature 0 with and without drafts on one server: the tokens agree up to the first one where the two paths of
     the model round apart, where the margin of the top token over the second (nats, without drafts) is small. A fault of
-    the drafts, the verify or a rollback parts them also where the model is sure of the next token"""
+    the drafts, the verify or a rollback parts them also where the model is sure of the next token. Up to that token the
+    context is the same, so the two distributions compare at every position: the gap of the top two tokens of the run
+    without drafts against the gap of the same two tokens with drafts (the verify path) there (shift: how far the paths
+    part, at the first other token and the largest before it), and every token with drafts must be the top one of its
+    own distribution at temperature 0 (not greedy: the acceptance took another, a fault whatever the rounding)"""
     rows = []
     for i, text in enumerate(prompts):
-        body = {"prompt": text, "n_predict": n_predict, "temperature": 0, "n_probs": 2, "return_tokens": True,
+        body = {"prompt": text, "n_predict": n_predict, "temperature": 0, "n_probs": n_probs, "return_tokens": True,
                 "cache_prompt": True}
         base = spec_completion(url, dict(body, **{"speculative.n_max": 0}))
         spec = spec_completion(url, body)
         a, b = base["tokens"], spec["tokens"]
+        pa = [x["top_logprobs"] for x in base["completion_probabilities"]]
+        pb = [x["top_logprobs"] for x in spec["completion_probabilities"]]
         first = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), None)
         if first is None and len(a) != len(b):
             first = min(len(a), len(b))
-        margin = None
-        if first is not None and first < len(base["completion_probabilities"]):
-            top = base["completion_probabilities"][first]["top_logprobs"]
-            margin = top[0]["logprob"] - top[1]["logprob"] if len(top) > 1 else float("inf")
+        margin = spec_gap = None
+        if first is not None and first < len(pa):
+            margin, spec_gap = gap_shift(pa[first], pb[first] if first < len(pb) else [])
+            if margin is None:
+                margin = float("inf")
+        end = min(len(pa), len(pb), len(a), len(b), len(a) if first is None else first)
+        shifts = [g[0] - g[1] for g in (gap_shift(pa[k], pb[k]) for k in range(end)) if g[0] is not None and g[1] is not None]
+        not_greedy = [k for k in range(min(len(b), len(pb), end + 1)) if pb[k] and pb[k][0]["id"] != b[k]]
+        base_not_greedy = [k for k in range(min(len(a), len(pa))) if pa[k] and pa[k][0]["id"] != a[k]]
         t = spec["timings"]
         rows.append({"prompt": i, "n": len(a), "same": len(a) if first is None else first, "margin": margin,
+                     "spec_gap": spec_gap, "shift_max": max((abs(x) for x in shifts), default=None),
+                     "not_greedy": not_greedy[:1], "base_not_greedy": base_not_greedy[:1],
                      "draft_n": t.get("draft_n", 0), "draft_acc": t.get("draft_n_accepted", 0)})
     return rows
 
@@ -1766,7 +1824,8 @@ def spec_pit(url, prompts, n_predict, n_probs, seed):
 
 def spec_flags(greedy, pit):
     """SPEC GREEDY DIFFERS: temperature 0 parts with and without drafts where the model without them was sure of the
-    token, a margin above QA_SPEC_MARGIN (1.0) nats. SPEC SAMPLING DIFFERS: the tokens with drafts do not follow the
+    token, a margin above QA_SPEC_MARGIN (1.0) nats. SPEC NOT GREEDY: a token with drafts that is not the top one of the
+    distribution the server gives for it (the verify path), at temperature 0 a fault of the acceptance. SPEC SAMPLING DIFFERS: the tokens with drafts do not follow the
     distribution they were drawn from (the shape or the mean of uniform_test below QA_SPEC_ALPHA, 1e-4, each) or one came
     out that it does not have. SPEC PROBE DIFFERS: the same without drafts, so the probe itself does not hold. NO DRAFTS: nothing drafted"""
     margin, alpha = float(env("QA_SPEC_MARGIN", "1.0")), float(env("QA_SPEC_ALPHA", "1e-4"))
@@ -1774,6 +1833,11 @@ def spec_flags(greedy, pit):
     for r in greedy:
         if r["margin"] is not None and r["margin"] > margin:
             flags.append(f"SPEC GREEDY DIFFERS (prompt {r['prompt']}, token {r['same']}, margin {r['margin']:.2f})")
+        if r.get("not_greedy"):
+            flags.append(f"SPEC NOT GREEDY (prompt {r['prompt']}, token {r['not_greedy'][0]}: not the top token of its own "
+                         f"distribution at temperature 0)")
+        if r.get("base_not_greedy"):
+            flags.append(f"SPEC PROBE NOT GREEDY (prompt {r['prompt']}, token {r['base_not_greedy'][0]} without drafts)")
     if not any(r["draft_n"] for r in greedy) or not pit["spec"]["draft_n"]:
         flags.append("NO DRAFTS")
     def off(a):
@@ -1799,13 +1863,14 @@ def spec_probe(run, model, port):
     identity = {"v": VERSION, "kind": "spec", "build": build_id(exe.parent), "args": args, "model": model_identity(model),
                 "draft": model_identity(Path(env("SPECDRAFT"))), "env": env_identity(os.environ),
                 "prompts": text_digest("\n".join(prompts)), "greedy": n_greedy, "tokens": n_tokens, "probs": n_probs,
+                "greedy_probs": n_probs,
                 "machine": machine()}
 
     def go(log):
         proc, log = start_server(exe, args, os.environ.copy(), log)
         try:
             url = f"http://127.0.0.1:{port}"
-            return {"greedy": spec_greedy(url, prompts, n_greedy), "pit": spec_pit(url, prompts, n_tokens, n_probs, 1000)}
+            return {"greedy": spec_greedy(url, prompts, n_greedy, n_probs), "pit": spec_pit(url, prompts, n_tokens, n_probs, 1000)}
         finally:
             proc.kill()
             proc.wait()
@@ -1814,11 +1879,17 @@ def spec_probe(run, model, port):
     r, kept = run.measure("spec", identity, go)
     k = " k" if kept else ""
     flags = spec_flags(r["greedy"], r["pit"])
+    def nats(x):
+        return "-" if x is None else f"{x:.2f}"
+
     run.add("", f"spec: temperature 0, {n_greedy} tokens of {len(prompts)} prompts with and without drafts: the same "
-                f"tokens up to the first other one, the margin of the top token there without drafts (nats)" + k,
-            *table(["prompt", "same", "margin", "drafted", "accepted"],
-                   [[g["prompt"], f"{g['same']}/{g['n']}", "-" if g["margin"] is None else f"{g['margin']:.2f}",
-                     g["draft_n"], g["draft_acc"]] for g in r["greedy"]]))
+                f"tokens up to the first other one; margin - the gap of the top two tokens there without drafts (nats), "
+                f"with drafts - the gap of the same two tokens in the verify path (below 0: it takes the second); shift "
+                f"before - the largest change of that gap at the tokens before it (the same context, the rounding of the "
+                f"two paths)" + k,
+            *table(["prompt", "same", "margin", "with drafts", "shift before", "drafted", "accepted"],
+                   [[g["prompt"], f"{g['same']}/{g['n']}", nats(g["margin"]), nats(g.get("spec_gap")),
+                     nats(g.get("shift_max")), g["draft_n"], g["draft_acc"]] for g in r["greedy"]]))
     run.add("", f"spec: temperature 1 (the temperature alone), {n_tokens} tokens of each prompt: the probability integral "
                 f"transform of every token under the distribution it was drawn from, uniform when they follow it" + k,
             *table(["", "tokens", "chi2 (19)", "p", "mean (0.5)", "p", "outside", "drafted", "accepted"],
@@ -3365,12 +3436,13 @@ def cmd_kld():
     args = ["-f", str(text), "-c", str(ctx), "-b", str(ctx), "-ub", ub, "--chunks", str(chunks),
             *split_args(env("QA_KLD_ARGS"))]
     margs = model_args(model)
+    base_margs = upstream_args(margs) if base_kind == "upstream" else margs
     base_env = os.environ.copy()
     if base_kind == "exact":
         base_env.update(KLD_EXACT_ENV)
     base_env.update(env_pairs(env("QA_KLD_BASE_ENV"), "QA_KLD_BASE_ENV"))
     ident_base = {"v": VERSION, "kind": "kld-base", "base": base_kind, "build": build_id(base_folder),
-                  "model": model_identity(model), "text": digest(text), "args": [str(a) for a in margs + args],
+                  "model": model_identity(model), "text": digest(text), "args": [str(a) for a in base_margs + args],
                   "env": env_identity(base_env)}
     folder = CACHE / "qa"
     folder.mkdir(parents=True, exist_ok=True)
@@ -3378,12 +3450,12 @@ def cmd_kld():
     head_base, _ = build_head(base_folder)
     base_desc = "upstream" if base_kind == "upstream" else "this build, every matmul in f32 (QA_KLD_BASE=exact)"
     run.add(f"base: {base_desc} {head_base or build_id(base_folder)}, {chunks} chunks of {ctx} tokens of {text.name} "
-            f"(the second half of each is compared), ubatch {ub}, {' '.join(map(str, margs[2:]))}")
+            f"(the second half of each is compared), ubatch {ub}, {' '.join(map(str, base_margs[2:]))}")
     base_ppl = base.with_suffix(".ppl")
     if forced("kld base") or not base.is_file() or not base_ppl.is_file():
         part = base.with_suffix(".part")
         print(f"kld base: running {base_kind}, {base.name}", flush=True)
-        execute([base_exe, *margs, *args, "--kl-divergence-base", part], run.dir / "base.log", base_env)
+        execute([base_exe, *base_margs, *args, "--kl-divergence-base", part], run.dir / "base.log", base_env)
         m = re.search(KLD_BASE_PPL, read_log(run.dir / "base.log"))
         if m is None:
             raise Fail(f"no PPL in {run.dir / 'base.log'}")
@@ -3395,6 +3467,7 @@ def cmd_kld():
     for name, up, arm_env in kld_arms():
         exe = up_exe if up else binary("llama-perplexity")
         bfolder = up_folder if up else Path(env("BIN"))
+        arm_margs = upstream_args(margs) if up else margs
         arm_env = dict(arm_env)
         arm_ub = arm_env.pop("QA_ARM_UB", None)
         arm_args = args if arm_ub is None else [a if i == 0 or args[i - 1] != "-ub" else arm_ub for i, a in enumerate(args)]
@@ -3403,8 +3476,8 @@ def cmd_kld():
         identity = {"v": VERSION, "kind": "kld", "build": build_id(bfolder), "base": ident_base,
                     "env": env_identity(run_env), "args": [str(a) for a in arm_args]}
 
-        def measure(log, exe=exe, run_env=run_env, arm_args=arm_args):
-            execute([exe, *margs, *arm_args, "--kl-divergence-base", base, "--kl-divergence"], log, run_env)
+        def measure(log, exe=exe, run_env=run_env, arm_args=arm_args, arm_margs=arm_margs):
+            execute([exe, *arm_margs, *arm_args, "--kl-divergence-base", base, "--kl-divergence"], log, run_env)
             return dict(kld_read(log), ppl_up=ppl_up)
 
         result, kept = run.measure(f"kld {name}", identity, measure)

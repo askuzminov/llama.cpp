@@ -75,6 +75,46 @@ static bool log_has(const char * what) {
     return g_log.find(what) != std::string::npos;
 }
 
+// the compute buffers of the generation phase after a prompt phase are smaller than those of the prompt phase: the
+// buffers of a scheduler only grow, so a generation reserve on the scheduler of the prompt phase kept the prompt
+// buffers, and on the 3090 the moe-cache got 46 instead of 93 slots per layer after a 25K prompt (12.11). the sizes
+// come from the "phase_mem: prompt" and "phase_mem: generation" lines (llama-context-fork.cpp); the number of the
+// generation phases that followed a prompt phase, -1 when one kept the buffers
+static int gen_after_prompt_smaller() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    int    n      = 0;
+    double prompt = -1.0;
+    size_t at     = 0;
+    while (true) {
+        const size_t p = g_log.find("phase_mem: prompt, ", at);
+        const size_t g = g_log.find("phase_mem: generation, ", at);
+        if (p == std::string::npos && g == std::string::npos) {
+            break;
+        }
+        const bool   is_p = g == std::string::npos || (p != std::string::npos && p < g);
+        const size_t here = is_p ? p : g;
+        const size_t c    = g_log.find("compute ", here);
+        const size_t eol  = g_log.find('\n', here);
+        double size = -1.0;
+        if (c != std::string::npos && c < eol) {
+            size = atof(g_log.c_str() + c + strlen("compute "));
+        }
+        if (is_p) {
+            prompt = size;
+        } else if (prompt > 0.0) {
+            if (!(size >= 0.0 && size < prompt)) {
+                fprintf(stderr, "a generation phase with compute buffers of %.1f MiB after a prompt phase with %.1f MiB\n",
+                        size, prompt);
+                return -1;
+            }
+            n++;
+            prompt = -1.0;
+        }
+        at = here + 1;
+    }
+    return n;
+}
+
 static const int N_EXPERT = 32;
 static const int N_SLOTS  = 32; // per layer: 33 slots of 1.125 MiB on each of the 2 layers, 74.25 MiB
 
@@ -508,6 +548,7 @@ int main(int argc, char ** argv) {
             fclose(f);
         }
         CHECK(log_has("moe_cache: ") && log_has("slots per layer"));
+        CHECK(gen_after_prompt_smaller() > 0);
         printf("%s: %zu tokens, the reference%s\n", argv[0], recs.size(), n_fail == 0 ? "" : ", FAILED");
         llama_backend_free();
         return n_fail == 0 ? 0 : 1;
@@ -570,6 +611,7 @@ int main(int argc, char ** argv) {
 
     // the path of the mode ran
     CHECK(log_has("kept their slots")); // an alloc() that uploaded only the layers it had taken
+    CHECK(gen_after_prompt_smaller() > 0);
     if (mode == "keep" || mode == "fill" || mode == "upload") {
         CHECK(log_has("(moe-cache kept 37 of 74 MiB)"));
         CHECK(log_has("prompt copies: "));

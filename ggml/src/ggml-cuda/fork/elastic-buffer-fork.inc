@@ -87,6 +87,18 @@ static bool ggml_backend_cuda_buffer_commit_fork(ggml_backend_buffer_t buffer, s
     const size_t i0 = offset/g;
     const size_t i1 = std::min(el->mapped.size(), (offset + size + g - 1)/g);
 
+    // not past the free device memory (fork/device-room-fork.inc), and GGML_CUDA_ELASTIC_MARGIN_MIB (512) stay free for
+    // the pool and cuBLAS, as GGML_VK_ELASTIC_MARGIN_MIB on Vulkan: a refusal limits the cells, and llama gives up slots
+    // of the moe-cache for them before it tries again
+    static const size_t margin = (size_t) std::max(0, ggml_cuda_env_int("GGML_CUDA_ELASTIC_MARGIN_MIB", 512))*1024*1024;
+    size_t n_new = 0;
+    for (size_t i = i0; i < i1; ++i) {
+        n_new += el->mapped[i] ? 0 : 1;
+    }
+    if (n_new > 0 && !ggml_cuda_device_has_room_fork(ctx->device, n_new*g + margin, nullptr)) {
+        return false;
+    }
+
     bool ok = true;
     for (size_t i = i0; i < i1 && ok; ++i) {
         if (el->mapped[i]) {
