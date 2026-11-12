@@ -597,8 +597,12 @@ int8, без f16-шейдеров и coopmat, пути f16 форка выклю
 `"QA_ARM_ARGS=<аргументы>"` в варианте 07 (в кавычках целиком, 12.11) - аргументы только этого варианта после
 аргументов модели; более позднее значение опции побеждает. Так раскладывается разница с upstream: 12.11 на 395 PPL
 форка 1.9460, его точного f32-эталона 1.9456, upstream 1.9270 (KLD 0.033), то есть разница не от наших 8- и 16-битных
-приближений. Граф upstream в этой сборке и наш граф с чтением строк PLE, как у upstream:
-`export QA_KARMS='fork;copy LLAMA_UPSTREAM=qwen4exp;lzmon "QA_ARM_ARGS=-lzm on";upstream @upstream'`.
+приближений. На Mac на тестовых qwen4exp (CPU и Vulkan, QSA и маршрутизация 32 экспертов включены, несколько ubatch,
+строки PLE через кеш строк и через отображение) форк и upstream расходятся не больше чем на KLD 2e-6, обходной путь
+маски top-k upstream (без слитой операции, как на Vulkan 395) совпадает со слитым. Плечи, которые раскладывают разницу
+на 395: граф upstream в этой сборке (`copy`), строки PLE как у upstream (`lzmon`), ключи пулов QSA в f32 (`pool32`),
+внимание по маске вместо списка (`nolist`), без отбора QSA у нас и у upstream (`dense`, `updense`):
+`export QA_KARMS='fork;copy LLAMA_UPSTREAM=qwen4exp;lzmon "QA_ARM_ARGS=-lzm on";pool32 LLAMA_QSA_POOL_F32=1;nolist LLAMA_QSA_FA_LIST=0;dense "QA_ARM_ARGS=--override-kv qwen4exp.attention.indexer.top_k=int:262144";upstream @upstream;updense @upstream "QA_ARM_ARGS=--override-kv qwen4exp.attention.indexer.top_k=int:262144"'`.
 
 ## Аргументы сервера в варианте (12.11)
 
