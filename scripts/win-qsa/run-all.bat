@@ -11,17 +11,19 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 13.11 evening (README, run-all). the 395: the draft checks on the f16 coopmat tile of
-rem mul_mm_f16reg.comp (GGML_VK_MM_F16REG_VERIFY: dense q8_0 of 2-8 columns, 1024 rows and more, f16 activations in
-rem place of the int8 mat-vec on q8_1), now with the f32 activations read in place and the tile r16x16/4x1. the first
-rem run (ae5965d43, the f16 copy, r16x16/8x1): vfyp2 (the smaller q8_0 in two planes) KLD 0.0115 against 0.0118 of
-rem the decode without drafts, TG -6.7%, a verify +5.6 ms and -0.5 ms a token. 03 at depth 0 with a reply of 256
-rem tokens: the GPU ms of a verify of each size and the ops of a verify of 4 tokens, default against vfyp2; 06 default,
-rem vfyp2 and vfyp2c (the f16 copy of the first run: its cost); 01 the ops and unit cases of the tile, the spec probe
-rem with vfyp2. 05, 07-exact (the read in place gives the outputs of the copy bit for bit on the Mac), 07 against
-rem upstream and 02 are off on the 395. the 3090: 01 (the MUL_MAT_VERIFY cases of 13.11 on CUDA; 13.11 16:57 1090/1090
-rem before them); 06, 07, 03 and 02 are off (03 answered 13.11: the reply 38.96-46.31 ms of GPU a token with the
-rem reports read per backend context). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
+rem the questions of 13.11 night (README, run-all). the 395: the precision of the draft checks, dense q8_0 of 2-8
+rem columns. vfyp2 (the f16 coopmat tile of GGML_VK_MM_F16REG_VERIFY for 1024 rows and more, two int8 planes below):
+rem KLD 0.0115 against 0.0118 without drafts and 0.0311 of default; 13.11 22:00 (e194f0bfb, read in place, r16x16/4x1)
+rem 06 TG -0.6% (the f16 copy -0.5%), but in 03 a verify of the same size +1.6-2.7 ms: the tile reads the big
+rem matrices at 190-202 GB/s in the model against 207-235 of the int8 mat-vec. now the f32 mat-vec that exists
+rem (f32d, GGML_VK_DISABLE_MMVQ=1: dense q8_0 against f32 activations, the experts stay on the fork mat-vec): 03 and 06
+rem default, vfyp2, f32d and again (default once more at the end: the order effect, 13.11 the draft step of the first
+rem arm 1.3-2.7% slower), all measured anew in this run (FORCE); 07-exact f32d; 01 only the spec probe again (default,
+rem vfyp2, f32d; the PIT mean of the mid-point transform). 05, 07 against upstream and 02 are off on the 395. the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
+rem 13.11 21:36 all ops passed without them); 06, 07, 03 and 02 are off (03 answered 13.11: the reply 38.96-46.31 ms of
+rem GPU a token with the reports read per backend context). both: the spec probe of 01 again, the PIT mean now of the
+rem mid-point transform (13.11: the randomized one took a fixed random stream whose first 1500 values average 0.516, so
+rem the mean without drafts was 0.511-0.518 in every run). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
 rem dense, nofuse, radix0); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP
 rem head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and
 rem the guard refused 256 bytes: 512 MiB next to the expert cache is too little); 13.11 upmoe5/upmoe8 (the cache of
@@ -36,16 +38,18 @@ rem the indexer kernels have not changed since the micro of 31.10 evening: 04-mi
 if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default"
-if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0"
-if not defined QA_PARMS set "QA_PARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0"
+if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;f32d GGML_VK_DISABLE_MMVQ=1"
+if not defined QA_PARMS set "QA_PARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;f32d GGML_VK_DISABLE_MMVQ=1;again LLAMA_QA_AGAIN=1"
 rem 03: depth 0 only (the dense matmuls do not depend on it), a reply of 256 tokens for verifies of every size, the
 rem tables of the ops at a verify of 4 tokens
 if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0"
 if not defined QA_PROF_TG set "QA_PROF_TG=256"
 if not defined QA_PROF_VERIFY set "QA_PROF_VERIFY=4"
-if not defined QA_DARMS set "QA_DARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;vfyp2c GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MM_F16REG_VERIFY_B16=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0"
+if not defined QA_DARMS set "QA_DARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;f32d GGML_VK_DISABLE_MMVQ=1;again LLAMA_QA_AGAIN=1"
+rem default and vfyp2 of 03 and 06 were measured on these sources at 22:00 13.11: all variants again in one session
+if not defined FORCE set "FORCE=^(decode|profile)"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
-if not defined RUN_EXACT set "RUN_EXACT=0"
+if not defined EXACT_KARMS set "EXACT_KARMS=f32d QA_ARM_UB=4 GGML_VK_DISABLE_MMVQ=1"
 if not defined RUN_KLD set "RUN_KLD=0"
 if not defined RUN_LONG set "RUN_LONG=0"
 goto :arms_done

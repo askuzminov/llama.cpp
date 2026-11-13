@@ -1826,12 +1826,14 @@ def chi2_sf(x, df):
 def pit_values(tokens, probs, rng):
     """the randomized probability integral transform of each emitted token under the distribution it was drawn from (the
     top n_probs of it in their order, the rest one bucket): uniform on [0, 1) when the tokens follow that distribution.
-    Returns the values and the count of tokens outside it (missing from a top that holds all of it)"""
-    out, outside = [], 0
+    And the mid-point transform lo + p/2 of each, with the mean and the variance it has under that distribution: its
+    mean is 1/2 there without the noise of a random draw. Returns the randomized values, the (value, mean, variance)
+    of the mid-point ones and the count of tokens outside the distribution (missing from a top that holds all of it)"""
+    out, mids, outside = [], [], 0
     for tok, top in zip(tokens, probs):
+        ps = [math.exp(e["logprob"]) for e in top]
         lo, p_tok = 0.0, None
-        for e in top:
-            p = math.exp(e["logprob"])
+        for e, p in zip(top, ps):
             if e["id"] == tok:
                 p_tok = p
                 break
@@ -1842,13 +1844,39 @@ def pit_values(tokens, probs, rng):
                 outside += 1
                 continue
         out.append(min(1.0 - 1e-12, lo + rng.random() * p_tok))
-    return out, outside
+        # the mean and the second moment of the mid-point transform over the atoms of the distribution, the rest one
+        acc, first, second = 0.0, 0.0, 0.0
+        for p in ps + [max(0.0, 1.0 - sum(ps))]:
+            m = acc + p / 2
+            first += p * m
+            second += p * m * m
+            acc += p
+        mids.append((lo + p_tok / 2, first, max(0.0, second - first * first)))
+    return out, mids, outside
+
+
+def mid_mean_test(mids):
+    """the mean of the mid-point transforms (pit_values) and the p-value of its z-test against the means they have under
+    their own distributions, with their exact variances: a shift of the tokens against the distribution they were drawn
+    from, without the randomization of the transform. The randomized transform carries the noise of its draws into the
+    mean, and the probe draws them from a fixed seed: the first 1500-1600 values of random.Random(1000) average 0.516-0.517,
+    which lifted the mean of every run until the evening of 13.11 by about 0.015 times the probability of the emitted token (the mean
+    without drafts 0.511-0.518 in the runs of 13.11 on both machines)"""
+    if not mids:
+        return None, None
+    var = sum(v for _, _, v in mids)
+    mean = statistics.mean(u for u, _, _ in mids)
+    if var <= 0.0:
+        return mean, None
+    z = sum(u - m for u, m, _ in mids) / math.sqrt(var)
+    return mean, math.erfc(abs(z) / math.sqrt(2.0))
 
 
 def uniform_test(values, bins=20):
     """values in [0, 1) against the uniform distribution: the chi-square over equal bins (its statistic and p-value) for the
     shape, and the p-value of their mean against 1/2 (a z-test, the variance of a uniform 1/12) for a shift, which a
-    leaning of the output to the tokens the draft favours makes and the bins see later"""
+    leaning of the output to the tokens the draft favours makes and the bins see later (the spec probe takes the shift
+    from mid_mean_test instead)"""
     n = len(values)
     if n < 5 * bins:
         return None, None, None
@@ -1961,22 +1989,24 @@ def spec_pit(url, prompts, n_predict, n_probs, seed):
     arms = {}
     for name, extra in (("spec", {}), ("nospec", {"speculative.n_max": 0})):
         rng = random.Random(seed)
-        values, outside, draft_n, draft_acc, n_tok = [], 0, 0, 0, 0
+        values, mids, outside, draft_n, draft_acc, n_tok = [], [], 0, 0, 0, 0
         for i, text in enumerate(prompts):
             r = spec_completion(url, {"prompt": text, "n_predict": n_predict, "temperature": 1.0, "samplers": ["temperature"],
                                       "n_probs": n_probs, "return_tokens": True, "cache_prompt": True, "seed": seed + i,
                                       **extra})
             # each entry with its own token: the tokens without one (aligned_probs) are left out
             cps = r["completion_probabilities"]
-            v, o = pit_values([x["id"] for x in cps], [x["top_logprobs"] for x in cps], rng)
+            v, mv, o = pit_values([x["id"] for x in cps], [x["top_logprobs"] for x in cps], rng)
             values += v
+            mids += mv
             outside += o
             n_tok += len(r["tokens"])
             draft_n += r["timings"].get("draft_n", 0)
             draft_acc += r["timings"].get("draft_n_accepted", 0)
-        stat, p, p_mean = uniform_test(values)
-        arms[name] = {"tokens": n_tok, "outside": outside, "chi2": stat, "p": p, "p_mean": p_mean,
-                      "mean": statistics.mean(values) if values else None, "draft_n": draft_n, "draft_acc": draft_acc}
+        stat, p, _ = uniform_test(values)
+        mean, p_mean = mid_mean_test(mids)
+        arms[name] = {"tokens": n_tok, "scored": len(values), "outside": outside, "chi2": stat, "p": p, "p_mean": p_mean,
+                      "mean": mean, "draft_n": draft_n, "draft_acc": draft_acc}
     return arms
 
 
@@ -2024,7 +2054,7 @@ def spec_probe(run, model, port, arm_name="default", arm_env=None):
     identity = {"v": VERSION, "kind": "spec", "build": build_id(exe.parent), "args": args, "model": model_identity(model),
                 "draft": model_identity(Path(env("SPECDRAFT"))), "env": env_identity(run_env),
                 "prompts": text_digest("\n".join(prompts)), "greedy": n_greedy, "tokens": n_tokens, "probs": n_probs,
-                "greedy_probs": n_probs, "aligned": 1,
+                "greedy_probs": n_probs, "aligned": 1, "pit": 2,
                 "machine": machine()}
 
     def go(log):
@@ -2052,9 +2082,13 @@ def spec_probe(run, model, port, arm_name="default", arm_env=None):
                    [[g["prompt"], f"{g['same']}/{g['n']}", nats(g["margin"]), nats(g.get("spec_gap")),
                      nats(g.get("shift_max")), g["draft_n"], g["draft_acc"]] for g in r["greedy"]]))
     run.add("", f"spec{label}: temperature 1 (the temperature alone), {n_tokens} tokens of each prompt: the probability integral "
-                f"transform of every token under the distribution it was drawn from, uniform when they follow it" + k,
-            *table(["", "tokens", "chi2 (19)", "p", "mean (0.5)", "p", "outside", "drafted", "accepted"],
-                   [[name, a["tokens"], "-" if a["chi2"] is None else f"{a['chi2']:.1f}",
+                f"transform of every token under the distribution it was drawn from, uniform when they follow it; scored - "
+                f"the tokens with a probability entry (the server writes none for a token that leaves a character "
+                f"unfinished); chi2 over the randomized transform, mean - of the mid-point one (lo + p/2, 1/2 under every "
+                f"distribution) with the z-test of its exact variance (since the evening of 13.11; before, the randomized mean, from a fixed "
+                f"random stream that averaged 0.516 over its first 1500 values)" + k,
+            *table(["", "tokens", "scored", "chi2 (19)", "p", "mean (0.5)", "p", "outside", "drafted", "accepted"],
+                   [[name, a["tokens"], a.get("scored", "-"), "-" if a["chi2"] is None else f"{a['chi2']:.1f}",
                      "-" if a["p"] is None else f"{a['p']:.2g}", "-" if a["mean"] is None else f"{a['mean']:.3f}",
                      "-" if a.get("p_mean") is None else f"{a['p_mean']:.2g}",
                      a["outside"], a["draft_n"], a["draft_acc"]] for name, a in r["pit"].items()]))
