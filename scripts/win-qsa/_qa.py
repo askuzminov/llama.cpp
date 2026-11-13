@@ -1116,12 +1116,20 @@ def check_ops(run):
                         "env": env_identity(run_env), "machine": machine()}
 
             def go(log, cmd=cmd, run_env=run_env):
-                code, text = execute(cmd, log, run_env, model=False, check=False)
-                counts = re.findall(r"(\d+)/(\d+) tests passed", text)
-                if not counts:
-                    raise Fail(f"{exit_text(code)}, no test result: {last_error(text)} ({log.name})")
-                return {"passed": sum(int(a) for a, _ in counts), "total": sum(int(b) for _, b in counts),
-                        "fails": [s.strip() for s in text.splitlines() if "FAIL" in s][:8]}
+                def once(log):
+                    code, text = execute(cmd, log, run_env, model=False, check=False)
+                    counts = re.findall(r"(\d+)/(\d+) tests passed", text)
+                    if not counts:
+                        raise Fail(f"{exit_text(code)}, no test result: {last_error(text)} ({log.name})")
+                    return {"passed": sum(int(a) for a, _ in counts), "total": sum(int(b) for _, b in counts),
+                            "fails": [s.strip() for s in text.splitlines() if "FAIL" in s][:8]}
+                r = once(log)
+                # a failed op runs once more with new random data (test-backend-ops seeds from random_device): 12.11-13.11
+                # MUL_MAT_ID on the 3090 failed in 2 of 3 runs of 01 (n=1, m=37 only) and never in 21 runs by hand
+                if r["passed"] != r["total"] and env("QA_OPS_RERUN", "1") != "0":
+                    again = once(log.with_name(log.stem + "-rerun.log"))
+                    r["rerun"] = {"passed": again["passed"], "total": again["total"], "fails": again["fails"]}
+                return r
 
             label = "ops " + " ".join(op) + " " + arm.name
             try:
@@ -1134,8 +1142,13 @@ def check_ops(run):
             run.failed |= not ok
             run.record("ops", f"{op[0]} {arm.name}", {"passed": r["passed"], "total": r["total"]}, kept, exe.parent)
             # 0/0: the device supports none of the cases
-            rows.append([" ".join(op), arm.name, f"{r['passed']}/{r['total']}" + ("" if ok else " FAIL") + (" k" if kept else "")])
+            rerun = r.get("rerun")
+            note = "" if not rerun else (f", rerun {rerun['passed']}/{rerun['total']}" +
+                                         (" passed" if rerun["passed"] == rerun["total"] else " FAIL"))
+            rows.append([" ".join(op), arm.name, f"{r['passed']}/{r['total']}" + ("" if ok else " FAIL") + note + (" k" if kept else "")])
             fails.extend(f"  {op[0]} {arm.name}: {s}" for s in r["fails"])
+            if rerun:
+                fails.extend(f"  {op[0]} {arm.name} rerun: {s}" for s in rerun["fails"])
     # the fork's unit tests that build on this machine: exit code 0 passes. CHECKUNITS=none: none
     units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill "
              "test-mtp-window-fork test-spec-auto-fork test-env-fork test-elastic-buffer-fork"))
@@ -3522,7 +3535,14 @@ def cmd_kld():
                     run_env)
             return dict(kld_read(log), ppl_up=ppl_up)
 
-        result, kept = run.measure(f"kld {name}", identity, measure)
+        # a failed arm is a row of its own: the arms before it stay in the table (13.11, the 3090: the cpu arm aborted
+        # in the load and the whole table of the six arms before it was lost)
+        try:
+            result, kept = run.measure(f"kld {name}", identity, measure)
+        except Fail as e:
+            run.failed = True
+            rows.append([name, "FAIL", "", "", "", "", "", "", str(e)[:200]])
+            continue
         result["ppl_ratio"] = result["ppl"] / result["ppl_up"]
         run.record("kld", name, result, kept, bfolder)
         before = kld_before(run, name, build_id(bfolder))

@@ -18,6 +18,11 @@ size_t llama_load_chunked_fork::chunk_size() {
     return bytes;
 }
 
+bool llama_load_chunked_fork::takes_parts(ggml_backend_buffer_t buf) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
 void llama_load_chunked_fork::wait(int i, llama_load_watch_fork & watch, int64_t & t_wait_us) {
     if (!done[i].valid()) {
         return;

@@ -2156,9 +2156,13 @@ bool llama_model_loader::load_all_data(
                             ++buffer_idx;
                             buffer_idx %= n_buffers;
                         }
-                    } else if (load_chunked) {
+                    } else if (load_chunked && llama_load_chunked_fork::takes_parts(cur->buffer)) {
                         chunked.load(*file, cur, weight->offs, n_size, watch, t_read_us, n_read, t_upload_us);
                     } else {
+                        if (load_chunked) {
+                            // fork: a tensor of a buffer that takes no parts; its set must not run next to a chunk copy
+                            chunked.finish(watch, t_upload_us);
+                        }
                         // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
                         const size_t align          = file->read_alignment();
                         const size_t aligned_offset = weight->offs & ~(align - 1);

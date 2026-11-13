@@ -9,6 +9,8 @@
 
 #include "llama-impl.h"
 
+#include "ggml-backend.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -21,6 +23,11 @@ struct llama_load_watch_fork;
 struct llama_load_chunked_fork {
     // the chunk in bytes, 0 for the whole-tensor path
     static size_t chunk_size();
+
+    // whether a tensor of buf can be set in parts: not one of the extra buffer types of the CPU (repack, AMX), which
+    // convert a tensor in one set (ggml_backend_cpu_repack_buffer_set_tensor asserts offset 0 and the whole size).
+    // 13.11 the 3090 aborted a load of the model on the CPU with -lm dio there
+    static bool takes_parts(ggml_backend_buffer_t buf);
 
     // reads [offs, offs + size) of file into cur, from the start of cur. the reads count in t_read_us and n_read, the
     // waits for a copy in t_wait_us; an error of an earlier copy is thrown here
