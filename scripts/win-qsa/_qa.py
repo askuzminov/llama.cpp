@@ -681,16 +681,20 @@ def vulkan_blocks(text):
     return blocks
 
 def cuda_reports(text):
-    """The GGML_CUDA_OP_TIMING reports of a log part in order: [(compute calls, [[op, count, ms], ...]), ...]. With
-    =idle a report comes at a compute call that starts 300 ms or more after the one before and holds the calls since the
-    last report, so the first report of a request holds the end of the request before it (when that one computed); on
-    the 3090 the CPU experts make such gaps inside a prompt too, and one request leaves many reports. A report lists its
-    40 longest labels and, since 31.10, the rest by op ("OP (rest)"); what the lines of an older report leave out of its
-    total is a row named (unlisted)"""
+    """The GGML_CUDA_OP_TIMING reports of a log part in order: [(context, compute calls, [[op, count, ms], ...]), ...].
+    With =idle a report comes at a compute call that starts 300 ms or more after the one before and holds the calls since
+    the last report, so the first report of a request holds the end of the request before it (when that one computed);
+    on the 3090 the CPU experts make such gaps inside a prompt too, and one request leaves many reports. A report lists
+    its 40 longest labels and, since 31.10, the rest by op ("OP (rest)"); what the lines of an older report leave out of
+    its total is a row named (unlisted). Each backend context keeps and reports its own calls: since 13.11 the line names
+    it ("CUDA0#2"), older logs give the device only. The reports of the flatten of the deferred GDN rollback (only
+    GATED_DELTA_NET_LAZY, a context of its own at a state save) are left out: before 13.11 the flatten after a reply came
+    first in the next part, was read as the end of the reply and the reply itself went missing (03 on the 3090 since
+    12.11: 0.1-0.8 ms of GPU time per generated token in place of ~37)"""
     lines = text.splitlines()
     out = []
     for i, line in enumerate(lines):
-        m = re.match(r"cuda_op_timing \S+: (\d+) compute calls, \d+ ops, ([\d.]+) ms of kernels", line)
+        m = re.match(r"cuda_op_timing (\S+): (\d+) compute calls, \d+ ops, ([\d.]+) ms of kernels", line)
         if not m:
             continue
         ops = []
@@ -699,26 +703,32 @@ def cuda_reports(text):
             if not r:
                 break
             ops.append([r[3].strip(), int(r[2]), float(r[1])])
-        rest = float(m[2]) - sum(o[2] for o in ops)
+        if ops and all(o[0].startswith("GATED_DELTA_NET_LAZY") for o in ops):
+            continue
+        rest = float(m[3]) - sum(o[2] for o in ops)
         if rest > 0.01:
             ops.append(["(unlisted)", 0, rest])
-        out.append((int(m[1]), ops))
+        out.append((m[1], int(m[2]), ops))
     return out
 
 
 def cuda_work(this_text, next_text):
-    """The work of a request: its reports after the first (which holds the request before) and the first report of the
-    next request (the end of this one). (compute calls, [[op, count, ms], ...]) or None"""
-    reports = cuda_reports(this_text)[1:] + cuda_reports(next_text)[:1]
+    """The work of a request, per backend context: its reports after the first (which holds the request before) and the
+    first report of the next request (the end of this one); the contexts summed. (compute calls, [[op, count, ms], ...])
+    or None"""
+    this_r, next_r = cuda_reports(this_text), cuda_reports(next_text)
+    reports = []
+    for tag in dict.fromkeys(t for t, _, _ in this_r + next_r):
+        reports += [r for r in this_r if r[0] == tag][1:] + [r for r in next_r if r[0] == tag][:1]
     if not reports:
         return None
     total = {}
-    for _, ops in reports:
+    for _, _, ops in reports:
         for op, c, ms in ops:
             x = total.setdefault(op, [0, 0.0])
             x[0] += c
             x[1] += ms
-    return (sum(n for n, _ in reports),
+    return (sum(n for _, n, _ in reports),
             sorted(([op, c, ms] for op, (c, ms) in total.items()), key=lambda o: -o[2]))
 
 def block_kind(block):
@@ -1098,6 +1108,73 @@ class CheckArm:
                 self.args.append(t)
 
 
+def compute_sanitizer():
+    """compute-sanitizer of the CUDA toolkit (CUDA_PATH: compute-sanitizer/ since CUDA 11.6, bin/ before), or None"""
+    cp = os.environ.get("CUDA_PATH")
+    if cp:
+        for p in (Path(cp) / "compute-sanitizer" / "compute-sanitizer.exe", Path(cp) / "bin" / "compute-sanitizer.exe",
+                  Path(cp) / "compute-sanitizer" / "compute-sanitizer"):
+            if p.is_file():
+                return p
+    w = shutil.which("compute-sanitizer")
+    return Path(w) if w else None
+
+
+def ops_diag(cmd, run_env, log, fails, device):
+    """What a failed op depends on (12.11-13.11 MUL_MAT_ID on the 3090: q4_K and q5_1 at n=1 m=37 failed in 4 of 5
+    runs of 01, ERR 0.001-1.0, and never in 21 runs by hand): alone - only the failed cases, QA_OPS_DIAG_RUNS processes;
+    cpu1 - the whole op with a CPU reference of one thread (TEST_ARG_HARDWARE_CONCURRENCY=2, test-backend-ops gives the
+    CPU half of it); on CUDA blocking (CUDA_LAUNCH_BLOCKING=1: a kernel at a time) and nograph (GGML_CUDA_DISABLE_GRAPHS=1)
+    over the whole op, memcheck and initcheck of compute-sanitizer over the failed cases (initcheck: reads of device
+    memory nothing wrote). A list of "name: result" lines and the lines of their errors"""
+    cases = []
+    for line in fails:
+        m = re.search(r"\b[A-Z][A-Z0-9_]*\((.*)\): .*FAIL", line)
+        if m and m[1] not in cases:
+            cases.append(m[1])
+    if not cases:
+        return [], []
+    esc = lambda v: "".join("\\" + ch if ch in "\\^$.|?*+()[]{}" else ch for ch in v)
+    alone = [str(c) for c in cmd]
+    if "-p" in alone:
+        del alone[alone.index("-p"):alone.index("-p") + 2]
+    alone += ["-p", "|".join("^" + esc(v) + "$" for v in cases)]
+    whole = [str(c) for c in cmd]
+    cuda = device.upper().startswith("CUDA")
+    rows, detail = [], []
+
+    def tests(name, c, e):
+        code, text = execute(c, log.with_name(f"{log.stem}-{name}.log"), e, model=False, check=False)
+        counts = re.findall(r"(\d+)/(\d+) tests passed", text)
+        bad = not counts or sum(int(a) for a, _ in counts) != sum(int(b) for _, b in counts)
+        errs = [float(x) for x in re.findall(r"ERR = ([\d.]+(?:e[-+]?\d+)?)", text)]
+        detail.extend(f"  {name}: {x.strip()}" for x in text.splitlines() if "ERR =" in x or "========= " in x and "ERROR" in x)
+        return bad, errs, code, text
+
+    n = env_int("QA_OPS_DIAG_RUNS", 10)
+    bad_n, worst = 0, 0.0
+    for i in range(n):
+        bad, errs, _, _ = tests(f"alone{i}", alone, run_env)
+        bad_n += bad
+        worst = max([worst] + errs)
+    rows.append(f"alone {bad_n}/{n} failed" + (f" (ERR up to {worst:.3g})" if bad_n else ""))
+    variants = [("cpu1", {"TEST_ARG_HARDWARE_CONCURRENCY": "2"})]
+    if cuda:
+        variants += [("blocking", {"CUDA_LAUNCH_BLOCKING": "1"}), ("nograph", {"GGML_CUDA_DISABLE_GRAPHS": "1"})]
+    for name, extra in variants:
+        bad, errs, _, _ = tests(name, whole, dict(run_env, **extra))
+        rows.append(f"{name} " + (f"FAIL (ERR up to {max(errs):.3g})" if bad and errs else "FAIL" if bad else "passed"))
+    cs = compute_sanitizer() if cuda else None
+    if cuda and cs is None:
+        rows.append("compute-sanitizer: not found (CUDA_PATH)")
+    elif cs is not None:
+        for tool in ("memcheck", "initcheck"):
+            _, _, code, text = tests(tool, [str(cs), "--tool", tool, *alone], run_env)
+            m = re.search(r"ERROR SUMMARY: (\d+) error", text)
+            rows.append(f"{tool} " + (f"{m[1]} errors" if m else f"no summary ({exit_text(code)})"))
+    return rows, detail[:24]
+
+
 def check_ops(run):
     """test-backend-ops of the ops of the model on the device against the CPU, and the fork's unit tests."""
     device = env("CHECKDEVICE", DEVICES.get(env("BACKEND"), "CPU"))
@@ -1129,6 +1206,10 @@ def check_ops(run):
                 if r["passed"] != r["total"] and env("QA_OPS_RERUN", "1") != "0":
                     again = once(log.with_name(log.stem + "-rerun.log"))
                     r["rerun"] = {"passed": again["passed"], "total": again["total"], "fails": again["fails"]}
+                # what the failure depends on (ops_diag); QA_OPS_DIAG=0: off
+                if r["passed"] != r["total"] and env("QA_OPS_DIAG", "1") != "0":
+                    diag_rows, diag_detail = ops_diag(cmd, run_env, log, r["fails"] + r.get("rerun", {}).get("fails", []), device)
+                    r["diag"] = {"rows": diag_rows, "detail": diag_detail}
                 return r
 
             label = "ops " + " ".join(op) + " " + arm.name
@@ -1149,6 +1230,10 @@ def check_ops(run):
             fails.extend(f"  {op[0]} {arm.name}: {s}" for s in r["fails"])
             if rerun:
                 fails.extend(f"  {op[0]} {arm.name} rerun: {s}" for s in rerun["fails"])
+            diag = r.get("diag")
+            if diag:
+                fails.append(f"  {op[0]} {arm.name} diag: " + "; ".join(diag["rows"]))
+                fails.extend(f"  {op[0]} {arm.name} diag {s.strip()}" for s in diag["detail"])
     # the fork's unit tests that build on this machine: exit code 0 passes. CHECKUNITS=none: none
     units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill "
              "test-mtp-window-fork test-spec-auto-fork test-env-fork test-elastic-buffer-fork test-mmvq-planes-fork"))

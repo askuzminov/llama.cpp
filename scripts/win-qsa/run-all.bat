@@ -11,15 +11,19 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the question of 13.11 (README, run-all), the 395 only: the q8_1 activations of the int8 mat-vec in two planes
+rem the questions of 13.11 (README, run-all). the 395: the q8_1 activations of the int8 mat-vec in two planes
 rem (GGML_VK_MMVQ_PLANES=2, planes2): 01 the backend ops and the unit test against double math, the spec probe (the
 rem 1-token and the verify paths parted by up to 2 nats on 12.11), 06 the decode speed, 07-exact the decode at 4 and 8
 rem tokens against the exact f32 math (12.11: decode4 0.0311, decode8 0.0307, f32 mat-vecs 0.0065). 07 against
-rem upstream, 03 and 02 are off on the 395 (the prompt path did not change; 13.11 the PPL gap is upstream's own); the
-rem 3090 has nothing new (Vulkan code). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of
-rem 12.11 (copy, dense, nofuse, radix0); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary
-rem of the MTP head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran
-rem full and the guard refused 256 bytes: 512 MiB next to the expert cache is too little); again (a second default)
+rem upstream, 03 and 02 are off on the 395 (the prompt path did not change; 13.11 the PPL gap is upstream's own). the
+rem 3090: 01 with the diagnostics of a failed op (MUL_MAT_ID at n=1 m=37 failed in 4 of 5 runs of 01, ops_diag in
+rem _qa.py) and 03 with the op reports read per backend context (since 12.11 the reply of 03 read 0.1-0.8 ms of GPU
+rem a token in place of ~37); 06, 07 and 02 are off (the CUDA change is the label of the reports). settled and left
+rem out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy, dense, nofuse, radix0); on the 3090
+rem nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP head, -0.3%), m256, upmoe0 (-1.6%),
+rem upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and the guard refused 256 bytes: 512 MiB
+rem next to the expert cache is too little); 13.11 upmoe5/upmoe8 (the cache of upstream -20%/-10% TG in two runs) and
+rem the 07 split (copy = upstream bit for bit, the CPU: fork 1.9434 against upstream 1.9442); again (a second default)
 rem stays: the logits of default bit for bit
 if not defined QA_PAR_ARMS set "QA_PAR_ARMS=default;rows0 LLAMA_QSA_ROWS=0"
 rem the decode tasks with a long prompt (about 24K tokens) and a short reply: the prompt speed of each variant too
@@ -41,13 +45,11 @@ goto :arms_done
 :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PARMS set "QA_PARMS=default"
-rem upmoe: 6500 MiB, about the ~46 slots a layer of our cache at full depth (RESEARCH.md); --moe-cache 0 turns ours
-rem off. 12.11 the share of the misses on the CPU: 0 -1.6%, 0.3 +7.4%, 0.5 +20.3% TG, the 22K prompt 33% slower
-rem (all against our cache with the buffers of the prompt phase kept, before the fix)
-if not defined QA_DARMS set "QA_DARMS=default;upmoe5 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.5";upmoe8 "QA_ARM_ARGS=--moe-cache 0 --moe-cache-mib 6500 --moe-cache-cpu-share 0.8""
-rem cpu, upcpu: the whole model on the CPU (128 GB here, the 395 has 32 GB beside its GPU): our code against upstream
-rem without either GPU backend
-if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream;copy LLAMA_UPSTREAM=qwen4exp;lzmon "QA_ARM_ARGS=-lzm on";dense "QA_ARM_ARGS=--override-kv qwen4exp.attention.indexer.top_k=int:262144";updense @upstream "QA_ARM_ARGS=--override-kv qwen4exp.attention.indexer.top_k=int:262144";cpu "QA_ARM_ARGS=-ngl 0 -dev none";upcpu @upstream "QA_ARM_ARGS=-ngl 0 -dev none";radix-up GGML_CUDA_TOPK_RADIX_STABLE=0"
+if not defined QA_DARMS set "QA_DARMS=default"
+if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
+if not defined RUN_DECODE set "RUN_DECODE=0"
+if not defined RUN_KLD set "RUN_KLD=0"
+if not defined RUN_LONG set "RUN_LONG=0"
 rem the CUDA matmuls have no f32 mode: 07 against the exact base runs on the 395 only
 if not defined RUN_EXACT set "RUN_EXACT=0"
 :arms_done

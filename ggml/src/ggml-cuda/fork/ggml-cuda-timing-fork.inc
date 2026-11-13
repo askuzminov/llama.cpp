@@ -279,7 +279,9 @@ static void ggml_backend_cuda_timing_take_fork(ggml_backend_t backend, double * 
 // events), so the time between the ops is not the one of a normal run; the time of each kernel is. every period the
 // log gets the ops by total time, with their count and mean, labelled by op, type and shape. GGML_CUDA_OP_TIMING=idle:
 // the report comes when a compute call starts after the GPU was idle for 300 ms or more, so it holds one request of a
-// server (scripts/win-qsa 05: the report of a request is printed at the start of the next one)
+// server (scripts/win-qsa 05: the report of a request is printed at the start of the next one). Each backend context
+// keeps its own calls and reports them under "<device>#<n>", n counting the contexts from 1 (13.11): a server has the
+// target's, the MTP head's and the one of the deferred GDN rollback's flatten, whose reports come in between
 
 #include <map>
 #include <string>
@@ -300,6 +302,7 @@ struct ggml_cuda_op_timing_fork {
     int64_t n_ops   = 0;
     double  op_us   = 0.0;
     std::chrono::steady_clock::time_point t_last {}; // the start of the last compute call (idle mode)
+    int     id      = 0; // the number of this context in the reports, from 1
 };
 
 // the report period in compute calls, -1 for idle, 0 off
@@ -323,7 +326,9 @@ static ggml_cuda_op_timing_fork * ggml_cuda_op_timing_fork_get(const ggml_backen
     std::lock_guard<std::mutex> lock(ggml_cuda_timing_fork_mutex);
     auto & t = ggml_cuda_op_timing_fork_ctx[ctx];
     if (!t) {
+        static int n_made = 0;
         t = std::make_unique<ggml_cuda_op_timing_fork>();
+        t->id = ++n_made;
     }
     return t.get();
 }
@@ -425,7 +430,9 @@ static void ggml_cuda_op_timing_fork_drain(ggml_cuda_op_timing_fork * t, bool wa
 }
 
 // the ops by total time; to stderr, as llama-bench (05) drops the log
-static void ggml_cuda_op_timing_fork_report(const char * name, ggml_cuda_op_timing_fork * t) {
+static void ggml_cuda_op_timing_fork_report(const char * device, ggml_cuda_op_timing_fork * t) {
+    const std::string tag  = std::string(device) + "#" + std::to_string(t->id);
+    const char *      name = tag.c_str();
     std::vector<std::pair<std::string, std::pair<int64_t, double>>> rows(t->agg.begin(), t->agg.end());
     std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.second > y.second.second; });
     const double n_calls = (double) std::max<int64_t>(t->n_calls, 1);
