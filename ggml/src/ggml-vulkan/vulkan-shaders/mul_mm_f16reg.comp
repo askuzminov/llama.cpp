@@ -209,24 +209,41 @@ void load_b_tile(const uint ic, const uint k0) {
         if (it < B_IT && t < BN * 4) {
             const uint n  = t >> 2;
             const uint q  = t & 3;
-            // tokens past N read the last one: a column of B only feeds the same column of the result, which is not
-            // stored (no zeroing of the registers after the loads)
-            const uint gn = min(ic * BN + n, p.N - 1);
+            // tokens past N are zeros, not loads: a column of B only feeds the same column of the result, which is not
+            // stored. The draft checks (2-8 of the 16 tokens of the tile) read their activations at every stage of
+            // every workgroup, so the loads of the rest were 2-8 times the B traffic they need (13.11: at 4 tokens as
+            // many bytes a call as the weights, from L2, 10240 x 2560: 26 MB against 27.9)
+            const uint gn = ic * BN + n;
+            if (gn < p.N) {
 #ifdef B_F16
-            const uint base = (gn * p.stride_b + k0 + q * 16) / 8;
-            rb[it][0] = data_b8[base];
-            rb[it][1] = data_b8[base + 1];
+                const uint base = (gn * p.stride_b + k0 + q * 16) / 8;
+                rb[it][0] = data_b8[base];
+                rb[it][1] = data_b8[base + 1];
 #else
-            const uint base = (gn * p.stride_b + k0 + q * 16) / 4;
-            [[unroll]] for (uint i = 0; i < 4; ++i) {
-                if (BPF == 2) {
-                    const vec4 v = data_b4[base + i];
-                    rbh[it][i] = uvec2(packFloat2x16(f16sat2(v.xy)), packFloat2x16(f16sat2(v.zw)));
-                } else {
-                    rb[it][i] = data_b4[base + i];
+                const uint base = (gn * p.stride_b + k0 + q * 16) / 4;
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    if (BPF == 2) {
+                        const vec4 v = data_b4[base + i];
+                        rbh[it][i] = uvec2(packFloat2x16(f16sat2(v.xy)), packFloat2x16(f16sat2(v.zw)));
+                    } else {
+                        rb[it][i] = data_b4[base + i];
+                    }
                 }
-            }
 #endif
+            } else {
+#ifdef B_F16
+                rb[it][0] = uvec4(0);
+                rb[it][1] = uvec4(0);
+#else
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    if (BPF == 2) {
+                        rbh[it][i] = uvec2(0);
+                    } else {
+                        rb[it][i] = vec4(0.0);
+                    }
+                }
+#endif
+            }
         }
     }
 }

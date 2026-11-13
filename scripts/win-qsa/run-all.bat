@@ -11,15 +11,15 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 13.11 night (README, run-all). the 395: the precision of the draft checks, dense q8_0 of 2-8
-rem columns. vfyp2 (the f16 coopmat tile of GGML_VK_MM_F16REG_VERIFY for 1024 rows and more, two int8 planes below):
-rem KLD 0.0115 against 0.0118 without drafts and 0.0311 of default; 13.11 22:00 (e194f0bfb, read in place, r16x16/4x1)
-rem 06 TG -0.6% (the f16 copy -0.5%), but in 03 a verify of the same size +1.6-2.7 ms: the tile reads the big
-rem matrices at 190-202 GB/s in the model against 207-235 of the int8 mat-vec. now the f32 mat-vec that exists
-rem (f32d, GGML_VK_DISABLE_MMVQ=1: dense q8_0 against f32 activations, the experts stay on the fork mat-vec): 03 and 06
-rem default, vfyp2, f32d and again (default once more at the end: the order effect, 13.11 the draft step of the first
-rem arm 1.3-2.7% slower), all measured anew in this run (FORCE); 07-exact f32d; 01 only the spec probe again (default,
-rem vfyp2, f32d; the PIT mean of the mid-point transform). 05, 07 against upstream and 02 are off on the 395. the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
+rem the questions of 13.11 night (README, run-all). the 395: vfyp2 is the default on AMD RDNA3 now (the f16 coopmat
+rem tile of GGML_VK_MM_F16REG_VERIFY for the dense q8_0 of 2-8 columns and 1024 rows and more, two int8 planes for
+rem the rest; 13.11 KLD 0.0115 against 0.0311, TG -1.9%), and the tile reads no activations for its columns past N
+rem (13.11: at 4 tokens it read 16, as many bytes a call as the weights; the same outputs bit for bit on the Mac).
+rem old: the path before it (GGML_VK_MM_F16REG_VERIFY=0, which also leaves one plane); minn4: the verifies of 2-3
+rem tokens on the two planes, the tile from 4. 03 at depth 0 and 06: default, old, minn4, again (default once more
+rem at the end: the order effect); 07-exact decode4 (expected 0.0115, the numbers of vfyp2); 01 everything (the
+rem shader changed, vfy0 in CHECKARMS is the old path now), the spec probe with the default. 05, 07 against upstream
+rem and 02 are off on the 395. the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
 rem 13.11 21:36 all ops passed without them); 06, 07, 03 and 02 are off (03 answered 13.11: the reply 38.96-46.31 ms of
 rem GPU a token with the reports read per backend context). both: the spec probe of 01 again, the PIT mean now of the
 rem mid-point transform (13.11: the randomized one took a fixed random stream whose first 1500 values average 0.516, so
@@ -38,18 +38,17 @@ rem the indexer kernels have not changed since the micro of 31.10 evening: 04-mi
 if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default"
-if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;f32d GGML_VK_DISABLE_MMVQ=1"
-if not defined QA_PARMS set "QA_PARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;f32d GGML_VK_DISABLE_MMVQ=1;again LLAMA_QA_AGAIN=1"
+if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default"
+if not defined QA_PARMS set "QA_PARMS=default;old GGML_VK_MM_F16REG_VERIFY=0;minn4 GGML_VK_MM_F16REG_VERIFY_MIN_N=4;again LLAMA_QA_AGAIN=1"
 rem 03: depth 0 only (the dense matmuls do not depend on it), a reply of 256 tokens for verifies of every size, the
 rem tables of the ops at a verify of 4 tokens
 if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0"
 if not defined QA_PROF_TG set "QA_PROF_TG=256"
 if not defined QA_PROF_VERIFY set "QA_PROF_VERIFY=4"
-if not defined QA_DARMS set "QA_DARMS=default;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;f32d GGML_VK_DISABLE_MMVQ=1;again LLAMA_QA_AGAIN=1"
-rem default and vfyp2 of 03 and 06 were measured on these sources at 22:00 13.11: all variants again in one session
-if not defined FORCE set "FORCE=^(decode|profile)"
+if not defined QA_DARMS set "QA_DARMS=default;old GGML_VK_MM_F16REG_VERIFY=0;minn4 GGML_VK_MM_F16REG_VERIFY_MIN_N=4;again LLAMA_QA_AGAIN=1"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
-if not defined EXACT_KARMS set "EXACT_KARMS=f32d QA_ARM_UB=4 GGML_VK_DISABLE_MMVQ=1"
+rem decode4: the default at ubatch 4 (the draft checks), the arm of 12.11 (0.0311 then): its column before
+if not defined EXACT_KARMS set "EXACT_KARMS=decode4 QA_ARM_UB=4"
 if not defined RUN_KLD set "RUN_KLD=0"
 if not defined RUN_LONG set "RUN_LONG=0"
 goto :arms_done

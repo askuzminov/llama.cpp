@@ -382,8 +382,9 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
 }
 
 // MUL_MAT of q8_0 weights over 2-8 columns (the draft checks of decode) on mul_mm_f16reg.comp with the tile of
-// GGML_VK_MM_F16REG_VERIFY (16 tokens: the columns past N are computed on the last one and not stored), f16 activations
-// in place of the int8 mat-vec on q8_1 activations. f32 activations are read in place and rounded to f16 in the shader
+// GGML_VK_MM_F16REG_VERIFY (the default on AMD RDNA3 since 13.11 night, see ggml_vk_fork_mm_f16reg_init; 16 tokens: the
+// columns past N read no activations, they are zeros, and are not stored), f16 activations in place of the int8
+// mat-vec on q8_1 activations. f32 activations are read in place and rounded to f16 in the shader
 // (the saturating rounding of the f16 copy, the same values); GGML_VK_MM_F16REG_VERIFY_B16=1 copies them to f16 in
 // prealloc_y first as the prompt path does (13.11 first 395 run: that copy, a dispatch and a barrier per activation
 // tensor, and the q8_1 quantization of the mat-vecs that read the same tensor taking prealloc_y from it in turn, were
@@ -399,10 +400,13 @@ bool ggml_vk_fork_mm_f16reg_verify(ggml_backend_vk_context * ctx, vk_context & s
     }
     static const int64_t min_m = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_MIN_M"); return e ? (int64_t) atoll(e) : (int64_t) 1024; }();
     static const bool b16_copy = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_B16"); return e != nullptr && atoi(e) != 0; }();
+    // the fewest columns on the tile (2): its cost hardly depends on them (16 a tile), that of the mat-vec does, so a
+    // verify of 2-3 tokens may be cheaper on the two int8 planes at the same precision (13.11 night, a question for the 395)
+    static const int64_t min_n = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_MIN_N"); return e ? (int64_t) atoll(e) : (int64_t) 2; }();
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
-    if (N < 2 || N > (int64_t) mul_mat_vec_max_cols || M < std::max<int64_t>(16, min_m) || K < 64 || K % 64 != 0 ||
+    if (N < std::max<int64_t>(2, min_n) || N > (int64_t) mul_mat_vec_max_cols || M < std::max<int64_t>(16, min_m) || K < 64 || K % 64 != 0 ||
         src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
         !ggml_is_contiguous(src1)) {

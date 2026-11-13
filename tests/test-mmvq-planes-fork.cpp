@@ -290,6 +290,10 @@ int main(int argc, char ** argv) {
     if (verify != nullptr) {
         set_env("GGML_VK_MM_F16REG_VERIFY", verify);
         set_env("GGML_VK_MM_F16REG_LOG", "1");
+    } else {
+        // the tile of the draft checks is the default on AMD RDNA3 since 13.11 night: off here, so that every MUL_MAT
+        // case runs on the int8 mat-vec (the cases have 64 rows, under its 1024, but the test should not rely on that)
+        set_env("GGML_VK_MM_F16REG_VERIFY", "0");
     }
     ggml_log_set(log_cb, nullptr);
 

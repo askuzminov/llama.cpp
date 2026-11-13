@@ -323,8 +323,15 @@ static int ggml_vk_fork_type_by_name(const std::string & name) {
 
 void ggml_vk_fork_mmvq_planes_init(vk_device & device) {
     const char * env = getenv("GGML_VK_MMVQ_PLANES");
-    device->mmvq_planes = env != nullptr && atoi(env) == 2 ? 2 : 1;
     const char * types = getenv("GGML_VK_MMVQ_PLANES_TYPES");
+    // with the f16 tile of the draft checks on (GGML_VK_MM_F16REG_VERIFY, its default on AMD RDNA3 since 13.11 night),
+    // the q8_0 mat-vecs it leaves (under 1024 rows, the head of the hc down, 640 and 512 rows) read two planes unless
+    // GGML_VK_MMVQ_PLANES says otherwise: together the decode precision of the path without drafts (see the tile)
+    const bool pdefault = (env == nullptr || env[0] == 0) && device->mm_f16reg_vfy && device->integer_dot_product;
+    device->mmvq_planes = pdefault || (env != nullptr && atoi(env) == 2) ? 2 : 1;
+    if (pdefault && (types == nullptr || types[0] == 0)) {
+        types = "q8_0";
+    }
     std::string list;
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         device->mmvq_planes_type[t] = types == nullptr || types[0] == 0;
@@ -348,7 +355,8 @@ void ggml_vk_fork_mmvq_planes_init(vk_device & device) {
         list = std::string(" for ") + types;
     }
     if (device->mmvq_planes == 2) {
-        GGML_LOG_INFO("ggml_vulkan: the int8 mat-vec reads its q8_1 activations in two planes (GGML_VK_MMVQ_PLANES=2)%s\n",
+        GGML_LOG_INFO("ggml_vulkan: the int8 mat-vec reads its q8_1 activations in two planes (%s)%s\n",
+                      pdefault ? "the default with the tile of the draft checks, GGML_VK_MMVQ_PLANES=1: one" : "GGML_VK_MMVQ_PLANES=2",
                       list.c_str());
     }
 }
@@ -585,15 +593,19 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
         device->mm_f16reg_name[1] += "_emu";
     }
     // the draft checks of decode, dense q8_0 over 2-8 columns, on a tile of 16 tokens with f16 activations in place of the
-    // int8 mat-vec on q8_1 activations (13.11, a prototype): GGML_VK_MM_F16REG_VERIFY=<tile> as above (1: r16x16/4x1),
-    // off without it. On the 395 the int8 mat-vec of 8 columns reads the big dense matrices at 198-216 GB/s already
-    // (profile-20261113-165722): this tile has the compute to stay there with f16 activations. 1 was r16x16/8x1 in the
-    // first 395 run (mm-20261113-202015, 8 tokens): r16x16/4x1 (64-row tiles, twice the workgroups) 5.0 against 3.4
-    // TFLOP/s on 2560 x 6144, 5.5 against 4.6 on 6144 x 2560, the best tile on every shape of 1024 rows and more
+    // int8 mat-vec on q8_1 activations: GGML_VK_MM_F16REG_VERIFY=<tile> as above (1: r16x16/4x1), 0: off. The default on
+    // AMD RDNA3 since 13.11 night, with the q8_0 mat-vecs it leaves (under 1024 rows) on two int8 planes
+    // (ggml_vk_fork_mmvq_planes_init): on the 395 the decode KLD against the exact math 0.0115 against 0.0311 of the int8
+    // mat-vec, the 0.0118 of the decode without drafts (kld-20261113-204409), TG -1.9% (decode-20261113-223143, a
+    // second default at the end within 0.1%), and the spec probe of 01 no longer parts the verify path from the 1-token
+    // path at a margin of 1.35 nats. 1 was r16x16/8x1 in the first 395 run (mm-20261113-202015, 8 tokens): r16x16/4x1
+    // (64-row tiles, twice the workgroups) 5.0 against 3.4 TFLOP/s on 2560 x 6144, 5.5 against 4.6 on 6144 x 2560, the
+    // best tile on every shape of 1024 rows and more, and in the model TG -6.7% -> -0.6% (decode-20261113-214955)
     device->mm_f16reg_vfy = false;
     const char * envv = getenv("GGML_VK_MM_F16REG_VERIFY");
-    if (envv != nullptr && *envv != 0 && strcmp(envv, "0") != 0) {
-        const char * vtile = strcmp(envv, "1") == 0 ? "r16x16/4x1" : envv;
+    const bool vdefault = (envv == nullptr || *envv == 0) && device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
+    if (vdefault || (envv != nullptr && *envv != 0 && strcmp(envv, "0") != 0)) {
+        const char * vtile = vdefault || strcmp(envv, "1") == 0 ? "r16x16/4x1" : envv;
         uint32_t vbm = 0, vbn = 0, vsh = 0;
         if (ggml_vk_fork_mm_f16reg_tile(device, "GGML_VK_MM_F16REG_VERIFY", vtile, device->mm_f16reg_vfy_tile,
                                         device->mm_f16reg_vfy_lds, device->mm_f16reg_vfy_name, vbm, vbn, vsh)) {
