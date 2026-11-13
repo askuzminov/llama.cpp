@@ -400,9 +400,11 @@ bool ggml_vk_fork_mm_f16reg_verify(ggml_backend_vk_context * ctx, vk_context & s
     }
     static const int64_t min_m = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_MIN_M"); return e ? (int64_t) atoll(e) : (int64_t) 1024; }();
     static const bool b16_copy = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_B16"); return e != nullptr && atoi(e) != 0; }();
-    // the fewest columns on the tile (2): its cost hardly depends on them (16 a tile), that of the mat-vec does, so a
-    // verify of 2-3 tokens may be cheaper on the two int8 planes at the same precision (13.11 night, a question for the 395)
-    static const int64_t min_n = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_MIN_N"); return e ? (int64_t) atoll(e) : (int64_t) 2; }();
+    // the fewest columns on the tile (5): its cost hardly depends on them (16 a tile), that of the mat-vec does, so the
+    // shorter verifies go to the two int8 planes (ggml_vk_fork_mmvq_planes_init) at the same precision. 395, 03 at depth
+    // 0 (profile-20261113-234415, -20261114-000455), ms of a verify on the two planes against the tile: 2 tokens 45.02
+    // against 47.25, 3 49.94 against 51.38, 4 55.02 against 55.96, 5 62.25 against 60.15, 8 82.32 against 75.01
+    static const int64_t min_n = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_MIN_N"); return e ? (int64_t) atoll(e) : (int64_t) 5; }();
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];

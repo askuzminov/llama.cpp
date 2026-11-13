@@ -325,8 +325,9 @@ void ggml_vk_fork_mmvq_planes_init(vk_device & device) {
     const char * env = getenv("GGML_VK_MMVQ_PLANES");
     const char * types = getenv("GGML_VK_MMVQ_PLANES_TYPES");
     // with the f16 tile of the draft checks on (GGML_VK_MM_F16REG_VERIFY, its default on AMD RDNA3 since 13.11 night),
-    // the q8_0 mat-vecs it leaves (under 1024 rows, the head of the hc down, 640 and 512 rows) read two planes unless
-    // GGML_VK_MMVQ_PLANES says otherwise: together the decode precision of the path without drafts (see the tile)
+    // the q8_0 mat-vecs it leaves (under 1024 rows: the hc down, 640 and 512 rows; the verifies of fewer tokens than
+    // GGML_VK_MM_F16REG_VERIFY_MIN_N, 5) read two planes unless GGML_VK_MMVQ_PLANES says otherwise: together the decode
+    // precision of the path without drafts (see the tile)
     const bool pdefault = (env == nullptr || env[0] == 0) && device->mm_f16reg_vfy && device->integer_dot_product;
     device->mmvq_planes = pdefault || (env != nullptr && atoi(env) == 2) ? 2 : 1;
     if (pdefault && (types == nullptr || types[0] == 0)) {
@@ -594,8 +595,8 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
     }
     // the draft checks of decode, dense q8_0 over 2-8 columns, on a tile of 16 tokens with f16 activations in place of the
     // int8 mat-vec on q8_1 activations: GGML_VK_MM_F16REG_VERIFY=<tile> as above (1: r16x16/4x1), 0: off. The default on
-    // AMD RDNA3 since 13.11 night, with the q8_0 mat-vecs it leaves (under 1024 rows) on two int8 planes
-    // (ggml_vk_fork_mmvq_planes_init): on the 395 the decode KLD against the exact math 0.0115 against 0.0311 of the int8
+    // AMD RDNA3 since 13.11 night, with the q8_0 mat-vecs it leaves (under 1024 rows, and since 14.11 the verifies of
+    // 2-4 tokens, GGML_VK_MM_F16REG_VERIFY_MIN_N) on two int8 planes (ggml_vk_fork_mmvq_planes_init): on the 395 the decode KLD against the exact math 0.0115 against 0.0311 of the int8
     // mat-vec, the 0.0118 of the decode without drafts (kld-20261113-204409), TG -1.9% (decode-20261113-223143, a
     // second default at the end within 0.1%), and the spec probe of 01 no longer parts the verify path from the 1-token
     // path at a margin of 1.35 nats. 1 was r16x16/8x1 in the first 395 run (mm-20261113-202015, 8 tokens): r16x16/4x1
