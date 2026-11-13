@@ -11,15 +11,14 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 13.11 night (README, run-all). the 395: vfyp2 is the default on AMD RDNA3 now (the f16 coopmat
-rem tile of GGML_VK_MM_F16REG_VERIFY for the dense q8_0 of 2-8 columns and 1024 rows and more, two int8 planes for
-rem the rest; 13.11 KLD 0.0115 against 0.0311, TG -1.9%), and the tile reads no activations for its columns past N
-rem (13.11: at 4 tokens it read 16, as many bytes a call as the weights; the same outputs bit for bit on the Mac).
-rem old: the path before it (GGML_VK_MM_F16REG_VERIFY=0, which also leaves one plane); minn4: the verifies of 2-3
-rem tokens on the two planes, the tile from 4. 03 at depth 0 and 06: default, old, minn4, again (default once more
-rem at the end: the order effect); 07-exact decode4 (expected 0.0115, the numbers of vfyp2); 01 everything (the
-rem shader changed, vfy0 in CHECKARMS is the old path now), the spec probe with the default. 05, 07 against upstream
-rem and 02 are off on the 395. the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
+rem the questions of 14.11 (README, run-all). the 395: the default since 13.11 night (82c035bcf; the f16 coopmat tile
+rem of GGML_VK_MM_F16REG_VERIFY for the dense q8_0 of 2-8 columns and 1024 rows and more, two int8 planes for the
+rem rest) gave 07-exact decode4 0.0115 (0.0311 before), no SPEC GREEDY DIFFERS, 06 TG -2.7% against old (the path
+rem before it); in 03 a verify on the tile costs +1.5-2.5 ms at every size, while the two planes cost +0.2 ms at 2
+rem tokens and +0.85 at 3 (minn4). now 03 only (the same sources: default, old, minn4 kept): minn5 (two planes up to
+rem 4 tokens) and p2all (GGML_VK_MM_F16REG_VERIFY_MIN_N=9: every verify on the two planes), the cost of the two
+rem planes at every size next to that of the tile, for the size from which the tile takes over. 01, 06, 07-exact
+rem keep their results, 05, 07 against upstream and 02 are off on the 395. the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
 rem 13.11 21:36 all ops passed without them); 06, 07, 03 and 02 are off (03 answered 13.11: the reply 38.96-46.31 ms of
 rem GPU a token with the reports read per backend context). both: the spec probe of 01 again, the PIT mean now of the
 rem mid-point transform (13.11: the randomized one took a fixed random stream whose first 1500 values average 0.516, so
@@ -39,7 +38,7 @@ if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default"
 if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default"
-if not defined QA_PARMS set "QA_PARMS=default;old GGML_VK_MM_F16REG_VERIFY=0;minn4 GGML_VK_MM_F16REG_VERIFY_MIN_N=4;again LLAMA_QA_AGAIN=1"
+if not defined QA_PARMS set "QA_PARMS=default;old GGML_VK_MM_F16REG_VERIFY=0;minn4 GGML_VK_MM_F16REG_VERIFY_MIN_N=4;minn5 GGML_VK_MM_F16REG_VERIFY_MIN_N=5;p2all GGML_VK_MM_F16REG_VERIFY_MIN_N=9"
 rem 03: depth 0 only (the dense matmuls do not depend on it), a reply of 256 tokens for verifies of every size, the
 rem tables of the ops at a verify of 4 tokens
 if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0"
@@ -49,6 +48,8 @@ if not defined QA_DARMS set "QA_DARMS=default;old GGML_VK_MM_F16REG_VERIFY=0;min
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
 rem decode4: the default at ubatch 4 (the draft checks), the arm of 12.11 (0.0311 then): its column before
 if not defined EXACT_KARMS set "EXACT_KARMS=decode4 QA_ARM_UB=4"
+if not defined RUN_DECODE set "RUN_DECODE=0"
+if not defined RUN_EXACT set "RUN_EXACT=0"
 if not defined RUN_KLD set "RUN_KLD=0"
 if not defined RUN_LONG set "RUN_LONG=0"
 goto :arms_done
