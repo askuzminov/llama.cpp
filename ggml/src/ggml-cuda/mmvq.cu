@@ -655,6 +655,12 @@ static __global__ void mul_mat_vec_q(
         dst = fusion.shared_dst;
         stride_col_dst = fusion.shared_stride_col_dst;
     }
+    // fork: the rows of dst that a partial row block may write. Upstream bounds them by stride_col_dst, which with ids
+    // (one token here, the slots are the channels) is the stride of a token, rows x slots: the rows of the last row block
+    // past the end of a slot went into the first rows of the next slot, as fast as the blocks of that slot wrote them
+    // (13.11 3090: MUL_MAT_ID q4_K/q5_1 m=37 n=1 with a small k, rows 4 a block, failed in most runs of 01). A slot of
+    // dst holds the rows of one channel, stride_channel_dst
+    const uint32_t nrows_dst = ids != nullptr && !shared_expert ? stride_channel_dst : stride_col_dst;
 
     uint32_t channel_x;
     uint32_t channel_y;
@@ -708,7 +714,7 @@ static __global__ void mul_mat_vec_q(
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
         if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
-            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_dst)) { // fork: nrows_dst
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
@@ -829,7 +835,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_dst)) { // fork: nrows_dst
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
