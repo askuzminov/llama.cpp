@@ -36,6 +36,9 @@
 layout(constant_id = 0) const uint WG_SIZE = 32;   // the subgroup size, the host requires full subgroups of it
 layout(constant_id = 1) const uint MAXR = 5;       // rounds of a lane loaded at once (at most 8)
 layout(constant_id = 2) const uint FENCE = 1;      // the never-taken branch that keeps the loads of a pass together (0: none)
+// the activations in two planes (GGML_VK_MMVQ_PLANES=2, see mul_mat_vecq_planes_fork.glsl): a group of 128 values is
+// two x4 blocks in a row, the integer dot 128 * dot(w, q1) + dot(w, q2), the scale d / 128, the sum of both pairs
+layout(constant_id = 3) const uint PLANES = 1;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -62,7 +65,8 @@ layout(binding = 0) readonly buffer A { uvec2 data_a[]; };   // a block: ((d, m)
 #else
 #error unsupported type
 #endif
-// block_q8_1_x4 (the 4 (d, sum) pairs, then 4 x 32 code bytes) as 16-byte words, and its pairs as 8 and 4 bytes
+// block_q8_1_x4 (the 4 (d, sum) pairs, then 4 x 32 code bytes) as 16-byte words, and its pairs as 8 and 4 bytes;
+// PLANES of them in a row for 128 values
 layout(binding = 1) readonly buffer B   { uvec4 data_b[]; };
 layout(binding = 1) readonly buffer B64 { uvec2 data_b64[]; };
 layout(binding = 1) readonly buffer B32 { uint  data_b32[]; };
@@ -210,12 +214,17 @@ void main() {
         qv##I = data_a[(arow + sb##I) * 9 + 1 + c]; \
     }
 #define LOAD_B(K, I) \
-    uvec4 bq0_##I, bq1_##I; uvec2 bds_##I; \
+    uvec4 bq0_##I, bq1_##I, bp0_##I, bp1_##I; uvec2 bds_##I, bps_##I; \
     if (I < MAXR) { \
-        const uint gi = ((brow[K] * nblk + sb##I * 8 + 2 * jp) / 4) * 9; \
+        const uint gi = ((brow[K] * nblk + sb##I * 8 + 2 * jp) / 4) * (9 * PLANES); \
         bq0_##I = data_b[gi + bq_off]; \
         bq1_##I = data_b[gi + bq_off + 2]; \
         bds_##I = data_b64[gi * 2 + (jp % 2)]; \
+        if (PLANES == 2) { \
+            bp0_##I = data_b[gi + 9 + bq_off]; \
+            bp1_##I = data_b[gi + 9 + bq_off + 2]; \
+            bps_##I = data_b64[(gi + 9) * 2 + (jp % 2)]; \
+        } \
     }
 #define DEC_A(I) \
     float dsc0_##I, dsc1_##I, dmn0_##I, dmn1_##I; \
@@ -236,9 +245,17 @@ void main() {
     if (I < MAXR) { \
         const uvec4 lo  = qv##I & 0x0F0F0F0Fu; \
         const uvec4 hi  = (qv##I >> 4) & 0x0F0F0F0Fu; \
-        const vec2  ds0 = unpackHalf2x16(bds_##I.x); \
-        const vec2  ds1 = unpackHalf2x16(bds_##I.y); \
-        acc[K] += dsc0_##I * ds0.x * float(dot16(lo, bq0_##I)) + dsc1_##I * ds1.x * float(dot16(hi, bq1_##I)) - \
+        vec2 ds0 = unpackHalf2x16(bds_##I.x); \
+        vec2 ds1 = unpackHalf2x16(bds_##I.y); \
+        int  q0  = dot16(lo, bq0_##I); \
+        int  q1  = dot16(hi, bq1_##I); \
+        if (PLANES == 2) { \
+            q0  = q0 * 128 + dot16(lo, bp0_##I); \
+            q1  = q1 * 128 + dot16(hi, bp1_##I); \
+            ds0 = vec2(ds0.x * (1.0 / 128.0), ds0.y + unpackHalf2x16(bps_##I.x).y); \
+            ds1 = vec2(ds1.x * (1.0 / 128.0), ds1.y + unpackHalf2x16(bps_##I.y).y); \
+        } \
+        acc[K] += dsc0_##I * ds0.x * float(q0) + dsc1_##I * ds1.x * float(q1) - \
                   dmn0_##I * ds0.y - dmn1_##I * ds1.y; \
     }
 // every word round I loaded (weights and the first token's activations), for the FENCE branch
@@ -246,6 +263,10 @@ void main() {
     if (I < MAXR) { \
         const uvec4 t4 = hd##I ^ qv##I ^ bq0_##I ^ bq1_##I; \
         touch ^= t4.x ^ t4.y ^ t4.z ^ t4.w ^ bds_##I.x ^ bds_##I.y; \
+        if (PLANES == 2) { \
+            const uvec4 p4 = bp0_##I ^ bp1_##I; \
+            touch ^= p4.x ^ p4.y ^ p4.z ^ p4.w ^ bps_##I.x ^ bps_##I.y; \
+        } \
     }
 #elif defined(DATA_A_Q5_1)
     const uint nround = (nblk + LPR - 1) / LPR;
@@ -263,13 +284,18 @@ void main() {
         w2_##I = data_a[a + 2]; \
     }
 #define LOAD_B(K, I) \
-    uvec4 bq0_##I, bq1_##I; uint bds_##I; \
+    uvec4 bq0_##I, bq1_##I, bp0_##I, bp1_##I; uint bds_##I, bps_##I; \
     if (I < MAXR) { \
         const uint bb = brow[K] * nblk + b##I; \
-        const uint gi = (bb / 4) * 9; \
+        const uint gi = (bb / 4) * (9 * PLANES); \
         bq0_##I = data_b[gi + 1 + (bb % 4) * 2]; \
         bq1_##I = data_b[gi + 2 + (bb % 4) * 2]; \
         bds_##I = data_b32[gi * 4 + bb % 4]; \
+        if (PLANES == 2) { \
+            bp0_##I = data_b[gi + 10 + (bb % 4) * 2]; \
+            bp1_##I = data_b[gi + 11 + (bb % 4) * 2]; \
+            bps_##I = data_b32[(gi + 9) * 4 + bb % 4]; \
+        } \
     }
 #define DEC_A(I) \
     vec2 dm_##I; uvec4 lo_##I, hi_##I; \
@@ -285,14 +311,23 @@ void main() {
     }
 #define COMP(K, I) \
     if (I < MAXR) { \
-        const vec2 ds = unpackHalf2x16(bds_##I); \
-        acc[K] += dm_##I.x * ds.x * float(dot16(lo_##I, bq0_##I) + dot16(hi_##I, bq1_##I)) + dm_##I.y * ds.y; \
+        vec2 ds = unpackHalf2x16(bds_##I); \
+        int  q  = dot16(lo_##I, bq0_##I) + dot16(hi_##I, bq1_##I); \
+        if (PLANES == 2) { \
+            q  = q * 128 + dot16(lo_##I, bp0_##I) + dot16(hi_##I, bp1_##I); \
+            ds = vec2(ds.x * (1.0 / 128.0), ds.y + unpackHalf2x16(bps_##I).y); \
+        } \
+        acc[K] += dm_##I.x * ds.x * float(q) + dm_##I.y * ds.y; \
     }
 #define TOUCH(K, I) \
     if (I < MAXR) { \
         const uvec4 t4 = bq0_##I ^ bq1_##I; \
         const uvec2 t2 = w0_##I ^ w1_##I ^ w2_##I; \
         touch ^= t4.x ^ t4.y ^ t4.z ^ t4.w ^ t2.x ^ t2.y ^ bds_##I; \
+        if (PLANES == 2) { \
+            const uvec4 p4 = bp0_##I ^ bp1_##I; \
+            touch ^= p4.x ^ p4.y ^ p4.z ^ p4.w ^ bps_##I; \
+        } \
     }
 #endif
 

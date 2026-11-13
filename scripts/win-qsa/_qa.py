@@ -1151,7 +1151,7 @@ def check_ops(run):
                 fails.extend(f"  {op[0]} {arm.name} rerun: {s}" for s in rerun["fails"])
     # the fork's unit tests that build on this machine: exit code 0 passes. CHECKUNITS=none: none
     units = [] if env("CHECKUNITS") == "none" else split_args(env("CHECKUNITS", "test-row-cache test-prompt-cache-spill "
-             "test-mtp-window-fork test-spec-auto-fork test-env-fork test-elastic-buffer-fork"))
+             "test-mtp-window-fork test-spec-auto-fork test-env-fork test-elastic-buffer-fork test-mmvq-planes-fork"))
     for name in units:
         try:
             uexe = binary(name)

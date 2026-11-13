@@ -25,6 +25,13 @@ llama_build_and_test(test-top-k-fork.cpp)
 # values in F32, as a model runs them (the tiled K-quant kernels of x86 builds included); no model
 llama_build_and_test(test-cpu-f16-src1-fork.cpp LINK ggml)
 
+# the q8_1 activations of the Vulkan int8 mat-vec in two planes (GGML_VK_MMVQ_PLANES=2) and in one, against double
+# math (MUL_MAT of 1-8 columns, MUL_MAT_ID of 1-8 tokens); skipped without a Vulkan device with the int8 dot
+llama_build_and_test(test-mmvq-planes-fork.cpp LINK ggml)
+set_tests_properties(test-mmvq-planes-fork PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED")
+llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-1 ARGS --planes 1)
+set_tests_properties(test-mmvq-planes-fork-1 PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED")
+
 # the qwen4exp indexer timed on one device at the shapes of the model (lightning indexer, the head matmul of the Vulkan
 # graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines
 llama_build(test-micro-fork.cpp LINK ggml)

@@ -11,20 +11,16 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions after the runs of 12.11 (README, run-all): the guards of the device memory (01), the QSA block lists
-rem of the slots (02 par, rows0), the PPL gap against upstream (+1.0% on the 395, 12.11: not the PLE rows, the QSA pool,
-rem the attention list or the QSA selection; about 40% our graph, the rest also with the graph of upstream in this
-rem build): on the 395 07 with the graph of upstream without QSA selection, the fusions of Vulkan off, the radix top-k
-rem of upstream; on the 3090 the same split on CUDA and the whole model on the CPU. 07-exact on the 395 keeps the prompt
-rem path and the decode kernels at 4 tokens against the exact f32 math (a regression check; f32 mat-vecs and 8 tokens
-rem answered 12.11). on the 3090 the expert cache after the fix of the generation phase against the expert cache of
-rem upstream with a CPU share of the misses (upmoe5, upmoe8: 06; they did not run on 12.11) and the radix top-k of
-rem upstream (radix-up). settled and left out: on the 395 mm and radix0
-rem (01.11, 02.11); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP head,
-rem -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and the
-rem guard refused 256 bytes: 512 MiB next to the expert cache is too little); again (a second default) stays: the
-rem logits of default bit for bit
-if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
+rem the question of 13.11 (README, run-all), the 395 only: the q8_1 activations of the int8 mat-vec in two planes
+rem (GGML_VK_MMVQ_PLANES=2, planes2): 01 the backend ops and the unit test against double math, the spec probe (the
+rem 1-token and the verify paths parted by up to 2 nats on 12.11), 06 the decode speed, 07-exact the decode at 4 and 8
+rem tokens against the exact f32 math (12.11: decode4 0.0311, decode8 0.0307, f32 mat-vecs 0.0065). 07 against
+rem upstream, 03 and 02 are off on the 395 (the prompt path did not change; 13.11 the PPL gap is upstream's own); the
+rem 3090 has nothing new (Vulkan code). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of
+rem 12.11 (copy, dense, nofuse, radix0); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary
+rem of the MTP head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran
+rem full and the guard refused 256 bytes: 512 MiB next to the expert cache is too little); again (a second default)
+rem stays: the logits of default bit for bit
 if not defined QA_PAR_ARMS set "QA_PAR_ARMS=default;rows0 LLAMA_QSA_ROWS=0"
 rem the decode tasks with a long prompt (about 24K tokens) and a short reply: the prompt speed of each variant too
 if not defined QA_DEC_SET set "QA_DEC_SET=prose ru code-py code-cpp edit json long"
@@ -33,12 +29,17 @@ if not defined LONG_QARMS set "LONG_QARMS=default"
 rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
 if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
+if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1;planes2 GGML_VK_MMVQ_PLANES=2"
 if not defined QA_PARMS set "QA_PARMS=default"
-if not defined QA_DARMS set "QA_DARMS=default"
-if not defined QA_KARMS set "QA_KARMS=fork;copy LLAMA_UPSTREAM=qwen4exp;dense "QA_ARM_ARGS=--override-kv qwen4exp.attention.indexer.top_k=int:262144";copydense LLAMA_UPSTREAM=qwen4exp "QA_ARM_ARGS=--override-kv qwen4exp.attention.indexer.top_k=int:262144";nofuse GGML_VK_DISABLE_FUSION=1;copynofuse LLAMA_UPSTREAM=qwen4exp GGML_VK_DISABLE_FUSION=1;radix0 GGML_VK_TOPK_RADIX_STABLE=0;upstream @upstream;updense @upstream "QA_ARM_ARGS=--override-kv qwen4exp.attention.indexer.top_k=int:262144""
-if not defined EXACT_KARMS set "EXACT_KARMS=prompt;decode4 QA_ARM_UB=4"
+if not defined QA_DARMS set "QA_DARMS=default;planes2 GGML_VK_MMVQ_PLANES=2"
+if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
+if not defined EXACT_KARMS set "EXACT_KARMS=decode4 QA_ARM_UB=4;decode4p2 QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2;decode8p2 QA_ARM_UB=8 GGML_VK_MMVQ_PLANES=2"
+if not defined RUN_KLD set "RUN_KLD=0"
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
+if not defined RUN_LONG set "RUN_LONG=0"
 goto :arms_done
 :arms_cuda
+if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PARMS set "QA_PARMS=default"
 rem upmoe: 6500 MiB, about the ~46 slots a layer of our cache at full depth (RESEARCH.md); --moe-cache 0 turns ours
 rem off. 12.11 the share of the misses on the CPU: 0 -1.6%, 0.3 +7.4%, 0.5 +20.3% TG, the 22K prompt 33% slower

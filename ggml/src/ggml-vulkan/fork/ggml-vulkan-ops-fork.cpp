@@ -464,6 +464,10 @@ void ggml_vk_gated_delta_net_lazy(ggml_backend_vk_context * ctx, vk_context & su
         pc, { H, (uint32_t) info->ne[1], S_v });
 }
 
+vk_pipeline ggml_vk_fork_mmvq_quantize_pipeline(const ggml_backend_vk_context * ctx) {
+    return ctx->device->mmvq_planes == 2 ? ctx->device->pipeline_quantize_q8_1_x4_p2 : ctx->device->pipeline_quantize_q8_1_x4;
+}
+
 // MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK, see ggml_vk_fork_mmv_id_init): src1
 // quantized to q8_1 x4 blocks in prealloc_y as the upstream mat-vec does it (and found there for the second projection
 // of the same activations), then one dispatch over (row blocks, slots, tokens). A fused MUL by the routing weights is
@@ -489,11 +493,12 @@ bool ggml_vk_fork_mmv_id(ggml_backend_vk_context * ctx, vk_context & subctx, con
     }
 
     vk_pipeline pipeline = ctx->device->pipeline_mmv_id_fork[src0->type];
-    vk_pipeline to_q8_1  = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    vk_pipeline to_q8_1  = ggml_vk_fork_mmvq_quantize_pipeline(ctx);
     GGML_ASSERT(pipeline != nullptr && to_q8_1 != nullptr);
 
     const uint64_t y_ne = ggml_nelements(src1);
-    const uint64_t y_sz = ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1);
+    const uint64_t y_sz = ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1) *
+                          ctx->device->mmvq_planes;
     if (y_sz > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested preallocation size is too large");
     }
@@ -517,7 +522,7 @@ bool ggml_vk_fork_mmv_id(ggml_backend_vk_context * ctx, vk_context & subctx, con
         if (ctx->prealloc_y_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
-        ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, (uint32_t) y_ne);
+        ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, (uint32_t) y_ne, to_q8_1);
         ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
         ctx->prealloc_y_last_tensor_used   = src1;
         ctx->prealloc_y_last_k_padded      = false;

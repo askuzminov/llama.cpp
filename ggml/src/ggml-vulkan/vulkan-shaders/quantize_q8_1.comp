@@ -22,6 +22,23 @@ layout (push_constant) uniform parameter
 
 layout(constant_id = 0) const uint GROUP_SIZE = 32;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+// fork: x4 blocks in two planes for the int8 mat-vec (GGML_VK_MMVQ_PLANES=2, see mul_mat_vecq_planes_fork.glsl): a
+// group of 128 values is two block_q8_1_x4 in a row, plane 1 the codes q1 of scale d (d rounded to f16 as the mat-vec
+// reads it), plane 2 the codes q2 of x - d * q1 in steps of d / 128. The sum of a block is that of the values the two
+// planes hold, d / 128 * (128 * q1 + q2), so the weights with a minimum (q4_0, q5_1, the K-quants) see the same values
+// in both terms; plane 1 holds the sum in f16, plane 2 the rest of it
+layout(constant_id = 1) const uint PLANES = 1;
+
+// v rounded to the nearest f16 (ties to even) by integer steps on its bits: float(float16_t(v)) is not kept by every
+// compiler (MoltenVK's fast math drops the round trip, and the rest of every value then misses the rounding of d: an
+// NMSE of about 1e-7 in place of 1e-8). f16 subnormals in steps of 2^-24, no overflow handling (d stays far below)
+float f16_round(const float v) {
+    if (abs(v) < 6.103515625e-05) {
+        return roundEven(v * 16777216.0) * (1.0 / 16777216.0);
+    }
+    const uint b = floatBitsToUint(v);
+    return uintBitsToFloat((b + 0xFFFu + ((b >> 13) & 1u)) & ~0x1FFFu);
+}
 
 // fork: A_F16, an f16 source (the f16 hc read of qwen4exp, LLAMA_HC_F16)
 #ifdef A_F16
@@ -51,11 +68,11 @@ void quantize(const uint wgid) {
     const uint iqs = tid % 8;
 
 #ifdef QBLOCK_X4
-    const uint ibx4_outer = ib / 4;
+    const uint ibx4_outer = ib / 4 * PLANES; // fork: groups of PLANES x4 blocks
     const uint ibx4_inner = ib % 4;
 
     const uint required_x4_blocks = (p.ne + 127) / 128;
-    if (ibx4_outer >= required_x4_blocks) {
+    if (ib / 4 >= required_x4_blocks) {
         return;
     }
 #endif
@@ -84,12 +101,22 @@ void quantize(const uint wgid) {
 
     const float d = amax / 127.0;
     const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+    const vec4 x = vals; // fork
     vals = round(vals * d_inv);
 
 #ifndef QBLOCK_X4
     data_b[ib].qs[iqs] = pack32(i8vec4(round(vals)));
 #else
     data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(round(vals)));
+    // fork: the codes of plane 2. dh is d as the f16 the mat-vec reads; |x - dh * q1| stays under 0.57 dh (72 steps of
+    // dh / 128) unless dh is an f16 subnormal (blocks under 2^-7)
+    const float dh = PLANES == 2 ? f16_round(d) : d;
+    vec4 q2 = vec4(0.0);
+    if (PLANES == 2) {
+        const float r_inv = dh != 0.0 ? 128.0 / dh : 0.0;
+        q2 = clamp(round((x - vals * dh) * r_inv), -127.0, 127.0);
+        data_b[ibx4_outer + 1].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(q2));
+    }
 #endif
 
 #ifndef USE_SUBGROUPS
@@ -97,7 +124,13 @@ void quantize(const uint wgid) {
 #endif
 
     // Calculate the sum for each block
+#ifdef QBLOCK_X4
+    // fork: two planes, the sum of 128 * q1 + q2 (whole numbers, exact)
+    const vec4 sv = PLANES == 2 ? vals * 128.0 + q2 : vals;
+    const float thread_sum = sv.x + sv.y + sv.z + sv.w;
+#else
     const float thread_sum = vals.x + vals.y + vals.z + vals.w;
+#endif
 #ifndef USE_SUBGROUPS
     shmem[tid] = thread_sum;
     barrier();
@@ -118,7 +151,15 @@ void quantize(const uint wgid) {
 #ifndef QBLOCK_X4
         data_b[ib].ds = f16vec2(vec2(d, sum * d));
 #else
-        data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(d, sum * d));
+        if (PLANES == 2) {
+            // fork: the sum in f16 in plane 1 and the rest in plane 2; dh and s1 are exact in f16
+            const float st = sum * (dh * (1.0 / 128.0));
+            const float s1 = f16_round(st);
+            data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(dh, s1));
+            data_b[ibx4_outer + 1].ds[ibx4_inner] = f16vec2(vec2(0.0, st - s1));
+        } else {
+            data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(d, sum * d));
+        }
 #endif
     }
 }

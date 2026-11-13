@@ -58,18 +58,22 @@ upstream). Повторный запуск без изменений исход�
 | Шаг | 395 (Vulkan) | 3090 (CUDA) | Вопрос |
 |---|---|---|---|
 | 00 upstream | `UPSTREAMREF=0d69255c5` | то же | эталон 07: master слияния 12.11 |
-| 01 `QA_QARMS` | `default;again LLAMA_QA_AGAIN=1` | то же | слияние: операции, юнит-тесты, точность, чекпойнт, спекуляция; повторяет ли себя прогон |
+| 01 `QA_QARMS` | `default;again LLAMA_QA_AGAIN=1;planes2 GGML_VK_MMVQ_PLANES=2` | `default;again LLAMA_QA_AGAIN=1` | операции, юнит-тесты (с 13.11 `test-mmvq-planes-fork`), точность, чекпойнт, спекуляция; повторяет ли себя прогон; 395: две плоскости активаций int8-матвека (13.11) в операциях и в пробе спекуляции |
 | 01 защиты | нет места (отказ с числами кучи), fit (отказ, всё на GPU), строка предела памяти | нет места (`-ncmoe 30` больше карты: отказ бэкенда, а не RAM) | ничего не уходит в RAM молча |
-| 06 `QA_DARMS` | `default` | `default`, `upmoe5`/`upmoe8` (кеш экспертов upstream 6500 МиБ, доля промахов на CPU 0.5, 0.8) | 3090: наш кеш после исправления фазы генерации против кеша upstream |
+| 06 `QA_DARMS` | `default`, `planes2` (`GGML_VK_MMVQ_PLANES=2`) | `default`, `upmoe5`/`upmoe8` (кеш экспертов upstream 6500 МиБ, доля промахов на CPU 0.5, 0.8) | 395: цена двух плоскостей в TG; 3090: наш кеш после исправления фазы генерации против кеша upstream |
 | 06 `QA_DEC_SET` | задачи и `long` (промпт ~24K) | то же | скорость промпта рядом с генерацией |
-| 03 `QA_PARMS` | `default` | то же | скорость после исправлений |
-| 07 `QA_KARMS` | `fork`, `copy`, `dense`, `copydense` (граф upstream без отбора QSA), `nofuse`/`copynofuse` (`GGML_VK_DISABLE_FUSION=1`), `radix0` (`GGML_VK_TOPK_RADIX_STABLE=0`), `upstream`, `updense` | `fork`, `upstream`, `copy`, `lzmon`, `dense`, `updense` (как в разделе 07), `cpu`/`upcpu` (вся модель на CPU, `-ngl 0 -dev none`) и `radix-up` | слияние не отодвинуло форк от upstream (столбец before); 3090: есть ли разница PPL 395 (+1.0%) на CUDA и на CPU, точность radix upstream |
-| 07-exact `EXACT_KARMS` | `prompt`, `decode4 QA_ARM_UB=4` | не идёт (у CUDA нет режима f32) | регрессия цены 8- и 16-битных активаций против точной математики (12.11: prompt 0.0144, decode4 0.0311, decode4f32 0.0065, decode8 0.0307 - отвечено) |
-| 02 `LONG_QARMS` | `default` | то же | весь контекст после слияния |
-| 02 `QA_PAR_ARMS` | `default;rows0 LLAMA_QSA_ROWS=0` | то же | списки блоков QSA по слотам: время шага par и ответы |
+| 03 `QA_PARMS` | не идёт (`RUN_PROFILE=0`: путь промпта не менялся) | `default` | скорость после исправлений |
+| 07 `QA_KARMS` | не идёт (`RUN_KLD=0`, 13.11 разница PPL - своя у upstream; при `RUN_KLD=1` `fork`, `upstream`) | `fork`, `upstream`, `copy`, `lzmon`, `dense`, `updense` (как в разделе 07), `cpu`/`upcpu` (вся модель на CPU, `-ngl 0 -dev none`) и `radix-up` | слияние не отодвинуло форк от upstream (столбец before); 3090: есть ли разница PPL 395 (+1.0%) на CUDA и на CPU, точность radix upstream |
+| 07-exact `EXACT_KARMS` | `decode4 QA_ARM_UB=4`, `decode4p2`, `decode8p2` (`QA_ARM_UB=4`/`8 GGML_VK_MMVQ_PLANES=2`) | не идёт (у CUDA нет режима f32) | KLD декода против точной математики с двумя плоскостями (12.11: decode4 0.0311, decode8 0.0307, f32-матвеки 0.0065; prompt 0.0144) |
+| 02 `LONG_QARMS` | не идёт (`RUN_LONG=0`) | `default` | весь контекст после слияния |
+| 02 `QA_PAR_ARMS` | не идёт | `default;rows0 LLAMA_QSA_ROWS=0` | списки блоков QSA по слотам: время шага par и ответы |
 
 Где смотреть ответы:
 
+- две плоскости (395, 13.11): в 01 операции `planes2` и юнит `test-mmvq-planes-fork` проходят, в пробе спекуляции
+  `planes2` против `default` - сдвиг зазора между путём одного токена и путём проверки и строка `SPEC GREEDY DIFFERS`;
+  в 06 TG `planes2` против `default`; в 07-exact KLD `decode4p2`/`decode8p2` против `decode4` (0.031) и f32-матвеков
+  (0.0065). 3090 этот вопрос не касается (код Vulkan);
 - слияние: коды выхода всех шагов 0; в `07` KLD `fork` и столбец before (прошлая сборка) рядом; скорость 06/03
   против прошлых итогов в `logs`;
 - защиты: блок `guards` в итоге 01; на 395 строка `device memory: ... this process up to ... MiB (+... MiB over the

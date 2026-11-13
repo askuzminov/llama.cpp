@@ -295,6 +295,40 @@ bool ggml_vk_fork_mmvq_n5_rows4(const vk_device & device) {
     return rows4;
 }
 
+// the q8_1 activations of the int8 mat-vec in two planes (see mul_mat_vecq_planes_fork.glsl): the dense mat-vec of up to
+// 8 columns (mul_mat_vecq.comp, the draft checks and, below the k threshold of ggml_vk_should_use_mmvq, decode), the
+// MUL_MAT_ID mat-vec of upstream and of the fork. An activation keeps about 15 bits of its block's largest value in
+// place of 7; the second dot takes the decoded weights of the first. GGML_VK_MMVQ_PLANES=2: two planes, else one
+void ggml_vk_fork_mmvq_planes_init(vk_device & device) {
+    const char * env = getenv("GGML_VK_MMVQ_PLANES");
+    device->mmvq_planes = env != nullptr && atoi(env) == 2 ? 2 : 1;
+    if (device->mmvq_planes == 2) {
+        GGML_LOG_INFO("ggml_vulkan: the int8 mat-vec reads its q8_1 activations in two planes (GGML_VK_MMVQ_PLANES=2)\n");
+    }
+}
+
+// mul_mat_vecq.comp ("mul_mat_vec_<type>_q8_1_f32", "mul_mat_vec_id_<type>_q8_1_f32" and their reduction variants):
+// the planes as spec constant 3 (MMVQ_PLANES). The MUL_MAT_ID pipelines pass two constants; NUM_COLS (2) keeps its
+// default 1
+void ggml_vk_fork_mmvq_spec(const vk_device & device, const char * name, std::vector<uint32_t> & spec) {
+    if (device->mmvq_planes == 1 || strncmp(name, "mul_mat_vec_", 12) != 0 || strstr(name, "_q8_1_f32") == nullptr) {
+        return;
+    }
+    if (spec.size() < 3) {
+        spec.resize(3, 1);
+    }
+    spec.resize(4);
+    spec[3] = device->mmvq_planes;
+}
+
+bool ggml_vk_fork_int_dot_emulated() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_VK_INT_DOT_EMULATED");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
 void ggml_vk_fork_mmv_id_init(vk_device & device) {
     // the decode and draft-check MUL_MAT_ID (up to 8 tokens) on mul_mat_vec_id_fork.comp instead of mul_mat_vecq.comp:
     // one dispatch for all tokens, an expert read once for the tokens that share it, raw loads before the decode, the

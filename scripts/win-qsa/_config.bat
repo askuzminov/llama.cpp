@@ -74,6 +74,8 @@ if not defined QA_SPEC   set "QA_SPEC=--spec-auto --spec-draft-n-max 3"
 :defaults_done
 rem test-elastic-buffer-fork fails when it tested no device (a skip must not count as a pass)
 if not defined TEST_ELASTIC_REQUIRE set "TEST_ELASTIC_REQUIRE=1"
+rem test-mmvq-planes-fork too on the vulkan machine when it ran no int8 mat-vec (the cuda build has no vulkan device)
+if /i "%BACKEND%"=="vulkan" if not defined TEST_MMVQ_PLANES_REQUIRE set "TEST_MMVQ_PLANES_REQUIRE=1"
 if not defined WARMUP set "WARMUP=0"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 rem the vocabulary subset of the MTP head is on by default since 10.11 and takes its base from a counts file in the
