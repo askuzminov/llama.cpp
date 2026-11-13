@@ -1076,8 +1076,10 @@ struct vk_device_struct {
     // fork: upstream's 4 rows per workgroup for the dense int8 mat-vec of 5-8 columns on RDNA3/4 (ggml_vk_fork_mmvq_n5_rows4)
     bool mmvq_n5_rows4 = true;
     // fork: the planes of the q8_1 activations of the int8 mat-vec, mul_mat_vecq.comp and mul_mat_vec_id_fork.comp: 1, or
-    // 2 (GGML_VK_MMVQ_PLANES=2, see mul_mat_vecq_planes_fork.glsl and ggml_vk_fork_mmvq_planes_init)
+    // 2 (GGML_VK_MMVQ_PLANES=2, see mul_mat_vecq_planes_fork.glsl and ggml_vk_fork_mmvq_planes_init) for the weight
+    // types of GGML_VK_MMVQ_PLANES_TYPES (all without it); ggml_vk_fork_mmvq_planes_of
     uint32_t mmvq_planes = 1;
+    bool mmvq_planes_type[GGML_TYPE_COUNT] = {};
     uint32_t mmv_id_fork_mode = 0;
     uint32_t mmv_id_fork_wg = 32;
     uint32_t mmv_id_fork_maxr_q4_k = 5;

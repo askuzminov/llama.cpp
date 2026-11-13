@@ -464,8 +464,9 @@ void ggml_vk_gated_delta_net_lazy(ggml_backend_vk_context * ctx, vk_context & su
         pc, { H, (uint32_t) info->ne[1], S_v });
 }
 
-vk_pipeline ggml_vk_fork_mmvq_quantize_pipeline(const ggml_backend_vk_context * ctx) {
-    return ctx->device->mmvq_planes == 2 ? ctx->device->pipeline_quantize_q8_1_x4_p2 : ctx->device->pipeline_quantize_q8_1_x4;
+vk_pipeline ggml_vk_fork_mmvq_quantize_pipeline(const ggml_backend_vk_context * ctx, ggml_type type) {
+    return ggml_vk_fork_mmvq_planes_of(ctx->device, type) == 2 ? ctx->device->pipeline_quantize_q8_1_x4_p2
+                                                               : ctx->device->pipeline_quantize_q8_1_x4;
 }
 
 // MUL_MAT_ID of up to 8 tokens on mul_mat_vec_id_fork.comp (GGML_VK_MMV_ID_FORK, see ggml_vk_fork_mmv_id_init): src1
@@ -493,12 +494,12 @@ bool ggml_vk_fork_mmv_id(ggml_backend_vk_context * ctx, vk_context & subctx, con
     }
 
     vk_pipeline pipeline = ctx->device->pipeline_mmv_id_fork[src0->type];
-    vk_pipeline to_q8_1  = ggml_vk_fork_mmvq_quantize_pipeline(ctx);
+    vk_pipeline to_q8_1  = ggml_vk_fork_mmvq_quantize_pipeline(ctx, src0->type);
     GGML_ASSERT(pipeline != nullptr && to_q8_1 != nullptr);
 
     const uint64_t y_ne = ggml_nelements(src1);
     const uint64_t y_sz = ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1) *
-                          ctx->device->mmvq_planes;
+                          ggml_vk_fork_mmvq_planes_of(ctx->device, src0->type);
     if (y_sz > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested preallocation size is too large");
     }

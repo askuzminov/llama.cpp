@@ -3937,11 +3937,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // q4_K unless GGML_VK_MMV_ID_FORK_Q4_K=0: without its pipeline ggml_vk_fork_mmv_id_takes leaves it upstream
         if (device->mmv_id_fork_q4_k) {
             ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q4_K], q4k.name, q4k.len, q4k.data, "main", 6,
-                                    sizeof(vk_mmv_id_fork_push_constants), {wg / lpr4, 1, 1}, {wg, device->mmv_id_fork_maxr_q4_k, fence, device->mmvq_planes}, 1,
+                                    sizeof(vk_mmv_id_fork_push_constants), {wg / lpr4, 1, 1}, {wg, device->mmv_id_fork_maxr_q4_k, fence, ggml_vk_fork_mmvq_planes_of(device, GGML_TYPE_Q4_K)}, 1,
                                     true, true, sg);
         }
         ggml_vk_create_pipeline(device, device->pipeline_mmv_id_fork[GGML_TYPE_Q5_1], q51.name, q51.len, q51.data, "main", 6,
-                                sizeof(vk_mmv_id_fork_push_constants), {wg / lpr5, 1, 1}, {wg, device->mmv_id_fork_maxr_q5_1, fence, device->mmvq_planes}, 1,
+                                sizeof(vk_mmv_id_fork_push_constants), {wg / lpr5, 1, 1}, {wg, device->mmv_id_fork_maxr_q5_1, fence, ggml_vk_fork_mmvq_planes_of(device, GGML_TYPE_Q5_1)}, 1,
                                 true, true, sg);
     }
     // fork: dense MUL_MAT of q8_0 on f16 coopmat with the tile of GGML_VK_MM_F16REG, [f16 activations]
@@ -7315,7 +7315,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_fork_mmvq_quantize_pipeline(ctx); // fork: one or two planes
+        to_q8_1 = ggml_vk_fork_mmvq_quantize_pipeline(ctx, src0->type); // fork: one or two planes
     }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
@@ -7337,7 +7337,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     const uint64_t qx_sz = ggml_vk_align_size(ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type), ctx->device->properties.limits.minStorageBufferOffsetAlignment);
     const uint64_t x_sz = x_non_contig ? ggml_vk_align_size(ggml_type_size(src0->type) * x_ne, ctx->device->properties.limits.minStorageBufferOffsetAlignment) : qx_sz;
-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1) * ctx->device->mmvq_planes) :
+    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1) * ggml_vk_fork_mmvq_planes_of(ctx->device, src0->type)) :
                          (f16_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
 
     {
@@ -8477,7 +8477,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_fork_mmvq_quantize_pipeline(ctx); // fork: one or two planes
+        to_q8_1 = ggml_vk_fork_mmvq_quantize_pipeline(ctx, src0->type); // fork: one or two planes
     }
 
     const bool qx_needs_dequant = x_non_contig;
@@ -8498,7 +8498,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     const uint64_t qx_sz = ggml_vk_align_size(ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type), ctx->device->properties.limits.minStorageBufferOffsetAlignment);
     const uint64_t x_sz = x_non_contig ? ggml_vk_align_size(ggml_type_size(src0->type) * x_ne, ctx->device->properties.limits.minStorageBufferOffsetAlignment) : qx_sz;
-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1) * ctx->device->mmvq_planes) :
+    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1) * ggml_vk_fork_mmvq_planes_of(ctx->device, src0->type)) :
                                        (f16_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
 
     {

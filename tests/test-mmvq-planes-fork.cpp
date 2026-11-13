@@ -8,7 +8,9 @@
 // (the int8 mat-vec at every shape and type) and, unless set, GGML_VK_INT_DOT_EMULATED=1 (MoltenVK has the int8 dot
 // without acceleration) and GGML_VK_MMV_ID_FORK=2 before the backends load.
 //
-// usage: test-mmvq-planes-fork [--planes 1|2] [-dev <Vulkan device>] [--dump <file>]
+// usage: test-mmvq-planes-fork [--planes 1|2] [--types <list>] [-dev <Vulkan device>] [--dump <file>]
+//   --types: GGML_VK_MMVQ_PLANES_TYPES, the weight types of two planes (comma-separated names); the others then must
+//            show one plane
 //   --dump: the outputs of the device, all cases in a row as floats (two builds compared byte for byte)
 // TEST_MMVQ_PLANES_REQUIRE=1: a skip (no Vulkan device, no int8 mat-vec) fails (01-check on the 395)
 
@@ -17,6 +19,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -182,9 +185,12 @@ static result run(ggml_backend_t backend, int planes, ggml_type type, int64_t k,
 int main(int argc, char ** argv) {
     int          planes   = 2;
     const char * dev_name = nullptr;
+    std::string  types;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--planes") == 0 && i + 1 < argc) {
             planes = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--types") == 0 && i + 1 < argc) {
+            types = argv[++i];
         } else if ((strcmp(argv[i], "-dev") == 0 || strcmp(argv[i], "--device") == 0) && i + 1 < argc) {
             dev_name = argv[++i];
         } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
@@ -194,7 +200,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         } else {
-            fprintf(stderr, "usage: %s [--planes 1|2] [-dev <Vulkan device>] [--dump <file>]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--planes 1|2] [--types <list>] [-dev <Vulkan device>] [--dump <file>]\n", argv[0]);
             return 1;
         }
     }
@@ -204,6 +210,22 @@ int main(int argc, char ** argv) {
     }
 
     set_env("GGML_VK_MMVQ_PLANES", planes == 2 ? "2" : "1");
+    set_env("GGML_VK_MMVQ_PLANES_TYPES", types.c_str());
+    // the planes a weight type gets: two with --planes 2 for the types of --types (all without it)
+    auto planes_for = [&](ggml_type type) {
+        if (planes != 2 || types.empty()) {
+            return planes;
+        }
+        std::string name = ggml_type_name(type);
+        for (auto & c : name) {
+            c = (char) tolower((unsigned char) c);
+        }
+        std::string list = "," + types + ",";
+        for (auto & c : list) {
+            c = (char) tolower((unsigned char) c);
+        }
+        return list.find("," + name + ",") != std::string::npos ? 2 : 1;
+    };
     set_env("GGML_VK_FORCE_MMVQ", "1");
     if (getenv("GGML_VK_INT_DOT_EMULATED") == nullptr) {
         set_env("GGML_VK_INT_DOT_EMULATED", "1");
@@ -241,8 +263,8 @@ int main(int argc, char ** argv) {
     // the NMSE of the device over that of the CPU rounding: the rounding ties and the float sums of the device apart,
     // the same activations. One plane: upstream's sum of a block (of the codes times d before its rounding to f16) adds
     // a little for the weights with a minimum
-    const double lo = planes == 2 ? 0.9 : 0.9;
-    const double hi = planes == 2 ? 1.1 : 1.2;
+    const double lo = 0.9;
+    auto         hi = [](int p) { return p == 2 ? 1.1 : 1.2; };
 
     // the int8 dot of MoltenVK on the AMD GPU of a Mac gets the q8_0 mat-vec wrong (upstream mul_mat_vecq.comp with one
     // plane fails test-backend-ops there with GGML_VK_INT_DOT_EMULATED=1 GGML_VK_FORCE_MMVQ=1; the Intel GPU passes)
@@ -258,7 +280,8 @@ int main(int argc, char ** argv) {
 
     auto check = [&](const char * what, ggml_type type, int64_t k, int64_t m, int64_t n, int64_t n_exp,
                      int64_t n_used) {
-        const result r = run(backend, planes, type, k, m, n, n_exp, n_used, rng);
+        const int    p = planes_for(type);
+        const result r = run(backend, p, type, k, m, n, n_exp, n_used, rng);
         if (!r.ran) {
             printf("  %-10s %-6s k %5lld n %lld: not supported\n", what, ggml_type_name(type), (long long) k,
                    (long long) n);
@@ -266,9 +289,9 @@ int main(int argc, char ** argv) {
         }
         const double ratio = r.sim > 0.0 ? r.nmse / r.sim : 0.0;
         const bool   known = q8_0_broken && type == GGML_TYPE_Q8_0;
-        const bool   ok    = ratio > lo && ratio < hi;
-        printf("  %-10s %-6s k %5lld n %lld: NMSE %.3e, of the rounding %.3e, ratio %.3f%s\n", what,
-               ggml_type_name(type), (long long) k, (long long) n, r.nmse, r.sim, ratio,
+        const bool   ok    = ratio > lo && ratio < hi(p);
+        printf("  %-10s %-6s k %5lld n %lld, %d plane%s: NMSE %.3e, of the rounding %.3e, ratio %.3f%s\n", what,
+               ggml_type_name(type), (long long) k, (long long) n, p, p == 2 ? "s" : " ", r.nmse, r.sim, ratio,
                ok ? "" : known ? "  (the int8 dot of MoltenVK on AMD, not counted)" : "  <- outside the range");
         if (known) {
             return;
@@ -280,8 +303,9 @@ int main(int argc, char ** argv) {
         }
     };
 
-    printf("%s: %s (%s), %d plane%s, NMSE of the device over that of the rounding in (%.2f, %.2f)\n", argv[0],
-           ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), planes, planes == 2 ? "s" : "", lo, hi);
+    printf("%s: %s (%s), %d plane%s%s%s, NMSE of the device over that of the rounding in (%.2f, %.2f) for two planes, "
+           "(%.2f, %.2f) for one\n", argv[0], ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), planes,
+           planes == 2 ? "s" : "", types.empty() ? "" : " for ", types.c_str(), lo, hi(2), lo, hi(1));
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
                             GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
         for (int64_t n : { 1, 2, 3, 5, 8 }) {

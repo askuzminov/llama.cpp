@@ -3,6 +3,7 @@
 #include "ggml-vulkan-fork.h"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <atomic>
 #include <cinttypes>
@@ -298,27 +299,87 @@ bool ggml_vk_fork_mmvq_n5_rows4(const vk_device & device) {
 // the q8_1 activations of the int8 mat-vec in two planes (see mul_mat_vecq_planes_fork.glsl): the dense mat-vec of up to
 // 8 columns (mul_mat_vecq.comp, the draft checks and, below the k threshold of ggml_vk_should_use_mmvq, decode), the
 // MUL_MAT_ID mat-vec of upstream and of the fork. An activation keeps about 15 bits of its block's largest value in
-// place of 7; the second dot takes the decoded weights of the first. GGML_VK_MMVQ_PLANES=2: two planes, else one
+// place of 7; the second dot takes the decoded weights of the first. GGML_VK_MMVQ_PLANES=2: two planes, else one;
+// GGML_VK_MMVQ_PLANES_TYPES: the weight types that take two planes, by name, comma-separated (q8_0: the dense matrices
+// of qwen4exp, q4_K: the gate and up of its experts, q5_1: their down; 395 13.11 all of them: decode KLD against the
+// exact math 0.0311 -> 0.0078, the verify 5.1 -> 8.2 ms a token, TG -22%), all types without it
+// the type of a name as ggml_type_name gives it, case aside (the pipeline names write q4_k), GGML_TYPE_COUNT for none
+static int ggml_vk_fork_type_by_name(const std::string & name) {
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const char * tn = ggml_type_name((ggml_type) t);
+        if (tn == nullptr || strlen(tn) != name.size()) {
+            continue;
+        }
+        bool same = true;
+        for (size_t i = 0; i < name.size() && same; ++i) {
+            same = tolower((unsigned char) tn[i]) == tolower((unsigned char) name[i]);
+        }
+        if (same) {
+            return t;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
 void ggml_vk_fork_mmvq_planes_init(vk_device & device) {
     const char * env = getenv("GGML_VK_MMVQ_PLANES");
     device->mmvq_planes = env != nullptr && atoi(env) == 2 ? 2 : 1;
-    if (device->mmvq_planes == 2) {
-        GGML_LOG_INFO("ggml_vulkan: the int8 mat-vec reads its q8_1 activations in two planes (GGML_VK_MMVQ_PLANES=2)\n");
+    const char * types = getenv("GGML_VK_MMVQ_PLANES_TYPES");
+    std::string list;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        device->mmvq_planes_type[t] = types == nullptr || types[0] == 0;
     }
+    if (types != nullptr && types[0] != 0) {
+        std::string all = types;
+        for (size_t pos = 0; pos <= all.size();) {
+            const size_t end  = std::min(all.find(',', pos), all.size());
+            const std::string name = all.substr(pos, end - pos);
+            pos = end + 1;
+            if (name.empty()) {
+                continue;
+            }
+            const int t = ggml_vk_fork_type_by_name(name);
+            if (t < GGML_TYPE_COUNT) {
+                device->mmvq_planes_type[t] = true;
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_MMVQ_PLANES_TYPES: no type %s\n", name.c_str());
+            }
+        }
+        list = std::string(" for ") + types;
+    }
+    if (device->mmvq_planes == 2) {
+        GGML_LOG_INFO("ggml_vulkan: the int8 mat-vec reads its q8_1 activations in two planes (GGML_VK_MMVQ_PLANES=2)%s\n",
+                      list.c_str());
+    }
+}
+
+uint32_t ggml_vk_fork_mmvq_planes_of(const vk_device & device, ggml_type type) {
+    return device->mmvq_planes == 2 && type >= 0 && type < GGML_TYPE_COUNT && device->mmvq_planes_type[type] ? 2 : 1;
 }
 
 // mul_mat_vecq.comp ("mul_mat_vec_<type>_q8_1_f32", "mul_mat_vec_id_<type>_q8_1_f32" and their reduction variants):
 // the planes as spec constant 3 (MMVQ_PLANES). The MUL_MAT_ID pipelines pass two constants; NUM_COLS (2) keeps its
 // default 1
 void ggml_vk_fork_mmvq_spec(const vk_device & device, const char * name, std::vector<uint32_t> & spec) {
-    if (device->mmvq_planes == 1 || strncmp(name, "mul_mat_vec_", 12) != 0 || strstr(name, "_q8_1_f32") == nullptr) {
+    const char * tail = strstr(name, "_q8_1_f32");
+    if (device->mmvq_planes == 1 || strncmp(name, "mul_mat_vec_", 12) != 0 || tail == nullptr) {
+        return;
+    }
+    // the weight type between the prefix and _q8_1_f32
+    const char * type0 = name + 12;
+    if (strncmp(type0, "id_", 3) == 0) {
+        type0 += 3;
+    }
+    const int      t      = ggml_vk_fork_type_by_name(std::string(type0, tail - type0));
+    const uint32_t planes = t < GGML_TYPE_COUNT ? ggml_vk_fork_mmvq_planes_of(device, (ggml_type) t) : 1;
+    if (planes == 1) {
         return;
     }
     if (spec.size() < 3) {
         spec.resize(3, 1);
     }
     spec.resize(4);
-    spec[3] = device->mmvq_planes;
+    spec[3] = planes;
 }
 
 bool ggml_vk_fork_int_dot_emulated() {

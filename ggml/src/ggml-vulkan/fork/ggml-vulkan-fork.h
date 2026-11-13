@@ -264,11 +264,13 @@ void ggml_vk_fork_mmv_id_init(vk_device & device);
 // ggml_vk_load_shaders), false the rows of 1-4 columns (GGML_VK_MMVQ_N5_ROWS4)
 bool ggml_vk_fork_mmvq_n5_rows4(const vk_device & device);
 // the q8_1 activations of the int8 mat-vec in two planes (GGML_VK_MMVQ_PLANES=2, see mul_mat_vecq_planes_fork.glsl):
-// device->mmvq_planes at device init; the spec constants of a pipeline of mul_mat_vecq.comp with the planes added (in
-// ggml_vk_load_shaders); the quantize pipeline of the mat-vec paths (the matmul keeps one plane)
+// device->mmvq_planes at device init; the planes of a weight type; the spec constants of a pipeline of mul_mat_vecq.comp
+// with the planes added (in ggml_vk_load_shaders); the quantize pipeline of the mat-vec of a weight type (the matmul
+// keeps one plane)
 void ggml_vk_fork_mmvq_planes_init(vk_device & device);
+uint32_t ggml_vk_fork_mmvq_planes_of(const vk_device & device, ggml_type type);
 void ggml_vk_fork_mmvq_spec(const vk_device & device, const char * name, std::vector<uint32_t> & spec);
-vk_pipeline ggml_vk_fork_mmvq_quantize_pipeline(const ggml_backend_vk_context * ctx);
+vk_pipeline ggml_vk_fork_mmvq_quantize_pipeline(const ggml_backend_vk_context * ctx, ggml_type type);
 // GGML_VK_INT_DOT_EMULATED=1: the int8 dot where the device has it without acceleration (MoltenVK), for tests
 bool ggml_vk_fork_int_dot_emulated();
 bool ggml_vk_fork_mmv_id_takes(const ggml_backend_vk_context * ctx, const ggml_tensor * dst);

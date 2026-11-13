@@ -31,6 +31,9 @@ llama_build_and_test(test-mmvq-planes-fork.cpp LINK ggml)
 set_tests_properties(test-mmvq-planes-fork PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED")
 llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-1 ARGS --planes 1)
 set_tests_properties(test-mmvq-planes-fork-1 PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED")
+# two planes for some weight types only (GGML_VK_MMVQ_PLANES_TYPES), the others one
+llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-types ARGS --planes 2 --types q5_1,q8_0)
+set_tests_properties(test-mmvq-planes-fork-types PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED")
 
 # the qwen4exp indexer timed on one device at the shapes of the model (lightning indexer, the head matmul of the Vulkan
 # graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines

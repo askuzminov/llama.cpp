@@ -11,15 +11,15 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 13.11 (README, run-all). the 395: the q8_1 activations of the int8 mat-vec in two planes
-rem (GGML_VK_MMVQ_PLANES=2, planes2): 01 the backend ops and the unit test against double math, the spec probe (the
-rem 1-token and the verify paths parted by up to 2 nats on 12.11), 06 the decode speed, 07-exact the decode at 4 and 8
-rem tokens against the exact f32 math (12.11: decode4 0.0311, decode8 0.0307, f32 mat-vecs 0.0065). 07 against
-rem upstream, 03 and 02 are off on the 395 (the prompt path did not change; 13.11 the PPL gap is upstream's own). the
-rem 3090: 01 with the diagnostics of a failed op (MUL_MAT_ID at n=1 m=37 failed in 4 of 5 runs of 01, ops_diag in
-rem _qa.py) and 03 with the op reports read per backend context (since 12.11 the reply of 03 read 0.1-0.8 ms of GPU
-rem a token in place of ~37); 06, 07 and 02 are off (the CUDA change is the label of the reports). settled and left
-rem out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy, dense, nofuse, radix0); on the 3090
+rem the questions of 13.11 (README, run-all). the 395: two planes for which weight type (GGML_VK_MMVQ_PLANES_TYPES):
+rem 13.11 all types took the decode KLD against the exact math from 0.0311 to 0.0078 (f32 mat-vecs 0.0065), and the
+rem verify from 5.1 to 8.2 ms a token, TG -22%. 03 the GPU time of each op with two planes, 06 TG and 07-exact KLD
+rem with two planes for q8_0 (the dense matrices), q4_K (gate and up of the experts), q5_1 (their down) alone. 01, 07
+rem against upstream and 02 are off on the 395 (the default path did not change; 13.11 the PPL gap is upstream's
+rem own). the 3090: 01 with the diagnostics of a failed op (MUL_MAT_ID at n=1 m=37 failed in 4 of 5 runs of 01,
+rem ops_diag in _qa.py) and 03 with the op reports read per backend context (since 12.11 the reply of 03 read 0.1-0.8
+rem ms of GPU a token in place of ~37); 06, 07 and 02 are off (the CUDA change is the label of the reports). settled
+rem and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy, dense, nofuse, radix0); on the 3090
 rem nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP head, -0.3%), m256, upmoe0 (-1.6%),
 rem upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and the guard refused 256 bytes: 512 MiB
 rem next to the expert cache is too little); 13.11 upmoe5/upmoe8 (the cache of upstream -20%/-10% TG in two runs) and
@@ -34,12 +34,12 @@ rem the indexer kernels have not changed since the micro of 31.10 evening: 04-mi
 if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1;planes2 GGML_VK_MMVQ_PLANES=2"
-if not defined QA_PARMS set "QA_PARMS=default"
-if not defined QA_DARMS set "QA_DARMS=default;planes2 GGML_VK_MMVQ_PLANES=2"
+if not defined QA_PARMS set "QA_PARMS=default;planes2 GGML_VK_MMVQ_PLANES=2"
+if not defined QA_DARMS set "QA_DARMS=default;p2q80 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;p2q4k GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q4_K;p2q51 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q5_1"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
-if not defined EXACT_KARMS set "EXACT_KARMS=decode4 QA_ARM_UB=4;decode4p2 QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2;decode8p2 QA_ARM_UB=8 GGML_VK_MMVQ_PLANES=2"
+if not defined EXACT_KARMS set "EXACT_KARMS=p2q80 QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;p2q4k QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q4_K;p2q51 QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q5_1"
+if not defined RUN_CHECK set "RUN_CHECK=0"
 if not defined RUN_KLD set "RUN_KLD=0"
-if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined RUN_LONG set "RUN_LONG=0"
 goto :arms_done
 :arms_cuda
