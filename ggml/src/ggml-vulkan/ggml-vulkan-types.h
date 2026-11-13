@@ -1100,6 +1100,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_mm_f16reg[2];
     // the same matmul with the DSV4_HC_PRE that follows it in the store (MUL_MAT_DSV4_HC_PRE): [f16 activations][f16 streams]
     vk_pipeline pipeline_mm_f16reg_hcpre[2][2];
+    // the dense q8_0 MUL_MAT of 2-8 columns (the draft checks of decode) on the same shader with the tile of
+    // GGML_VK_MM_F16REG_VERIFY (16 tokens), f16 activations, in place of the int8 mat-vec (ggml_vk_fork_mm_f16reg_verify)
+    bool mm_f16reg_vfy = false;
+    bool mm_f16reg_vfy_lds = false;
+    std::array<uint32_t, 5> mm_f16reg_vfy_tile = {};
+    std::string mm_f16reg_vfy_name;
+    vk_pipeline pipeline_mm_f16reg_vfy;
     // the f16 copies of the activations these matmuls read, saturating (ggml_vk_fork_cpy_f16_sat)
     vk_pipeline pipeline_cpy_f32_f16_sat_fork, pipeline_contig_cpy_f32_f16_sat_fork;
     // <name>_Shared: buffers in the host memory the gpu reads in place, for tensor overrides (-ot)

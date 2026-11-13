@@ -48,10 +48,10 @@ if not defined DECARGS   set "DECARGS=-fit off -b 16384 -ub 4096"
 rem seconds of rest after a build or a long model run (COOL_RUN seconds, 300) before a timed run: the 395 runs warm
 rem (95 C in an hour of chats); the short arms of a profile at depth 0 go one after another
 if not defined COOL      set "COOL=120"
-if not defined CHECKOPS  set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;GATED_DELTA_NET_LAZY;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;MOE_GLU_F16_DOWN;MUL_MAT_HC_PRE;HC_MIX;HC_POST_MIX;MUL_MAT_ID_SCALE;MUL_MAT_F16_RANGE;MUL_MAT_ID_F16_RANGE"
+if not defined CHECKOPS  set "CHECKOPS=MUL_MAT;MUL_MAT_ID;MUL_MAT_ID_FUSION;MUL_MAT_FUSION;MUL_MAT_RELU;MUL_MAT_HEADSUM;TOP_K;TOPK_QSA;LIGHTNING_INDEXER;LIGHTNING_INDEXER_UNIT;GET_ROWS;GATED_DELTA_NET;GATED_DELTA_NET_CACHE_FUSION;DSV4_HC_PRE;DSV4_HC_POST;HC_POST_GATE;REPEAT;FLASH_ATTN_EXT n_kv_max=[1-9];RMS_NORM;RMS_NORM_SCALE;RMS_NORM_MUL_SIGMOID_MUL;SSM_CONV;CONCAT_SSM_CONV;MUL_MAT_ID_REPEAT;GATED_DELTA_NET_LAZY;FLASH_ATTN_LIST;DSV4_HC_PRE_F16;DSV4_HC_POST_NORM_F16;MOE_GLU_F16_DOWN;MUL_MAT_HC_PRE;HC_MIX;HC_POST_MIX;MUL_MAT_ID_SCALE;MUL_MAT_F16_RANGE;MUL_MAT_ID_F16_RANGE;MUL_MAT_VERIFY"
 rem int8: the int8 coopmat path of the experts, off by default (f16reg), checked as well; glu0: the fused gate/up of
 rem f16reg (and its f16 result into the down projection) on the short tests too, it runs from 2048 tokens
-if not defined CHECKARMS set "CHECKARMS=default;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_REPEAT,MUL_MAT_ID_FUSION,MUL_MAT_FUSION,MOE_GLU_F16_DOWN;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_FUSION,MOE_GLU_F16_DOWN"
+if not defined CHECKARMS set "CHECKARMS=default;int8 GGML_VK_MMID_F16REG=0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_ID,MUL_MAT_ID_REPEAT,MUL_MAT_ID_FUSION,MUL_MAT_FUSION,MOE_GLU_F16_DOWN;glu0 GGML_VK_MMID_GLU_MIN_TOKENS=0 @o=MUL_MAT_FUSION,MOE_GLU_F16_DOWN;vfy GGML_VK_MM_F16REG_VERIFY=1 @o=MUL_MAT,MUL_MAT_VERIFY,MUL_MAT_F16_RANGE"
 goto :defaults_done
 
 :cuda_defaults
@@ -76,6 +76,8 @@ rem test-elastic-buffer-fork fails when it tested no device (a skip must not cou
 if not defined TEST_ELASTIC_REQUIRE set "TEST_ELASTIC_REQUIRE=1"
 rem test-mmvq-planes-fork too on the vulkan machine when it ran no int8 mat-vec (the cuda build has no vulkan device)
 if /i "%BACKEND%"=="vulkan" if not defined TEST_MMVQ_PLANES_REQUIRE set "TEST_MMVQ_PLANES_REQUIRE=1"
+rem and its cases of the draft checks on the f16 coopmat tile of mul_mm_f16reg.comp (GGML_VK_MM_F16REG_VERIFY, 13.11)
+if /i "%BACKEND%"=="vulkan" if not defined TEST_MMVQ_VERIFY set "TEST_MMVQ_VERIFY=1"
 if not defined WARMUP set "WARMUP=0"
 if not defined GGML_ALLOC_PEAK set "GGML_ALLOC_PEAK=1"
 rem the vocabulary subset of the MTP head is on by default since 10.11 and takes its base from a counts file in the

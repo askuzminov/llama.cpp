@@ -11,19 +11,22 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 13.11 (README, run-all). the 395: two planes for which weight type (GGML_VK_MMVQ_PLANES_TYPES):
-rem 13.11 all types took the decode KLD against the exact math from 0.0311 to 0.0078 (f32 mat-vecs 0.0065), and the
-rem verify from 5.1 to 8.2 ms a token, TG -22%. 03 the GPU time of each op with two planes, 06 TG and 07-exact KLD
-rem with two planes for q8_0 (the dense matrices), q4_K (gate and up of the experts), q5_1 (their down) alone. 01, 07
-rem against upstream and 02 are off on the 395 (the default path did not change; 13.11 the PPL gap is upstream's
-rem own). the 3090: 01 after the fix of the row bound of the CUDA mat-vec with ids (MUL_MAT_ID n=1 m=37 failed in 4
-rem of 5 runs of 01: the rows past a slot went into the next one); 06, 07, 03 and 02 are off (03 answered 13.11: the
-rem reply 38.96-46.31 ms of GPU a token with the reports read per backend context). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy, dense, nofuse, radix0); on the 3090
-rem nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP head, -0.3%), m256, upmoe0 (-1.6%),
-rem upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and the guard refused 256 bytes: 512 MiB
-rem next to the expert cache is too little); 13.11 upmoe5/upmoe8 (the cache of upstream -20%/-10% TG in two runs) and
-rem the 07 split (copy = upstream bit for bit, the CPU: fork 1.9434 against upstream 1.9442); again (a second default)
-rem stays: the logits of default bit for bit
+rem the questions of 13.11 (README, run-all). the 395: the prototype of the draft checks on the f16 coopmat tile of
+rem mul_mm_f16reg.comp (GGML_VK_MM_F16REG_VERIFY: dense q8_0 of 2-8 columns, 1024 rows and more, f16 activations in
+rem place of the int8 mat-vec on q8_1): 05 its tiles against the int8 mat-vec and its two planes at 8 tokens (ms of the
+rem dense q8_0 of one verify step), 07-exact its decode KLD against the exact math (13.11: one plane 0.0311, q8_0 in two
+rem planes 0.0125, all types 0.0078, f32 mat-vecs 0.0065) alone (vfy) and with the smaller dense matrices in two planes
+rem (vfyp2), and the decode without drafts (decode1); 06 its TG; 01 its ops and unit cases, the spec probe with it. 03,
+rem 07 against upstream and 02 are off on the 395 (13.11 the
+rem PPL gap is upstream's own). the 3090: 01 after the fix of the row bound of the CUDA mat-vec with ids (MUL_MAT_ID
+rem n=1 m=37 failed in 4 of 5 runs of 01: the rows past a slot went into the next one; 13.11 16:57 1090/1090); 06,
+rem 07, 03 and 02 are off (03 answered 13.11: the reply 38.96-46.31 ms of GPU a token with the reports read per
+rem backend context). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
+rem dense, nofuse, radix0); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP
+rem head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and
+rem the guard refused 256 bytes: 512 MiB next to the expert cache is too little); 13.11 upmoe5/upmoe8 (the cache of
+rem upstream -20%/-10% TG in two runs) and the 07 split (copy = upstream bit for bit, the CPU: fork 1.9434 against
+rem upstream 1.9442); again (a second default) stays: the logits of default bit for bit
 if not defined QA_PAR_ARMS set "QA_PAR_ARMS=default;rows0 LLAMA_QSA_ROWS=0"
 rem the decode tasks with a long prompt (about 24K tokens) and a short reply: the prompt speed of each variant too
 if not defined QA_DEC_SET set "QA_DEC_SET=prose ru code-py code-cpp edit json long"
@@ -32,12 +35,17 @@ if not defined LONG_QARMS set "LONG_QARMS=default"
 rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
 if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
-if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1;planes2 GGML_VK_MMVQ_PLANES=2"
-if not defined QA_PARMS set "QA_PARMS=default;planes2 GGML_VK_MMVQ_PLANES=2"
-if not defined QA_DARMS set "QA_DARMS=default;p2q80 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;p2q4k GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q4_K;p2q51 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q5_1"
+if not defined QA_QARMS set "QA_QARMS=default"
+if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default;vfy GGML_VK_MM_F16REG_VERIFY=1"
+if not defined QA_PARMS set "QA_PARMS=default"
+if not defined QA_DARMS set "QA_DARMS=default;vfy GGML_VK_MM_F16REG_VERIFY=1;vfyp2 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0"
+rem 05: the tiles of 16 tokens, all shapes through them (_MIN_M=1), the int8 mat-vec and its two planes; 8 tokens
+if not defined RUN_MM set "RUN_MM=1"
+if not defined QA_MM_N set "QA_MM_N=8"
+if not defined QA_MMARMS set "QA_MMARMS=mmvq;p2q80 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;r16x16-8 GGML_VK_MM_F16REG_VERIFY=r16x16/8x1 GGML_VK_MM_F16REG_VERIFY_MIN_M=1;r16x16-4 GGML_VK_MM_F16REG_VERIFY=r16x16/4x1 GGML_VK_MM_F16REG_VERIFY_MIN_M=1;r32x16-4 GGML_VK_MM_F16REG_VERIFY=r32x16/4x1 GGML_VK_MM_F16REG_VERIFY_MIN_M=1;l16x16-8 GGML_VK_MM_F16REG_VERIFY=l16x16/8x1 GGML_VK_MM_F16REG_VERIFY_MIN_M=1"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
-if not defined EXACT_KARMS set "EXACT_KARMS=p2q80 QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0;p2q4k QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q4_K;p2q51 QA_ARM_UB=4 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q5_1"
-if not defined RUN_CHECK set "RUN_CHECK=0"
+if not defined EXACT_KARMS set "EXACT_KARMS=decode1 QA_ARM_UB=1;vfy QA_ARM_UB=4 GGML_VK_MM_F16REG_VERIFY=1;vfyp2 QA_ARM_UB=4 GGML_VK_MM_F16REG_VERIFY=1 GGML_VK_MMVQ_PLANES=2 GGML_VK_MMVQ_PLANES_TYPES=q8_0"
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined RUN_KLD set "RUN_KLD=0"
 if not defined RUN_LONG set "RUN_LONG=0"
 goto :arms_done
@@ -53,6 +61,8 @@ if not defined RUN_LONG set "RUN_LONG=0"
 rem the CUDA matmuls have no f32 mode: 07 against the exact base runs on the 395 only
 if not defined RUN_EXACT set "RUN_EXACT=0"
 :arms_done
+rem 05-mm (the dense q8_0 matmuls by tile) only where a section above or _local.bat asks (RUN_MM=1)
+if not defined RUN_MM set "RUN_MM=0"
 
 for %%v in (BUILD MICRO CHECK DECODE PROFILE KLD EXACT LONG) do if not defined RUN_%%v set "RUN_%%v=1"
 rem the upstream build is the base of 07 against upstream
@@ -61,6 +71,7 @@ set "STEPS="
 if "%RUN_BUILD%"=="1"    set "STEPS=!STEPS! 00-build"
 if "%RUN_UPSTREAM%"=="1" set "STEPS=!STEPS! 00-upstream"
 if "%RUN_MICRO%"=="1"    set "STEPS=!STEPS! 04-micro"
+if "%RUN_MM%"=="1"       set "STEPS=!STEPS! 05-mm"
 if "%RUN_CHECK%"=="1"    set "STEPS=!STEPS! 01-check"
 if "%RUN_DECODE%"=="1"   set "STEPS=!STEPS! 06-decode"
 if "%RUN_PROFILE%"=="1"  set "STEPS=!STEPS! 03-profile"

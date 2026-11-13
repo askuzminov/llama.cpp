@@ -94,6 +94,18 @@ struct test_mul_mat_f16_range : public test_mul_mat {
     }
 };
 
+// the dense q8_0 matmuls of the draft checks (2-8 columns of 1024 rows and more): on Vulkan the f16 coopmat tile of
+// GGML_VK_MM_F16REG_VERIFY when it is set, else the int8 mat-vec; its own name for CHECKOPS and -o
+struct test_mul_mat_verify : public test_mul_mat {
+    test_mul_mat_verify(ggml_type type_b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(GGML_TYPE_Q8_0, type_b, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VERIFY";
+    }
+};
+
 struct test_mul_mat_id_f16_range : public test_mul_mat_id {
     test_mul_mat_id_f16_range(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
         : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k) {}
@@ -1057,6 +1069,18 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
     // tile (K above), MUL_MAT_ID through the conversion in the tile
     test_cases.emplace_back(new test_mul_mat_f16_range(GGML_TYPE_Q8_0, 512, 129, 256));
     test_cases.emplace_back(new test_mul_mat_f16_range(GGML_TYPE_Q8_0, 512, 129, 4160));
+    // the same range through the f16 copy of the draft checks (GGML_VK_MM_F16REG_VERIFY)
+    test_cases.emplace_back(new test_mul_mat_f16_range(GGML_TYPE_Q8_0, 1024, 4, 256));
+    // the draft checks: 2-8 columns over the 16 tokens of the tile, rows across the tile (1040), K of one stage (64), of
+    // five (320), a short (640), qwen4exp's 2560 and a long one (6144); f16 activations read in place
+    for (int64_t n : {2, 3, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat_verify(GGML_TYPE_F32, 1024, n, 2560));
+    }
+    test_cases.emplace_back(new test_mul_mat_verify(GGML_TYPE_F32, 1040, 4, 64));
+    test_cases.emplace_back(new test_mul_mat_verify(GGML_TYPE_F32, 2560, 8, 6144));
+    test_cases.emplace_back(new test_mul_mat_verify(GGML_TYPE_F32, 4096, 7, 320));
+    test_cases.emplace_back(new test_mul_mat_verify(GGML_TYPE_F32, 2560, 6, 640));
+    test_cases.emplace_back(new test_mul_mat_verify(GGML_TYPE_F16, 1024, 4, 2560));
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_mul_mat_id_f16_range(type_a, 4, 4, 256, 256, 256));
     }
@@ -1379,6 +1403,17 @@ static void make_test_cases_eval_fork(std::vector<std::unique_ptr<test_case>> & 
 }
 
 static void make_test_cases_perf_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // qwen4exp decode: the dense q8_0 mat-vecs of one token and of the draft checks (2, 4, 8 tokens), every shape of the
+    // verify step (03, 13.11), the lm head included; the hc down of f16 streams too (LLAMA_HC_F16). 05-mm with QA_MM_N
+    // = 1, 2, 4 or 8 compares the int8 mat-vec, its two planes and the verify tile of mul_mm_f16reg.comp
+    for (int64_t n : {1, 2, 4, 8}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {2560, 6144}, {10240, 320}, {248320, 2560},
+                                                                      {6144, 2560}, {320, 10240}, {12288, 2560}, {640, 2560}, {2560, 640}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240, {1, 1}, {1, 1}));
+    }
+
     // qwen4exp prefill: the hyper-connection down projection [hc*n_embd] -> [hc_lr] (m 320, k 10240) at four
     // ubatch sizes, and q8_0 neighbours of the same graph to tell which of m, k and n makes it slow
     for (int64_t n : {512, 1024, 2048, 4096}) {

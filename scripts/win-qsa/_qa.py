@@ -1554,7 +1554,9 @@ def cmd_check():
             run.add("", f"ckpt: FAIL {e}")
     if env("QA_CHECK_SPEC", "1") != "0":
         try:
-            spec_probe(run, model_path(), env_int("QA_PORT", 8097))
+            # QA_SPEC_ARMS: variants of the probe ("name VAR=value ...;..."), the server of each with its environment
+            for arm_name, arm_env in variants("QA_SPEC_ARMS", "default"):
+                spec_probe(run, model_path(), env_int("QA_PORT", 8097), arm_name, arm_env)
         except Skip as e:
             run.add("", f"spec: skipped, {e}")
         except Fail as e:
@@ -1877,6 +1879,26 @@ def spec_completion(url, body):
     return r
 
 
+def aligned_probs(tokens, cps):
+    """the top_logprobs of each emitted token in order, None where the server gave none. llama-server writes a probability
+    entry only for a token after which the text is whole UTF-8 (process_token: add_token under !incomplete), while
+    return_tokens lists every token: the entry of a token that leaves a character unfinished (a dash, an accent, CJK in
+    byte pieces) is missing, and a zip of the two lists paired every later token with the distribution of the next
+    position (before 13.11: the PIT mean of the probe without drafts 0.502-0.522 in all 11 runs on both machines, and
+    the margins of the greedy part from a wrong position once such a character came before the first other token).
+    Each entry holds its own token (id) and its distribution; a token gets the next entry with its id"""
+    out = [None] * len(tokens)
+    j = 0
+    for c in cps:
+        while j < len(tokens) and tokens[j] != c["id"]:
+            j += 1
+        if j >= len(tokens):
+            break
+        out[j] = c["top_logprobs"]
+        j += 1
+    return out
+
+
 def logprob_of(top, tok):
     """the logprob of token tok in a list of top_logprobs, None when the list lacks it"""
     return next((e["logprob"] for e in top if e["id"] == tok), None)
@@ -1907,20 +1929,22 @@ def spec_greedy(url, prompts, n_predict, n_probs):
         base = spec_completion(url, dict(body, **{"speculative.n_max": 0}))
         spec = spec_completion(url, body)
         a, b = base["tokens"], spec["tokens"]
-        pa = [x["top_logprobs"] for x in base["completion_probabilities"]]
-        pb = [x["top_logprobs"] for x in spec["completion_probabilities"]]
+        # by token, None where the server wrote no entry (aligned_probs)
+        pa = aligned_probs(a, base["completion_probabilities"])
+        pb = aligned_probs(b, spec["completion_probabilities"])
         first = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), None)
         if first is None and len(a) != len(b):
             first = min(len(a), len(b))
         margin = spec_gap = None
-        if first is not None and first < len(pa):
-            margin, spec_gap = gap_shift(pa[first], pb[first] if first < len(pb) else [])
+        if first is not None and first < len(pa) and pa[first]:
+            margin, spec_gap = gap_shift(pa[first], (pb[first] if first < len(pb) else None) or [])
             if margin is None:
                 margin = float("inf")
-        end = min(len(pa), len(pb), len(a), len(b), len(a) if first is None else first)
-        shifts = [g[0] - g[1] for g in (gap_shift(pa[k], pb[k]) for k in range(end)) if g[0] is not None and g[1] is not None]
-        not_greedy = [k for k in range(min(len(b), len(pb), end + 1)) if pb[k] and pb[k][0]["id"] != b[k]]
-        base_not_greedy = [k for k in range(min(len(a), len(pa))) if pa[k] and pa[k][0]["id"] != a[k]]
+        end = min(len(a), len(b), len(a) if first is None else first)
+        shifts = [g[0] - g[1] for g in (gap_shift(pa[k], pb[k]) for k in range(end) if pa[k] and pb[k])
+                  if g[0] is not None and g[1] is not None]
+        not_greedy = [k for k in range(min(len(b), end + 1)) if pb[k] and pb[k][0]["id"] != b[k]]
+        base_not_greedy = [k for k in range(len(a)) if pa[k] and pa[k][0]["id"] != a[k]]
         t = spec["timings"]
         rows.append({"prompt": i, "n": len(a), "same": len(a) if first is None else first, "margin": margin,
                      "spec_gap": spec_gap, "shift_max": max((abs(x) for x in shifts), default=None),
@@ -1942,7 +1966,9 @@ def spec_pit(url, prompts, n_predict, n_probs, seed):
             r = spec_completion(url, {"prompt": text, "n_predict": n_predict, "temperature": 1.0, "samplers": ["temperature"],
                                       "n_probs": n_probs, "return_tokens": True, "cache_prompt": True, "seed": seed + i,
                                       **extra})
-            v, o = pit_values(r["tokens"], [x["top_logprobs"] for x in r["completion_probabilities"]], rng)
+            # each entry with its own token: the tokens without one (aligned_probs) are left out
+            cps = r["completion_probabilities"]
+            v, o = pit_values([x["id"] for x in cps], [x["top_logprobs"] for x in cps], rng)
             values += v
             outside += o
             n_tok += len(r["tokens"])
@@ -1982,9 +2008,12 @@ def spec_flags(greedy, pit):
     return flags
 
 
-def spec_probe(run, model, port):
+def spec_probe(run, model, port, arm_name="default", arm_env=None):
     """the speculative decoding of the server as serve.bat runs it (SPECDRAFT, QA_SPEC): greedy tokens with and without
-    drafts, and the calibration of sampled tokens with and without them (spec_greedy, spec_pit, spec_flags)"""
+    drafts, and the calibration of sampled tokens with and without them (spec_greedy, spec_pit, spec_flags); arm_env:
+    the environment of a variant (QA_SPEC_ARMS)"""
+    run_env = dict(os.environ, **(arm_env or {}))
+    label = "" if arm_name == "default" else f" {arm_name}"
     if not env("SPECDRAFT") or env("QA_SPEC", "--spec-auto") == "none":
         raise Skip("no MTP head (SPECDRAFT) or QA_SPEC=none")
     exe = binary("llama-server")
@@ -1993,13 +2022,13 @@ def spec_probe(run, model, port):
     n_greedy, n_tokens, n_probs = env_int("QA_SPEC_GREEDY", 64), env_int("QA_SPEC_TOKENS", 2048), env_int("QA_SPEC_PROBS", 20)
     prompts = spec_prompts(env_int("QA_SPEC_PROMPTS", 4), env_int("QA_SPEC_CHARS", 4000))
     identity = {"v": VERSION, "kind": "spec", "build": build_id(exe.parent), "args": args, "model": model_identity(model),
-                "draft": model_identity(Path(env("SPECDRAFT"))), "env": env_identity(os.environ),
+                "draft": model_identity(Path(env("SPECDRAFT"))), "env": env_identity(run_env),
                 "prompts": text_digest("\n".join(prompts)), "greedy": n_greedy, "tokens": n_tokens, "probs": n_probs,
-                "greedy_probs": n_probs,
+                "greedy_probs": n_probs, "aligned": 1,
                 "machine": machine()}
 
     def go(log):
-        proc, log = start_server(exe, args, os.environ.copy(), log)
+        proc, log = start_server(exe, args, run_env.copy(), log)
         try:
             url = f"http://127.0.0.1:{port}"
             return {"greedy": spec_greedy(url, prompts, n_greedy, n_probs), "pit": spec_pit(url, prompts, n_tokens, n_probs, 1000)}
@@ -2008,13 +2037,13 @@ def spec_probe(run, model, port):
             proc.wait()
             mark_end()
 
-    r, kept = run.measure("spec", identity, go)
+    r, kept = run.measure("spec" + label, identity, go)
     k = " k" if kept else ""
     flags = spec_flags(r["greedy"], r["pit"])
     def nats(x):
         return "-" if x is None else f"{x:.2f}"
 
-    run.add("", f"spec: temperature 0, {n_greedy} tokens of {len(prompts)} prompts with and without drafts: the same "
+    run.add("", f"spec{label}: temperature 0, {n_greedy} tokens of {len(prompts)} prompts with and without drafts: the same "
                 f"tokens up to the first other one; margin - the gap of the top two tokens there without drafts (nats), "
                 f"with drafts - the gap of the same two tokens in the verify path (below 0: it takes the second); shift "
                 f"before - the largest change of that gap at the tokens before it (the same context, the rounding of the "
@@ -2022,7 +2051,7 @@ def spec_probe(run, model, port):
             *table(["prompt", "same", "margin", "with drafts", "shift before", "drafted", "accepted"],
                    [[g["prompt"], f"{g['same']}/{g['n']}", nats(g["margin"]), nats(g.get("spec_gap")),
                      nats(g.get("shift_max")), g["draft_n"], g["draft_acc"]] for g in r["greedy"]]))
-    run.add("", f"spec: temperature 1 (the temperature alone), {n_tokens} tokens of each prompt: the probability integral "
+    run.add("", f"spec{label}: temperature 1 (the temperature alone), {n_tokens} tokens of each prompt: the probability integral "
                 f"transform of every token under the distribution it was drawn from, uniform when they follow it" + k,
             *table(["", "tokens", "chi2 (19)", "p", "mean (0.5)", "p", "outside", "drafted", "accepted"],
                    [[name, a["tokens"], "-" if a["chi2"] is None else f"{a['chi2']:.1f}",
@@ -2031,8 +2060,8 @@ def spec_probe(run, model, port):
                      a["outside"], a["draft_n"], a["draft_acc"]] for name, a in r["pit"].items()]))
     if flags:
         run.failed = True
-        run.add("spec: " + "; ".join(flags))
-    run.record("check", "spec", {"greedy_same": sum(g["same"] for g in r["greedy"]) / max(1, sum(g["n"] for g in r["greedy"])),
+        run.add(f"spec{label}: " + "; ".join(flags))
+    run.record("check", "spec" + label, {"greedy_same": sum(g["same"] for g in r["greedy"]) / max(1, sum(g["n"] for g in r["greedy"])),
                "pit_p_spec": r["pit"]["spec"]["p"], "pit_p_nospec": r["pit"]["nospec"]["p"],
                "pit_mean_spec": r["pit"]["spec"]["mean"],
                "accept": r["pit"]["spec"]["draft_acc"] / max(1, r["pit"]["spec"]["draft_n"])}, kept, exe.parent)
@@ -3460,8 +3489,26 @@ def cmd_mm():
                     ms += c * us / 1000.0
                 total.append(f"{ms:.0f}" if ms is not None else "")
             rows.append(["ubatch ms (31.10 counts)", *total])
-        run.add("", f"TFLOP/s at {n_tok} tokens (* best of the shape); the last row: ms of the dense q8_0 matmuls of a "
-                    f"4096-token ubatch of qwen4exp", *table(["shape", *names], rows))
+        # the dense q8_0 mat-vecs of one verify step of qwen4exp (03 of the 395, 13.11: verify of 8 tokens at 252K; the hc
+        # down reads f16 streams): their time at QA_MM_N = 1-8 tokens
+        vcounts = {(10240, 2560): 37, (2560, 6144): 48, (10240, 320): 97, (248320, 2560): 1, (6144, 2560): 36,
+                   (320, 10240): 97, (12288, 2560): 12, (640, 2560): 96, (2560, 640): 48}
+        if n_tok in ("1", "2", "4", "8"):
+            total = []
+            for a in names:
+                ms = 0.0
+                for (mm_, k), c in vcounts.items():
+                    us = perf_us.get(("f16", mm_, k), {}).get(a) if (mm_, k) == (320, 10240) else None
+                    us = us if us is not None else perf_us.get(("f32", mm_, k), {}).get(a)
+                    if us is None:
+                        ms = None
+                        break
+                    ms += c * us / 1000.0
+                total.append(f"{ms:.2f}" if ms is not None else "")
+            rows.append([f"verify step ms ({n_tok} tokens, 13.11 counts)", *total])
+        unit = "the last row: ms of the dense q8_0 matmuls of a 4096-token ubatch of qwen4exp" if n_tok == "4096" else \
+               "the last row: ms of the dense q8_0 mat-vecs of one verify step of qwen4exp"
+        run.add("", f"TFLOP/s at {n_tok} tokens (* best of the shape); {unit}", *table(["shape", *names], rows))
     if stat_rows:
         run.add("", "pipeline statistics of the driver", *table(["variant", "pipeline", "statistics"], stat_rows))
     return run.finish()

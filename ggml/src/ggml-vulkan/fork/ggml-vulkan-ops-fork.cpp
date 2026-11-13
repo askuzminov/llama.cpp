@@ -233,6 +233,34 @@ static bool ggml_vk_fork_tensor_buffer(const ggml_backend_vk_context * ctx, cons
     return true;
 }
 
+// the f32 activations src1 (contiguous, at b) as f16 in prealloc_y through the saturating copy, once for the matmuls in a
+// row that read the same tensor (the cached pipeline and tensor of prealloc_y); b becomes the copy
+static bool ggml_vk_fork_f16reg_copy_b(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src1, vk_subbuffer & b) {
+    vk_pipeline cpy = ggml_vk_fork_cpy_f16_sat(ctx, src1, nullptr);
+    if (!cpy) {
+        return false;
+    }
+    const size_t y_sz = sizeof(ggml_fp16_t) * (size_t) ggml_nelements(src1);
+    if (ctx->prealloc_size_y < y_sz) {
+        ctx->prealloc_size_y = y_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, cpy, 1);
+    if (ctx->prealloc_y_last_pipeline_used != cpy.get() || ctx->prealloc_y_last_tensor_used != src1 || ctx->prealloc_y_last_k_padded) {
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_cpy_to_contiguous(ctx, subctx, cpy, src1, b, ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0));
+        ctx->prealloc_y_last_pipeline_used = cpy.get();
+        ctx->prealloc_y_last_tensor_used   = src1;
+        ctx->prealloc_y_last_k_padded      = false;
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+    b = vk_subbuffer{ ctx->prealloc_y, 0, y_sz };
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}
+
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): f16 activations, f32 ones of K <= 4096 through an
 // f16 copy, longer ones read in place; from GGML_VK_MM_F16REG_MIN_N tokens (64) and GGML_VK_MM_F16REG_MIN_M rows (512)
 // (and K 1024 for f32 read in place), 2D, K a multiple of 64 (a block pair of a row on a word), the activations on 16
@@ -306,29 +334,8 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
     if (check_only) {
         return true;
     }
-    if (to_f16) {
-        vk_pipeline cpy = ggml_vk_fork_cpy_f16_sat(ctx, src1, nullptr);
-        if (!cpy) {
-            return false;
-        }
-        const size_t y_sz = sizeof(ggml_fp16_t) * (size_t) ggml_nelements(src1);
-        if (ctx->prealloc_size_y < y_sz) {
-            ctx->prealloc_size_y = y_sz;
-            ggml_vk_preallocate_buffers(ctx, subctx);
-        }
-        ggml_pipeline_request_descriptor_sets(ctx, cpy, 1);
-        if (ctx->prealloc_y_last_pipeline_used != cpy.get() || ctx->prealloc_y_last_tensor_used != src1 || ctx->prealloc_y_last_k_padded) {
-            if (ctx->prealloc_y_need_sync) {
-                ggml_vk_sync_buffers(ctx, subctx);
-            }
-            ggml_vk_cpy_to_contiguous(ctx, subctx, cpy, src1, b, ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0));
-            ctx->prealloc_y_last_pipeline_used = cpy.get();
-            ctx->prealloc_y_last_tensor_used   = src1;
-            ctx->prealloc_y_last_k_padded      = false;
-        }
-        ggml_vk_sync_buffers(ctx, subctx);
-        b = vk_subbuffer{ ctx->prealloc_y, 0, y_sz };
-        ctx->prealloc_y_need_sync = true;
+    if (to_f16 && !ggml_vk_fork_f16reg_copy_b(ctx, subctx, src1, b)) {
+        return false;
     }
 
     vk_mat_mat_push_constants pc = {};
@@ -370,6 +377,77 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, x }, hpc, { (uint32_t) M, (uint32_t) N, 1 });
         return true;
     }
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { (uint32_t) M, (uint32_t) N, 1 });
+    return true;
+}
+
+// MUL_MAT of q8_0 weights over 2-8 columns (the draft checks of decode) on mul_mm_f16reg.comp with the tile of
+// GGML_VK_MM_F16REG_VERIFY (16 tokens: the columns past N are computed on the last one and not stored), f16 activations
+// (f32 ones through the f16 copy at any K, N x K halves), in place of the int8 mat-vec on q8_1 activations. From
+// GGML_VK_MM_F16REG_VERIFY_MIN_M rows (1024): the tile has no split over K, so a few rows over a long K leave few
+// workgroups (the hc down of qwen4exp, 320 x 10240). Nothing fused into the matmul (ggml_vk_mul_mat asks without fused ops)
+bool ggml_vk_fork_mm_f16reg_verify(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
+                                   const ggml_tensor * src1, const ggml_tensor * dst, bool check_only) {
+    const vk_device & device = ctx->device;
+    if (!device->mm_f16reg_vfy || !device->pipeline_mm_f16reg_vfy || src0->type != GGML_TYPE_Q8_0 ||
+        (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    static const int64_t min_m = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_MIN_M"); return e ? (int64_t) atoll(e) : (int64_t) 1024; }();
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+    const int64_t N = src1->ne[1];
+    if (N < 2 || N > (int64_t) mul_mat_vec_max_cols || M < std::max<int64_t>(16, min_m) || K < 64 || K % 64 != 0 ||
+        src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    const size_t qs = ggml_type_size(src0->type);
+    const bool   to_f16 = src1->type == GGML_TYPE_F32;
+    if (src0->nb[0] != qs || src0->nb[1] % (2 * qs) != 0 || (!to_f16 && src1->nb[1] % 16 != 0) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const uint64_t range = device->properties.limits.maxStorageBufferRange;
+    if (ggml_nbytes(src0) > range || ggml_nbytes(src1) > range || ggml_nbytes(dst) > range) {
+        return false;
+    }
+    vk_pipeline pipeline = device->pipeline_mm_f16reg_vfy;
+    vk_subbuffer a, b, d;
+    if (!ggml_vk_fork_tensor_buffer(ctx, src0, 4, a) || !ggml_vk_fork_tensor_buffer(ctx, src1, to_f16 ? 4 : 16, b) ||
+        !ggml_vk_fork_tensor_buffer(ctx, dst, 4, d) || (to_f16 && !ggml_vk_fork_cpy_f16_sat(ctx, src1, nullptr))) {
+        return false;
+    }
+    if (check_only) {
+        return true;
+    }
+    if (to_f16 && !ggml_vk_fork_f16reg_copy_b(ctx, subctx, src1, b)) {
+        GGML_ABORT("ggml_vk_fork_mm_f16reg_verify: no f16 copy of %s", src1->name);
+    }
+
+    vk_mat_mat_push_constants pc = {};
+    pc.M           = (uint32_t) M;
+    pc.N           = (uint32_t) N;
+    pc.K           = (uint32_t) K;
+    pc.stride_a    = (uint32_t) (src0->nb[1] / qs * ggml_blck_size(src0->type));
+    pc.stride_b    = to_f16 ? (uint32_t) K : (uint32_t) (src1->nb[1] / ggml_type_size(src1->type));
+    pc.stride_d    = (uint32_t) (dst->nb[1] / sizeof(float));
+    pc.num_batches = 1;
+    pc.k_split     = (uint32_t) K;
+    pc.ne02        = 1;
+    pc.ne12        = 1;
+    pc.broadcast2  = 1;
+    pc.broadcast3  = 1;
+    pc.padded_N    = (uint32_t) N;
+
+    // the first use, every one with GGML_VK_MM_F16REG_LOG=1 (test-mmvq-planes-fork --verify looks for it)
+    static const bool log_all = getenv("GGML_VK_MM_F16REG_LOG") != nullptr;
+    static bool logged = false;
+    if (!logged || log_all) {
+        logged = true;
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 %ld x %ld x %ld on %s\n", (long) M, (long) N, (long) K, pipeline->name.c_str());
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { (uint32_t) M, (uint32_t) N, 1 });
     return true;
 }

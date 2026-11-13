@@ -34,6 +34,11 @@ set_tests_properties(test-mmvq-planes-fork-1 PROPERTIES SKIP_REGULAR_EXPRESSION 
 # two planes for some weight types only (GGML_VK_MMVQ_PLANES_TYPES), the others one
 llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-types ARGS --planes 2 --types q5_1,q8_0)
 set_tests_properties(test-mmvq-planes-fork-types PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED")
+# the dense q8_0 of the draft checks on the f16 coopmat tile of mul_mm_f16reg.comp (GGML_VK_MM_F16REG_VERIFY), emulated
+# here so that devices without coopmat run it too
+llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-verify ARGS --planes 1 --verify r16x16/8x1)
+set_tests_properties(test-mmvq-planes-fork-verify PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED"
+                     ENVIRONMENT "GGML_VK_MM_F16REG=r16x96/8x1;GGML_VK_MM_F16REG_EMULATE=1")
 
 # the qwen4exp indexer timed on one device at the shapes of the model (lightning indexer, the head matmul of the Vulkan
 # graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines

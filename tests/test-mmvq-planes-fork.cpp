@@ -12,11 +12,18 @@
 //   --types: GGML_VK_MMVQ_PLANES_TYPES, the weight types of two planes (comma-separated names); the others then must
 //            show one plane
 //   --dump: the outputs of the device, all cases in a row as floats (two builds compared byte for byte)
+//   --verify <tile>: GGML_VK_MM_F16REG_VERIFY, the dense q8_0 of 2-8 columns (1024 rows and more) on the f16 coopmat tile
+//            of mul_mm_f16reg.comp: those cases must run there (its log line) and match weights and activations
+//            rounded to f16 (the shader decodes q8_0 to f16(d * q), the activations through a saturating f16 copy);
+//            on a device without coopmat with GGML_VK_MM_F16REG=<tile> GGML_VK_MM_F16REG_EMULATE=1; TEST_MMVQ_VERIFY=<tile>
+//            does the same
 // TEST_MMVQ_PLANES_REQUIRE=1: a skip (no Vulkan device, no int8 mat-vec) fails (01-check on the 395)
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+
+#include <mutex>
 
 #include <algorithm>
 #include <cctype>
@@ -30,6 +37,27 @@
 
 static int    n_fail = 0;
 static FILE * g_dump = nullptr;
+
+// the log of the backends (--verify: the line of each dispatch of the verify tile)
+static std::mutex  g_log_mutex;
+static std::string g_log;
+
+static void log_cb(ggml_log_level level, const char * text, void * /*user_data*/) {
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        g_log += text;
+    }
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        fputs(text, stderr);
+    }
+}
+
+// the planes argument of the f16 coopmat tile of the draft checks: weights and activations rounded to f16
+static constexpr int PLANES_F16 = 16;
+
+static float f16_round(float v) {
+    return ggml_fp16_to_fp32(ggml_fp32_to_fp16(std::min(65504.0f, std::max(-65504.0f, v))));
+}
 
 static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
@@ -59,6 +87,12 @@ static void fill_x(std::vector<float> & x, std::mt19937 & rng) {
 // d * q1 + d / 128 * q2
 static std::vector<float> planes_of(const std::vector<float> & x, int planes) {
     std::vector<float> r(x.size());
+    if (planes == PLANES_F16) {
+        for (size_t i = 0; i < x.size(); ++i) {
+            r[i] = f16_round(x[i]);
+        }
+        return r;
+    }
     for (size_t b = 0; b < x.size(); b += 32) {
         float amax = 0.0f;
         for (size_t i = b; i < b + 32; ++i) {
@@ -123,6 +157,14 @@ static result run(ggml_backend_t backend, int planes, ggml_type type, int64_t k,
         ggml_get_type_traits(type)->to_float(wq.data(), wf.data(), k*m*ne);
         ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
     }
+    // the f16 tile computes with f16(d * q)
+    std::vector<float> wp;
+    if (planes == PLANES_F16) {
+        wp.resize(wf.size());
+        for (size_t i = 0; i < wf.size(); ++i) {
+            wp[i] = f16_round(wf[i]);
+        }
+    }
     std::vector<float> xf(k*n);
     fill_x(xf, rng);
     const std::vector<float> xp = planes_of(xf, planes);
@@ -157,13 +199,14 @@ static result run(ggml_backend_t backend, int planes, ggml_type type, int64_t k,
                 const int64_t e = id ? idv[t*n_used + s] : 0;
                 for (int64_t i = 0; i < m; ++i) {
                     const float * wr = wf.data() + (e*m + i)*k;
+                    const float * wq = wp.empty() ? wr : wp.data() + (e*m + i)*k;
                     const float * xr = xf.data() + t*k;
                     const float * pr = xp.data() + t*k;
                     double acc = 0.0;
                     double acp = 0.0;
                     for (int64_t j = 0; j < k; ++j) {
                         acc += (double) wr[j] * (double) xr[j];
-                        acp += (double) wr[j] * (double) pr[j];
+                        acp += (double) wq[j] * (double) pr[j];
                     }
                     const double v = yf[(t*n_slot + s)*m + i];
                     err += (v - acc)*(v - acc);
@@ -186,11 +229,14 @@ int main(int argc, char ** argv) {
     int          planes   = 2;
     const char * dev_name = nullptr;
     std::string  types;
+    const char * verify   = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--planes") == 0 && i + 1 < argc) {
             planes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--types") == 0 && i + 1 < argc) {
             types = argv[++i];
+        } else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc) {
+            verify = argv[++i];
         } else if ((strcmp(argv[i], "-dev") == 0 || strcmp(argv[i], "--device") == 0) && i + 1 < argc) {
             dev_name = argv[++i];
         } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
@@ -200,8 +246,15 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         } else {
-            fprintf(stderr, "usage: %s [--planes 1|2] [--types <list>] [-dev <Vulkan device>] [--dump <file>]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--planes 1|2] [--types <list>] [--verify <tile>] [-dev <Vulkan device>] [--dump <file>]\n", argv[0]);
             return 1;
+        }
+    }
+    // TEST_MMVQ_VERIFY=<tile> as --verify (01-check runs the unit without arguments)
+    if (verify == nullptr) {
+        const char * e = getenv("TEST_MMVQ_VERIFY");
+        if (e != nullptr && *e != 0 && strcmp(e, "0") != 0) {
+            verify = e;
         }
     }
     if (planes != 1 && planes != 2) {
@@ -233,6 +286,11 @@ int main(int argc, char ** argv) {
     if (getenv("GGML_VK_MMV_ID_FORK") == nullptr) {
         set_env("GGML_VK_MMV_ID_FORK", "2");
     }
+    if (verify != nullptr) {
+        set_env("GGML_VK_MM_F16REG_VERIFY", verify);
+        set_env("GGML_VK_MM_F16REG_LOG", "1");
+    }
+    ggml_log_set(log_cb, nullptr);
 
     ggml_backend_load_all();
 
@@ -317,6 +375,46 @@ int main(int argc, char ** argv) {
         for (int64_t n : { 1, 2, 4, 8 }) {
             check("MUL_MAT_ID", type, k, 96, n, 16, 4);
         }
+    }
+
+    if (verify != nullptr) {
+        // the dense q8_0 of the draft checks on the f16 coopmat tile: each case must log its dispatch on that tile
+        printf("%s: the draft checks on the tile %s, weights and activations in f16: NMSE of the device over that of "
+               "the rounding in (%.2f, %.2f)\n", argv[0], verify, lo, hi(2));
+        auto check_verify = [&](int64_t k, int64_t m, int64_t n) {
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                g_log.clear();
+            }
+            const result r = run(backend, PLANES_F16, GGML_TYPE_Q8_0, k, m, n, 0, 0, rng);
+            bool used = false;
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                used = g_log.find("_vfy") != std::string::npos;
+            }
+            if (!r.ran) {
+                printf("  MUL_MAT    q8_0   m %5lld k %5lld n %lld: not supported\n", (long long) m, (long long) k, (long long) n);
+                n_fail++;
+                return;
+            }
+            const double ratio = r.sim > 0.0 ? r.nmse / r.sim : 0.0;
+            const bool   ok    = used && ratio > lo && ratio < hi(2);
+            printf("  MUL_MAT    q8_0   m %5lld k %5lld n %lld, f16 tile: NMSE %.3e, of the rounding %.3e, ratio %.3f%s\n",
+                   (long long) m, (long long) k, (long long) n, r.nmse, r.sim, ratio,
+                   !used ? "  <- not on the verify tile" : ok ? "" : "  <- outside the range");
+            n_ran++;
+            worst = std::max(worst, r.nmse);
+            if (!ok) {
+                n_fail++;
+            }
+        };
+        for (int64_t n : { 2, 3, 5, 8 }) {
+            check_verify(2560, 1024, n);
+        }
+        check_verify(6144, 2560, 8);
+        check_verify(320, 4096, 7);
+        check_verify(640, 2560, 3);
+        check_verify(64, 1040, 4);
     }
 
     ggml_backend_free(backend);

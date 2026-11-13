@@ -278,6 +278,10 @@ bool ggml_vk_fork_mmv_id(ggml_backend_vk_context * ctx, vk_context & subctx, con
 // MUL_MAT of q8_0 weights on mul_mm_f16reg.comp (GGML_VK_MM_F16REG): dispatches it and returns true, false for the
 // upstream path (off, a fused op, another type or shape). hc_pre: the gated DSV4_HC_PRE after it takes the store
 // (MUL_MAT_DSV4_HC_PRE); check_only: the answer without a dispatch
+// the dense q8_0 MUL_MAT of 2-8 columns on mul_mm_f16reg.comp with the tile of GGML_VK_MM_F16REG_VERIFY: dispatches it
+// and returns true, false for the mat-vec path; check_only: the answer without a dispatch
+bool ggml_vk_fork_mm_f16reg_verify(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
+                                   const ggml_tensor * src1, const ggml_tensor * dst, bool check_only);
 bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0, const ggml_tensor * src1,
                             const ggml_tensor * dst, const ggml_tensor * fused_dst, uint32_t fusion_flags,
                             const ggml_tensor * hc_pre = nullptr, bool check_only = false);

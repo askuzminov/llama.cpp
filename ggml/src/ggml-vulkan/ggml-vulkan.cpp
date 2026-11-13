@@ -3963,6 +3963,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->mm_f16reg_lds[0] ? MMF16(lds, b32_hcpre) : MMF16(reg, b32_hcpre),
             device->mm_f16reg_lds[1] ? MMF16(lds, b16_hcpre) : MMF16(reg, b16_hcpre),
         };
+        // the draft checks (GGML_VK_MM_F16REG_VERIFY): f16 activations
+        const mm_f16reg_shader shader_vfy = device->mm_f16reg_vfy_lds ? MMF16(lds, b16) : MMF16(reg, b16);
 #undef MMF16
 #undef MMF16_CM1
         const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
@@ -3980,6 +3982,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                         4, sizeof(vk_fork_mm_hc_pre_push_constants), {bm, bn, 1}, {t[0], t[1], t[2], t[3], t[4], (uint32_t) x},
                                         1, false, sg != 0, sg);
             }
+        }
+        if (device->mm_f16reg_vfy) {
+            const std::array<uint32_t, 5> & t = device->mm_f16reg_vfy_tile;
+            const uint32_t bm = t[3] * t[1] * 16;
+            const uint32_t bn = (t[0] / 32 / t[3]) * t[2] * 16;
+            ggml_vk_create_pipeline2(device, device->pipeline_mm_f16reg_vfy, device->mm_f16reg_vfy_name + "_b16_vfy", shader_vfy.len,
+                                     shader_vfy.data, "main", 3, sizeof(vk_mat_mat_push_constants), {bm, bn, 1},
+                                     {t[0], t[1], t[2], t[3], t[4]}, 1, false, sg != 0, sg);
         }
     }
     for (auto &s : device->pipeline_solve_tri_f32) {
@@ -7939,6 +7949,10 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
+    // fork: the dense q8_0 of 2-8 columns (the draft checks) on mul_mm_f16reg.comp with f16 activations, in place of the
+    // int8 mat-vec (GGML_VK_MM_F16REG_VERIFY)
+    } else if (ctx->num_additional_fused_ops == 0 && ggml_vk_fork_mm_f16reg_verify(ctx, subctx, src0, src1, dst, true)) {
+        ggml_vk_fork_mm_f16reg_verify(ctx, subctx, src0, src1, dst, false);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&

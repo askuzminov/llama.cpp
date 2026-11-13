@@ -584,6 +584,36 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
         device->mm_f16reg_name[0] += "_emu";
         device->mm_f16reg_name[1] += "_emu";
     }
+    // the draft checks of decode, dense q8_0 over 2-8 columns, on a tile of 16 tokens with f16 activations in place of the
+    // int8 mat-vec on q8_1 activations (13.11, a prototype): GGML_VK_MM_F16REG_VERIFY=<tile> as above (1: r16x16/8x1),
+    // off without it. On the 395 the int8 mat-vec of 8 columns reads the big dense matrices at 198-216 GB/s already
+    // (profile-20261113-165722): this tile has the compute to stay there with f16 activations
+    device->mm_f16reg_vfy = false;
+    const char * envv = getenv("GGML_VK_MM_F16REG_VERIFY");
+    if (envv != nullptr && *envv != 0 && strcmp(envv, "0") != 0) {
+        const char * vtile = strcmp(envv, "1") == 0 ? "r16x16/8x1" : envv;
+        uint32_t vbm = 0, vbn = 0, vsh = 0;
+        if (ggml_vk_fork_mm_f16reg_tile(device, "GGML_VK_MM_F16REG_VERIFY", vtile, device->mm_f16reg_vfy_tile,
+                                        device->mm_f16reg_vfy_lds, device->mm_f16reg_vfy_name, vbm, vbn, vsh)) {
+            bool layout_ok = true;
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            // the A fragments built in registers: the layout the probe checks, if the tiles above did not ask for it
+            const bool probed = !device->mm_f16reg_lds[0] || !device->mm_f16reg_lds[1] || device->mmid_f16reg_mode == 1;
+            if (mode == 1 && !device->mm_f16reg_vfy_lds && !probed && !ggml_vk_fork_coopmat_a_probe(device)) {
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_MM_F16REG_VERIFY=%s off: the coopmat A layout is not the one the shader takes\n", vtile);
+                layout_ok = false;
+            }
+#endif
+            device->mm_f16reg_vfy = layout_ok;
+            if (mode == 2) {
+                device->mm_f16reg_vfy_name += "_emu";
+            }
+        }
+        if (device->mm_f16reg_vfy) {
+            GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 of 2-8 columns on %s: tiles of %u rows x %u tokens, %u invocations, %u bytes of "
+                          "shared memory\n", device->mm_f16reg_vfy_name.c_str(), vbm, vbn, device->mm_f16reg_vfy_tile[0], vsh);
+        }
+    }
     // the same tile on both paths: one line
     const bool same = device->mm_f16reg_name[0] == device->mm_f16reg_name[1];
     for (int b = same ? 1 : 0; b < 2; ++b) {
