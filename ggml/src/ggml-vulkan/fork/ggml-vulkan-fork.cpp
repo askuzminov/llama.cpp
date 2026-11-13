@@ -585,13 +585,15 @@ void ggml_vk_fork_mm_f16reg_init(vk_device & device) {
         device->mm_f16reg_name[1] += "_emu";
     }
     // the draft checks of decode, dense q8_0 over 2-8 columns, on a tile of 16 tokens with f16 activations in place of the
-    // int8 mat-vec on q8_1 activations (13.11, a prototype): GGML_VK_MM_F16REG_VERIFY=<tile> as above (1: r16x16/8x1),
+    // int8 mat-vec on q8_1 activations (13.11, a prototype): GGML_VK_MM_F16REG_VERIFY=<tile> as above (1: r16x16/4x1),
     // off without it. On the 395 the int8 mat-vec of 8 columns reads the big dense matrices at 198-216 GB/s already
-    // (profile-20261113-165722): this tile has the compute to stay there with f16 activations
+    // (profile-20261113-165722): this tile has the compute to stay there with f16 activations. 1 was r16x16/8x1 in the
+    // first 395 run (mm-20261113-202015, 8 tokens): r16x16/4x1 (64-row tiles, twice the workgroups) 5.0 against 3.4
+    // TFLOP/s on 2560 x 6144, 5.5 against 4.6 on 6144 x 2560, the best tile on every shape of 1024 rows and more
     device->mm_f16reg_vfy = false;
     const char * envv = getenv("GGML_VK_MM_F16REG_VERIFY");
     if (envv != nullptr && *envv != 0 && strcmp(envv, "0") != 0) {
-        const char * vtile = strcmp(envv, "1") == 0 ? "r16x16/8x1" : envv;
+        const char * vtile = strcmp(envv, "1") == 0 ? "r16x16/4x1" : envv;
         uint32_t vbm = 0, vbn = 0, vsh = 0;
         if (ggml_vk_fork_mm_f16reg_tile(device, "GGML_VK_MM_F16REG_VERIFY", vtile, device->mm_f16reg_vfy_tile,
                                         device->mm_f16reg_vfy_lds, device->mm_f16reg_vfy_name, vbm, vbn, vsh)) {

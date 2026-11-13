@@ -3094,7 +3094,8 @@ def profile_read(raw, depths, vulkan, mtp):
 
 
 def verify_size(reads, depths):
-    """the largest verify that every depth of every run has, so that a column compares the same step; None without MTP"""
+    """the verify that the tables compare, so that a column compares the same step: QA_PROF_VERIFY (tokens) when every
+    depth of every run has it, otherwise the largest that all have; None without MTP"""
     common = None
     for r in reads:
         for d in depths:
@@ -3102,7 +3103,10 @@ def verify_size(reads, depths):
             if x:
                 have = {int(m[1]) for m in (re.match(r"verify of (\d+) tokens", g[0]) for g in x["tg_groups"]) if m}
                 common = have if common is None else common & have
-    return max(common) if common else None
+    if not common:
+        return None
+    want = env_int("QA_PROF_VERIFY", 0)
+    return want if want in common else max(common)
 
 
 def step_group(x, nv):
@@ -3117,8 +3121,10 @@ def cmd_profile():
     QA_PROF_TG tokens (tg: the decode steps). Vulkan: GGML_VK_PERF_LOGGER, a block per graph compute; CUDA:
     GGML_CUDA_OP_TIMING=idle, a report when the GPU has been idle. LLAMA_INPUT_TIMING gives the host steps.
     QA_PARMS: variants to compare (name VAR=value ...;...), each a run of its own; the tables are those of the first,
-    then the totals of every variant side by side. With MTP the tables compare the verify of one size, the largest that
-    every depth of every variant has: a reply mixes verifies of 1 to 4 tokens, and their mix differs per text."""
+    then the totals of every variant side by side. With MTP the tables compare the verify of one size, QA_PROF_VERIFY
+    tokens or else the largest that every depth of every variant has: a reply mixes verifies of 1 to 8 tokens, and
+    their mix differs per text; with variants also the verify of every size per variant and the ops of the compared one
+    side by side."""
     run = Run("profile")
     model = model_path()
     exe = binary("llama-server")
@@ -3304,6 +3310,39 @@ def cmd_profile():
                     "device (MiB)",
                 *table(["variant", "depth", "prompt", "t/s", "qsa", nv and f"verify {nv}" or "decode", "qsa", "delta net",
                         "rows, copies", "per token", "accept", "compute"], rows))
+        if mtp:
+            # the cost of a verify by its tokens in each variant: the base and the cost per token of a kernel path
+            def verify_cells(x):
+                cells = {}
+                for label, n, ops in x["tg_groups"]:
+                    m = re.match(r"verify of (\d+) tokens", label)
+                    if m:
+                        cells[int(m[1])] = f"{sum(o[2] for o in ops):.2f} ({n})"
+                return cells
+            sizes = sorted({v for _, _, rd, _ in results for d in depths if str(d) in rd for v in verify_cells(rd[str(d)])})
+            rows = []
+            for name, _, rd, _ in results:
+                for d in depths:
+                    if str(d) in rd:
+                        cells = verify_cells(rd[str(d)])
+                        rows.append([name, str(rd[str(d)]["depth"]), *[cells.get(v, "-") for v in sizes]])
+            if sizes:
+                run.add("", "variants: GPU ms of a verify by its tokens (mean of n verifies)",
+                        *table(["variant", "depth", *map(str, sizes)], rows))
+        # the ops of the compared step side by side, at the deepest depth that every variant has
+        common = [d for d in depths if all(str(d) in rd for _, _, rd, _ in results)]
+        if common:
+            per, depth = [], None
+            for _, _, rd, _ in results:
+                x = rd[str(common[-1])]
+                depth = x["depth"]
+                main = step_group(x, nv)
+                per.append({o: ms for o, _, ms in main[2]} if main else {})
+            ops = sorted(set().union(*per), key=lambda o: -max(p.get(o, 0.0) for p in per))[:30]
+            run.add("", f"the ops of the {step_name} at {depth} tokens by variant (GPU ms)",
+                    *table([*[name for name, _, _, _ in results], "op"],
+                           [[f"{p.get(o, 0.0):.3f}" for p in per] + [o] for o in ops] +
+                           [[f"{sum(p.values()):.3f}" for p in per] + ["total"]]))
     return run.finish()
 
 

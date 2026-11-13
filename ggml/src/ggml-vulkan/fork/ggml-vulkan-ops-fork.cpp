@@ -383,17 +383,22 @@ bool ggml_vk_fork_mm_f16reg(ggml_backend_vk_context * ctx, vk_context & subctx, 
 
 // MUL_MAT of q8_0 weights over 2-8 columns (the draft checks of decode) on mul_mm_f16reg.comp with the tile of
 // GGML_VK_MM_F16REG_VERIFY (16 tokens: the columns past N are computed on the last one and not stored), f16 activations
-// (f32 ones through the f16 copy at any K, N x K halves), in place of the int8 mat-vec on q8_1 activations. From
-// GGML_VK_MM_F16REG_VERIFY_MIN_M rows (1024): the tile has no split over K, so a few rows over a long K leave few
-// workgroups (the hc down of qwen4exp, 320 x 10240). Nothing fused into the matmul (ggml_vk_mul_mat asks without fused ops)
+// in place of the int8 mat-vec on q8_1 activations. f32 activations are read in place and rounded to f16 in the shader
+// (the saturating rounding of the f16 copy, the same values); GGML_VK_MM_F16REG_VERIFY_B16=1 copies them to f16 in
+// prealloc_y first as the prompt path does (13.11 first 395 run: that copy, a dispatch and a barrier per activation
+// tensor, and the q8_1 quantization of the mat-vecs that read the same tensor taking prealloc_y from it in turn, were
+// the suspects of a base cost of +5.6-5.8 ms per verify). From GGML_VK_MM_F16REG_VERIFY_MIN_M rows (1024): the tile has no
+// split over K, so a few rows over a long K leave few workgroups (the hc down of qwen4exp, 320 x 10240). Nothing fused
+// into the matmul (ggml_vk_mul_mat asks without fused ops)
 bool ggml_vk_fork_mm_f16reg_verify(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
                                    const ggml_tensor * src1, const ggml_tensor * dst, bool check_only) {
     const vk_device & device = ctx->device;
-    if (!device->mm_f16reg_vfy || !device->pipeline_mm_f16reg_vfy || src0->type != GGML_TYPE_Q8_0 ||
-        (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
+    if (!device->mm_f16reg_vfy || src0->type != GGML_TYPE_Q8_0 || (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) ||
+        dst->type != GGML_TYPE_F32) {
         return false;
     }
     static const int64_t min_m = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_MIN_M"); return e ? (int64_t) atoll(e) : (int64_t) 1024; }();
+    static const bool b16_copy = [] { const char * e = getenv("GGML_VK_MM_F16REG_VERIFY_B16"); return e != nullptr && atoi(e) != 0; }();
     const int64_t K = src0->ne[0];
     const int64_t M = src0->ne[1];
     const int64_t N = src1->ne[1];
@@ -404,18 +409,32 @@ bool ggml_vk_fork_mm_f16reg_verify(ggml_backend_vk_context * ctx, vk_context & s
         return false;
     }
     const size_t qs = ggml_type_size(src0->type);
-    const bool   to_f16 = src1->type == GGML_TYPE_F32;
-    if (src0->nb[0] != qs || src0->nb[1] % (2 * qs) != 0 || (!to_f16 && src1->nb[1] % 16 != 0) || dst->nb[0] != sizeof(float)) {
+    if (src0->nb[0] != qs || src0->nb[1] % (2 * qs) != 0 || dst->nb[0] != sizeof(float)) {
         return false;
     }
     const uint64_t range = device->properties.limits.maxStorageBufferRange;
     if (ggml_nbytes(src0) > range || ggml_nbytes(src1) > range || ggml_nbytes(dst) > range) {
         return false;
     }
-    vk_pipeline pipeline = device->pipeline_mm_f16reg_vfy;
     vk_subbuffer a, b, d;
-    if (!ggml_vk_fork_tensor_buffer(ctx, src0, 4, a) || !ggml_vk_fork_tensor_buffer(ctx, src1, to_f16 ? 4 : 16, b) ||
-        !ggml_vk_fork_tensor_buffer(ctx, dst, 4, d) || (to_f16 && !ggml_vk_fork_cpy_f16_sat(ctx, src1, nullptr))) {
+    if (!ggml_vk_fork_tensor_buffer(ctx, src0, 4, a) || !ggml_vk_fork_tensor_buffer(ctx, dst, 4, d)) {
+        return false;
+    }
+    // B read in place: columns and the start on 16 bytes (the shader reads vec4 / 8 halves); otherwise f32 ones go to the
+    // f16 copy, which reads them on 4 bytes
+    bool to_f16 = src1->type == GGML_TYPE_F32 && (b16_copy || !device->pipeline_mm_f16reg_vfy[0]);
+    if (!to_f16 && (src1->nb[1] % 16 != 0 || !ggml_vk_fork_tensor_buffer(ctx, src1, 16, b))) {
+        if (src1->type != GGML_TYPE_F32) {
+            return false;
+        }
+        to_f16 = true;
+    }
+    if (to_f16 && (!ggml_vk_fork_tensor_buffer(ctx, src1, 4, b) || !ggml_vk_fork_cpy_f16_sat(ctx, src1, nullptr))) {
+        return false;
+    }
+    const int bi = src1->type == GGML_TYPE_F16 || to_f16 ? 1 : 0;
+    vk_pipeline pipeline = device->pipeline_mm_f16reg_vfy[bi];
+    if (!pipeline) {
         return false;
     }
     if (check_only) {
@@ -440,11 +459,11 @@ bool ggml_vk_fork_mm_f16reg_verify(ggml_backend_vk_context * ctx, vk_context & s
     pc.broadcast3  = 1;
     pc.padded_N    = (uint32_t) N;
 
-    // the first use, every one with GGML_VK_MM_F16REG_LOG=1 (test-mmvq-planes-fork --verify looks for it)
+    // the first use of each pipeline, every one with GGML_VK_MM_F16REG_LOG=1 (test-mmvq-planes-fork --verify looks for it)
     static const bool log_all = getenv("GGML_VK_MM_F16REG_LOG") != nullptr;
-    static bool logged = false;
-    if (!logged || log_all) {
-        logged = true;
+    static bool logged[2] = {};
+    if (!logged[bi] || log_all) {
+        logged[bi] = true;
         GGML_LOG_INFO("ggml_vulkan: MUL_MAT q8_0 %ld x %ld x %ld on %s\n", (long) M, (long) N, (long) K, pipeline->name.c_str());
     }
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);

@@ -35,10 +35,14 @@ set_tests_properties(test-mmvq-planes-fork-1 PROPERTIES SKIP_REGULAR_EXPRESSION 
 llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-types ARGS --planes 2 --types q5_1,q8_0)
 set_tests_properties(test-mmvq-planes-fork-types PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED")
 # the dense q8_0 of the draft checks on the f16 coopmat tile of mul_mm_f16reg.comp (GGML_VK_MM_F16REG_VERIFY), emulated
-# here so that devices without coopmat run it too
-llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-verify ARGS --planes 1 --verify r16x16/8x1)
+# here so that devices without coopmat run it too: the f32 activations read in place (the default tile), and through
+# the f16 copy (GGML_VK_MM_F16REG_VERIFY_B16=1) on another tile
+llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-verify ARGS --planes 1 --verify r16x16/4x1)
 set_tests_properties(test-mmvq-planes-fork-verify PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED"
                      ENVIRONMENT "GGML_VK_MM_F16REG=r16x96/8x1;GGML_VK_MM_F16REG_EMULATE=1")
+llama_test(test-mmvq-planes-fork NAME test-mmvq-planes-fork-verify-b16 ARGS --planes 1 --verify r16x16/8x1)
+set_tests_properties(test-mmvq-planes-fork-verify-b16 PROPERTIES SKIP_REGULAR_EXPRESSION "test-mmvq-planes-fork: SKIPPED"
+                     ENVIRONMENT "GGML_VK_MM_F16REG=r16x96/8x1;GGML_VK_MM_F16REG_EMULATE=1;GGML_VK_MM_F16REG_VERIFY_B16=1")
 
 # the qwen4exp indexer timed on one device at the shapes of the model (lightning indexer, the head matmul of the Vulkan
 # graph and of the other backends): a benchmark, built but not a ctest; 04-micro.bat runs it on the machines

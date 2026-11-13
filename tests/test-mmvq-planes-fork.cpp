@@ -13,10 +13,11 @@
 //            show one plane
 //   --dump: the outputs of the device, all cases in a row as floats (two builds compared byte for byte)
 //   --verify <tile>: GGML_VK_MM_F16REG_VERIFY, the dense q8_0 of 2-8 columns (1024 rows and more) on the f16 coopmat tile
-//            of mul_mm_f16reg.comp: those cases must run there (its log line) and match weights and activations
-//            rounded to f16 (the shader decodes q8_0 to f16(d * q), the activations through a saturating f16 copy);
-//            on a device without coopmat with GGML_VK_MM_F16REG=<tile> GGML_VK_MM_F16REG_EMULATE=1; TEST_MMVQ_VERIFY=<tile>
-//            does the same
+//            of mul_mm_f16reg.comp: those cases must run there (its log line: the pipeline that reads the f32
+//            activations in place, _b32_vfy, or with GGML_VK_MM_F16REG_VERIFY_B16=1 the one that reads their f16
+//            copy, _b16_vfy) and match weights and activations rounded to f16 (the shader decodes q8_0 to f16(d * q),
+//            the activations go through the saturating f16 rounding either way); on a device without coopmat with
+//            GGML_VK_MM_F16REG=<tile> GGML_VK_MM_F16REG_EMULATE=1; TEST_MMVQ_VERIFY=<tile> does the same
 // TEST_MMVQ_PLANES_REQUIRE=1: a skip (no Vulkan device, no int8 mat-vec) fails (01-check on the 395)
 
 #include "ggml.h"
@@ -378,9 +379,12 @@ int main(int argc, char ** argv) {
     }
 
     if (verify != nullptr) {
-        // the dense q8_0 of the draft checks on the f16 coopmat tile: each case must log its dispatch on that tile
-        printf("%s: the draft checks on the tile %s, weights and activations in f16: NMSE of the device over that of "
-               "the rounding in (%.2f, %.2f)\n", argv[0], verify, lo, hi(2));
+        // the dense q8_0 of the draft checks on the f16 coopmat tile: each case must log its dispatch on the pipeline of
+        // its B path
+        const char * b16_env  = getenv("GGML_VK_MM_F16REG_VERIFY_B16");
+        const char * want_vfy = b16_env != nullptr && atoi(b16_env) != 0 ? "_b16_vfy" : "_b32_vfy";
+        printf("%s: the draft checks on the tile %s (%s), weights and activations in f16: NMSE of the device over that of "
+               "the rounding in (%.2f, %.2f)\n", argv[0], verify, want_vfy + 1, lo, hi(2));
         auto check_verify = [&](int64_t k, int64_t m, int64_t n) {
             {
                 std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -390,7 +394,7 @@ int main(int argc, char ** argv) {
             bool used = false;
             {
                 std::lock_guard<std::mutex> lock(g_log_mutex);
-                used = g_log.find("_vfy") != std::string::npos;
+                used = g_log.find(want_vfy) != std::string::npos;
             }
             if (!r.ran) {
                 printf("  MUL_MAT    q8_0   m %5lld k %5lld n %lld: not supported\n", (long long) m, (long long) k, (long long) n);
@@ -401,7 +405,7 @@ int main(int argc, char ** argv) {
             const bool   ok    = used && ratio > lo && ratio < hi(2);
             printf("  MUL_MAT    q8_0   m %5lld k %5lld n %lld, f16 tile: NMSE %.3e, of the rounding %.3e, ratio %.3f%s\n",
                    (long long) m, (long long) k, (long long) n, r.nmse, r.sim, ratio,
-                   !used ? "  <- not on the verify tile" : ok ? "" : "  <- outside the range");
+                   !used ? "  <- not on the verify pipeline" : ok ? "" : "  <- outside the range");
             n_ran++;
             worst = std::max(worst, r.nmse);
             if (!ok) {

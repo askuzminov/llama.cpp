@@ -3963,8 +3963,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->mm_f16reg_lds[0] ? MMF16(lds, b32_hcpre) : MMF16(reg, b32_hcpre),
             device->mm_f16reg_lds[1] ? MMF16(lds, b16_hcpre) : MMF16(reg, b16_hcpre),
         };
-        // the draft checks (GGML_VK_MM_F16REG_VERIFY): f16 activations
-        const mm_f16reg_shader shader_vfy = device->mm_f16reg_vfy_lds ? MMF16(lds, b16) : MMF16(reg, b16);
+        // the draft checks (GGML_VK_MM_F16REG_VERIFY): f32 activations read in place, f16 ones
+        const mm_f16reg_shader shaders_vfy[2] = {
+            device->mm_f16reg_vfy_lds ? MMF16(lds, b32) : MMF16(reg, b32),
+            device->mm_f16reg_vfy_lds ? MMF16(lds, b16) : MMF16(reg, b16),
+        };
 #undef MMF16
 #undef MMF16_CM1
         const uint32_t sg = device->subgroup_size_control ? 32u : 0u;
@@ -3987,9 +3990,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const std::array<uint32_t, 5> & t = device->mm_f16reg_vfy_tile;
             const uint32_t bm = t[3] * t[1] * 16;
             const uint32_t bn = (t[0] / 32 / t[3]) * t[2] * 16;
-            ggml_vk_create_pipeline2(device, device->pipeline_mm_f16reg_vfy, device->mm_f16reg_vfy_name + "_b16_vfy", shader_vfy.len,
-                                     shader_vfy.data, "main", 3, sizeof(vk_mat_mat_push_constants), {bm, bn, 1},
-                                     {t[0], t[1], t[2], t[3], t[4]}, 1, false, sg != 0, sg);
+            for (int b = 0; b < 2; ++b) {
+                ggml_vk_create_pipeline2(device, device->pipeline_mm_f16reg_vfy[b], device->mm_f16reg_vfy_name + (b ? "_b16_vfy" : "_b32_vfy"),
+                                         shaders_vfy[b].len, shaders_vfy[b].data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                         {bm, bn, 1}, {t[0], t[1], t[2], t[3], t[4]}, 1, false, sg != 0, sg);
+            }
         }
     }
     for (auto &s : device->pipeline_solve_tri_f32) {
