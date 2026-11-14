@@ -11,29 +11,15 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 14.11 (README, run-all). the 395, after a reconnected remote desktop took its device memory back
-rem and Windows moved part of the server to the shared memory (13.11, the system swapped): the device memory limit
-rem keeps GGML_VK_DEVICE_RESERVE_MIB (2048) free under the most the other processes held, and the elastic KV gives back
-rem the cells it does not use without --phase-mem (far over the cells in use, or any while the device memory is over
-rem its limit). 14.11 13:25 (dca946fbb): 01 green on both machines (the limit 94664 MiB = the heap - 1592 MiB of the
-rem others - 2048), 06 TG as before, but no trim: at -c 32768 the margin is 2 steps of 8192 cells, the capacity after the
-rem long task stops at 32768 = what the next task needs + the margin, and the decode servers log no INFO. 14.11 13:56
-rem (544c2d146), 03 at its depths: the trim before the short request after each depth gave back 1.5/3.5/6.5 GB in
-rem 156/349/684 ms, which that request waited for, and the conversation coming back mapped them again in 241/493 ms.
-rem the user: give memory back while idle, not under load. now a batch gives memory back only while the device memory
-rem is over its limit, and an idle server each second while over it and all of it after LLAMA_KV_TRIM_IDLE_S (60)
-rem seconds. 03 at depths 0, 65536, 131072: default (no trim expected, the gaps are 1.5 s) and idle1
-rem (LLAMA_KV_TRIM_IDLE_S=1: the trims in the gaps, the summary "the elastic KV gave back memory") and evict600 (the
-rem idle slots to the prompt cache when the system moved device memory of the server out, here a forced estimate; the
-rem summary "idle slots moved to the prompt cache"); 01 on both machines (the loop of the server calls the trim each idle
-rem second). the reconnect itself is a test by hand with serve.bat (the lines "the system moved about ... MiB"). answered before (e001cfa45): the default
-rem takes the f16 tile for verifies of 5-8 tokens and two int8 planes below, 07-exact 0.0125/0.0121 against 0.0311/
-rem 0.0307 of old, 06 old +1.9%. 03, 07-exact, 05, 07 against upstream and 02 are off on the 395. the 3090: 01 (the
-rem sources of llama changed; its elastic KV takes the --phase-mem path, which this does not touch). the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
-rem 13.11 21:36 all ops passed without them); 06, 07, 03 and 02 are off (03 answered 13.11: the reply 38.96-46.31 ms of
-rem GPU a token with the reports read per backend context). both: the spec probe of 01 again, the PIT mean now of the
-rem mid-point transform (13.11: the randomized one took a fixed random stream whose first 1500 values average 0.516, so
-rem the mean without drafts was 0.511-0.518 in every run). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
+rem the questions of 14.11 (README, run-all). the 395: device memory against other processes (13.11 a reconnected
+rem remote desktop took its memory back, Windows moved part of the server to the shared memory, the system swapped).
+rem 14.11 15:25-15:50 (f348322df): 01 green on both machines; 03 default without trims, idle1 (LLAMA_KV_TRIM_IDLE_S=1)
+rem gave back 4968 MiB in two idle gaps, evict600 (LLAMA_KV_TEST_DEMOTED_MIB=600) moved slots to the prompt cache and
+rem the next requests restored them (38062 tokens: 864 MiB in 92 ms, restored in ~0.25 s), prompt and verify times the
+rem same in all three. two of its three moves were slots within the step of the elastic KV (13 and 4014 tokens, 0 MiB
+rem given back): now only slots over the step move. 03 evict600 once more (one move expected, the long slot); 01 off
+rem (the change is in the idle path of the server only); the 3090 has nothing to run. the reconnect itself is a test
+rem by hand with serve.bat (README: the lines "the system moved about ... MiB" and "moved to the prompt cache"). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
 rem dense, nofuse, radix0); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP
 rem head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and
 rem the guard refused 256 bytes: 512 MiB next to the expert cache is too little); 13.11 upmoe5/upmoe8 (the cache of
@@ -50,7 +36,8 @@ if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default"
 rem 03 at three depths: one trim and growth after each of the first two in idle1; evict600: the estimate of moved
 rem memory forced to 600 MiB (LLAMA_KV_TEST_DEMOTED_MIB), so that the first idle second with a slot moves it to the
 rem prompt cache and the next request restores it from there (once: the given back memory covers the 600 MiB)
-if not defined QA_PARMS set "QA_PARMS=default;idle1 LLAMA_KV_TRIM_IDLE_S=1;evict600 LLAMA_KV_TEST_DEMOTED_MIB=600"
+if not defined QA_PARMS set "QA_PARMS=evict600 LLAMA_KV_TEST_DEMOTED_MIB=600"
+if not defined RUN_CHECK set "RUN_CHECK=0"
 if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0 65536 131072"
 if not defined QA_DARMS set "QA_DARMS=default"
 if not defined RUN_DECODE set "RUN_DECODE=0"
@@ -66,8 +53,8 @@ goto :arms_done
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PARMS set "QA_PARMS=default"
 if not defined QA_DARMS set "QA_DARMS=default"
-rem 01: the loop of the server calls the trim of the elastic KV each idle second (the 3090 takes the --phase-mem path,
-rem where it gives nothing back)
+rem nothing to run on the 3090 this time (the change is in the idle path of the server, which gives nothing back here)
+if not defined RUN_CHECK set "RUN_CHECK=0"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
 if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_PROFILE set "RUN_PROFILE=0"

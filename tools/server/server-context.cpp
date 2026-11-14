@@ -2216,6 +2216,15 @@ private:
             const char * e = getenv("LLAMA_KV_EVICT_DEMOTED_MIB");
             return (size_t) std::max<int64_t>(1, e != nullptr && e[0] != 0 ? (int64_t) atoll(e) : (int64_t) 512)*1024*1024;
         }();
+        // a slot within the step of the elastic KV (LLAMA_KV_ELASTIC_STEP, 8192 cells) frees no device memory: the capacity
+        // keeps a step, and its save and restore would cost for nothing (14.11 395: slots of 13 and 4014 tokens, 0 MiB)
+        static const uint32_t min_tokens = [] {
+            const char * e = getenv("LLAMA_KV_ELASTIC_STEP");
+            return (uint32_t) std::max<int64_t>(256, e != nullptr && e[0] != 0 ? (int64_t) atoll(e) : (int64_t) 8192);
+        }();
+        auto movable = [&](const server_slot & slot) {
+            return !slot.is_processing() && slot.prompt.n_tokens() > (int64_t) min_tokens;
+        };
         const size_t margin = 256u*1024*1024;
         size_t demoted = 0;
         llama_kv_elastic_over_fork(ctx_tgt, &demoted);
@@ -2227,7 +2236,7 @@ private:
         }
         bool any = false;
         for (const auto & slot : slots) {
-            any = any || (!slot.is_processing() && slot.prompt.n_tokens() > 0);
+            any = any || movable(slot);
         }
         // a round at most every 10 s, the time taken only by a round that has slots to move
         const int64_t now = ggml_time_ms();
@@ -2241,7 +2250,7 @@ private:
         while (idle_evicted_fork < demoted + margin) {
             server_slot * lru = nullptr;
             for (auto & slot : slots) {
-                if (!slot.is_processing() && slot.prompt.n_tokens() > 0 && (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
+                if (movable(slot) && (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
                     lru = &slot;
                 }
             }
