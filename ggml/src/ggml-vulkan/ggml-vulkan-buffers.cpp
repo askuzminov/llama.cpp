@@ -96,6 +96,9 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     const vk::MemoryPriorityAllocateInfoEXT mem_priority_info { 1.0f };
 
+    // fork: the memory type of the allocation, for the count of device local bytes (fork_local_bytes)
+    uint32_t alloc_type = UINT32_MAX;
+
     vk::MemoryAllocateFlagsInfo mem_flags_info { mem_flags };
 
     if (device->memory_priority) {
@@ -165,6 +168,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
                 try {
                     buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
                     buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
+                    alloc_type = *mtype_it;
                     done = true;
                     break;
                 } catch (const vk::SystemError& e) {
@@ -209,6 +213,11 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     buf->device = device;
     buf->size = size;
+    if (alloc_type != UINT32_MAX &&
+            (mem_props.memoryHeaps[mem_props.memoryTypes[alloc_type].heapIndex].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+        buf->fork_local = mem_req.size;
+        device->fork_local_bytes.fetch_add(mem_req.size, std::memory_order_relaxed);
+    }
 
     if (device->buffer_device_address) {
         const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);

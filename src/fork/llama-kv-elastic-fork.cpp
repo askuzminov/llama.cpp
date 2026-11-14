@@ -26,7 +26,7 @@ typedef ggml_backend_buffer_t (*llama_buft_alloc_elastic_t)(ggml_backend_buffer_
 typedef bool (*llama_buffer_commit_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 typedef void (*llama_buffer_decommit_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 typedef bool (*llama_buffer_zero_reads_t)(ggml_backend_buffer_t buffer);
-typedef size_t (*llama_buffer_heap_over_t)(ggml_backend_buffer_t buffer);
+typedef size_t (*llama_buffer_heap_over_t)(ggml_backend_buffer_t buffer, size_t * demoted);
 
 // the VMM granule of CUDA; a coarser one only maps a little more than asked
 static constexpr size_t LLAMA_KV_ELASTIC_ALIGN = 2u*1024*1024;
@@ -346,17 +346,23 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
     return true;
 }
 
-size_t llama_kv_cache::elastic_heap_over_fork() const {
+size_t llama_kv_cache::elastic_heap_over_fork(size_t * demoted) const {
     size_t res = 0;
+    size_t dem = 0;
     if (elastic_fork) {
         ggml_backend_buffer_t last = nullptr;
         for (const auto & r : elastic_fork->ranges) {
             // a chunk holds many tensors in a row: ask each buffer once
             if (r.heap_over && r.buf != last) {
-                res  = std::max(res, r.heap_over(r.buf));
+                size_t d = 0;
+                res  = std::max(res, r.heap_over(r.buf, &d));
+                dem  = std::max(dem, d);
                 last = r.buf;
             }
         }
+    }
+    if (demoted) {
+        *demoted = dem;
     }
     return res;
 }

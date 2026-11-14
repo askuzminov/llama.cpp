@@ -357,6 +357,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
+                // fork: an idle second (the elastic KV gives back memory, server_context)
+                if (callback_idle_fork) {
+                    const int64_t idle_ms = ggml_time_ms() - time_last_task;
+                    lock.unlock();
+                    callback_idle_fork(idle_ms);
+                    continue;
+                }
                 // otherwise, loop again to check sleeping condition
             }
         }

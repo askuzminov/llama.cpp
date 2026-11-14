@@ -1748,6 +1748,9 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        queue_tasks.on_idle_fork([this](int64_t idle_ms) {
+            idle_trim_fork(idle_ms);
+        });
 
         metrics.init();
 
@@ -2169,6 +2172,100 @@ private:
     // (server_slot_room_fork). it runs while other slots generate or wait for a decode, so the save writes nothing to
     // disk (defer_writes): the cache can stay above its RAM limit until the next update(), at a task launch, and
     // write_behind writes the state out once the server is idle. false when no idle slot holds tokens
+    // fork: an idle server (no slot at work) each second: the elastic KV of the target gives back what it maps past its
+    // cells in use while the device memory is over its limit (the other processes took more than the backend keeps for
+    // them: a desktop session that came back), and once per idle period after LLAMA_KV_TRIM_IDLE_S (60) seconds all of
+    // it (-1: never). the user (14.11): memory goes back while idle, not under load - before a batch it cost the request
+    // 0.16-0.68 s on the 395 (profile-20261114-135627). a conversation that comes back maps its cells again
+    bool idle_trimmed_fork = false;
+
+    void idle_trim_fork(int64_t idle_ms) {
+        if (ctx_tgt == nullptr || sleeping) {
+            return;
+        }
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                return;
+            }
+        }
+        static const int64_t idle_s = [] {
+            const char * e = getenv("LLAMA_KV_TRIM_IDLE_S");
+            return e != nullptr && e[0] != 0 ? (int64_t) atoll(e) : (int64_t) 60;
+        }();
+        const bool all = !idle_trimmed_fork && idle_s >= 0 && idle_ms >= idle_s*1000;
+        llama_kv_elastic_trim_fork(ctx_tgt, all);
+        if (all) {
+            idle_trimmed_fork = true;
+        }
+        idle_evict_fork();
+    }
+
+    // fork: the system moved memory of this server out of the device memory for another process (the backend's estimate,
+    // llama_kv_elastic_over_fork; Windows does it when a desktop session takes more device memory than the reserve left,
+    // and pages that memory back at every use - the swap and the 19 t/s of 13.11). an idle server then moves its idle
+    // slots to the prompt cache (RAM, the disk past its limit), least recently used first, and gives the memory of their
+    // cells back to the device, until what it gave back covers what was moved (LLAMA_KV_EVICT_DEMOTED_MIB, 512: the least
+    // that starts it). the next request of a conversation restores it from the cache. a slot no cache takes is cleared all
+    // the same, its next request computes the prompt again: the paged model costs every request. the user (14.11):
+    // "1 - давай сделаем"
+    int64_t idle_evict_ms_fork    = 0; // the last round (ggml_time_ms), 0: none yet
+    size_t  idle_evicted_fork     = 0; // given back since the system started moving memory out, until it stops
+
+    void idle_evict_fork() {
+        static const size_t min_bytes = [] {
+            const char * e = getenv("LLAMA_KV_EVICT_DEMOTED_MIB");
+            return (size_t) std::max<int64_t>(1, e != nullptr && e[0] != 0 ? (int64_t) atoll(e) : (int64_t) 512)*1024*1024;
+        }();
+        const size_t margin = 256u*1024*1024;
+        size_t demoted = 0;
+        llama_kv_elastic_over_fork(ctx_tgt, &demoted);
+        if (demoted < margin) {
+            idle_evicted_fork = 0;
+        }
+        if (demoted < min_bytes || idle_evicted_fork >= demoted + margin) {
+            return;
+        }
+        bool any = false;
+        for (const auto & slot : slots) {
+            any = any || (!slot.is_processing() && slot.prompt.n_tokens() > 0);
+        }
+        // a round at most every 10 s, the time taken only by a round that has slots to move
+        const int64_t now = ggml_time_ms();
+        if (!any || (idle_evict_ms_fork != 0 && now - idle_evict_ms_fork < 10000)) {
+            return;
+        }
+        idle_evict_ms_fork = now;
+
+        SRV_WRN("the system moved about %.0f MiB of the device memory of this server out for another process: the idle slots "
+                "go to the prompt cache\n", demoted/1024.0/1024.0);
+        while (idle_evicted_fork < demoted + margin) {
+            server_slot * lru = nullptr;
+            for (auto & slot : slots) {
+                if (!slot.is_processing() && slot.prompt.n_tokens() > 0 && (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
+                    lru = &slot;
+                }
+            }
+            if (lru == nullptr) {
+                break;
+            }
+            // no request runs: the cache may write to disk to stay in its RAM limit
+            bool saved = false;
+            if (prompt_cache) {
+                saved = lru->prompt_save(*prompt_cache);
+                if (saved) {
+                    prompt_cache->update();
+                }
+            }
+            const size_t n_tokens = lru->prompt.tokens.size();
+            lru->prompt_clear();
+            const size_t back = llama_kv_elastic_trim_fork(ctx_tgt, true);
+            idle_evicted_fork += std::max<size_t>(back, 1);
+            SRV_WRN("slot %d with %zu tokens %s, %.0f MiB of device memory given back\n", lru->id, n_tokens,
+                    saved ? "moved to the prompt cache" : "cleared (no prompt cache took it: its next request computes it again)",
+                    back/1024.0/1024.0);
+        }
+    }
+
     bool evict_idle_lru_fork(const server_slot * keep) {
         server_slot * lru = nullptr;
         for (auto & slot : slots) {
@@ -4388,6 +4485,9 @@ private:
 
             } else {
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
+
+                // fork: work again, the next idle period gives memory back again (idle_trim_fork)
+                idle_trimmed_fork = false;
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();

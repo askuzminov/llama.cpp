@@ -544,6 +544,12 @@ public:
     // apply a delta on top of an already loaded BASE state
     int32_t state_seq_apply_delta(const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos base_pos);
 
+    // elastic KV without --phase-mem (the 395): the capacity past the cells in use, the cells of the batch (n_tokens) and
+    // a step goes back to the device - all of it with all (an idle server, llama_kv_elastic_trim_fork), else only while
+    // the device memory is over its limit (kv_heap_over_fork, asked at most once a second; before each batch). returns
+    // the bytes given back
+    size_t kv_elastic_trim_fork(uint32_t n_tokens, bool all);
+
 private:
     // before the graph of a ubatch runs: the fork's work that overlaps it (llama_fork_before_compute)
     void fork_before_compute(llama_memory_context_i * mctx);
@@ -614,10 +620,6 @@ private:
     bool kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t strm = -1);
     uint32_t kv_elastic_capacity_fork(uint32_t n_cells, int32_t strm = -1); // memory->kv_set_capacity_fork within LLAMA_KV_ELASTIC_TEST_MIB
 
-    // elastic KV without --phase-mem (the 395): the capacity of a stream far over its cells in use, or any past them and
-    // a step while the device memory is over its limit (kv_heap_over_fork, asked at most once a second), goes back to
-    // the device before a batch; phase_update does the first with --phase-mem
-    void kv_elastic_trim_fork(uint32_t n_tokens);
 
     bool     kv_elastic      = false;
     uint32_t kv_elastic_step = 8192;

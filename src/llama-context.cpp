@@ -2462,7 +2462,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (cparams.phase_mem && phase_owner == nullptr && !opt_ctx) {
         phase_update(n_tokens_all);
     } else if (kv_elastic && !opt_ctx) {
-        kv_elastic_trim_fork(n_tokens_all);
+        kv_elastic_trim_fork(n_tokens_all, false);
     }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better

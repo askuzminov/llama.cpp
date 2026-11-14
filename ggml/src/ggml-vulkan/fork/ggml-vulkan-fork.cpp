@@ -1256,8 +1256,16 @@ struct ggml_vk_elastic_fork {
     ~ggml_vk_elastic_fork() {
         for (const slab & s : slabs) {
             if (s.mem) {
-                device->device.freeMemory(s.mem);
+                free_slab_memory(s);
             }
+        }
+    }
+
+    // the memory of a slab back to the device; a device slab leaves the count of device local bytes
+    void free_slab_memory(const slab & s) const {
+        device->device.freeMemory(s.mem);
+        if (!s.spill) {
+            device->fork_local_bytes.fetch_sub(slab_granules*granularity, std::memory_order_relaxed);
         }
     }
 
@@ -1364,6 +1372,9 @@ struct ggml_vk_elastic_fork {
                 slabs[k].used.assign(slab_granules, 0);
                 slabs[k].n_used = 0;
                 slabs[k].spill  = spill;
+                if (!spill) {
+                    device->fork_local_bytes.fetch_add(slab_granules*granularity, std::memory_order_relaxed);
+                }
             }
         }
         slab & s = slabs[k];
@@ -1386,7 +1397,7 @@ struct ggml_vk_elastic_fork {
     void free_empty() {
         for (slab & s : slabs) {
             if (s.mem && s.n_used == 0) {
-                device->device.freeMemory(s.mem);
+                free_slab_memory(s);
                 s.mem = vk::DeviceMemory();
             }
         }
@@ -1684,8 +1695,17 @@ static bool ggml_backend_vk_buffer_elastic_zero_reads_fork(ggml_backend_buffer_t
 // the bytes this process holds of the device memory heap of an elastic buffer past its limit (ggml_vk_fork_heap_limit:
 // the heap less the most the other processes held and the reserve), 0 within it, for another buffer or without the
 // budget extension. past the limit the other processes took more than the reserve left: llama gives back the cells of
-// its elastic KV not in use (llama_context::kv_elastic_trim_fork, 14.11)
-static size_t ggml_backend_vk_buffer_heap_over_fork(ggml_backend_buffer_t buffer) {
+// its elastic KV not in use (llama_context::kv_elastic_trim_fork, 14.11).
+// demoted: the memory the system moved out of the heap, an estimate. the usage of the heap is over what this process
+// allocated there (fork_local_bytes) by the memory of the driver; when the system takes memory of this process out of
+// the heap for another one (Windows when a desktop session takes its device memory back, 13.11) the usage falls and
+// the allocations do not: the fall of that gap from the most it was. an idle server then moves its slots to the prompt
+// cache (server_context, 14.11). it holds where the usage of the budget extension counts the memory in the heap, which
+// the logs of a reconnect have to show (the WARN lines below)
+static size_t ggml_backend_vk_buffer_heap_over_fork(ggml_backend_buffer_t buffer, size_t * demoted) {
+    if (demoted) {
+        *demoted = 0;
+    }
     if (!ggml_backend_buffer_is_vk(buffer)) {
         return 0;
     }
@@ -1697,6 +1717,26 @@ static size_t ggml_backend_vk_buffer_heap_over_fork(ggml_backend_buffer_t buffer
     uint64_t usage = 0;
     uint64_t limit = 0;
     el->heap_room(el->memory_type, &usage, &limit);
+
+    const vk_device & dev   = el->device;
+    const uint64_t    local = dev->fork_local_bytes.load(std::memory_order_relaxed);
+    const int64_t     gap   = (int64_t) usage - (int64_t) local;
+    int64_t           most  = dev->fork_local_gap_max.load(std::memory_order_relaxed);
+    while (gap > most && !dev->fork_local_gap_max.compare_exchange_weak(most, gap, std::memory_order_relaxed)) {
+    }
+    most = std::max(most, gap);
+    const uint64_t moved = most > gap ? (uint64_t) (most - gap) : 0;
+    if (moved >= 512ull*1024*1024 && !dev->fork_demoted_on.exchange(true)) {
+        GGML_LOG_WARN("ggml_vulkan: %s: the system moved about %.0f MiB of the device memory of this process out of the heap "
+                "(%.0f MiB in use there, %.0f MiB allocated): another process took its device memory\n", dev->name.c_str(),
+                moved/1048576.0, usage/1048576.0, local/1048576.0);
+    } else if (moved < 256ull*1024*1024 && dev->fork_demoted_on.exchange(false)) {
+        GGML_LOG_WARN("ggml_vulkan: %s: the device memory of this process is in the heap again (%.0f MiB in use there, %.0f MiB "
+                "allocated)\n", dev->name.c_str(), usage/1048576.0, local/1048576.0);
+    }
+    if (demoted) {
+        *demoted = (size_t) moved;
+    }
     return usage > limit ? (size_t) (usage - limit) : 0;
 }
 

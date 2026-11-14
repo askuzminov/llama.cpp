@@ -1038,6 +1038,12 @@ struct vk_device_struct {
     std::map<std::string, uint64_t> fusion_counts;
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
+    // fork: the bytes this process allocated from device local heaps (buffers and the slabs of the elastic ones), always
+    // counted (vk_memory_logger only with its debug switch): against the usage of the heap it tells the memory the system
+    // moved out of it (ggml_backend_vk_buffer_heap_over_fork)
+    std::atomic<uint64_t> fork_local_bytes {};
+    std::atomic<int64_t>  fork_local_gap_max { INT64_MIN }; // the most the heap usage was over fork_local_bytes
+    std::atomic<bool>     fork_demoted_on { false };       // logged: the system moved memory of this process out
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
@@ -1142,6 +1148,7 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    uint64_t  fork_local = 0; // fork: the bytes it counts in device->fork_local_bytes
 
     ~vk_buffer_struct() {
         if (size == 0) {
@@ -1151,6 +1158,9 @@ struct vk_buffer_struct {
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
+        if (fork_local) {
+            device->fork_local_bytes.fetch_sub(fork_local, std::memory_order_relaxed);
+        }
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }

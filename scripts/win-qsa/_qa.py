@@ -887,10 +887,14 @@ NOTE_LIMIT = re.compile(r"device memory heap \d+ of ([\d.]+) MiB, other processe
 NOTE_REFUSED = re.compile(r"device memory heap \d+: ([\d.]+) MiB in use of a limit of ([\d.]+) MiB, ([\d.]+) MiB more asked")
 # 14.11: the other processes took more device memory while this one ran (a desktop session reconnected), with the
 # overcommit of the heap when there is one (Windows then moves memory of ours to the shared memory)
-# 14.11: the elastic KV gave back cells without --phase-mem (llama_context::kv_elastic_trim_fork), WARN when the device
-# memory was over its limit
-NOTE_TRIM = re.compile(r"kv_elastic: (the device memory is ([\d.]+) MiB over its limit .*?: )?(\d+) -> (\d+) cells mapped, ([\d.]+) MiB given back"
+# 14.11: the elastic KV gave back cells without --phase-mem (llama_context::kv_elastic_trim_fork): "idle, " from an idle
+# server, WARN when the device memory was over its limit
+NOTE_TRIM = re.compile(r"kv_elastic: (?:idle, )?(the device memory is ([\d.]+) MiB over its limit .*?: )?(\d+) -> (\d+) cells mapped, ([\d.]+) MiB given back"
                        r"(?: \(\d+ in use\) in ([\d.]+) ms)?")
+# 14.11: the system moved memory of the process out of the device heap (the Vulkan estimate), and the idle slots the
+# server moved to the prompt cache for it
+NOTE_DEMOTED = re.compile(r"the system moved about ([\d.]+) MiB of the device memory of this process out of the heap")
+NOTE_EVICT = re.compile(r"slot (\d+) with (\d+) tokens (moved to the prompt cache|cleared)[^,]*, ([\d.]+) MiB of device memory given back")
 # a capacity change of the elastic KV with its time (14.11): the price of mapping the cells again after a trim
 NOTE_GROW = re.compile(r"kv_elastic: (\d+) -> (\d+) cells \(\d+ in use(?:, \d+ cells mapped in all)?\) in ([\d.]+) ms")
 NOTE_OTHERS = re.compile(r"other processes hold ([\d.]+) MiB of device memory heap \d+ now, at most ([\d.]+) MiB before; "
@@ -909,7 +913,7 @@ NOTE_MOE_NONE = re.compile(r"moe_cache: (\S+) has (\d+) MiB free, one slot on \d
 NOTE_RELIEF = re.compile(r"relieving [\d.]+ MiB from the prompt cache")
 NOTE_FIT = re.compile(r"would go to host memory, refused")
 NOTE_KEYS = (b"device memory heap", b"elastic buffer", b"QSA scores", b"moe_cache: ", b"relieving", b"refused", b"given back",
-             b"kv_elastic: ")
+             b"kv_elastic: ", b"the system moved about")
 
 
 def log_first(log, pattern):
@@ -928,9 +932,11 @@ def log_first(log, pattern):
 def log_notes(folder):
     """the notes of the logs in folder (NOTE_*), as lines for the summary"""
     limits, refused, spills, floors, qsa, moe, relief, fits, later, trims, grows = [], [], [], [], [], [], [], [], [], [], []
+    demoted, evicts = [], []
     for log in sorted(Path(folder).glob("*.log")):
         first, n_relief, n_trim, trim_mib, trim_over, trim_ms = {}, 0, 0, 0.0, 0, 0.0
         n_grow, grow_ms, grow_max = 0, 0.0, None
+        dem_max, n_evict, evict_tok, evict_mib, n_cleared = None, 0, 0, 0.0, 0
         try:
             with log.open("rb") as f:
                 for raw in f:
@@ -945,6 +951,15 @@ def log_notes(folder):
                         trim_mib += float(m_trim[5])
                         trim_over += 1 if m_trim[1] else 0
                         trim_ms += float(m_trim[6] or 0)
+                    m_dem = NOTE_DEMOTED.search(line)
+                    if m_dem:
+                        dem_max = max(dem_max or 0.0, float(m_dem[1]))
+                    m_ev = NOTE_EVICT.search(line)
+                    if m_ev:
+                        n_evict += 1
+                        evict_tok += int(m_ev[2])
+                        evict_mib += float(m_ev[4])
+                        n_cleared += 1 if m_ev[3] == "cleared" else 0
                     m_grow = NOTE_GROW.search(line)
                     if m_grow and int(m_grow[2]) > int(m_grow[1]):
                         n_grow += 1
@@ -967,6 +982,11 @@ def log_notes(folder):
         if n_trim:
             trims.append(f"{name} {n_trim} times, {trim_mib:.0f} MiB in {trim_ms:.0f} ms" +
                          (f", {trim_over} of them over the limit" if trim_over else ""))
+        if dem_max is not None:
+            demoted.append(f"{name} up to {dem_max:.0f} MiB")
+        if n_evict:
+            evicts.append(f"{name} {n_evict} slots, {evict_tok} tokens, {evict_mib:.0f} MiB" +
+                          (f", {n_cleared} cleared without the cache" if n_cleared else ""))
         if n_grow:
             grows.append(f"{name} {n_grow} times in {grow_ms:.0f} ms, the longest {grow_max[0]:.0f} ms ({grow_max[1]} -> {grow_max[2]} cells)")
         if "others" in first:
@@ -1011,7 +1031,9 @@ def log_notes(folder):
                          ("fit refused, weights would go to host memory", fits),
                          ("device memory the other processes took later", later),
                          ("the elastic KV gave back memory", trims),
-                         ("the elastic KV grew (time of mapping)", grows)):
+                         ("the elastic KV grew (time of mapping)", grows),
+                         ("the system moved device memory of the server out (estimate)", demoted),
+                         ("idle slots moved to the prompt cache for it", evicts)):
         if items:
             out.append(f"{title}: " + "; ".join(items[:8]) + (f"; {len(items) - 8} more" if len(items) > 8 else ""))
     return out

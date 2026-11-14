@@ -17,11 +17,16 @@ rem keeps GGML_VK_DEVICE_RESERVE_MIB (2048) free under the most the other proces
 rem the cells it does not use without --phase-mem (far over the cells in use, or any while the device memory is over
 rem its limit). 14.11 13:25 (dca946fbb): 01 green on both machines (the limit 94664 MiB = the heap - 1592 MiB of the
 rem others - 2048), 06 TG as before, but no trim: at -c 32768 the margin is 2 steps of 8192 cells, the capacity after the
-rem long task stops at 32768 = what the next task needs + the margin, and the decode servers log no INFO. now 03 at its
-rem depths (0, 65536, 131072, near the end of 262144) with -lv 4: after each depth a short request ("ok") finds the long
-rem conversation's cells mapped and gives them back, the next depth maps them again - the log lines give the times
-rem (the summary: "the elastic KV gave back memory", "the elastic KV grew"), the price of the trim for a conversation
-rem that comes back. the reconnect itself is a test by hand with serve.bat (README). answered before (e001cfa45): the default
+rem long task stops at 32768 = what the next task needs + the margin, and the decode servers log no INFO. 14.11 13:56
+rem (544c2d146), 03 at its depths: the trim before the short request after each depth gave back 1.5/3.5/6.5 GB in
+rem 156/349/684 ms, which that request waited for, and the conversation coming back mapped them again in 241/493 ms.
+rem the user: give memory back while idle, not under load. now a batch gives memory back only while the device memory
+rem is over its limit, and an idle server each second while over it and all of it after LLAMA_KV_TRIM_IDLE_S (60)
+rem seconds. 03 at depths 0, 65536, 131072: default (no trim expected, the gaps are 1.5 s) and idle1
+rem (LLAMA_KV_TRIM_IDLE_S=1: the trims in the gaps, the summary "the elastic KV gave back memory") and evict600 (the
+rem idle slots to the prompt cache when the system moved device memory of the server out, here a forced estimate; the
+rem summary "idle slots moved to the prompt cache"); 01 on both machines (the loop of the server calls the trim each idle
+rem second). the reconnect itself is a test by hand with serve.bat (the lines "the system moved about ... MiB"). answered before (e001cfa45): the default
 rem takes the f16 tile for verifies of 5-8 tokens and two int8 planes below, 07-exact 0.0125/0.0121 against 0.0311/
 rem 0.0307 of old, 06 old +1.9%. 03, 07-exact, 05, 07 against upstream and 02 are off on the 395. the 3090: 01 (the
 rem sources of llama changed; its elastic KV takes the --phase-mem path, which this does not touch). the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
@@ -42,10 +47,11 @@ if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default"
 if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default"
-rem 03 at its own depths (QA_PROF_DEPTHS unset): the trims and the growths of the elastic KV between them. 01 passed
-rem on the sources before (14.11 13:25), these add the times to two log lines only
-if not defined QA_PARMS set "QA_PARMS=default"
-if not defined RUN_CHECK set "RUN_CHECK=0"
+rem 03 at three depths: one trim and growth after each of the first two in idle1; evict600: the estimate of moved
+rem memory forced to 600 MiB (LLAMA_KV_TEST_DEMOTED_MIB), so that the first idle second with a slot moves it to the
+rem prompt cache and the next request restores it from there (once: the given back memory covers the 600 MiB)
+if not defined QA_PARMS set "QA_PARMS=default;idle1 LLAMA_KV_TRIM_IDLE_S=1;evict600 LLAMA_KV_TEST_DEMOTED_MIB=600"
+if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0 65536 131072"
 if not defined QA_DARMS set "QA_DARMS=default"
 if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
@@ -60,9 +66,8 @@ goto :arms_done
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PARMS set "QA_PARMS=default"
 if not defined QA_DARMS set "QA_DARMS=default"
-rem 01 passed 14.11 13:25 on the sources before; since then only times in two log lines of the elastic KV (the 3090
-rem takes the --phase-mem path): nothing to run here
-if not defined RUN_CHECK set "RUN_CHECK=0"
+rem 01: the loop of the server calls the trim of the elastic KV each idle second (the 3090 takes the --phase-mem path,
+rem where it gives nothing back)
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
 if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_PROFILE set "RUN_PROFILE=0"

@@ -45,6 +45,8 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    // fork: each second the loop waits for a task, with the milliseconds since the last one (on the loop thread)
+    std::function<void(int64_t)>              callback_idle_fork;
 
 public:
     ~server_queue() { worker_stop(); }
@@ -132,6 +134,12 @@ public:
     // entering sleep: queue.sleeping = true --> cb0(true) --> cb1(true) --> cb2(true)
     // leaving sleep: cb2(false) --> cb1(false) --> cb0(false) --> queue.sleeping = false
     // note: caller will hold mutex_tasks while calling the callbacks
+    // fork: called each second while the loop waits for a task, with the milliseconds since the last one, on the thread
+    // of start_loop (the one of update_slots), the queue unlocked
+    void on_idle_fork(std::function<void(int64_t)> callback) {
+        callback_idle_fork = std::move(callback);
+    }
+
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
     }

@@ -142,8 +142,9 @@ struct llama_memory_i {
     virtual size_t   kv_mapped_cells_fork() const { return 0; }
     virtual size_t   kv_cell_bytes_fork() const { return 0; }
     // the bytes the process holds past the limit of the device memory of the elastic cache (the other processes took
-    // more of it than the backend keeps for them; 0: within it, or the backend cannot tell)
-    virtual size_t   kv_heap_over_fork() const { return 0; }
+    // more of it than the backend keeps for them; 0: within it, or the backend cannot tell), and in *demoted the memory
+    // of the process the system moved out of that memory for another one (an estimate)
+    virtual size_t   kv_heap_over_fork(size_t * demoted = nullptr) const { if (demoted) { *demoted = 0; } return 0; }
     virtual void     kv_set_grow_fork(std::function<bool(uint32_t, uint32_t)> grow) { (void) grow; }
     // the caches built without memory (llama_kv_defer_scope_fork) that did not become elastic, allocated in full
     virtual void     kv_alloc_deferred_fork() {}

@@ -602,6 +602,17 @@ extern "C" {
     // such a batch in one pass
     LLAMA_API bool llama_split_equal(const struct llama_context * ctx);
 
+    // fork: an elastic KV cache (LLAMA_KV_ELASTIC) gives back the device memory of the cells past the cells in use and a
+    // step: all of it with all, else only while the device memory is over its limit (other processes took more of it
+    // than the backend keeps for them). A server calls it while idle; under load a batch gives memory back only over
+    // the limit. Returns the bytes given back, 0 for a cache that is not elastic
+    LLAMA_API size_t llama_kv_elastic_trim_fork(struct llama_context * ctx, bool all);
+
+    // fork: the bytes the process holds past the limit of the device memory of the elastic KV cache (0: within it, or
+    // the backend cannot tell), and in *demoted the memory of the process the system moved out of the device memory for
+    // another process (an estimate, Vulkan; LLAMA_KV_TEST_DEMOTED_MIB sets it for tests)
+    LLAMA_API size_t llama_kv_elastic_over_fork(struct llama_context * ctx, size_t * demoted);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

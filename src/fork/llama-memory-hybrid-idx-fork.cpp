@@ -341,8 +341,14 @@ size_t llama_memory_hybrid_idx_fork::kv_mapped_cells_fork() const {
     return res;
 }
 
-size_t llama_memory_hybrid_idx_fork::kv_heap_over_fork() const {
-    return std::max(get_mem_attn()->elastic_heap_over_fork(), idx_elastic ? mem_idx->elastic_heap_over_fork() : (size_t) 0);
+size_t llama_memory_hybrid_idx_fork::kv_heap_over_fork(size_t * demoted) const {
+    size_t d0 = 0;
+    size_t d1 = 0;
+    const size_t res = std::max(get_mem_attn()->elastic_heap_over_fork(&d0), idx_elastic ? mem_idx->elastic_heap_over_fork(&d1) : (size_t) 0);
+    if (demoted) {
+        *demoted = std::max(d0, d1);
+    }
+    return res;
 }
 
 size_t llama_memory_hybrid_idx_fork::kv_cell_bytes_fork() const {
