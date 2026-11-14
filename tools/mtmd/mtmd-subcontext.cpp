@@ -65,6 +65,11 @@ ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device) {
 
 mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
                              ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+    // fork: for reset_sched()
+    this->max_nodes         = max_nodes;
+    this->cb_eval           = cb_eval;
+    this->cb_eval_user_data = cb_eval_user_data;
+
     threadpool = mtmd_threadpool_init(n_threads);
 
     backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -103,6 +108,54 @@ mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_n
     if (cb_eval != nullptr) {
         ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
     }
+}
+
+// fork: on demand, see mtmd_context_params::on_demand
+void mtmd_backends::reset_sched(bool cpu) {
+    sched.reset();
+    cpu_only = cpu && backend != backend_cpu;
+    std::vector<ggml_backend_t>             p = ptrs;
+    std::vector<ggml_backend_buffer_type_t> b = bufts;
+    if (cpu_only) {
+        p = { backend_cpu };
+        b = { ggml_backend_get_default_buffer_type(backend_cpu) };
+    }
+    sched.reset(ggml_backend_sched_new(p.data(), b.data(), p.size(), max_nodes, false, true));
+    if (cb_eval != nullptr) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+    }
+    gen++;
+}
+
+bool mtmd_backends::make_room(ggml_cgraph * gf) {
+    if (backend == backend_cpu) {
+        return true;
+    }
+    // the kernels of the device take some memory of their own next to the buffers (cuBLAS workspaces and the like)
+    static constexpr size_t margin = 256ull*1024*1024;
+
+    std::vector<size_t> sizes(ptrs.size(), 0);
+    ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
+    const size_t need = sizes[0] + margin; // the device first in ptrs
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    size_t free  = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(dev, &free, &total);
+    // a test hook: the free memory of the device in MiB, as a device full of the moe-cache has it
+    static const char * test_free = std::getenv("MTMD_ON_DEMAND_TEST_FREE_MIB");
+    if (test_free != nullptr) {
+        free = (size_t) std::max(0LL, std::atoll(test_free))*1024*1024;
+    }
+    if (need <= free) {
+        return true;
+    }
+    if (device_room != nullptr && device_room(dev, need, device_room_user_data)) {
+        return true;
+    }
+    LOG_WRN("%s: an encode needs %.0f MiB of %s, %.0f MiB are free and no more was given: it runs on the CPU\n", __func__,
+            need / 1048576.0, ggml_backend_dev_name(dev), free / 1048576.0);
+    return false;
 }
 
 mtmd_backends::~mtmd_backends() {
@@ -208,6 +261,7 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
     }
 
     is_allocated = true; // mark buffers as allocated
+    alloc_gen    = backends.gen; // fork: on demand
 
     LOG_INF("%s: flash attention is %s\n", __func__,
         (flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED) ? "enabled" : "disabled");
@@ -529,7 +583,14 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
-    if (!is_allocated) {
+    // fork: on demand also after a new scheduler, and the device memory of this graph is asked for first
+    if (!is_allocated || alloc_gen != backends.gen) {
+        if (backends.on_demand && !backends.cpu_only) {
+            ggml_cgraph * gm = mtmd_get_graph_builder(this, imgs, params)->build();
+            if (!backends.make_room(gm)) {
+                backends.reset_sched(true);
+            }
+        }
         warmup(*params->imgs);
     }
 

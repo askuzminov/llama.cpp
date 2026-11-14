@@ -263,7 +263,7 @@ llama_build(test-graph-cache-fork.cpp)
         SKIP_REGULAR_EXPRESSION "test-moe-cache-fork: SKIPPED"
         RUN_SERIAL TRUE
     )
-    foreach(MOE_CACHE_MODE keep fill kv upload state)
+    foreach(MOE_CACHE_MODE keep fill kv upload room state)
         llama_test(
             test-moe-cache-fork
             NAME test-moe-cache-fork-${MOE_CACHE_MODE}

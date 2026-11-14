@@ -177,3 +177,7 @@ const common_prompt_checkpoint * server_ckpt_restore(
         llama_context * ctx_tgt,
         llama_context * ctx_dft,
         llama_seq_id seq_id);
+
+// --mmproj-on-demand: the device memory of an encode of the projector, from the moe-cache of the target context
+// (llama_device_make_room_fork). user_data is the address of the server's llama_context pointer, read at the call
+bool server_mmproj_device_room_fork(ggml_backend_dev_t dev, size_t bytes, void * user_data);

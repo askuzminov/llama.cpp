@@ -46,6 +46,22 @@ struct mtmd_backends {
     // its buffers fit the largest graph reserved by the subcontexts
     ggml_backend_sched_ptr sched;
 
+    // fork: on demand (mtmd_context_params::on_demand) the scheduler has no buffers between encodes; gen counts the new
+    // schedulers, and a subcontext reserves its graph again when it reserved it on an older one
+    bool     on_demand = false;
+    bool     cpu_only  = false; // this encode runs on the CPU alone (the device had no room)
+    uint64_t gen       = 0;
+    int      max_nodes = 0;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void *   cb_eval_user_data = nullptr;
+    bool  (*device_room)(ggml_backend_dev_t dev, size_t bytes, void * user_data) = nullptr;
+    void *   device_room_user_data = nullptr;
+
+    // fork: a new scheduler without buffers, over the device and the CPU or over the CPU alone
+    void reset_sched(bool cpu);
+    // fork: the device memory the buffers of gf take, asked for from device_room when it is not free; false when not given
+    bool make_room(ggml_cgraph * gf);
+
     // device nullptr means CPU
     mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
                   ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
@@ -158,6 +174,7 @@ struct mtmd_subcontext {
     int max_nodes = 8192;
     mtmd_flash_attn_type flash_attn_type = MTMD_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
+    uint64_t alloc_gen = 0; // fork: the mtmd_backends::gen of the scheduler it reserved its graph on
 
     bool debug_output_embeddings = false;
 

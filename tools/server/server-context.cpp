@@ -1334,6 +1334,10 @@ private:
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
+            // fork: --mmproj-on-demand, the device memory of an encode from the moe-cache of ctx_tgt
+            mparams.on_demand             = params_base.mmproj_on_demand;
+            mparams.device_room           = server_mmproj_device_room_fork;
+            mparams.device_room_user_data = &ctx_tgt;
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;

@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <type_traits>
@@ -597,6 +598,9 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* on_demand         */ false,
+        /* device_room       */ nullptr,
+        /* device_room_user_data */ nullptr,
     };
     return params;
 }
@@ -711,6 +715,11 @@ struct mtmd_context {
         }
 
         ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        // fork: on demand the weights stay in host memory and the device computes an encode by uploading them (op offload)
+        const bool on_demand = ctx_params.on_demand && device != nullptr;
+        if (ctx_params.on_demand && device == nullptr) {
+            LOG_WRN("%s: on demand needs the projector on a device (--no-mmproj-offload or no GPU), it runs on the CPU\n", __func__);
+        }
 
         mtmd_model_params model_params;
         model_params.image_min_tokens            = ctx_params.image_min_tokens;
@@ -719,7 +728,7 @@ struct mtmd_context {
         model_params.progress_callback           = ctx_params.progress_callback;
         model_params.progress_callback_user_data = ctx_params.progress_callback_user_data;
 
-        ggml_backend_buffer_type_t buft = device
+        ggml_backend_buffer_type_t buft = device && !on_demand
             ? ggml_backend_dev_buffer_type(device)
             : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
         models = mtmd_model_load(mmproj_fname, model_params, buft);
@@ -739,6 +748,9 @@ struct mtmd_context {
         // no_alloc only measures memory, nothing is computed
         backends = std::make_unique<mtmd_backends>(device, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
                                                    ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+        backends->on_demand             = on_demand && !no_alloc;
+        backends->device_room           = ctx_params.device_room;
+        backends->device_room_user_data = ctx_params.device_room_user_data;
 
         // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
         mtmd_subctx_params sctx_params {
@@ -760,6 +772,14 @@ struct mtmd_context {
                 LOG_INF("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                         ggml_backend_buft_name(backends->bufts[i]), size / 1024.0 / 1024.0);
             }
+        }
+        // fork: on demand the buffers of the warmups go back until the first encode
+        if (backends->on_demand) {
+            LOG_INF("%s: on demand: the weights in host memory, an encode takes %.1f MiB of %s at the warmup size and "
+                    "gives it back\n", __func__,
+                    ggml_backend_sched_get_buffer_size(backends->sched.get(), backends->backend) / 1024.0 / 1024.0,
+                    ggml_backend_name(backends->backend));
+            backends->reset_sched(false);
         }
 
         // if both vision and audio mmproj are present, we need to validate their n_embd
@@ -2393,11 +2413,36 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
     return 1;
 }
 
+// fork: on demand (mtmd_context_params::on_demand) an encode that fails on the device runs again on the CPU, and the
+// buffers on the device go back after it either way
+static int32_t mtmd_on_demand_encode(mtmd_context * ctx, const std::function<int32_t()> & fn) {
+    mtmd_backends * b = ctx->backends.get();
+    if (b == nullptr || !b->on_demand) {
+        return fn();
+    }
+    auto run = [&]() -> int32_t {
+        try {
+            return fn();
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: error: %s\n", __func__, e.what());
+            return 1;
+        }
+    };
+    int32_t res = run();
+    if (res != 0 && !b->cpu_only) {
+        LOG_WRN("%s: the encode on %s failed, again on the CPU\n", __func__, ggml_backend_name(b->backend));
+        b->reset_sched(true);
+        res = run();
+    }
+    b->reset_sched(false);
+    return res;
+}
+
 int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     // this is the non-batching version
     std::lock_guard<std::mutex> lock(ctx->compute_mutex);
     try {
-        return mtmd_encode_chunk_impl(ctx, chunk, ctx->out_embd);
+        return mtmd_on_demand_encode(ctx, [&] { return mtmd_encode_chunk_impl(ctx, chunk, ctx->out_embd); });
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return 1;
@@ -2407,7 +2452,7 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
     std::lock_guard<std::mutex> lock(ctx->compute_mutex);
     try {
-        return mtmd_encode_impl(ctx, image_tokens, ctx->out_embd);
+        return mtmd_on_demand_encode(ctx, [&] { return mtmd_encode_impl(ctx, image_tokens, ctx->out_embd); });
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return 1;
@@ -3287,7 +3332,7 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
 int32_t mtmd_batch_encode(mtmd_batch * batch) {
     std::lock_guard<std::mutex> lock(batch->ctx->compute_mutex);
     try {
-        return mtmd_batch_encode_impl(batch);
+        return mtmd_on_demand_encode(batch->ctx, [&] { return mtmd_batch_encode_impl(batch); });
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return 1;

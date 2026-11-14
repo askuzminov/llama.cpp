@@ -889,7 +889,7 @@ NOTE_REFUSED = re.compile(r"device memory heap \d+: ([\d.]+) MiB in use of a lim
 # overcommit of the heap when there is one (Windows then moves memory of ours to the shared memory)
 # 14.11: the elastic KV gave back cells without --phase-mem (llama_context::kv_elastic_trim_fork): "idle, " from an idle
 # server, WARN when the device memory was over its limit
-NOTE_TRIM = re.compile(r"kv_elastic: (?:idle, )?(the device memory is ([\d.]+) MiB over its limit .*?: )?(\d+) -> (\d+) cells mapped, ([\d.]+) MiB given back"
+NOTE_TRIM = re.compile(r"kv_elastic: (?:idle, )?(the device memory is ([\d.]+) MiB (?:over its limit|into the reserve) .*?: )?(\d+) -> (\d+) cells mapped, ([\d.]+) MiB given back"
                        r"(?: \(\d+ in use\) in ([\d.]+) ms)?")
 # 14.11: the system moved memory of the process out of the device heap (the Vulkan estimate), and the idle slots the
 # server moved to the prompt cache for it

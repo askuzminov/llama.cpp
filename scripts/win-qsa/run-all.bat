@@ -19,8 +19,12 @@ rem the next requests restored them, prompt and verify times the same in all thr
 rem within the step of the elastic KV (0 MiB given back), since then only slots over the step move. 15:55 (e6cedc528)
 rem evict600 again: one move (the slot of 38062 tokens, 864 MiB in 90 ms), restored by the next request in 253 ms
 rem (154 ms of it mapping the cells). without the forced estimate no "system moved" line: the usage of the heap
-rem follows the trims (1512 and 3456 MiB in idle1). nothing to run on either machine now; the reconnect itself is a
-rem test by hand with serve.bat (README: the model loaded while the remote desktop is away, then a reconnect).
+rem follows the trims (1512 and 3456 MiB in idle1). the reconnect itself is a test by hand with serve.bat (README: the
+rem model loaded while the remote desktop is away, then a reconnect). 14.11 evening, the user: the server of the 395
+rem refused every request (ErrorOutOfDeviceMemory, 90 MiB more at 93086 of 93148 MiB): the reserve was a wall. now the
+rem allocations stop at the heap less the most the others held, the reserve is a soft limit past which the elastic KV
+rem gives back what it does not use, and the most of the others takes a value only after three readings (~3 s): the
+rem 395 runs 01 (the limit line "takes up to X MiB, and past Y MiB", the no-room guard); the 3090 has nothing to run.
 rem settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
 rem dense, nofuse, radix0); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP
 rem head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and
@@ -40,7 +44,7 @@ rem evict600 LLAMA_KV_TEST_DEMOTED_MIB=600 (the estimate of moved memory forced:
 rem slot moves it to the prompt cache, the next request restores it)
 if not defined QA_PARMS set "QA_PARMS=default"
 if not defined RUN_PROFILE set "RUN_PROFILE=0"
-if not defined RUN_CHECK set "RUN_CHECK=0"
+if not defined RUN_CHECK set "RUN_CHECK=1"
 if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0 65536 131072"
 if not defined QA_DARMS set "QA_DARMS=default"
 if not defined RUN_DECODE set "RUN_DECODE=0"

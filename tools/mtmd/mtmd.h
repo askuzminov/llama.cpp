@@ -133,6 +133,14 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // fork: --mmproj-on-demand. the weights stay in host memory and the device of use_gpu/device computes an encode by
+    // uploading the weights of its ops (op offload); its buffers on the device exist only during the encode, before which
+    // device_room (may be NULL) is asked for the device memory it needs (the server takes it from the moe-cache). an
+    // encode that does not get it, or fails on the device, runs on the CPU
+    bool on_demand;
+    bool (*device_room)(ggml_backend_dev_t dev, size_t bytes, void * user_data);
+    void * device_room_user_data;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

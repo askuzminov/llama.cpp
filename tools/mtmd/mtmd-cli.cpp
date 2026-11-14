@@ -163,6 +163,7 @@ struct mtmd_cli_context {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.on_demand        = params.mmproj_on_demand; // fork: --mmproj-on-demand
         {
             // non-causal models need the whole image in one ubatch
             const int n_ubatch = llama_n_ubatch(lctx);

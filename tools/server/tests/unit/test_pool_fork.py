@@ -1064,6 +1064,36 @@ def test_pool_weighs_nodes_of_other_devices_by_their_speed():
     assert max(n["weight"] for n in nodes) == 1.0
 
 
+
+def test_pool_leaves_out_a_router_that_stops_sharing():
+    # 14.11: a router whose models.ini no longer has pool = on (a machine taken out of the pool so) stayed a node of the
+    # others until they restarted: they sent it conversations and loaded the model there. now its /pool/router answers
+    # 404 (no pool), it is "left" and takes no request; it comes back when it shares the model again
+    start_pool()
+    with open(routers[1].models_preset) as f:
+        shared = f.read()
+    routers[1].stop()
+    with open(routers[1].models_preset, "w") as f:
+        f.write(shared.replace("pool = on\n", ""))
+    routers[1].start()
+    deadline = time.time() + 20
+    while node_of("n1")["status"] != "left":
+        assert time.time() < deadline, node_of("n1")
+        time.sleep(0.2)
+    assert "does not share" in node_of("n1")["error"], node_of("n1")
+    for i in range(3):
+        chat([{"role": "user", "content": f"conversation {i} while n1 is out of the pool"}])
+    assert {e["node"] for e in events("new")} == {"n0"}, events("new")
+    assert events("load") == []
+    routers[1].stop()
+    with open(routers[1].models_preset, "w") as f:
+        f.write(shared)
+    routers[1].start()
+    deadline = time.time() + 20
+    while node_of("n1")["status"] != "up":
+        assert time.time() < deadline, node_of("n1")
+        time.sleep(0.2)
+
 def test_pool_moves_no_state_into_a_node_without_room():
     # 07.11: the node a state goes to makes room in its RAM before the transfer (on a 395 the RAM is what the GPU leaves,
     # and the cache holds all of it down to its reserve), or says it cannot before gigabytes cross the network: n1 keeps

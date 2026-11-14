@@ -111,6 +111,7 @@ main { max-width: 1600px; margin: 0 auto; padding: 18px 20px 48px; }
 .node::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--ok); }
 .node.s-draining::before, .node.s-loading::before, .node.s-unloaded::before { background: var(--warn); }
 .node.s-down::before, .node.s-mismatch::before { background: var(--bad); }
+.node.s-left::before { background: var(--idle); }
 .node.dim .body { opacity: .62; }
 .nhead { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .nname { font-weight: 650; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -314,7 +315,7 @@ function badges(n) {
   return '<span class="badge ' + stateCls(st) + '">' + esc(st) + '</span>' + (n.draining ? '<span class="badge wa" title="takes no new conversations">draining</span>' : '') +
     (n.mismatch ? '<span class="badge ba" title="another model than the other nodes">mismatch</span>' : '');
 }
-function stateCls(st) { return st === "up" ? "ok" : (st === "down" || st === "mismatch") ? "ba" : "wa"; }
+function stateCls(st) { return st === "up" ? "ok" : (st === "down" || st === "mismatch") ? "ba" : st === "left" ? "" : "wa"; }
 function busyOf(n) { return (n.inflight || 0) + (n.external || 0); }
 
 // GPU names without the vendor words: "AMD Radeon(TM) 8060S Graphics" -> "8060S", "NVIDIA GeForce RTX 3090" -> "RTX 3090"

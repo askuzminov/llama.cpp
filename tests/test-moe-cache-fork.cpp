@@ -9,6 +9,9 @@
 //   makes it full), the next step gives them back
 // - upload: as keep, and the uploads ahead of whole weights (GGML_SCHED_PREFETCH, every prompt here with
 //   GGML_SCHED_PREFETCH_LOAD=0) take the experts the slots hold from device memory too (LLAMA_MOE_CACHE_COPY=2)
+// - room: as keep, and in the middle of every answer another user of the device (the multimodal projector on demand,
+//   --mmproj-on-demand) asks for 1 MiB more than is free (llama_device_make_room_fork): the cache gives up a layer of
+//   slots, and the next generation step allocates and uploads it again. the logits bit for bit
 // - state: the hot experts across runs (LLAMA_MOE_CACHE_STATE): a run saves them in a file of its model, the next run
 //   of the same model reads it, the same model under another name (a model of the same shape) reads none of it and
 //   keeps a file of its own; a file with an expert twice in a layer (a damaged or edited one) is ignored
@@ -21,7 +24,7 @@
 // modes must run on the same one. every logprob must be a number: a run that gives NaN fails, the reference too (the
 // comparison alone takes NaN against NaN as equal)
 //
-// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf [-dev <name>] (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)
+// usage: test-moe-cache-fork -m <dir>/qwen4exp-moe.gguf [-dev <name>] (--out <file> | --ref <file> --mode keep|fill|kv|upload|room|state)
 
 #include "llama.h"
 
@@ -41,6 +44,10 @@
 #include <vector>
 
 static int n_fail = 0;
+
+// mode room: the device memory another user of it asks for after every answer
+static bool g_room = false;
+static int  g_room_given = 0;
 
 static void check(bool ok, const char * what, int line) {
     if (!ok) {
@@ -307,6 +314,19 @@ static bool run(const std::string & path, ggml_backend_dev_t gpu, std::vector<re
             }
             recs.push_back(r);
 
+            // mode room: in the middle of the answer, so that the next batch is a generation one: the graphs that read
+            // the slots are built again and the cache allocates and uploads the layer again within the phase
+            if (g_room && g == 16) {
+                size_t free  = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(gpu, &free, &total);
+                // what is free already takes nothing from the cache, 1 MiB more takes a layer of slots
+                CHECK(llama_device_make_room_fork(lctx, gpu, 1024*1024));
+                const bool given = llama_device_make_room_fork(lctx, gpu, free + 1024*1024);
+                CHECK(given);
+                g_room_given += given ? 1 : 0;
+            }
+
             ok = decode({ (llama_token) r.token });
         }
     }
@@ -434,8 +454,9 @@ int main(int argc, char ** argv) {
         }
     }
     if (bad_arg || model_in == nullptr || (out == nullptr) == (ref == nullptr) ||
-            (ref != nullptr && mode != "keep" && mode != "fill" && mode != "kv" && mode != "upload" && mode != "state")) {
-        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> [-dev <name>] (--out <file> | --ref <file> --mode keep|fill|kv|upload|state)\n", argv[0]);
+            (ref != nullptr && mode != "keep" && mode != "fill" && mode != "kv" && mode != "upload" && mode != "room" &&
+             mode != "state")) {
+        fprintf(stderr, "usage: %s -m <qwen4exp-moe.gguf> [-dev <name>] (--out <file> | --ref <file> --mode keep|fill|kv|upload|room|state)\n", argv[0]);
         return 1;
     }
 
@@ -457,7 +478,8 @@ int main(int argc, char ** argv) {
         if (mode == "state") {
             set_env("LLAMA_MOE_CACHE_STATE", (std::string(ref) + ".state.bin").c_str());
         }
-    } else if (mode == "keep" || mode == "fill" || mode == "upload") {
+    } else if (mode == "keep" || mode == "fill" || mode == "upload" || mode == "room") {
+        g_room = mode == "room";
         // one of the two layers of 37.1 MiB stays (the last one goes first: the counts are even), so the 1-token MoE of
         // the last layer in a prompt graph (its output row) has no slots, as in the reference
         set_env("LLAMA_MOE_CACHE_KEEP", "40");
@@ -574,7 +596,7 @@ int main(int argc, char ** argv) {
 
     // keep is bit for bit; fill computes the experts that wait on the host (3.5e-5 apart on the Mac Vulkan0); kv keeps
     // all slots through the prompts, so the 1-token MoE of the last layer reads them there (4.8e-7)
-    const double tol = mode == "keep" || mode == "upload" ? 0.0 : mode == "fill" ? 1e-4 : 1e-5;
+    const double tol = mode == "keep" || mode == "upload" || mode == "room" ? 0.0 : mode == "fill" ? 1e-4 : 1e-5;
 
     const size_t want_nonfinite = count_nonfinite(want);
     if (want_nonfinite > 0) {
@@ -625,6 +647,10 @@ int main(int argc, char ** argv) {
     }
     if (mode == "kv") {
         CHECK(log_has("kv_elastic: 512 -> 768 cells"));
+    }
+    if (mode == "room") {
+        CHECK(g_room_given == 6);
+        CHECK(log_has("the moe-cache gave 37 MiB of"));
     }
 
     printf("%s %s: %zu tokens, logprobs of %zu compared, %.3g apart%s\n", argv[0], mode.c_str(), recs.size(), n_cmp, max_diff,

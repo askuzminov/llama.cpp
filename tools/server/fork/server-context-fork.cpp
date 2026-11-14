@@ -547,3 +547,8 @@ bool server_slot_room_fork() {
     }();
     return room;
 }
+
+bool server_mmproj_device_room_fork(ggml_backend_dev_t dev, size_t bytes, void * user_data) {
+    llama_context * ctx = user_data != nullptr ? *static_cast<llama_context **>(user_data) : nullptr;
+    return ctx != nullptr && llama_device_make_room_fork(ctx, dev, bytes);
+}

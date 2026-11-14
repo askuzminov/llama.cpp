@@ -593,6 +593,11 @@ struct pool_node {
     // weight (update_weights); empty until known
     std::string hw;
     double      weight      = 1.0;
+    // its router does not share the model (GET /pool/router?model= 404: no pool there, 400: no pool of this model):
+    // pool = on taken out of its models.ini, or a pool-peers entry that never had it. it takes no request and no load of
+    // the pool; it comes back when the router shares the model again (14.11: before, a router that left stayed a node
+    // of the others until they restarted, they sent it conversations and loaded the model there)
+    bool        left        = false;
     uint64_t    starts      = 0;   // the requests this router started there, to tell an answer that ran alone
     // measured: the part of a prefix of other conversations it reused for a prompt (cache_n of the answers), -1 = none
     // yet. a transformer takes all of it, a hybrid model (qwen4exp: gated delta net) or SWA only up to a checkpoint
@@ -2231,6 +2236,7 @@ struct server_pool_fork::impl {
         int64_t     t_slots    = 0;  // when /slots answered (ms): the counters of the slots are of that moment
         json        info;
         json        router;
+        int         router_status = 0; // of GET /pool/router, 0 = not asked or no answer
         bool        failed     = false;
         int         n_running  = 0;
         int         max_models = -1; // -1 = not read this time
@@ -2257,6 +2263,7 @@ struct server_pool_fork::impl {
             }
             if (want_router) {
                 auto rr = cli.Get("/pool/router?model=" + node.model, hdrs);
+                pr.router_status = rr ? rr->status : 0;
                 if (rr && rr->status == 200) {
                     pr.router = json::parse_no_throw(rr->body);
                 }
@@ -2406,8 +2413,16 @@ struct server_pool_fork::impl {
                         node.link = used;
                     }
                 }
-                const std::string status = used >= 0 ? pr.status : "down";
-                const std::string error  = used >= 0 ? pr.error : node.links[active].error;
+                // whether its router shares the model, from the answer of /pool/router (every 5 s): 404 and 400 say
+                // it does not, 200 that it does; another answer (a key the router refuses, an error) changes nothing
+                if (used >= 0 && (pr.router_status == 200 || pr.router_status == 400 || pr.router_status == 404)) {
+                    node.left = pr.router_status != 200;
+                }
+                const bool left = used >= 0 && node.left;
+                const std::string status = used < 0 ? "down" : left ? "left" : pr.status;
+                const std::string error  = used < 0 ? node.links[active].error : left
+                    ? "its router does not share " + node.model + " (no pool = on in its models.ini): it takes no request of the pool"
+                    : pr.error;
                 if (status != node.status) {
                     event(status.c_str(), "", i, status == "up" ? pool_base(node.links[node.link]) : (error.empty() ? status : error));
                     SRV_INF("pool: node %s is %s%s%s\n", node.name.c_str(), status.c_str(), error.empty() ? "" : ": ", error.c_str());

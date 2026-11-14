@@ -1095,11 +1095,20 @@ static void ggml_vk_fork_profiler(bool start) {
 // server grew into what a desktop gave back for a while: on the 395 a remote desktop session reconnected, its desktop
 // took its device memory again, the heap was overcommitted and Windows moved part of this process to the shared
 // memory (system RAM outside the carve-out): the system swapped and the decode fell to 19 t/s (user, 13.11). growth of
-// the others past their most is logged, with the overcommit if there is one
+// the others past their most is logged, with the overcommit if there is one.
+// 14.11 evening: the reserve is not part of the limit any more. as a wall it refused a buffer of 90 MiB at 93086 of
+// 93148 MiB on the 395 (the others had held at most 3108 MiB) with ~2 GB of the heap that no other process ever held,
+// and every request failed with ErrorOutOfDeviceMemory. soft (may be nullptr): the limit less the reserve, past which
+// the elastic KV gives back the cells it does not use (ggml_backend_vk_buffer_heap_over_fork); the limit itself where
+// the others are not known
 static uint64_t ggml_vk_fork_heap_limit(const vk_device & device, uint32_t heap,
-        const vk::PhysicalDeviceMemoryBudgetPropertiesEXT & bp, const vk::PhysicalDeviceMemoryProperties & mp) {
+        const vk::PhysicalDeviceMemoryBudgetPropertiesEXT & bp, const vk::PhysicalDeviceMemoryProperties & mp,
+        uint64_t * soft = nullptr) {
     const uint64_t size   = mp.memoryHeaps[heap].size;
     const uint64_t budget = std::min<uint64_t>(bp.heapBudget[heap], size);
+    if (soft) {
+        *soft = budget;
+    }
 
     static const bool use_budget = [] {
         const char * e = getenv("GGML_VK_DEVICE_LIMIT");
@@ -1124,6 +1133,8 @@ static uint64_t ggml_vk_fork_heap_limit(const vk_device & device, uint32_t heap,
         bool     known    = false;
         uint64_t others   = 0;
         uint64_t most     = 0;     // the most the others held while this process ran
+        uint64_t recent[3] = {};   // the last readings of the others, the newest first
+        int      n_recent = 0;
         bool     logged   = false;
     };
     static std::mutex                     mtx;
@@ -1151,31 +1162,48 @@ static uint64_t ggml_vk_fork_heap_limit(const vk_device & device, uint32_t heap,
         st.known  = ggml_vk_fork_adapter_dedicated_usage(st.luid, &sys);
         st.others = st.known && sys > bp.heapUsage[heap] ? sys - bp.heapUsage[heap] : 0;
         st.t_us   = t_us;
-        if (st.known && st.logged && st.others >= st.most + 256*1024*1024) {
+        // the counter of the system follows the allocations later than the budget extension: a reading just after this
+        // process freed memory (a trim of the elastic KV, a slot moved to the prompt cache) counts what it freed as the
+        // others' for a while, and the most kept it for good. so the most takes a value only when the last three
+        // readings (~3 s) all reach it, the first reading of the process as it is
+        uint64_t confirmed = 0;
+        if (st.known) {
+            st.recent[2] = st.recent[1];
+            st.recent[1] = st.recent[0];
+            st.recent[0] = st.others;
+            st.n_recent  = std::min(st.n_recent + 1, 3);
+            confirmed = st.n_recent == 1 ? st.others
+                      : st.n_recent == 3 ? std::min(st.recent[0], std::min(st.recent[1], st.recent[2])) : 0;
+        }
+        if (st.known && st.logged && confirmed >= st.most + 256*1024*1024) {
             const uint64_t mine = bp.heapUsage[heap];
-            const uint64_t over = mine + st.others > size ? mine + st.others - size : 0;
+            const uint64_t over = mine + confirmed > size ? mine + confirmed - size : 0;
             GGML_LOG_WARN("ggml_vulkan: %s: other processes hold %.0f MiB of device memory heap %u now, at most %.0f MiB before; "
-                    "this process holds %.0f MiB of %.0f%s\n", device->name.c_str(), st.others/1048576.0, heap,
+                    "this process holds %.0f MiB of %.0f%s\n", device->name.c_str(), confirmed/1048576.0, heap,
                     st.most/1048576.0, mine/1048576.0, size/1048576.0,
                     over ? " MiB: the heap is overcommitted, Windows moves memory of this process to the shared memory "
                            "(system RAM), which may swap and slow the GPU (GGML_VK_DEVICE_RESERVE_MIB)" : " MiB");
         }
         if (st.known) {
-            st.most = std::max(st.most, st.others);
+            st.most = std::max(st.most, confirmed);
         }
     }
     if (!st.known) {
         return budget;
     }
-    const uint64_t taken = st.most + reserve;
-    const uint64_t limit = size > taken ? size - taken : 0;
+    const uint64_t limit = size > st.most ? size - st.most : 0;
+    const uint64_t lower = limit > reserve ? limit - reserve : 0;
+    if (soft) {
+        *soft = lower;
+    }
     if (!st.logged) {
         st.logged = true;
         GGML_LOG_WARN("ggml_vulkan: %s: device memory heap %u of %.0f MiB, other processes hold %.0f MiB of it, the driver "
-                "budgets %.0f MiB: this process takes up to %.0f MiB (%.0f MiB more kept free for processes that take device "
-                "memory later, GGML_VK_DEVICE_RESERVE_MIB; GGML_VK_DEVICE_LIMIT=budget: the budget)\n",
+                "budgets %.0f MiB: this process takes up to %.0f MiB, and past %.0f MiB (the %.0f MiB of "
+                "GGML_VK_DEVICE_RESERVE_MIB for processes that take device memory later) it gives back the KV cells it does "
+                "not use (GGML_VK_DEVICE_LIMIT=budget: the budget)\n",
                 device->name.c_str(), heap, size/1048576.0, st.others/1048576.0, budget/1048576.0, limit/1048576.0,
-                reserve/1048576.0);
+                lower/1048576.0, reserve/1048576.0);
     }
     return limit;
 }
@@ -1206,8 +1234,9 @@ bool ggml_vk_fork_heap_has_room(const vk_device & device, uint32_t type, uint64_
         return true;
     }
     GGML_LOG_ERROR("ggml_vulkan: device memory heap %u: %.0f MiB in use of a limit of %.0f MiB, %.0f MiB more asked (%.0f MiB "
-            "kept free): not allocated there, the driver would back it with system memory (GGML_VK_DEVICE_MARGIN_MIB; "
-            "GGML_VK_ALLOW_SYSMEM_FALLBACK=1 allows system memory)\n",
+            "kept free): not allocated there, past the limit (the heap less the most the other processes held) the system "
+            "backs device memory with system memory (GGML_VK_DEVICE_MARGIN_MIB; GGML_VK_ALLOW_SYSMEM_FALLBACK=1 allows "
+            "system memory)\n",
             heap, usage/1048576.0, limit/1048576.0, size/1048576.0, margin/1048576.0);
     return false;
 }
@@ -1281,7 +1310,7 @@ struct ggml_vk_elastic_fork {
 
     // whether a slab fits the heap of the memory type within its budget, less the margin; true without the budget.
     // usage and limit: what the budget read, for the log
-    bool heap_room(uint32_t type, uint64_t * usage = nullptr, uint64_t * limit = nullptr) const {
+    bool heap_room(uint32_t type, uint64_t * usage = nullptr, uint64_t * limit = nullptr, uint64_t * soft = nullptr) const {
         if (!budget) {
             return true;
         }
@@ -1290,7 +1319,7 @@ struct ggml_vk_elastic_fork {
         props2.pNext = &budget_props;
         device->physical_device.getMemoryProperties2(&props2);
         const uint32_t heap = props2.memoryProperties.memoryTypes[type].heapIndex;
-        const uint64_t lim  = ggml_vk_fork_heap_limit(device, heap, budget_props, props2.memoryProperties);
+        const uint64_t lim  = ggml_vk_fork_heap_limit(device, heap, budget_props, props2.memoryProperties, soft);
         if (usage) {
             *usage = budget_props.heapUsage[heap];
         }
@@ -1692,10 +1721,11 @@ static bool ggml_backend_vk_buffer_elastic_zero_reads_fork(ggml_backend_buffer_t
     return ctx->elastic != nullptr && ctx->elastic->device->properties.sparseProperties.residencyNonResidentStrict;
 }
 
-// the bytes this process holds of the device memory heap of an elastic buffer past its limit (ggml_vk_fork_heap_limit:
-// the heap less the most the other processes held and the reserve), 0 within it, for another buffer or without the
-// budget extension. past the limit the other processes took more than the reserve left: llama gives back the cells of
-// its elastic KV not in use (llama_context::kv_elastic_trim_fork, 14.11).
+// the bytes this process holds of the device memory heap of an elastic buffer past the limit less the reserve
+// (ggml_vk_fork_heap_limit: the heap less the most the other processes held, less GGML_VK_DEVICE_RESERVE_MIB), 0 within
+// it, for another buffer or without the budget extension. past it the reserve kept for the other processes is in use:
+// llama gives back the cells of its elastic KV not in use (llama_context::kv_elastic_trim_fork, 14.11); the
+// allocations themselves stop at the limit only (14.11 evening).
 // demoted: the memory the system moved out of the heap, an estimate. the usage of the heap is over what this process
 // allocated there (fork_local_bytes) by the memory of the driver; when the system takes memory of this process out of
 // the heap for another one (Windows when a desktop session takes its device memory back, 13.11) the usage falls and
@@ -1716,7 +1746,8 @@ static size_t ggml_backend_vk_buffer_heap_over_fork(ggml_backend_buffer_t buffer
     }
     uint64_t usage = 0;
     uint64_t limit = 0;
-    el->heap_room(el->memory_type, &usage, &limit);
+    uint64_t soft  = 0;
+    el->heap_room(el->memory_type, &usage, &limit, &soft);
 
     const vk_device & dev   = el->device;
     const uint64_t    local = dev->fork_local_bytes.load(std::memory_order_relaxed);
@@ -1737,7 +1768,8 @@ static size_t ggml_backend_vk_buffer_heap_over_fork(ggml_backend_buffer_t buffer
     if (demoted) {
         *demoted = (size_t) moved;
     }
-    return usage > limit ? (size_t) (usage - limit) : 0;
+    // past the limit less the reserve (GGML_VK_DEVICE_RESERVE_MIB): the reserve for the other processes is in use
+    return usage > soft ? (size_t) (usage - soft) : 0;
 }
 
 bool ggml_vk_fork_elastic_clear(ggml_backend_vk_buffer_context * ctx, uint8_t value) {

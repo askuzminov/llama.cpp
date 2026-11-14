@@ -550,6 +550,9 @@ public:
     // the bytes given back
     size_t kv_elastic_trim_fork(uint32_t n_tokens, bool all);
 
+    // fork: device memory for another user of dev, see llama_device_make_room_fork
+    bool device_make_room_fork(ggml_backend_dev_t dev, size_t bytes);
+
 private:
     // before the graph of a ubatch runs: the fork's work that overlaps it (llama_fork_before_compute)
     void fork_before_compute(llama_memory_context_i * mctx);

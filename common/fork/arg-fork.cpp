@@ -119,6 +119,19 @@ static void common_params_add_args_n_cpu_moe(const common_params & /*params*/, c
             params.phase_mem = true;
         }
     ).set_env("LLAMA_ARG_PHASE_MEM"));
+    // 14.11, the 3090: --no-mmproj-offload kept the projector off the card for the moe-cache, and the prompts with images
+    // read at the speed of the CPU
+    add_opt(common_arg(
+        {"--mmproj-on-demand"},
+        {"--no-mmproj-on-demand"},
+        "keep the weights of the multimodal projector in host memory and run it on the GPU only while it encodes: the GPU gets "
+        "the weights its ops need for each encode (op offload) and gives the memory back after it; with --moe-cache and "
+        "--phase-mem the moe-cache makes room for it. an encode the GPU has no room for runs on the CPU (default: off) "
+        "[EXPERIMENTAL]",
+        [](common_params & params, bool value) {
+            params.mmproj_on_demand = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MMPROJ_ON_DEMAND"));
 }
 
 static void common_params_add_args_spec_synth_rates(const common_params & params, const std::function<void(common_arg)> & add_opt) {

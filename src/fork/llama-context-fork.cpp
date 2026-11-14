@@ -267,9 +267,9 @@ bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t 
 //   batch the 395 took 156 / 349 / 684 ms to give back 1.5 / 3.5 / 6.5 GB after a conversation of 70K / 135K / 248K
 //   cells, which the next request waited for (profile-20261114-135627), and mapping them again for the conversation
 //   coming back 241 / 493 ms
-// - else only while the device memory is over its limit (the backend: the other processes took more than its reserve
-//   left, ggml_backend_buffer_heap_over_fork; asked at most once a second): before a batch, and each second of an idle
-//   server
+// - else only while the device memory is in the reserve kept for the other processes (the backend: past its limit less
+//   GGML_VK_DEVICE_RESERVE_MIB, ggml_backend_buffer_heap_over_fork; asked at most once a second): before a batch, and each
+//   second of an idle server
 size_t llama_context::kv_elastic_trim_fork(uint32_t n_tokens, bool all) {
     if (!kv_elastic || cparams.phase_mem) {
         return 0;
@@ -303,7 +303,7 @@ size_t llama_context::kv_elastic_trim_fork(uint32_t n_tokens, bool all) {
     const size_t bytes = (before - after)*memory->kv_cell_bytes_fork();
     const double ms    = 1e-3*(ggml_time_us() - t0_us);
     if (over > 0) {
-        LLAMA_LOG_WARN("%s: kv_elastic: the device memory is %.0f MiB over its limit (other processes took more of it): "
+        LLAMA_LOG_WARN("%s: kv_elastic: the device memory is %.0f MiB into the reserve kept for other processes: "
                 "%zu -> %zu cells mapped, %.0f MiB given back (%u in use) in %.1f ms\n", __func__, over/1024.0/1024.0, before,
                 after, bytes/1024.0/1024.0, memory->get_n_kv_used(), ms);
     } else {
@@ -771,6 +771,37 @@ uint32_t llama_mtp_window_kv(const llama_context * ctx, uint32_t * n_window) {
 
 size_t llama_kv_elastic_trim_fork(llama_context * ctx, bool all) {
     return ctx ? ctx->kv_elastic_trim_fork(0, all) : 0;
+}
+
+// 14.11: the multimodal projector on demand (--mmproj-on-demand) asks for the device memory of an encode right before it
+// is allocated, and the moe-cache holds all that a generation phase left free (phase_gen). its slots of whole layers go
+// (release_bytes, as for the buffers of a prompt phase), the graphs that read them are built again, and the next
+// generation phase allocates and uploads those layers again (phase_update, phase_cache)
+bool llama_context::device_make_room_fork(ggml_backend_dev_t dev, size_t bytes) {
+    size_t free  = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(dev, &free, &total);
+    if (free >= bytes) {
+        return true;
+    }
+    if (!cparams.phase_mem || !moe_cache_fork || !moe_cache_fork->ready() || moe_cache_fork->get_dev() != dev) {
+        return false;
+    }
+    const int64_t t_start_us = ggml_time_us();
+    synchronize();
+    const size_t freed = moe_cache_fork->release_bytes(bytes - free);
+    gf_res_prev_reset();
+    gf_res_prev_active = nullptr;
+    phase_cache        = false;
+    ggml_backend_dev_memory(dev, &free, &total);
+    LLAMA_LOG_INFO("%s: the moe-cache gave %.0f MiB of %s to another user of it (%.0f MiB asked, %.0f MiB free) in %.1f ms\n",
+            __func__, freed/1048576.0, ggml_backend_dev_name(dev), bytes/1048576.0, free/1048576.0,
+            1e-3*(ggml_time_us() - t_start_us));
+    return free >= bytes;
+}
+
+bool llama_device_make_room_fork(llama_context * ctx, ggml_backend_dev_t dev, size_t bytes) {
+    return ctx != nullptr && dev != nullptr && ctx->device_make_room_fork(dev, bytes);
 }
 
 size_t llama_kv_elastic_over_fork(llama_context * ctx, size_t * demoted) {

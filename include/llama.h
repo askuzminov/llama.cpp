@@ -608,6 +608,11 @@ extern "C" {
     // the limit. Returns the bytes given back, 0 for a cache that is not elastic
     LLAMA_API size_t llama_kv_elastic_trim_fork(struct llama_context * ctx, bool all);
 
+    // fork: device memory for another user of dev (the multimodal projector on demand, --mmproj-on-demand): the moe-cache
+    // gives up the slots of whole layers until bytes are free, and the next generation phase takes the memory back
+    // (--phase-mem only). true when bytes are free
+    LLAMA_API bool llama_device_make_room_fork(struct llama_context * ctx, ggml_backend_dev_t dev, size_t bytes);
+
     // fork: the bytes the process holds past the limit of the device memory of the elastic KV cache (0: within it, or
     // the backend cannot tell), and in *demoted the memory of the process the system moved out of the device memory for
     // another process (an estimate, Vulkan; LLAMA_KV_TEST_DEMOTED_MIB sets it for tests)
