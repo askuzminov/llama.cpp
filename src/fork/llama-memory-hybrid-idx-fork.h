@@ -67,6 +67,7 @@ public:
     uint32_t kv_set_capacity_fork(uint32_t n_cells, int32_t strm) override;
     size_t   kv_mapped_cells_fork() const override;
     size_t   kv_cell_bytes_fork() const override;
+    size_t   kv_heap_over_fork() const override;
     void     kv_set_grow_fork(std::function<bool(uint32_t, uint32_t)> grow) override;
     void     kv_alloc_deferred_fork() override;
 

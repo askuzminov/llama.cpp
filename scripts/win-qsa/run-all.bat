@@ -11,13 +11,16 @@ rem the folder of this file, for the subroutine below: there the zeroth argument
 set "HERE=%~dp0"
 call "%HERE%_config.bat"
 
-rem the questions of 14.11 (README, run-all). the 395: the default since 13.11 night (the f16 coopmat tile of
-rem GGML_VK_MM_F16REG_VERIFY for the dense q8_0 of the draft checks, 1024 rows and more, two int8 planes for the
-rem rest: 07-exact decode4 0.0115 against 0.0311, 06 TG -2.7% against old) takes the tile from 5 tokens now
-rem (GGML_VK_MM_F16REG_VERIFY_MIN_N=5): in 03 (00:05) a verify of 2/3/4 tokens costs 2.2/1.4/0.9 ms less on the two
-rem planes than on the tile, of 5/8 tokens 2.1/7.3 ms more. 06 default, old (GGML_VK_MM_F16REG_VERIFY=0, the path
-rem before 13.11) and again (default once more at the end); 03 default and old at depth 0; 07-exact decode4 (the two
-rem planes now) and decode8 (the tile); 01 everything (the sources changed). 05, 07 against upstream and 02 are off. the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
+rem the questions of 14.11 (README, run-all). the 395, after a reconnected remote desktop took its device memory back
+rem and Windows moved part of the server to the shared memory (13.11, the system swapped): the device memory limit
+rem keeps GGML_VK_DEVICE_RESERVE_MIB (2048) free under the most the other processes held, and the elastic KV gives back
+rem the cells it does not use without --phase-mem (far over the cells in use, or any while the device memory is over
+rem its limit). 01: the guards read the new limit line. 06 default with the long task first, so that the next task
+rem finds 22K cells mapped for its 2K and gives them back (the summary: "the elastic KV gave back memory"), TG and texts
+rem as before. the reconnect itself is a test by hand with serve.bat (README). answered before (e001cfa45): the default
+rem takes the f16 tile for verifies of 5-8 tokens and two int8 planes below, 07-exact 0.0125/0.0121 against 0.0311/
+rem 0.0307 of old, 06 old +1.9%. 03, 07-exact, 05, 07 against upstream and 02 are off on the 395. the 3090: 01 (the
+rem sources of llama changed; its elastic KV takes the --phase-mem path, which this does not touch). the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
 rem 13.11 21:36 all ops passed without them); 06, 07, 03 and 02 are off (03 answered 13.11: the reply 38.96-46.31 ms of
 rem GPU a token with the reports read per backend context). both: the spec probe of 01 again, the PIT mean now of the
 rem mid-point transform (13.11: the randomized one took a fixed random stream whose first 1500 values average 0.516, so
@@ -28,8 +31,6 @@ rem the guard refused 256 bytes: 512 MiB next to the expert cache is too little)
 rem upstream -20%/-10% TG in two runs) and the 07 split (copy = upstream bit for bit, the CPU: fork 1.9434 against
 rem upstream 1.9442); again (a second default) stays: the logits of default bit for bit
 if not defined QA_PAR_ARMS set "QA_PAR_ARMS=default;rows0 LLAMA_QSA_ROWS=0"
-rem the decode tasks with a long prompt (about 24K tokens) and a short reply: the prompt speed of each variant too
-if not defined QA_DEC_SET set "QA_DEC_SET=prose ru code-py code-cpp edit json long"
 rem the probes of 02-long take the default only, the variants of the probes are a question for 01-check
 if not defined LONG_QARMS set "LONG_QARMS=default"
 rem the indexer kernels have not changed since the micro of 31.10 evening: 04-micro only on request (RUN_MICRO=1)
@@ -43,11 +44,15 @@ rem tables of the ops at a verify of 4 tokens
 if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0"
 if not defined QA_PROF_TG set "QA_PROF_TG=256"
 if not defined QA_PROF_VERIFY set "QA_PROF_VERIFY=4"
-if not defined QA_DARMS set "QA_DARMS=default;old GGML_VK_MM_F16REG_VERIFY=0;again LLAMA_QA_AGAIN=1"
+if not defined QA_DARMS set "QA_DARMS=default"
+rem the long task first: the trim of the elastic KV at the next task
+if not defined QA_DEC_SET set "QA_DEC_SET=long prose ru code-py code-cpp edit json"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
 rem decode4 and decode8: the default at ubatch 4 and 8 (the draft checks; 4 on the two planes, 8 on the tile), the
 rem arms of 12.11 (0.0311 and 0.0307 then): their column before
 if not defined EXACT_KARMS set "EXACT_KARMS=decode4 QA_ARM_UB=4;decode8 QA_ARM_UB=8"
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
+if not defined RUN_EXACT set "RUN_EXACT=0"
 if not defined RUN_KLD set "RUN_KLD=0"
 if not defined RUN_LONG set "RUN_LONG=0"
 goto :arms_done
@@ -63,6 +68,8 @@ if not defined RUN_LONG set "RUN_LONG=0"
 rem the CUDA matmuls have no f32 mode: 07 against the exact base runs on the 395 only
 if not defined RUN_EXACT set "RUN_EXACT=0"
 :arms_done
+rem the decode tasks with a long prompt (about 24K tokens) and a short reply: the prompt speed of each variant too
+if not defined QA_DEC_SET set "QA_DEC_SET=prose ru code-py code-cpp edit json long"
 rem 05-mm (the dense q8_0 matmuls by tile) only where a section above or _local.bat asks (RUN_MM=1)
 if not defined RUN_MM set "RUN_MM=0"
 

@@ -1089,7 +1089,13 @@ static void ggml_vk_fork_profiler(bool start) {
 // (93389 of 98304 MiB in every log), so the elastic cache went to the shared memory with ~3 GB of the carve-out free
 // (user, 12.11); the heap itself stays the bound, past it the driver backs the memory with system memory and stalls on
 // its first use (98.8 GB of buffers, 11.10). only a device with one device local heap, as the counter adds up the
-// adapter. the others are read again at most once a second. GGML_VK_DEVICE_LIMIT=budget: the budget of the driver
+// adapter. the others are read again at most once a second. GGML_VK_DEVICE_LIMIT=budget: the budget of the driver.
+// 14.11: the heap less the most the others held since the start (not what they hold at the moment) and less
+// GGML_VK_DEVICE_RESERVE_MIB (2048) for the device memory a process takes later. with the moment's value alone the
+// server grew into what a desktop gave back for a while: on the 395 a remote desktop session reconnected, its desktop
+// took its device memory again, the heap was overcommitted and Windows moved part of this process to the shared
+// memory (system RAM outside the carve-out): the system swapped and the decode fell to 19 t/s (user, 13.11). growth of
+// the others past their most is logged, with the overcommit if there is one
 static uint64_t ggml_vk_fork_heap_limit(const vk_device & device, uint32_t heap,
         const vk::PhysicalDeviceMemoryBudgetPropertiesEXT & bp, const vk::PhysicalDeviceMemoryProperties & mp) {
     const uint64_t size   = mp.memoryHeaps[heap].size;
@@ -1117,6 +1123,7 @@ static uint64_t ggml_vk_fork_heap_limit(const vk_device & device, uint32_t heap,
         int64_t  t_us     = 0;
         bool     known    = false;
         uint64_t others   = 0;
+        uint64_t most     = 0;     // the most the others held while this process ran
         bool     logged   = false;
     };
     static std::mutex                     mtx;
@@ -1136,22 +1143,39 @@ static uint64_t ggml_vk_fork_heap_limit(const vk_device & device, uint32_t heap,
     if (!st.id_valid) {
         return budget;
     }
+    static const uint64_t reserve = (uint64_t) std::max<int64_t>(0, getenv("GGML_VK_DEVICE_RESERVE_MIB") != nullptr ?
+                                        atoll(getenv("GGML_VK_DEVICE_RESERVE_MIB")) : 2048)*1024*1024;
     const int64_t t_us = ggml_time_us();
     if (st.t_us == 0 || t_us - st.t_us >= 1000000) {
         uint64_t sys = 0;
         st.known  = ggml_vk_fork_adapter_dedicated_usage(st.luid, &sys);
         st.others = st.known && sys > bp.heapUsage[heap] ? sys - bp.heapUsage[heap] : 0;
         st.t_us   = t_us;
+        if (st.known && st.logged && st.others >= st.most + 256*1024*1024) {
+            const uint64_t mine = bp.heapUsage[heap];
+            const uint64_t over = mine + st.others > size ? mine + st.others - size : 0;
+            GGML_LOG_WARN("ggml_vulkan: %s: other processes hold %.0f MiB of device memory heap %u now, at most %.0f MiB before; "
+                    "this process holds %.0f MiB of %.0f%s\n", device->name.c_str(), st.others/1048576.0, heap,
+                    st.most/1048576.0, mine/1048576.0, size/1048576.0,
+                    over ? " MiB: the heap is overcommitted, Windows moves memory of this process to the shared memory "
+                           "(system RAM), which may swap and slow the GPU (GGML_VK_DEVICE_RESERVE_MIB)" : " MiB");
+        }
+        if (st.known) {
+            st.most = std::max(st.most, st.others);
+        }
     }
     if (!st.known) {
         return budget;
     }
-    const uint64_t limit = size > st.others ? size - st.others : 0;
+    const uint64_t taken = st.most + reserve;
+    const uint64_t limit = size > taken ? size - taken : 0;
     if (!st.logged) {
         st.logged = true;
         GGML_LOG_WARN("ggml_vulkan: %s: device memory heap %u of %.0f MiB, other processes hold %.0f MiB of it, the driver "
-                "budgets %.0f MiB: this process takes up to %.0f MiB (GGML_VK_DEVICE_LIMIT=budget: the budget)\n",
-                device->name.c_str(), heap, size/1048576.0, st.others/1048576.0, budget/1048576.0, limit/1048576.0);
+                "budgets %.0f MiB: this process takes up to %.0f MiB (%.0f MiB more kept free for processes that take device "
+                "memory later, GGML_VK_DEVICE_RESERVE_MIB; GGML_VK_DEVICE_LIMIT=budget: the budget)\n",
+                device->name.c_str(), heap, size/1048576.0, st.others/1048576.0, budget/1048576.0, limit/1048576.0,
+                reserve/1048576.0);
     }
     return limit;
 }
@@ -1657,6 +1681,25 @@ static bool ggml_backend_vk_buffer_elastic_zero_reads_fork(ggml_backend_buffer_t
     return ctx->elastic != nullptr && ctx->elastic->device->properties.sparseProperties.residencyNonResidentStrict;
 }
 
+// the bytes this process holds of the device memory heap of an elastic buffer past its limit (ggml_vk_fork_heap_limit:
+// the heap less the most the other processes held and the reserve), 0 within it, for another buffer or without the
+// budget extension. past the limit the other processes took more than the reserve left: llama gives back the cells of
+// its elastic KV not in use (llama_context::kv_elastic_trim_fork, 14.11)
+static size_t ggml_backend_vk_buffer_heap_over_fork(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_vk(buffer)) {
+        return 0;
+    }
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    const ggml_vk_elastic_fork * el = ctx->elastic.get();
+    if (el == nullptr || !el->budget) {
+        return 0;
+    }
+    uint64_t usage = 0;
+    uint64_t limit = 0;
+    el->heap_room(el->memory_type, &usage, &limit);
+    return usage > limit ? (size_t) (usage - limit) : 0;
+}
+
 bool ggml_vk_fork_elastic_clear(ggml_backend_vk_buffer_context * ctx, uint8_t value) {
     ggml_vk_elastic_fork * el = ctx->elastic.get();
     if (el == nullptr) {
@@ -1698,6 +1741,9 @@ void * ggml_backend_vk_reg_get_proc_address_fork(ggml_backend_reg_t reg, const c
     }
     if (strcmp(name, "ggml_backend_buffer_elastic_zero_reads_fork") == 0) {
         return (void *) ggml_backend_vk_buffer_elastic_zero_reads_fork;
+    }
+    if (strcmp(name, "ggml_backend_buffer_heap_over_fork") == 0) {
+        return (void *) ggml_backend_vk_buffer_heap_over_fork;
     }
     return nullptr;
 }

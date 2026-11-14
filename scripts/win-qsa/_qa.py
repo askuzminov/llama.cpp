@@ -885,6 +885,13 @@ def cmd_build_upstream():
 NOTE_LIMIT = re.compile(r"device memory heap \d+ of ([\d.]+) MiB, other processes hold ([\d.]+) MiB of it, the driver "
                         r"budgets ([\d.]+) MiB: this process takes up to ([\d.]+) MiB")
 NOTE_REFUSED = re.compile(r"device memory heap \d+: ([\d.]+) MiB in use of a limit of ([\d.]+) MiB, ([\d.]+) MiB more asked")
+# 14.11: the other processes took more device memory while this one ran (a desktop session reconnected), with the
+# overcommit of the heap when there is one (Windows then moves memory of ours to the shared memory)
+# 14.11: the elastic KV gave back cells without --phase-mem (llama_context::kv_elastic_trim_fork), WARN when the device
+# memory was over its limit
+NOTE_TRIM = re.compile(r"kv_elastic: (the device memory is ([\d.]+) MiB over its limit .*?: )?(\d+) -> (\d+) cells mapped, ([\d.]+) MiB given back")
+NOTE_OTHERS = re.compile(r"other processes hold ([\d.]+) MiB of device memory heap \d+ now, at most ([\d.]+) MiB before; "
+                         r"this process holds ([\d.]+) MiB of ([\d.]+) MiB(: the heap is overcommitted)?")
 # the refusal of the CUDA backend on Windows (ggml-cuda/fork/device-room-fork.inc, 12.11): the driver would back it with
 # system memory
 NOTE_REFUSED_CUDA = re.compile(r"([\d.]+) MiB on device \d+ do not fit its free memory \(([\d.]+) MiB free of ([\d.]+) MiB")
@@ -898,7 +905,7 @@ NOTE_MOE_NONE = re.compile(r"moe_cache: (\S+) has (\d+) MiB free, one slot on \d
                            r"stay free, no slots")
 NOTE_RELIEF = re.compile(r"relieving [\d.]+ MiB from the prompt cache")
 NOTE_FIT = re.compile(r"would go to host memory, refused")
-NOTE_KEYS = (b"device memory heap", b"elastic buffer", b"QSA scores", b"moe_cache: ", b"relieving", b"refused")
+NOTE_KEYS = (b"device memory heap", b"elastic buffer", b"QSA scores", b"moe_cache: ", b"relieving", b"refused", b"given back")
 
 
 def log_first(log, pattern):
@@ -916,9 +923,9 @@ def log_first(log, pattern):
 
 def log_notes(folder):
     """the notes of the logs in folder (NOTE_*), as lines for the summary"""
-    limits, refused, spills, floors, qsa, moe, relief, fits = [], [], [], [], [], [], [], []
+    limits, refused, spills, floors, qsa, moe, relief, fits, later, trims = [], [], [], [], [], [], [], [], [], []
     for log in sorted(Path(folder).glob("*.log")):
-        first, n_relief = {}, 0
+        first, n_relief, n_trim, trim_mib, trim_over = {}, 0, 0, 0.0, 0
         try:
             with log.open("rb") as f:
                 for raw in f:
@@ -927,10 +934,15 @@ def log_notes(folder):
                     line = raw.decode("utf-8", errors="replace")
                     if NOTE_RELIEF.search(line):
                         n_relief += 1
+                    m_trim = NOTE_TRIM.search(line)
+                    if m_trim:
+                        n_trim += 1
+                        trim_mib += float(m_trim[5])
+                        trim_over += 1 if m_trim[1] else 0
                     for key, pattern in (("limit", NOTE_LIMIT), ("refused", NOTE_REFUSED),
                                          ("refused_cuda", NOTE_REFUSED_CUDA), ("spill", NOTE_SPILL),
                                          ("floor", NOTE_FLOOR), ("qsa", NOTE_QSA), ("moe", NOTE_MOE),
-                                         ("moe0", NOTE_MOE_NONE), ("fit", NOTE_FIT)):
+                                         ("moe0", NOTE_MOE_NONE), ("fit", NOTE_FIT), ("others", NOTE_OTHERS)):
                         if key not in first:
                             m = pattern.search(line)
                             if m:
@@ -940,6 +952,12 @@ def log_notes(folder):
         name = log.name
         if "limit" in first:
             limits.append([float(x) for x in first["limit"]])
+        if n_trim:
+            trims.append(f"{name} {n_trim} times, {trim_mib:.0f} MiB" + (f", {trim_over} of them over the limit" if trim_over else ""))
+        if "others" in first:
+            now, before, mine, heap, over = first["others"]
+            later.append(f"{name} ({before} -> {now} MiB, this process {mine} of {heap} MiB" +
+                          (", overcommitted)" if over else ")"))
         if "refused" in first:
             use, lim, ask = first["refused"]
             refused.append(f"{name} ({use} MiB in use of {lim}, {ask} more asked)")
@@ -975,7 +993,9 @@ def log_notes(folder):
                          ("KV cache in shared memory (elastic spill)", spills),
                          ("KV cache stopped at the RAM floor", floors), ("QSA block lists", qsa), ("expert cache", moe),
                          ("the prompt cache gave memory back (times)", relief),
-                         ("fit refused, weights would go to host memory", fits)):
+                         ("fit refused, weights would go to host memory", fits),
+                         ("device memory the other processes took later", later),
+                         ("the elastic KV gave back memory", trims)):
         if items:
             out.append(f"{title}: " + "; ".join(items[:8]) + (f"; {len(items) - 8} more" if len(items) > 8 else ""))
     return out

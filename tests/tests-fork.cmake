@@ -237,6 +237,14 @@ llama_build(test-graph-cache-fork.cpp)
         ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --mode reclaim
     )
     set_tests_properties(test-kv-elastic-streams-fork-reclaim PROPERTIES FIXTURES_REQUIRED generate-models)
+    # without --phase-mem a capacity far over the cells in use goes back (llama_context::kv_elastic_trim_fork, 14.11)
+    llama_test(
+        test-kv-elastic-streams-fork
+        NAME test-kv-elastic-streams-fork-trim
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --mode trim
+    )
+    set_tests_properties(test-kv-elastic-streams-fork-trim PROPERTIES FIXTURES_REQUIRED generate-models)
 
     # the moe-cache through the phase switches: the reference run writes the model it builds from the qwen4exp of the
     # matrix (32 experts, no per-expert scales) and its logprobs, each mode compares with them in a run of its own

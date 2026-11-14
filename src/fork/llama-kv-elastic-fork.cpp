@@ -26,6 +26,7 @@ typedef ggml_backend_buffer_t (*llama_buft_alloc_elastic_t)(ggml_backend_buffer_
 typedef bool (*llama_buffer_commit_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 typedef void (*llama_buffer_decommit_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
 typedef bool (*llama_buffer_zero_reads_t)(ggml_backend_buffer_t buffer);
+typedef size_t (*llama_buffer_heap_over_t)(ggml_backend_buffer_t buffer);
 
 // the VMM granule of CUDA; a coarser one only maps a little more than asked
 static constexpr size_t LLAMA_KV_ELASTIC_ALIGN = 2u*1024*1024;
@@ -46,6 +47,9 @@ struct llama_kv_elastic_fork {
         size_t                  span;   // up to the next granule boundary after it
         llama_buffer_commit_t   commit;
         llama_buffer_decommit_t decommit;
+        // the bytes the process holds past the limit of the heap of buf (ggml_backend_buffer_heap_over_fork, the Vulkan
+        // backend), null where the backend has none
+        llama_buffer_heap_over_t heap_over;
     };
 
     std::vector<range> ranges;
@@ -160,6 +164,7 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
         llama_buft_alloc_elastic_t alloc;
         llama_buffer_commit_t      commit;
         llama_buffer_decommit_t    decommit;
+        llama_buffer_heap_over_t   heap_over;
         std::vector<chunk>         chunks;
     };
     std::vector<plan> plans;
@@ -186,6 +191,7 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
             p.alloc    = (llama_buft_alloc_elastic_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_alloc_elastic_fork");
             p.commit   = (llama_buffer_commit_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit_fork");
             p.decommit = (llama_buffer_decommit_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_decommit_fork");
+            p.heap_over = (llama_buffer_heap_over_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_heap_over_fork");
         }
         if (!p.alloc || !p.commit || !p.decommit) {
             if (!emulate) {
@@ -299,7 +305,8 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
                 t->data   = nullptr;
                 GGML_ASSERT(ggml_backend_tensor_alloc(c.buf, t, base + offs) == GGML_STATUS_SUCCESS);
 
-                el->ranges.push_back({ t, c.buf, offs, t->nb[1], t->nb[2], ggml_nbytes(t), end - offs, p.commit, p.decommit });
+                el->ranges.push_back({ t, c.buf, offs, t->nb[1], t->nb[2], ggml_nbytes(t), end - offs, p.commit, p.decommit,
+                                       p.alloc ? p.heap_over : nullptr });
             }
         }
 
@@ -337,6 +344,21 @@ bool llama_kv_cache::elastic_init_fork(bool emulate) {
     }
 
     return true;
+}
+
+size_t llama_kv_cache::elastic_heap_over_fork() const {
+    size_t res = 0;
+    if (elastic_fork) {
+        ggml_backend_buffer_t last = nullptr;
+        for (const auto & r : elastic_fork->ranges) {
+            // a chunk holds many tensors in a row: ask each buffer once
+            if (r.heap_over && r.buf != last) {
+                res  = std::max(res, r.heap_over(r.buf));
+                last = r.buf;
+            }
+        }
+    }
+    return res;
 }
 
 size_t llama_kv_cache::elastic_cell_bytes_fork() const {

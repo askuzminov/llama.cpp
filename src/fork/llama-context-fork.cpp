@@ -254,6 +254,47 @@ bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t 
     return cap >= std::min(n_cells, full);
 }
 
+// the elastic KV of a context without --phase-mem (the 395, 14.11, user): its capacity only grew, so a slot that once
+// held a long conversation kept that memory, and when a desktop took device memory back the server held more of the heap
+// than the others left (Windows moved part of it to the shared memory, the system swapped). before each batch a stream
+// gives back the cells past the cells in use (the most of any stream: the streams of a ubatch read the same n_kv cells,
+// which a device that does not read unmapped memory as zeros maps in each of them), the cells of the batch and a step:
+// when its capacity is over that by more than max(2 steps, n_ctx/8) (the rule of phase_update, so that a conversation
+// that grows again does not map and unmap every batch), and at any size while the device memory is over its limit (the
+// backend: the other processes took more than its reserve left, ggml_backend_buffer_heap_over_fork; asked at most once
+// a second)
+void llama_context::kv_elastic_trim_fork(uint32_t n_tokens) {
+    size_t        over = 0;
+    const int64_t t_us = ggml_time_us();
+    if (t_us - kv_elastic_t_over_us >= 1000000) {
+        kv_elastic_t_over_us = t_us;
+        over = memory->kv_heap_over_fork();
+    }
+
+    const uint32_t slack  = std::max(2*kv_elastic_step, cparams.n_ctx/8);
+    const uint32_t want   = kv_elastic_round_up(memory->get_n_kv_used() + n_tokens + kv_elastic_step, kv_elastic_step);
+    const size_t   before = memory->kv_mapped_cells_fork();
+    for (uint32_t s = 0; s < kv_n_stream_fork(); ++s) {
+        const uint32_t cap = memory->kv_capacity_fork((int32_t) s);
+        if (cap > want && (over > 0 || cap > want + slack)) {
+            memory->kv_set_capacity_fork(want, (int32_t) s);
+        }
+    }
+
+    const size_t after = memory->kv_mapped_cells_fork();
+    if (after < before) {
+        const double mib = (double) (before - after)*memory->kv_cell_bytes_fork()/1024.0/1024.0;
+        if (over > 0) {
+            LLAMA_LOG_WARN("%s: kv_elastic: the device memory is %.0f MiB over its limit (other processes took more of it): "
+                    "%zu -> %zu cells mapped, %.0f MiB given back (%u in use)\n", __func__, over/1024.0/1024.0, before, after,
+                    mib, memory->get_n_kv_used());
+        } else {
+            LLAMA_LOG_INFO("%s: kv_elastic: %zu -> %zu cells mapped, %.0f MiB given back (%u in use)\n", __func__, before,
+                    after, mib, memory->get_n_kv_used());
+        }
+    }
+}
+
 bool llama_context::sched_upload_experts_fork(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     GGML_UNUSED(graph);
     auto * lctx = static_cast<llama_context *>(user_data);

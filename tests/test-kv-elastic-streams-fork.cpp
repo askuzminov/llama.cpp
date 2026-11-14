@@ -10,6 +10,12 @@
 //   ~1800 cells and is cleared, stream 1 then fits a long prompt only with the memory stream 0 still maps (no shrink
 //   without --phase-mem), which it takes back; then a copy of 1800 cells of stream 0 to stream 1 that the memory cannot
 //   hold leaves sequence 1 empty instead of copying cells it has no rows for. no reference: every decode succeeds
+// - trim: without --phase-mem a capacity far over the cells in use goes back before the next batch (14.11,
+//   llama_context::kv_elastic_trim_fork): stream 0 grows to 1800 cells and is cleared (the gated delta net takes no
+//   partial removal), and the first ubatch of the next prompt finds its capacity cut to 768 (the log line "given
+//   back"), then it grows past the cut again; the same in a context of 8x the cells, where the margin of n_ctx/8 keeps
+//   the capacity, must give the same logits bit for bit. the cells past a capacity hold NaN (LLAMA_KV_ELASTIC_POISON=1)
+//   until a capacity takes them back, so a cell that grew back without being cleared would show in the logits
 // the scenario on the qwen4exp of the matrix (attention, gated delta net, indexer cache): a long and a short prompt in two
 // streams, joint decode steps, a rollback of the drafts of both (n_rs_seq), the state of the long one restored into
 // stream 1 of another context, a copy of stream 0 to stream 1 (seq_cp across streams), a K-shift of stream 0
@@ -17,7 +23,7 @@
 // on the CPU the attention skips masked cells, so the NaN past a capacity shows only where a kernel reads them: --ngl 99
 // on a GPU (the Vulkan of this Mac emulates the elastic buffers too)
 //
-// usage: test-kv-elastic-streams-fork -m <dir>/qwen4exp-moe.gguf [--ngl N] (--out <file> | --ref <file> --mode zero|map | --mode reclaim)
+// usage: test-kv-elastic-streams-fork -m <dir>/qwen4exp-moe.gguf [--ngl N] (--out <file> | --ref <file> --mode zero|map | --mode reclaim|trim)
 
 #include "llama.h"
 
@@ -56,9 +62,9 @@ static void log_cb(ggml_log_level level, const char * text, void *) {
 static constexpr uint32_t N_CTX_SEQ = 2048; // cells of a stream
 static constexpr uint32_t N_RS_SEQ  = 4;    // recurrent snapshots: the drafts a rollback takes back
 
-static llama_context * make_ctx(llama_model * model) {
+static llama_context * make_ctx(llama_model * model, uint32_t n_ctx_seq = N_CTX_SEQ) {
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx           = 2*N_CTX_SEQ;
+    cp.n_ctx           = 2*n_ctx_seq;
     cp.n_batch         = 512;
     cp.n_ubatch        = 512;
     cp.n_seq_max       = 2;
@@ -230,6 +236,68 @@ static void scenario_reclaim(llama_model * model) {
     llama_free(ctx);
 }
 
+// the trim scenario in a context of n_ctx_seq cells a stream: the logits of the tokens after the cut, and whether the
+// capacity went back ("given back" in its part of the log)
+static bool scenario_trim_one(llama_model * model, uint32_t n_ctx_seq, std::vector<float> & logits) {
+    llama_context * ctx = make_ctx(model, n_ctx_seq);
+    CHECK(ctx != nullptr);
+    if (ctx == nullptr) {
+        return false;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    size_t mark = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        mark = g_log.size();
+    }
+
+    std::vector<tok> pa;
+    for (llama_pos i = 0; i < 1800; ++i) {
+        pa.push_back({ 0, i, tk(7000 + i) });
+    }
+    CHECK(decode(ctx, pa, false));
+    CHECK(llama_memory_seq_rm(mem, 0, -1, -1));
+
+    // the next prompt: its first ubatch of 512 finds the capacity of 1800 + a step over 768 + 512
+    std::vector<tok> pb;
+    for (llama_pos i = 0; i < 600; ++i) {
+        pb.push_back({ 0, i, tk(9000 + i) });
+    }
+    g_logits.clear();
+    CHECK(decode(ctx, pb, false));
+    CHECK(decode(ctx, { { 0, 600, tk(1) } }, true));
+    bool trimmed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        trimmed = g_log.find("given back", mark) != std::string::npos;
+    }
+    // and growing again past the cut
+    std::vector<tok> pc;
+    for (llama_pos i = 601; i < 1300; ++i) {
+        pc.push_back({ 0, i, tk(11000 + i) });
+    }
+    CHECK(decode(ctx, pc, false));
+    CHECK(decode(ctx, { { 0, 1300, tk(2) } }, true));
+    logits = g_logits;
+    for (float v : logits) {
+        if (!std::isfinite(v)) {
+            CHECK(std::isfinite(v));
+            break;
+        }
+    }
+
+    llama_free(ctx);
+    return trimmed;
+}
+
+static void scenario_trim(llama_model * model) {
+    std::vector<float> cut;
+    std::vector<float> kept;
+    CHECK(scenario_trim_one(model, N_CTX_SEQ, cut));     // margin max(512, 4096/8): 2048 cells over 768 + 512 go back
+    CHECK(!scenario_trim_one(model, 8*N_CTX_SEQ, kept)); // margin 4096: they stay
+    CHECK(!cut.empty() && cut == kept);
+}
+
 int main(int argc, char ** argv) {
     const char * path = nullptr;
     const char * out  = nullptr;
@@ -249,14 +317,20 @@ int main(int argc, char ** argv) {
             mode = argv[++i];
         }
     }
-    const bool reclaim = mode == "reclaim" && out == nullptr && ref == nullptr;
+    const bool trim    = mode == "trim" && out == nullptr && ref == nullptr;
+    const bool reclaim = (mode == "reclaim" || trim) && out == nullptr && ref == nullptr;
     if (path == nullptr || (!reclaim && ((out == nullptr) == (ref == nullptr) || (ref != nullptr && mode != "zero" && mode != "map")))) {
         fprintf(stderr, "usage: %s -m <dir>/qwen4exp-moe.gguf [--ngl N] (--out <file> | --ref <file> --mode zero|map | --mode reclaim)\n", argv[0]);
         return 1;
     }
 
     // the knobs are read once per process
-    if (reclaim) {
+    if (trim) {
+        set_env("LLAMA_KV_ELASTIC", "1");
+        set_env("LLAMA_KV_ELASTIC_STEP", "256");
+        set_env("LLAMA_KV_ELASTIC_ZERO_READS", "0");
+        set_env("LLAMA_KV_ELASTIC_POISON", "1");
+    } else if (reclaim) {
         set_env("LLAMA_KV_ELASTIC", "1");
         set_env("LLAMA_KV_ELASTIC_STEP", "256");
         set_env("LLAMA_KV_ELASTIC_TEST_MIB", "3");
@@ -292,7 +366,9 @@ int main(int argc, char ** argv) {
     }
     g_n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
-    if (reclaim) {
+    if (trim) {
+        scenario_trim(model);
+    } else if (reclaim) {
         scenario_reclaim(model);
         std::lock_guard<std::mutex> lock(g_log_mutex);
         CHECK(g_log.find("the other streams give back") != std::string::npos);

@@ -213,6 +213,9 @@ public:
     uint32_t elastic_set_capacity_fork(uint32_t strm, uint32_t n_cap);
     uint32_t elastic_capacity_fork(uint32_t strm) const { return strm < v_cap_fork.size() ? v_cap_fork[strm] : 0; }
     size_t   elastic_cell_bytes_fork() const;
+    // the bytes the process holds past the limit of the device memory of the cache (the backend's
+    // ggml_backend_buffer_heap_over_fork; 0 where it has none)
+    size_t   elastic_heap_over_fork() const;
 
     // fork: the buffers of a cache built without memory (llama_kv_defer_scope_fork) that elastic_init_fork did not
     // replace, allocated and cleared as the constructor does; nothing for the others

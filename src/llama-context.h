@@ -614,8 +614,14 @@ private:
     bool kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t strm = -1);
     uint32_t kv_elastic_capacity_fork(uint32_t n_cells, int32_t strm = -1); // memory->kv_set_capacity_fork within LLAMA_KV_ELASTIC_TEST_MIB
 
+    // elastic KV without --phase-mem (the 395): the capacity of a stream far over its cells in use, or any past them and
+    // a step while the device memory is over its limit (kv_heap_over_fork, asked at most once a second), goes back to
+    // the device before a batch; phase_update does the first with --phase-mem
+    void kv_elastic_trim_fork(uint32_t n_tokens);
+
     bool     kv_elastic      = false;
     uint32_t kv_elastic_step = 8192;
+    int64_t  kv_elastic_t_over_us = 0; // when kv_elastic_trim_fork asked the device last
 
     // env: LLAMA_GRAPH_CACHE, max graphs in gf_res_prev, 0 disables the scheduler snapshots
     uint32_t graph_cache_size = 8;
