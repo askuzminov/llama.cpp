@@ -201,9 +201,10 @@ bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t 
     }
 
     // the cells of one stream (all of them with one)
-    const uint32_t full = cparams.n_ctx_seq;
-    const uint32_t old  = memory->kv_capacity_fork(strm);
-    const uint32_t want = kv_elastic_round_up(n_cells, kv_elastic_step);
+    const uint32_t full  = cparams.n_ctx_seq;
+    const uint32_t old   = memory->kv_capacity_fork(strm);
+    const uint32_t want  = kv_elastic_round_up(n_cells, kv_elastic_step);
+    const int64_t  t0_us = ggml_time_us();
 
     uint32_t cap = kv_elastic_capacity_fork(want, strm);
 
@@ -241,13 +242,16 @@ bool llama_context::kv_elastic_set_fork(uint32_t n_cells, bool release, int32_t 
         }
     }
 
+    // the time: the memory a growth maps (allocations, sparse binds) or a release unmaps (14.11: the price of giving
+    // back the cells of a conversation that comes back)
     if (cap != old) {
+        const double ms = 1e-3*(ggml_time_us() - t0_us);
         if (kv_n_stream_fork() > 1) {
-            LLAMA_LOG_INFO("%s: kv_elastic: %s %u -> %u cells (%u in use, %zu cells mapped in all)\n", __func__,
+            LLAMA_LOG_INFO("%s: kv_elastic: %s %u -> %u cells (%u in use, %zu cells mapped in all) in %.1f ms\n", __func__,
                     strm >= 0 ? format("stream %d", strm).c_str() : "every stream", old, cap,
-                    memory->get_n_kv_used(), memory->kv_mapped_cells_fork());
+                    memory->get_n_kv_used(), memory->kv_mapped_cells_fork(), ms);
         } else {
-            LLAMA_LOG_INFO("%s: kv_elastic: %u -> %u cells (%u in use)\n", __func__, old, cap, memory->get_n_kv_used());
+            LLAMA_LOG_INFO("%s: kv_elastic: %u -> %u cells (%u in use) in %.1f ms\n", __func__, old, cap, memory->get_n_kv_used(), ms);
         }
     }
 
@@ -274,6 +278,7 @@ void llama_context::kv_elastic_trim_fork(uint32_t n_tokens) {
     const uint32_t slack  = std::max(2*kv_elastic_step, cparams.n_ctx/8);
     const uint32_t want   = kv_elastic_round_up(memory->get_n_kv_used() + n_tokens + kv_elastic_step, kv_elastic_step);
     const size_t   before = memory->kv_mapped_cells_fork();
+    const int64_t  t0_us  = ggml_time_us();
     for (uint32_t s = 0; s < kv_n_stream_fork(); ++s) {
         const uint32_t cap = memory->kv_capacity_fork((int32_t) s);
         if (cap > want && (over > 0 || cap > want + slack)) {
@@ -284,13 +289,14 @@ void llama_context::kv_elastic_trim_fork(uint32_t n_tokens) {
     const size_t after = memory->kv_mapped_cells_fork();
     if (after < before) {
         const double mib = (double) (before - after)*memory->kv_cell_bytes_fork()/1024.0/1024.0;
+        const double ms  = 1e-3*(ggml_time_us() - t0_us);
         if (over > 0) {
             LLAMA_LOG_WARN("%s: kv_elastic: the device memory is %.0f MiB over its limit (other processes took more of it): "
-                    "%zu -> %zu cells mapped, %.0f MiB given back (%u in use)\n", __func__, over/1024.0/1024.0, before, after,
-                    mib, memory->get_n_kv_used());
+                    "%zu -> %zu cells mapped, %.0f MiB given back (%u in use) in %.1f ms\n", __func__, over/1024.0/1024.0, before,
+                    after, mib, memory->get_n_kv_used(), ms);
         } else {
-            LLAMA_LOG_INFO("%s: kv_elastic: %zu -> %zu cells mapped, %.0f MiB given back (%u in use)\n", __func__, before,
-                    after, mib, memory->get_n_kv_used());
+            LLAMA_LOG_INFO("%s: kv_elastic: %zu -> %zu cells mapped, %.0f MiB given back (%u in use) in %.1f ms\n", __func__,
+                    before, after, mib, memory->get_n_kv_used(), ms);
         }
     }
 }

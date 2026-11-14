@@ -15,9 +15,13 @@ rem the questions of 14.11 (README, run-all). the 395, after a reconnected remot
 rem and Windows moved part of the server to the shared memory (13.11, the system swapped): the device memory limit
 rem keeps GGML_VK_DEVICE_RESERVE_MIB (2048) free under the most the other processes held, and the elastic KV gives back
 rem the cells it does not use without --phase-mem (far over the cells in use, or any while the device memory is over
-rem its limit). 01: the guards read the new limit line. 06 default with the long task first, so that the next task
-rem finds 22K cells mapped for its 2K and gives them back (the summary: "the elastic KV gave back memory"), TG and texts
-rem as before. the reconnect itself is a test by hand with serve.bat (README). answered before (e001cfa45): the default
+rem its limit). 14.11 13:25 (dca946fbb): 01 green on both machines (the limit 94664 MiB = the heap - 1592 MiB of the
+rem others - 2048), 06 TG as before, but no trim: at -c 32768 the margin is 2 steps of 8192 cells, the capacity after the
+rem long task stops at 32768 = what the next task needs + the margin, and the decode servers log no INFO. now 03 at its
+rem depths (0, 65536, 131072, near the end of 262144) with -lv 4: after each depth a short request ("ok") finds the long
+rem conversation's cells mapped and gives them back, the next depth maps them again - the log lines give the times
+rem (the summary: "the elastic KV gave back memory", "the elastic KV grew"), the price of the trim for a conversation
+rem that comes back. the reconnect itself is a test by hand with serve.bat (README). answered before (e001cfa45): the default
 rem takes the f16 tile for verifies of 5-8 tokens and two int8 planes below, 07-exact 0.0125/0.0121 against 0.0311/
 rem 0.0307 of old, 06 old +1.9%. 03, 07-exact, 05, 07 against upstream and 02 are off on the 395. the 3090: 01 (the
 rem sources of llama changed; its elastic KV takes the --phase-mem path, which this does not touch). the 3090: 01 (the MUL_MAT_VERIFY cases on CUDA, in its CHECKOPS since 13.11;
@@ -38,20 +42,16 @@ if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default"
 if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default"
-if not defined QA_PARMS set "QA_PARMS=default;old GGML_VK_MM_F16REG_VERIFY=0"
-rem 03: depth 0 only (the dense matmuls do not depend on it), a reply of 256 tokens for verifies of every size, the
-rem tables of the ops at a verify of 4 tokens
-if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0"
-if not defined QA_PROF_TG set "QA_PROF_TG=256"
-if not defined QA_PROF_VERIFY set "QA_PROF_VERIFY=4"
+rem 03 at its own depths (QA_PROF_DEPTHS unset): the trims and the growths of the elastic KV between them. 01 passed
+rem on the sources before (14.11 13:25), these add the times to two log lines only
+if not defined QA_PARMS set "QA_PARMS=default"
+if not defined RUN_CHECK set "RUN_CHECK=0"
 if not defined QA_DARMS set "QA_DARMS=default"
-rem the long task first: the trim of the elastic KV at the next task
-if not defined QA_DEC_SET set "QA_DEC_SET=long prose ru code-py code-cpp edit json"
+if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
 rem decode4 and decode8: the default at ubatch 4 and 8 (the draft checks; 4 on the two planes, 8 on the tile), the
 rem arms of 12.11 (0.0311 and 0.0307 then): their column before
 if not defined EXACT_KARMS set "EXACT_KARMS=decode4 QA_ARM_UB=4;decode8 QA_ARM_UB=8"
-if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined RUN_EXACT set "RUN_EXACT=0"
 if not defined RUN_KLD set "RUN_KLD=0"
 if not defined RUN_LONG set "RUN_LONG=0"
@@ -60,6 +60,9 @@ goto :arms_done
 if not defined QA_QARMS set "QA_QARMS=default;again LLAMA_QA_AGAIN=1"
 if not defined QA_PARMS set "QA_PARMS=default"
 if not defined QA_DARMS set "QA_DARMS=default"
+rem 01 passed 14.11 13:25 on the sources before; since then only times in two log lines of the elastic KV (the 3090
+rem takes the --phase-mem path): nothing to run here
+if not defined RUN_CHECK set "RUN_CHECK=0"
 if not defined QA_KARMS set "QA_KARMS=fork;upstream @upstream"
 if not defined RUN_DECODE set "RUN_DECODE=0"
 if not defined RUN_PROFILE set "RUN_PROFILE=0"

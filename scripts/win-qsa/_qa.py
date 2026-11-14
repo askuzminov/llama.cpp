@@ -889,7 +889,10 @@ NOTE_REFUSED = re.compile(r"device memory heap \d+: ([\d.]+) MiB in use of a lim
 # overcommit of the heap when there is one (Windows then moves memory of ours to the shared memory)
 # 14.11: the elastic KV gave back cells without --phase-mem (llama_context::kv_elastic_trim_fork), WARN when the device
 # memory was over its limit
-NOTE_TRIM = re.compile(r"kv_elastic: (the device memory is ([\d.]+) MiB over its limit .*?: )?(\d+) -> (\d+) cells mapped, ([\d.]+) MiB given back")
+NOTE_TRIM = re.compile(r"kv_elastic: (the device memory is ([\d.]+) MiB over its limit .*?: )?(\d+) -> (\d+) cells mapped, ([\d.]+) MiB given back"
+                       r"(?: \(\d+ in use\) in ([\d.]+) ms)?")
+# a capacity change of the elastic KV with its time (14.11): the price of mapping the cells again after a trim
+NOTE_GROW = re.compile(r"kv_elastic: (\d+) -> (\d+) cells \(\d+ in use(?:, \d+ cells mapped in all)?\) in ([\d.]+) ms")
 NOTE_OTHERS = re.compile(r"other processes hold ([\d.]+) MiB of device memory heap \d+ now, at most ([\d.]+) MiB before; "
                          r"this process holds ([\d.]+) MiB of ([\d.]+) MiB(: the heap is overcommitted)?")
 # the refusal of the CUDA backend on Windows (ggml-cuda/fork/device-room-fork.inc, 12.11): the driver would back it with
@@ -905,7 +908,8 @@ NOTE_MOE_NONE = re.compile(r"moe_cache: (\S+) has (\d+) MiB free, one slot on \d
                            r"stay free, no slots")
 NOTE_RELIEF = re.compile(r"relieving [\d.]+ MiB from the prompt cache")
 NOTE_FIT = re.compile(r"would go to host memory, refused")
-NOTE_KEYS = (b"device memory heap", b"elastic buffer", b"QSA scores", b"moe_cache: ", b"relieving", b"refused", b"given back")
+NOTE_KEYS = (b"device memory heap", b"elastic buffer", b"QSA scores", b"moe_cache: ", b"relieving", b"refused", b"given back",
+             b"kv_elastic: ")
 
 
 def log_first(log, pattern):
@@ -923,9 +927,10 @@ def log_first(log, pattern):
 
 def log_notes(folder):
     """the notes of the logs in folder (NOTE_*), as lines for the summary"""
-    limits, refused, spills, floors, qsa, moe, relief, fits, later, trims = [], [], [], [], [], [], [], [], [], []
+    limits, refused, spills, floors, qsa, moe, relief, fits, later, trims, grows = [], [], [], [], [], [], [], [], [], [], []
     for log in sorted(Path(folder).glob("*.log")):
-        first, n_relief, n_trim, trim_mib, trim_over = {}, 0, 0, 0.0, 0
+        first, n_relief, n_trim, trim_mib, trim_over, trim_ms = {}, 0, 0, 0.0, 0, 0.0
+        n_grow, grow_ms, grow_max = 0, 0.0, None
         try:
             with log.open("rb") as f:
                 for raw in f:
@@ -939,6 +944,13 @@ def log_notes(folder):
                         n_trim += 1
                         trim_mib += float(m_trim[5])
                         trim_over += 1 if m_trim[1] else 0
+                        trim_ms += float(m_trim[6] or 0)
+                    m_grow = NOTE_GROW.search(line)
+                    if m_grow and int(m_grow[2]) > int(m_grow[1]):
+                        n_grow += 1
+                        grow_ms += float(m_grow[3])
+                        if grow_max is None or float(m_grow[3]) > grow_max[0]:
+                            grow_max = (float(m_grow[3]), m_grow[1], m_grow[2])
                     for key, pattern in (("limit", NOTE_LIMIT), ("refused", NOTE_REFUSED),
                                          ("refused_cuda", NOTE_REFUSED_CUDA), ("spill", NOTE_SPILL),
                                          ("floor", NOTE_FLOOR), ("qsa", NOTE_QSA), ("moe", NOTE_MOE),
@@ -953,7 +965,10 @@ def log_notes(folder):
         if "limit" in first:
             limits.append([float(x) for x in first["limit"]])
         if n_trim:
-            trims.append(f"{name} {n_trim} times, {trim_mib:.0f} MiB" + (f", {trim_over} of them over the limit" if trim_over else ""))
+            trims.append(f"{name} {n_trim} times, {trim_mib:.0f} MiB in {trim_ms:.0f} ms" +
+                         (f", {trim_over} of them over the limit" if trim_over else ""))
+        if n_grow:
+            grows.append(f"{name} {n_grow} times in {grow_ms:.0f} ms, the longest {grow_max[0]:.0f} ms ({grow_max[1]} -> {grow_max[2]} cells)")
         if "others" in first:
             now, before, mine, heap, over = first["others"]
             later.append(f"{name} ({before} -> {now} MiB, this process {mine} of {heap} MiB" +
@@ -995,7 +1010,8 @@ def log_notes(folder):
                          ("the prompt cache gave memory back (times)", relief),
                          ("fit refused, weights would go to host memory", fits),
                          ("device memory the other processes took later", later),
-                         ("the elastic KV gave back memory", trims)):
+                         ("the elastic KV gave back memory", trims),
+                         ("the elastic KV grew (time of mapping)", grows)):
         if items:
             out.append(f"{title}: " + "; ".join(items[:8]) + (f"; {len(items) - 8} more" if len(items) > 8 else ""))
     return out
