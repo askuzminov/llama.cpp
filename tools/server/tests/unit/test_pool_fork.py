@@ -1019,6 +1019,51 @@ def test_pool_weighs_a_node_by_its_answers_alone():
         time.sleep(0.05)
 
 
+def alone_answers(node: str, n: int):
+    # n answers of 32 tokens on `node` alone (the other node drained), one after the other; the pool reads the timings
+    # of each a moment after the client has it
+    other = "n1" if node == "n0" else "n0"
+    drain(other)
+    want = node_of(node)["decode_n"] + n
+    for i in range(n):
+        chat([{"role": "user", "content": f"story {i} on {node}: tell a long story"}], n_predict=32)
+    deadline = time.time() + 5
+    while node_of(node)["decode_n"] < want:
+        assert time.time() < deadline, node_of(node)
+        time.sleep(0.05)
+    drain(other, False)
+
+
+def test_pool_weighs_nodes_of_the_same_devices_alike():
+    # 14.11: with drafts the decode speed of an answer follows its text (30-88 t/s on one 395), and two identical 395s
+    # weighed 1 and 0.5 by the last two answers each happened to have. the nodes of the same devices and model (here
+    # both on this machine with the same model) share one speed and so one weight, whatever each measured
+    start_pool()
+    alone_answers("n0", 5)
+    alone_answers("n1", 5)
+    nodes = status()["nodes"]
+    assert all(n["decode_n"] >= 5 and n["decode_tps"] > 0 for n in nodes), nodes
+    assert [n["weight"] for n in nodes] == [1.0, 1.0], [(n["name"], n["decode_tps"], n["weight"]) for n in nodes]
+
+
+def test_pool_weighs_nodes_of_other_devices_by_their_speed():
+    # the nodes of different devices (LLAMA_POOL_TEST_HW names them apart) weigh by their own speeds against the
+    # fastest, each once it has 4 answers
+    for i, r in enumerate(routers):
+        r.env_fork = {"LLAMA_SERVER_DEBUG_FAKE_TIMING": None, "LLAMA_POOL_TEST_HW": f" (machine {i})"}
+    start_pool()
+    alone_answers("n0", 5)
+    alone_answers("n1", 3)
+    nodes = status()["nodes"]
+    # n1 with 3 answers weighs 1 until it has 4, n0 is then the only one measured
+    assert [n["weight"] for n in nodes] == [1.0, 1.0], [(n["name"], n["decode_n"], n["decode_tps"], n["weight"]) for n in nodes]
+    alone_answers("n1", 1)
+    nodes = status()["nodes"]
+    best = max(n["decode_tps"] for n in nodes)
+    assert all(abs(n["weight"] - n["decode_tps"] / best) < 1e-9 for n in nodes), nodes
+    assert max(n["weight"] for n in nodes) == 1.0
+
+
 def test_pool_moves_no_state_into_a_node_without_room():
     # 07.11: the node a state goes to makes room in its RAM before the transfer (on a 395 the RAM is what the GPU leaves,
     # and the cache holds all of it down to its reserve), or says it cannot before gigabytes cross the network: n1 keeps

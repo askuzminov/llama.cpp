@@ -15,11 +15,13 @@ rem the questions of 14.11 (README, run-all). the 395: device memory against oth
 rem remote desktop took its memory back, Windows moved part of the server to the shared memory, the system swapped).
 rem 14.11 15:25-15:50 (f348322df): 01 green on both machines; 03 default without trims, idle1 (LLAMA_KV_TRIM_IDLE_S=1)
 rem gave back 4968 MiB in two idle gaps, evict600 (LLAMA_KV_TEST_DEMOTED_MIB=600) moved slots to the prompt cache and
-rem the next requests restored them (38062 tokens: 864 MiB in 92 ms, restored in ~0.25 s), prompt and verify times the
-rem same in all three. two of its three moves were slots within the step of the elastic KV (13 and 4014 tokens, 0 MiB
-rem given back): now only slots over the step move. 03 evict600 once more (one move expected, the long slot); 01 off
-rem (the change is in the idle path of the server only); the 3090 has nothing to run. the reconnect itself is a test
-rem by hand with serve.bat (README: the lines "the system moved about ... MiB" and "moved to the prompt cache"). settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
+rem the next requests restored them, prompt and verify times the same in all three; two of its three moves were slots
+rem within the step of the elastic KV (0 MiB given back), since then only slots over the step move. 15:55 (e6cedc528)
+rem evict600 again: one move (the slot of 38062 tokens, 864 MiB in 90 ms), restored by the next request in 253 ms
+rem (154 ms of it mapping the cells). without the forced estimate no "system moved" line: the usage of the heap
+rem follows the trims (1512 and 3456 MiB in idle1). nothing to run on either machine now; the reconnect itself is a
+rem test by hand with serve.bat (README: the model loaded while the remote desktop is away, then a reconnect).
+rem settled and left out: on the 395 mm and radix0 (01.11, 02.11), the 07 split of 12.11 (copy,
 rem dense, nofuse, radix0); on the 3090 nowin (02.11), and 12.11 cap7 (-1.1%), full (the whole vocabulary of the MTP
 rem head, -0.3%), m256, upmoe0 (-1.6%), upmoe3, radix-up in 03 (the prompt within 1.5%), m512 (the card ran full and
 rem the guard refused 256 bytes: 512 MiB next to the expert cache is too little); 13.11 upmoe5/upmoe8 (the cache of
@@ -33,10 +35,11 @@ if not defined RUN_MICRO set "RUN_MICRO=0"
 if /i "%BACKEND%"=="cuda" goto :arms_cuda
 if not defined QA_QARMS set "QA_QARMS=default"
 if not defined QA_SPEC_ARMS set "QA_SPEC_ARMS=default"
-rem 03 at three depths: one trim and growth after each of the first two in idle1; evict600: the estimate of moved
-rem memory forced to 600 MiB (LLAMA_KV_TEST_DEMOTED_MIB), so that the first idle second with a slot moves it to the
-rem prompt cache and the next request restores it from there (once: the given back memory covers the 600 MiB)
-if not defined QA_PARMS set "QA_PARMS=evict600 LLAMA_KV_TEST_DEMOTED_MIB=600"
+rem 03 at three depths; the arms of 14.11 on request: idle1 LLAMA_KV_TRIM_IDLE_S=1 (a trim in each idle gap),
+rem evict600 LLAMA_KV_TEST_DEMOTED_MIB=600 (the estimate of moved memory forced: the first idle second with a long
+rem slot moves it to the prompt cache, the next request restores it)
+if not defined QA_PARMS set "QA_PARMS=default"
+if not defined RUN_PROFILE set "RUN_PROFILE=0"
 if not defined RUN_CHECK set "RUN_CHECK=0"
 if not defined QA_PROF_DEPTHS set "QA_PROF_DEPTHS=0 65536 131072"
 if not defined QA_DARMS set "QA_DARMS=default"

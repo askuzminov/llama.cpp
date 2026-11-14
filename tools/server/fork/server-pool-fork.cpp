@@ -454,6 +454,18 @@ static constexpr int POOL_MAX_NODES = 64;
 static constexpr const char * POOL_HOP_HEADER = "X-Llama-Pool";
 // the header of the requests the pool makes itself: polls, probes, moves; logged at the debug level
 static constexpr const char * POOL_QUIET_HEADER = "X-Llama-Pool-Poll";
+// the decode speed of a node for its weight (14.11): the answers that ran alone, decayed by 1/16 an answer (the last ~16
+// count), each counted up to 256 tokens (a long answer is one text all the same), and 4 of them in its group before a
+// weight other than 1
+static constexpr double POOL_DECODE_DECAY = 1.0/16;
+static constexpr double POOL_DECODE_CAP   = 256.0;
+static constexpr int    POOL_WEIGHT_MIN   = 4;
+// the prompt speed of a slot on the dashboard (14.11, update_slots): measured from the second move of its counter on
+// (the first ones come as the batches are sent, not computed), over a window that moves on every 20 s, at most twice
+// the prefill speed of the node once that is measured
+static constexpr int    POOL_PP_SKIP      = 2;
+static constexpr int64_t POOL_PP_WINDOW_MS = 20000;
+static constexpr double POOL_PP_CAP       = 2.0;
 
 // one way to a node: a direct cable, the WiFi
 struct pool_link {
@@ -568,9 +580,19 @@ struct pool_node {
     double      prefill_tps = 0.0; // measured: the timings of the prompts of move_tokens and more it read, 0 = none yet
     // measured: the timings of the answers of 16 tokens and more that ran alone on the node (07.11: under load the slots
     // of a node share its GPU and a prompt next to an answer pauses it, a 395 with 2 slots measured half the speed of a
-    // 3090 with 1 and its weight was half), 0 = none yet; the speed of all answers apart, for the dashboard
+    // 3090 with 1 and its weight was half), 0 = none yet; the speed of all answers apart, for the dashboard.
+    // 14.11: the tokens and ms of the last ~16 of them (dec_n, dec_t; POOL_DECODE_DECAY, POOL_DECODE_CAP). with drafts
+    // the speed of an answer follows its text (06 on the 395: 30 t/s a story after a long prompt, 88 t/s an edit), and
+    // with the average of 0.5 an answer, the last two decided: two identical 395s weighed 1 and 0.5 by chance
     double      decode_tps  = 0.0;
     double      decode_all  = 0.0;
+    double      dec_n       = 0.0;
+    double      dec_t       = 0.0;
+    int         dec_count   = 0;
+    // the devices and the model of the node (GET /pool/node): the nodes with the same share one decode speed and so one
+    // weight (update_weights); empty until known
+    std::string hw;
+    double      weight      = 1.0;
     uint64_t    starts      = 0;   // the requests this router started there, to tell an answer that ran alone
     // measured: the part of a prefix of other conversations it reused for a prompt (cache_n of the answers), -1 = none
     // yet. a transformer takes all of it, a hybrid model (qwen4exp: gated delta net) or SWA only up to a checkpoint
@@ -593,10 +615,14 @@ struct pool_node {
         double  prompt_tps  = 0.0;
         int64_t t           = 0;
         // the prompt counter of a slot moves once per batch (16384 tokens take ~18 s on the 395, the polls come every
-        // second): its last move (time, count, tokens) and the speed measured over it
+        // second): its last move (time, count, tokens), the moves of the task seen, the move the speed is measured from
+        // (time, count) and the speed
         int64_t t_pp        = 0;
         int64_t n_pp        = 0;
         int64_t dn_pp       = 0;
+        int     pp_moves    = 0;
+        int64_t t_pa        = 0;
+        int64_t n_pa        = 0;
         double  pp_rate     = 0.0;
     };
     std::vector<slot_t> slot_state;
@@ -847,14 +873,64 @@ struct server_pool_fork::impl {
         return nodes[n].prefill_tps > 0 ? nodes[n].prefill_tps : cfg.prefill_tps;
     }
 
-    // the share of the new conversations a node takes: its speed for one conversation alone (decode_tps) against the
-    // fastest node, 1 until measured
+    // the share of the new conversations a node takes: its speed for one conversation alone against the fastest node, 1
+    // until measured (update_weights)
     double weight_of(int n) const {
-        double best = 0.0;
-        for (int i = 0; i < n_nodes.load(); ++i) {
-            best = std::max(best, nodes[i].decode_tps);
+        return nodes[n].weight;
+    }
+
+    // the devices (their kinds and names, not their memory) and the model of a node, as GET /pool/node gives them; empty
+    // while either is unknown
+    static std::string node_hw(const json & devices, const json & model) {
+        std::vector<std::string> names;
+        for (const auto & d : devices) {
+            if (d.is_object()) {
+                names.push_back(json_value(d, "type", std::string()) + ":" + json_value(d, "description", std::string()));
+            }
         }
-        return best > 0 && nodes[n].decode_tps > 0 ? nodes[n].decode_tps / best : 1.0;
+        if (names.empty() || !model.is_object() || model.empty()) {
+            return std::string();
+        }
+        std::sort(names.begin(), names.end());
+        std::string hw = model.dump();
+        for (const auto & name : names) {
+            hw += "|" + name;
+        }
+        return hw;
+    }
+
+    // the decode speed alone of the nodes with the devices and the model of node n (n alone while they are unknown), and
+    // how many answers it comes from
+    double group_decode(int n, int & count) const {
+        double sn = 0.0;
+        double st = 0.0;
+        count = 0;
+        for (int i = 0; i < n_nodes.load(); ++i) {
+            if (i == n || (!nodes[n].hw.empty() && nodes[i].hw == nodes[n].hw)) {
+                sn    += nodes[i].dec_n;
+                st    += nodes[i].dec_t;
+                count += nodes[i].dec_count;
+            }
+        }
+        return st > 0 ? sn*1000.0/st : 0.0;
+    }
+
+    // the weight of each node: the decode speed alone of its group (the same devices and model) against the fastest
+    // group, once a group has POOL_WEIGHT_MIN answers; 1 before. identical machines weigh the same whatever texts each
+    // happened to answer. under mu
+    void update_weights() {
+        const int nn = n_nodes.load();
+        std::vector<double> speed(nn, 0.0);
+        double best = 0.0;
+        for (int i = 0; i < nn; ++i) {
+            int count = 0;
+            const double v = group_decode(i, count);
+            speed[i] = count >= POOL_WEIGHT_MIN ? v : 0.0;
+            best = std::max(best, speed[i]);
+        }
+        for (int i = 0; i < nn; ++i) {
+            nodes[i].weight = best > 0 && speed[i] > 0 ? speed[i] / best : 1.0;
+        }
     }
 
     // the speed (bytes/s) a state moves at from `from` to `to`, which reads it from there itself: the link of `to` to
@@ -1415,7 +1491,13 @@ struct server_pool_fork::impl {
             const bool alone = it != running.end() && it->second.alone && it->second.starts_at == nodes[n].starts &&
                                nodes[n].external == 0;
             if (alone) {
-                nodes[n].decode_tps = avg(nodes[n].decode_tps, n_gen*1000.0/t_gen, 0.0);
+                pool_node & nd = nodes[n];
+                const double k = std::min(1.0, POOL_DECODE_CAP / n_gen);
+                nd.dec_n = (1.0 - POOL_DECODE_DECAY)*nd.dec_n + POOL_DECODE_DECAY*n_gen*k;
+                nd.dec_t = (1.0 - POOL_DECODE_DECAY)*nd.dec_t + POOL_DECODE_DECAY*t_gen*k;
+                nd.dec_count++;
+                nd.decode_tps = nd.dec_n*1000.0/nd.dec_t;
+                update_weights();
             }
             nodes[n].decode_all = avg(nodes[n].decode_all, n_gen*1000.0/t_gen, 0.0);
         }
@@ -1983,23 +2065,42 @@ struct server_pool_fork::impl {
                     const double g = std::max<int64_t>(0, st.n_decoded - p.n_decoded) / dt;
                     st.gen_tps = 0.5*g + 0.5*p.gen_tps;
 
-                    // the prompt: the tokens of the last move of the counter over the time since the move before it,
-                    // held until the next move. a poll between two moves would read 0, the poll of a move a whole batch
-                    // in one interval. past the time the last move took, the speed falls as that move over the time
-                    // since (a stalled prompt goes to 0); once the slot generates, its prompt is read
-                    st.t_pp    = p.t_pp;
-                    st.n_pp    = p.n_pp;
-                    st.dn_pp   = p.dn_pp;
-                    st.pp_rate = p.pp_rate;
+                    // the prompt: the tokens the counter moved by over the time, held until the next move. a poll
+                    // between two moves would read 0, the poll of a move a whole batch in one interval. the counter
+                    // moves when the decode of a batch returns, and a GPU backend returns once the batch is sent: on
+                    // Vulkan (an RDNA2 card on the Mac, 14.11) the first two batches of a prompt were sent 0.7 s apart
+                    // and then one every ~4 s as they were computed. over a single interval the first moves read a
+                    // batch per poll, 512 t/s against 130 (2-8K t/s on the 395, the user, 14.11). so the speed is
+                    // measured from the POOL_PP_SKIP-th move the pool sees on, over a window that starts again from
+                    // the move before once it is longer than POOL_PP_WINDOW_MS: a slowdown shows within ~20 s, and a
+                    // window of several batches leaves little of the second the polls round each move to
+                    st.t_pp     = p.t_pp;
+                    st.n_pp     = p.n_pp;
+                    st.dn_pp    = p.dn_pp;
+                    st.pp_moves = p.pp_moves;
+                    st.t_pa     = p.t_pa;
+                    st.n_pa     = p.n_pa;
+                    st.pp_rate  = p.pp_rate;
                     if (st.n_processed != p.n_pp && p.t_pp > 0) {
-                        st.dn_pp   = std::max<int64_t>(0, st.n_processed - p.n_pp);
-                        st.pp_rate = now > p.t_pp ? st.dn_pp*1000.0/(now - p.t_pp) : p.pp_rate;
-                        st.t_pp    = now;
-                        st.n_pp    = st.n_processed;
+                        if (st.n_processed < p.n_pp) { // the counter went back: from the start
+                            st.pp_moves = 0;
+                            st.pp_rate  = 0.0;
+                        }
+                        st.pp_moves++;
+                        if (st.pp_moves == POOL_PP_SKIP) {
+                            st.t_pa = now;
+                            st.n_pa = st.n_processed;
+                        } else if (st.pp_moves > POOL_PP_SKIP && now > st.t_pa) {
+                            st.pp_rate = (st.n_processed - st.n_pa)*1000.0/(now - st.t_pa);
+                            if (now - st.t_pa > POOL_PP_WINDOW_MS) {
+                                st.t_pa = p.t_pp;
+                                st.n_pa = p.n_pp;
+                            }
+                        }
+                        st.dn_pp = std::max<int64_t>(0, st.n_processed - p.n_pp);
+                        st.t_pp  = now;
+                        st.n_pp  = st.n_processed;
                     }
-                    const double since = (now - st.t_pp) / 1000.0;
-                    st.prompt_tps = st.n_decoded > 0 ? 0.0 :
-                                    since > 0.0 && st.pp_rate > 0.0 ? std::min(st.pp_rate, st.dn_pp/since) : st.pp_rate;
                 }
                 break;
             }
@@ -2008,10 +2109,33 @@ struct server_pool_fork::impl {
                 st.t_pp = now;
                 st.n_pp = st.n_processed;
             }
+            // at most POOL_PP_CAP times the prefill speed of the node (its answers' timings), whatever a backend that
+            // sends further ahead does to the moves; past the time the last batch took at that speed, it falls as that
+            // batch over the time since its move (a stalled prompt goes to 0); once the slot generates, its prompt is read
+            if (st.processing && st.n_decoded == 0 && st.pp_rate > 0.0) {
+                const double rate  = n.prefill_tps > 0.0 ? std::min(st.pp_rate, POOL_PP_CAP*n.prefill_tps) : st.pp_rate;
+                const double since = (now - st.t_pp) / 1000.0;
+                st.prompt_tps = since > 0.0 && st.dn_pp > 0 ? std::min(rate, st.dn_pp/since) : rate;
+            }
             busy += st.processing ? 1 : 0;
             gen  += st.gen_tps;
             pp   += st.prompt_tps;
             next.push_back(st);
+        }
+        // the prompts no batch of which is measured yet (the first one or two): the prefill speed of the node from the
+        // timings of its answers, shared among them, while none of its slots measures one (prompts read side by side
+        // share the batches)
+        int unmeasured = 0;
+        for (const auto & st : next) {
+            unmeasured += st.processing && st.n_decoded == 0 && st.pp_rate <= 0.0 ? 1 : 0;
+        }
+        if (unmeasured > 0 && pp <= 0.0 && n.prefill_tps > 0.0) {
+            for (auto & st : next) {
+                if (st.processing && st.n_decoded == 0 && st.pp_rate <= 0.0) {
+                    st.prompt_tps = n.prefill_tps / unmeasured;
+                }
+            }
+            pp = n.prefill_tps;
         }
         n.slot_state = std::move(next);
         n.busy       = busy;
@@ -2104,6 +2228,7 @@ struct server_pool_fork::impl {
         std::string error;
         json        props;
         json        slots;
+        int64_t     t_slots    = 0;  // when /slots answered (ms): the counters of the slots are of that moment
         json        info;
         json        router;
         bool        failed     = false;
@@ -2156,7 +2281,8 @@ struct server_pool_fork::impl {
                 }
                 auto rs = cli.Get("/slots" + q, hdrs);
                 if (rs && rs->status == 200) {
-                    pr.slots = json::parse_no_throw(rs->body);
+                    pr.slots   = json::parse_no_throw(rs->body);
+                    pr.t_slots = ggml_time_ms();
                 }
                 auto ri = cli.Get("/pool/node" + q, hdrs);
                 if (ri && ri->status == 200) {
@@ -2307,7 +2433,9 @@ struct server_pool_fork::impl {
                     node.t_props = now;
                 }
                 if (!pr.slots.is_discarded() && pr.slots.is_array()) {
-                    update_slots(node, pr.slots, now);
+                    // the time /slots answered, not the end of the poll: the requests after it (/pool/node with the
+                    // sensors of the GPUs) take a different time each poll, and the speeds of the slots are over it
+                    update_slots(node, pr.slots, pr.t_slots > 0 ? pr.t_slots : now);
                 } else if (status != "up") {
                     node.slot_state.clear();
                     node.busy = 0;
@@ -2319,6 +2447,11 @@ struct server_pool_fork::impl {
                     node.migrate    = json_value(pr.info, "migrate", false);
                     node.cache_ram  = json_value(pr.info, "cache_ram", (uint64_t) 0);
                     node.model_info = pr.info.contains("model") && pr.info.at("model").is_object() ? pr.info.at("model") : json::object();
+                    const std::string hw = node_hw(node.devices, node.model_info);
+                    if (hw != node.hw) {
+                        node.hw = hw;
+                        update_weights();
+                    }
                     const json room = pr.info.contains("room") && pr.info.at("room").is_object() ? pr.info.at("room") : json::object();
                     node.room_held     = json_value(room, "held", (int64_t) -1);
                     node.room_slots    = json_value(room, "slots", (int64_t) 0);
@@ -2636,6 +2769,7 @@ struct server_pool_fork::impl {
                 {"external", n.external}, {"weight", weight_of(i)}, {"requests", n.n_requests},
                 {"gen_tps", n.gen_tps}, {"prompt_tps", n.prompt_tps}, {"queued_for", queued_for},
                 {"prefill_tps", n.prefill_tps}, {"prefill_cfg", cfg.prefill_tps}, {"decode_tps", n.decode_tps}, {"decode_all", n.decode_all},
+                {"decode_n", n.dec_count},
                 {"share", n.share},
                 {"room", n.room_held >= 0 ? json{{"held", n.room_held}, {"n_ctx", n.room_ctx}, {"deferred", n.room_deferred}} : json()},
                 {"stats", n.stats}, {"gpus", n.gpus},
@@ -3192,6 +3326,9 @@ void server_pool_fork::attach(server_http_context & ctx_http, server_routes & ro
 //
 
 json server_pool_node_devices_fork() {
+    // a test hook: a text added to the names of the devices, so that the routers of pytest on one machine stand for
+    // machines of different devices (the nodes of the same devices and model share one weight)
+    static const std::string test_hw = getenv("LLAMA_POOL_TEST_HW") != nullptr ? getenv("LLAMA_POOL_TEST_HW") : "";
     json devices = json::array();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -3211,7 +3348,7 @@ json server_pool_node_devices_fork() {
             default:                             type = "other"; break;
         }
         devices.push_back({
-            {"name", ggml_backend_dev_name(dev)}, {"description", ggml_backend_dev_description(dev)},
+            {"name", ggml_backend_dev_name(dev)}, {"description", ggml_backend_dev_description(dev) + test_hw},
             {"type", type}, {"free", free}, {"total", total},
         });
     }

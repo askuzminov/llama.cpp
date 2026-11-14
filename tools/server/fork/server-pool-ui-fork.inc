@@ -439,7 +439,7 @@ function nodeCard(n) {
   const b = busyOf(n);
   h += '<div class="metrics">' +
     metric("gen", tps(n.gen_tps), "t/s", n.gen_tps > 0 ? "gen" : "zero", "tokens its slots generate per second now") +
-    metric("prompt", tps(n.prompt_tps), "t/s", n.prompt_tps > 0 ? "prompt" : "zero", "prompt tokens its slots compute per second now, each over its last batch") +
+    metric("prompt", tps(n.prompt_tps), "t/s", n.prompt_tps > 0 ? "prompt" : "zero", "prompt tokens its slots compute per second now, each over its last batches (from its second batch on, up to ~20 s); before that, the prefill speed of the node") +
     metric("busy", b, "/ " + (n.slots || 0), "", "requests in its slots: from this router" + (n.external ? ", " + n.external + " from other routers and clients" : "")) +
 )POOLUI",
 R"POOLUI(    metric("waiting", n.queued_for || 0, "", "", "requests in the queue of the pool that wait for this node") + '</div>';
@@ -455,7 +455,7 @@ R"POOLUI(    metric("waiting", n.queued_for || 0, "", "", "requests in the queue
   }
   const st2 = n.stats || {};
   h += '<div class="foot">' +
-    '<span title="the decode speed of one request: the average of its answers of 16 tokens and more">decode <b>' + (n.decode_tps > 0 ? tps(n.decode_tps) : "-") + '</b> t/s</span>' +
+    '<span title="the decode speed of one request alone: its last ~16 answers of 16 tokens and more (' + (n.decode_n || 0) + ' so far)">decode <b>' + (n.decode_tps > 0 ? tps(n.decode_tps) : "-") + '</b> t/s</span>' +
     '<span title="the prefill speed of one request the decisions use: the average of its prompts of move_tokens and more, else a default">prefill <b>' +
     tps(n.prefill_tps > 0 ? n.prefill_tps : n.prefill_cfg) + '</b>' + (n.prefill_tps > 0 ? "" : " (default)") + '</span>' +
     '<span title="of the prefix a new conversation shares with others it holds (the system prompt and tools of an agent), the part it took from its cache">shared prefix <b>' +
@@ -625,7 +625,7 @@ function pageNode(s, name) {
 )POOLUI",
 R"POOLUI(    metric("busy", busyOf(n), "/ " + (n.slots || 0), "", n.external ? n.external + " from other routers and clients" : "") +
     metric("waiting for it", n.queued_for || 0, "") +
-    metric("decode", n.decode_tps > 0 ? tps(n.decode_tps) : "-", n.decode_tps > 0 ? "t/s" : "", "", "one request: the average of its answers of 16 tokens and more") +
+    metric("decode", n.decode_tps > 0 ? tps(n.decode_tps) : "-", n.decode_tps > 0 ? "t/s" : "", "", "one request alone: its last ~16 answers of 16 tokens and more (" + (n.decode_n || 0) + " so far)") +
     metric("prefill", tps(n.prefill_tps > 0 ? n.prefill_tps : n.prefill_cfg), n.prefill_tps > 0 ? "t/s" : "t/s default", "", "one request: the average of its prompts of move_tokens and more") +
     metric("shared prefix", n.share >= 0 ? Math.round(n.share * 100) + "%" : "-", "", "", "the part of a shared prefix it took from its cache") +
     metric("served", n.requests || 0, "", "", "requests this router sent to it") + '</div>';
@@ -663,7 +663,7 @@ R"POOLUI(    metric("busy", busyOf(n), "/ " + (n.slots || 0), "", n.external ? n
     ["model", esc(n.model || "-")], ["type", esc(mi.ftype || "-")], ["parameters", mi.n_params ? count(mi.n_params) : "-"],
     ["size", mi.size ? size(mi.size) : "-"], ["vocabulary", mi.n_vocab ? tok(mi.n_vocab) : "-"],
     ["context", (n.n_ctx ? tok(n.n_ctx) : "-") + (mi.n_ctx_train ? " (trained " + tok(mi.n_ctx_train) + ")" : "")],
-    ["slots", String(n.slots || 0)], ["weight", n.weight != null ? n.weight.toFixed(2) + ' <span class="muted">share of new conversations against the fastest node</span>' : "-"],
+    ["slots", String(n.slots || 0)], ["weight", n.weight != null ? n.weight.toFixed(2) + ' <span class="muted">share of new conversations against the fastest node; the nodes with the same devices and model share one speed</span>' : "-"],
     ["moves state", yesno(n.migrate)], ["cache", n.signature ? '<span class="mono">' + esc(n.signature) + '</span>' : "-"],
     ["address", '<span class="mono">' + esc(n.url) + '</span>' + (n.fallback ? ' <span class="badge wa">fallback</span>' : '')],
     ["last answer", n.seen_ms >= 0 ? age(n.seen_ms) + (n.seen_ms >= 1000 ? " ago" : "") : "never"]];
