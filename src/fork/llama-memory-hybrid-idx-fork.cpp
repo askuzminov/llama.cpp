@@ -877,6 +877,7 @@ bool llama_memory_hybrid_idx_fork::qsa_group_update_multi(
     const int32_t n_bid_old = g.n_bid;
     const int32_t n_end_old = g.n_end;
     int32_t b_dead = n_bid_old;
+    std::vector<int32_t> moved;
     for (int32_t gi : lost) {
         const int32_t b = g.m_bid[gi];
         bool same = g.m_slots[gi] == slots_full;
@@ -886,6 +887,22 @@ bool llama_memory_hybrid_idx_fork::qsa_group_update_multi(
         if (!same) {
             g.m_bid[gi] = -1;
             b_dead = std::min(b_dead, b);
+            moved.push_back(b);
+        }
+    }
+
+    // the cells such a block had, all in one full group again (other positions or another sequence took them, f.ex. the
+    // next prompt of a slot the server cleared): that group takes the place of the block among the old ones, as
+    // group_full keeps the row of the pool for it
+    for (int32_t b : moved) {
+        const int32_t gx = g.m_cell_grp[g.blk_cells[b*r]];
+        bool take = gx >= 0 && g.m_slots[gx] == slots_full && g.m_bid[gx] < 0;
+        for (int64_t k = 1; k < r && take; ++k) {
+            take = g.m_cell_grp[g.blk_cells[b*r + k]] == gx;
+        }
+        if (take) {
+            g.m_bid[gx]    = b;
+            g.m_bid_grp[b] = gx;
         }
     }
 
@@ -1191,40 +1208,92 @@ llama_memory_hybrid_idx_fork::qsa_plan llama_memory_hybrid_idx_fork::qsa_prepare
 
             group_cells();
 
-            // mrope repeats one position across an image, so rank cells instead of using the position
-            if (dup && ubatch->is_pos_2d() && one_seq) {
-                g.order.clear();
-                g.order.reserve(n_kv);
+            // mrope repeats one position across an image, so rank cells instead of using the position. each sequence of
+            // the stream ranks its own cells (15.11): left on the position with several sequences (the slots of a unified
+            // cache), the patches of an image took one slot of one block, the rest went to spare blocks, and every later
+            // token of that conversation had to select them: 1024 patches took half of its 513 blocks, 2048 all of them
+            g.order_beg.clear();
+
+            if (dup && ubatch->is_pos_2d()) {
+                // (sequence, cell): a cell of several sequences once for each of them
+                std::vector<std::pair<int32_t, int32_t>> ent;
+                ent.reserve(n_kv);
 
                 for (int64_t j = 0; j < n_kv; ++j) {
-                    if (!cells.is_empty(j)) {
-                        g.order.push_back((int32_t) j);
+                    if (cells.is_empty(j)) {
+                        continue;
+                    }
+
+                    const auto & set = cells.seq_get_all((uint32_t) j);
+
+                    if (one_seq) {
+                        ent.emplace_back(0, (int32_t) j);
+                    } else if (set.count() == 1) {
+                        ent.emplace_back(qsa_first_seq(set), (int32_t) j);
+                    } else {
+                        for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+                            if (set.test((size_t) sq)) {
+                                ent.emplace_back(sq, (int32_t) j);
+                            }
+                        }
                     }
                 }
 
-                // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
-                std::sort(g.order.begin(), g.order.end(), [&cells](int32_t a, int32_t b) {
-                    const llama_pos pa = cells.pos_get(a);
-                    const llama_pos pb = cells.pos_get(b);
+                // per sequence the total order the mrope causal mask uses: pos, then ext.y, then ext.x
+                std::sort(ent.begin(), ent.end(), [&cells](const std::pair<int32_t, int32_t> & a, const std::pair<int32_t, int32_t> & b) {
+                    if (a.first != b.first) {
+                        return a.first < b.first;
+                    }
+
+                    const llama_pos pa = cells.pos_get(a.second);
+                    const llama_pos pb = cells.pos_get(b.second);
 
                     if (pa != pb) {
                         return pa < pb;
                     }
 
-                    const auto & ea = cells.ext_get(a);
+                    const auto & ea = cells.ext_get(a.second);
 
-                    return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
+                    return cells.ext_get(b.second).is_2d_gt(ea.x, ea.y);
                 });
 
-                g.rank.assign(n_kv, -1);
+                // where the cells of each sequence start in the order; one sequence takes all of it
+                if (!one_seq) {
+                    g.order_beg.assign(LLAMA_MAX_SEQ + 1, 0);
 
-                for (int64_t k = 0; k < (int64_t) g.order.size(); ++k) {
-                    g.rank[g.order[k]] = (int32_t) k;
+                    for (const auto & e : ent) {
+                        g.order_beg[e.first + 1]++;
+                    }
+                    for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+                        g.order_beg[sq + 1] += g.order_beg[sq];
+                    }
                 }
 
-                g.ranked = true;
+                g.order.resize(ent.size());
+                g.rank.assign(n_kv, -1);
 
-                group_cells();
+                // a cell of several sequences takes one rank, so it must be the same in each of them (a copied prompt
+                // is: the same cells in front)
+                bool one_rank = true;
+
+                for (size_t k = 0; k < ent.size(); ++k) {
+                    const int32_t c  = ent[k].second;
+                    const int32_t rk = (int32_t) k - (one_seq ? 0 : g.order_beg[ent[k].first]);
+
+                    one_rank   = one_rank && (g.rank[c] < 0 || g.rank[c] == rk);
+                    g.rank[c]  = rk;
+                    g.order[k] = c;
+                }
+
+                if (one_rank) {
+                    g.ranked = true;
+
+                    group_cells();
+                } else {
+                    g.order    .clear();
+                    g.rank     .clear();
+                    g.order_beg.clear();
+                }
             } else {
                 g.order.clear();
                 g.rank .clear();
@@ -1897,8 +1966,11 @@ void llama_memory_hybrid_idx_fork::set_input_qsa(
                     const llama_pos qy = ubatch->pos[i + n_tokens];
                     const llama_pos qx = ubatch->pos[i + n_tokens*2];
 
-                    int64_t lo = 0;
-                    int64_t hi = (int64_t) g.order.size();
+                    // the cells of the token's sequence in the order
+                    const int64_t beg = g.order_beg.empty() ? 0 : g.order_beg[seq_id];
+
+                    int64_t lo = beg;
+                    int64_t hi = g.order_beg.empty() ? (int64_t) g.order.size() : g.order_beg[seq_id + 1];
 
                     while (lo < hi) {
                         const int64_t   mid = (lo + hi)/2;
@@ -1912,7 +1984,7 @@ void llama_memory_hybrid_idx_fork::set_input_qsa(
                         }
                     }
 
-                    q = lo - 1;
+                    q = lo - beg - 1;
                 }
 
                 // the tail is an incomplete block and is always visible, as in the reference

@@ -206,7 +206,8 @@ private:
         std::vector<int32_t> bid_cell;
         std::vector<llama_kv_cells::seq_set_t> spare_seq;
         std::vector<int32_t> order;       // cells by mrope rank, empty unless ranked
-        std::vector<int32_t> rank;
+        std::vector<int32_t> order_beg;   // several sequences: where the cells of each one start in order, else empty
+        std::vector<int32_t> rank;        // of a cell among the cells of its sequence
         int32_t  n_bid  = 0;
         int32_t  n_end  = 0;              // blocks in use: pooled ones plus the spare ones after them
         int32_t  n_keep = 0;              // leading blocks the pool already holds
@@ -251,8 +252,9 @@ private:
 
     // the same for several sequences in one stream: the rollbacks since the last ubatch, then its new cells. the
     // blocks keep their ids up to the first one a rollback took, the ones after it keep their order, and the blocks
-    // completed now follow by their last cell, as the full grouping orders them (group_full). false when g cannot
-    // be carried. on the Mac, 4 slots at 8K each: 13 us per decode pass against 1260 for the full grouping
+    // completed now follow by their last cell, as the full grouping orders them (group_full); a full group that
+    // holds all the cells a block lost takes the place of that block there. false when g cannot be carried. on
+    // the Mac, 4 slots at 8K each: 13 us per decode pass against 1260 for the full grouping
     bool qsa_group_update_multi(qsa_group & g, const llama_kv_cells & cells, const std::vector<uint32_t> & new_cells,
                                 int64_t n_kv, int64_t r) const;
 

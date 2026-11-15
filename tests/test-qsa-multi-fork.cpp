@@ -24,6 +24,11 @@
 //   of its own sequences only. the run with the dense mask scores all blocks (LLAMA_QSA_ROWS=0), the other one takes
 //   the lists wherever they fit (2, padded to 4 blocks), and the logits must be the same bit for bit; a scenario of
 //   steps of one sequence while the others keep their cells (a prompt of one slot) must take them
+// - sequences removed whole while others stay (15.11: the server clears a slot for a new prompt): the tokens after it
+//   take their cells, so that the cells of an old block are a full group of other positions or of another sequence. the
+//   carried grouping gives that group the place of the old block, as the full one does
+// - an image in one sequence (15.11): its patches share one temporal position, so each sequence ranks its own cells; the
+//   logits of the steps after the image must be those of the same sequence with no other one in the cache
 //
 // usage: test-qsa-multi-fork -m <dir>/qwen4exp-moe.gguf [--dense-out <file> | --dense-in <file>] [-ngl <n>]
 
@@ -106,7 +111,26 @@ static int g_n_rows = 0; // the indexers that scored block lists (indexer_k_rows
 static int g_n_selections = 0;
 static int g_n_duplicate_rows = 0;
 
+// the most blocks a token had to take whatever their score (the bias of a forced block: +inf for the lightning indexer,
+// 1e9 on the scores of the matmul paths), while g_forced_on
+static bool g_forced_on  = false;
+static int  g_forced_max = 0;
+
 static bool eval_cb(ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (g_forced_on && strncmp(t->name, "indexer_score_blocks-", 21) == 0 && strchr(t->name, ' ') == nullptr &&
+            t->type == GGML_TYPE_F32) {
+        if (ask) {
+            return true;
+        }
+        std::vector<float> row(t->ne[0]);
+        for (int64_t i = 0; i < ggml_nrows(t); ++i) {
+            const size_t offset = (i % t->ne[1])*t->nb[1] + (i/t->ne[1] % t->ne[2])*t->nb[2] + (i/(t->ne[1]*t->ne[2]))*t->nb[3];
+            ggml_backend_tensor_get(t, row.data(), offset, row.size()*sizeof(float));
+            const int n = (int) std::count_if(row.begin(), row.end(), [](float v) { return v > 1e8f; });
+            g_forced_max = std::max(g_forced_max, n);
+        }
+        return true;
+    }
     if (ask && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_ABS && t->src[0] != nullptr &&
             t->src[0]->op == GGML_OP_SUB) {
         g_n_abs++;
@@ -144,6 +168,7 @@ struct step {
     std::vector<int>                      seqs;
     std::vector<std::vector<llama_token>> tokens; // per entry of seqs
     std::vector<int>                      keep;   // per entry of seqs, 0 = all (a prompt)
+    std::vector<int>                      restart; // the sequences removed whole before the step, they start at 0 again
 };
 
 enum scenario_kind {
@@ -151,6 +176,7 @@ enum scenario_kind {
     SC_STRIDE,      // the last sequence from just below the stride, past it after some rounds
     SC_COPIES,      // sequence 0 decodes the prompt, sequences 1 and 2 copy its cells
     SC_SINGLE,      // steps of one sequence while the others keep their cells, a round of all of them now and then
+    SC_RESTART,     // sequences removed whole, the next tokens take their cells (a server clears a slot for a new prompt)
 };
 
 struct scenario {
@@ -191,6 +217,48 @@ static scenario make_scenario(const char * name, scenario_kind kind, int n_vocab
             st.keep.push_back(0);
         }
         sc.steps.push_back(st);
+    }
+
+    if (kind == SC_RESTART) {
+        // sequences 1 to 3 go, and the cache is searched from its start again: the next 8 tokens of sequence 0 (positions
+        // 16 to 23) take the cells of the first two blocks sequence 1 had, its new prompt the cells of its other two.
+        // the blocks of the old rows are then full groups of other positions or of another sequence
+        auto chunk = [&](step & st, int s, int n, int keep) {
+            st.seqs.push_back(s);
+            st.tokens.emplace_back();
+            for (int i = 0; i < n; ++i) {
+                st.tokens.back().push_back(tok());
+            }
+            st.keep.push_back(keep);
+        };
+        {
+            step st;
+            st.restart = { 1, 2, 3 };
+            chunk(st, 0, 8, 0);
+            chunk(st, 1, 8, 0);
+            sc.steps.push_back(st);
+        }
+        {
+            step st;
+            for (int s = 0; s < sc.n_seq; ++s) {
+                chunk(st, s, 8, 0);
+            }
+            sc.steps.push_back(st);
+        }
+        // rounds of drafts, a sequence starts again every fourth round
+        for (int r = 0; r < 16; ++r) {
+            step st;
+            const int n_tok = 1 + (int) (rng() % N_DRAFT);
+            if (r % 4 == 3) {
+                st.restart = { 1 + (r/4) % 3 };
+            }
+            for (int s = 0; s < sc.n_seq; ++s) {
+                const bool again = !st.restart.empty() && st.restart[0] == s;
+                chunk(st, s, n_tok, again ? 0 : 1 + (int) (rng() % n_tok));
+            }
+            sc.steps.push_back(st);
+        }
+        return sc;
     }
 
     if (kind == SC_SINGLE) {
@@ -283,6 +351,13 @@ static bool run(llama_context * ctx, const scenario & sc, int only, logits_t & o
     bool ok = true;
     for (size_t si = 0; si < sc.steps.size() && ok; ++si) {
         const step & st = sc.steps[si];
+
+        for (const int s : st.restart) {
+            if (only < 0 || s == only) {
+                llama_memory_seq_rm(mem, seq_of(s), -1, -1);
+            }
+            pos[s] = 0;
+        }
 
         batch.n_tokens = 0;
         std::vector<std::pair<size_t, int>> at; // entry, batch index of its first token
@@ -443,6 +518,10 @@ static std::vector<bool> below_stride(const scenario & sc) {
     std::vector<bool>      held(N_SEQ, false);
     std::vector<bool>      res;
     for (const step & st : sc.steps) {
+        for (const int s : st.restart) {
+            pos[s]  = 0;
+            held[s] = false;
+        }
         llama_pos top = -1;
         for (int s = 0; s < N_SEQ; ++s) {
             if (held[s]) {
@@ -543,6 +622,12 @@ static void test_scenario(llama_model * model, const scenario & sc, const logits
             // the lists: forced in the run that compares with the dense one (LLAMA_QSA_ROWS=2)
             CHECK(dense == nullptr || multi.n_rows > 0);
             break;
+        case SC_RESTART:
+            // every round carries its grouping, the ones after a sequence went too (LLAMA_QSA_CHECK aborts on a
+            // carried grouping that differs from the full one)
+            CHECK(n_below == multi.n_multi);
+            CHECK(multi.n_checked >= multi.n_multi);
+            break;
     }
 
     // the same run with the values out of the dense mask (--dense-out): the same logits, bit for bit
@@ -576,6 +661,133 @@ static void test_scenario(llama_model * model, const scenario & sc, const logits
         CHECK(n_rows > 0);
         CHECK(worst < 1e-3);
     }
+}
+
+// the steps of a sequence that holds an image: text, the patches (M-RoPE: one temporal position, y and x from it, as
+// mtmd sets them), text, then drafts with rollbacks. with `other`, sequence 1 takes cells before the image
+static bool run_image(llama_model * model, bool other, std::vector<std::vector<float>> & out, int & n_forced) {
+    llama_context * ctx = make_ctx(model, N_SEQ, N_CELLS, true);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int n_embd  = llama_model_n_embd_inp(model);
+
+    std::mt19937 rng(97531);
+    std::mt19937 rng_other(8642);
+
+    llama_batch_ext * batch = llama_batch_ext_init(ctx);
+
+    bool ok = true;
+
+    // n tokens of a sequence in one batch, the logits of all of them or of none
+    auto text = [&](llama_seq_id s, llama_pos pos, int n, std::mt19937 & r, bool logits) {
+        llama_batch_ext_clear(batch);
+        for (int i = 0; i < n; ++i) {
+            const int32_t   idx = llama_batch_ext_add_token(batch, s, (llama_token) (r() % (uint32_t) n_vocab));
+            const llama_pos p   = pos + i;
+            ok = ok && idx >= 0 && llama_batch_ext_set_pos(batch, idx, &p) && llama_batch_ext_set_output_logits(batch, idx, logits);
+        }
+        ok = ok && llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) == 0;
+    };
+
+    llama_pos pos = 0;
+
+    text(0, pos, 24, rng, false);
+    pos += 24;
+
+    if (other) {
+        text(1, 0, 32, rng_other, false);
+    }
+
+    // 96 patches, 12 rows of 8: 95 of them shared the block slot of their position before the sequences ranked their cells
+    {
+        const int nx = 8;
+        const int ny = 12;
+
+        std::vector<float> embd((size_t) nx*ny*n_embd);
+        std::normal_distribution<float> dist(0.0f, 0.05f);
+        for (float & v : embd) {
+            v = dist(rng);
+        }
+
+        llama_batch_ext_clear(batch);
+        for (int i = 0; i < nx*ny; ++i) {
+            const int32_t   idx  = llama_batch_ext_add_embd(batch, 0, { embd.data() + (size_t) i*n_embd, 1, (size_t) n_embd });
+            const llama_pos p[4] = { pos, pos + i/nx, pos + i%nx, 0 };
+            ok = ok && idx >= 0 && llama_batch_ext_set_pos(batch, idx, p) && llama_batch_ext_set_output_logits(batch, idx, false);
+        }
+        ok = ok && llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) == 0;
+
+        pos += std::max(nx, ny);
+    }
+
+    text(0, pos, 24, rng, false);
+    pos += 24;
+
+    // the forced blocks of the tokens after the image
+    g_forced_max = 0;
+    g_forced_on  = true;
+
+    for (int st = 0; st < 10 && ok; ++st) {
+        text(0, pos, 3, rng, true);
+        for (int i = 0; i < 3 && ok; ++i) {
+            const float * lg = llama_get_logits_ith(ctx, i);
+            out.emplace_back(lg, lg + n_vocab);
+        }
+        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + 1, -1);
+        pos += 1;
+    }
+
+    g_forced_on = false;
+    n_forced    = g_forced_max;
+
+    llama_batch_ext_free(batch);
+    llama_free(ctx);
+
+    return ok;
+}
+
+// an image in one sequence of a unified cache: the logits of its later steps do not depend on another sequence that holds
+// cells. each sequence ranks its own cells (group_full); by the position, with several sequences, all patches but one went
+// to spare blocks, which every later token of the sequence had to select in place of scored ones (15.11, --kv-unified
+// with 4 slots: an answer to the wrong context, then a loop)
+static void test_image(llama_model * model) {
+    std::vector<std::vector<float>> alone;
+    std::vector<std::vector<float>> next;
+
+    int n_forced_alone = 0;
+    int n_forced_next  = 0;
+
+    const bool ok_alone = run_image(model, false, alone, n_forced_alone);
+    const bool ok_next  = run_image(model, true,  next,  n_forced_next);
+    CHECK(ok_alone);
+    CHECK(ok_next);
+
+    // a token must take its incomplete tail and the full blocks in it, a few blocks. the logits alone do not show the
+    // patches in spare blocks: the attention of this model moves them little (1.2e-4 of the largest logit, 15.11)
+    printf("image: at most %d forced blocks for a token alone, %d next to another sequence\n", n_forced_alone, n_forced_next);
+    CHECK(n_forced_alone > 0 && n_forced_alone <= 4);
+    CHECK(n_forced_next  > 0 && n_forced_next  <= 4);
+    CHECK(!alone.empty() && alone.size() == next.size());
+    if (!ok_alone || !ok_next || alone.empty() || alone.size() != next.size()) {
+        return;
+    }
+
+    double worst = 0.0;
+    for (size_t i = 0; i < alone.size(); ++i) {
+        double scale = 1.0;
+        double diff  = 0.0;
+        for (size_t j = 0; j < alone[i].size(); ++j) {
+            scale = std::max(scale, (double) std::fabs(alone[i][j]));
+            diff  = std::max(diff, (double) std::fabs(alone[i][j] - next[i][j]));
+        }
+        worst = std::max(worst, diff/scale);
+    }
+    printf("image: next to another sequence against alone, %zu rows of logits, largest difference %.3g of the largest logit\n",
+           alone.size(), worst);
+    CHECK(worst < 1e-3);
 }
 
 static void test_ple_read_error(const char * source) {
@@ -679,6 +891,7 @@ int main(int argc, char ** argv) {
         make_scenario("independent",     SC_INDEPENDENT, n_vocab, 1234),
         make_scenario("past the stride", SC_STRIDE,      n_vocab, 5678),
         make_scenario("one at a time",   SC_SINGLE,      n_vocab, 2468),
+        make_scenario("started again",   SC_RESTART,     n_vocab, 1357),
     };
 
     if (dense_out) {
@@ -709,6 +922,7 @@ int main(int argc, char ** argv) {
             test_scenario(model, compared[i], dense.empty() ? nullptr : &dense[i]);
         }
         test_scenario(model, make_scenario("copied prompt", SC_COPIES, n_vocab, 4321), nullptr);
+        test_image(model);
     }
 
     llama_model_free(model);
