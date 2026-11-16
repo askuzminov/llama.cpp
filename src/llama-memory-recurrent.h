@@ -147,6 +147,36 @@ public:
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
+    // fork: a ubatch that fails (llama-memory-recurrent-fork.cpp). find_slot() moves the cells of the sequences of a
+    // ubatch together and names for each cell of that range the row its state comes from, the graph then moves the
+    // states. when the graph did not run the cells named rows that held other states: a sequence outside the ubatch
+    // whose cell had moved went on with the state of another sequence, and the records and the pending rollback of the
+    // cells of the range were gone (16.11). ubatch_save() keeps what apply() and the fill of the inputs change
+    struct ubatch_undo {
+        bool                  valid = false;
+        std::vector<mem_cell> cells;
+        uint32_t              head = 0;
+        uint32_t              used = 0;
+        std::vector<uint32_t> rs_idx;
+        std::vector<uint32_t> rec_n;
+        std::vector<uint8_t>  rec_set;
+
+        // the sequences of the ubatch, each with its lowest position
+        std::vector<std::pair<llama_seq_id, llama_pos>> seqs;
+    };
+
+    ubatch_undo undo;
+
+    void ubatch_save(const llama_ubatch & ubatch);
+
+    // puts the cells back and returns the sequences whose state is lost, removed from this memory already. started
+    // (the graph was submitted): the sequences of the ubatch and every other one with a row the graph writes. else
+    // only a sequence of the ubatch whose new positions do not come after its state (the next patches of an image):
+    // seq_rm cannot tell them from the positions the state holds
+    std::vector<llama_seq_id> ubatch_restore(bool started);
+
+    void ubatch_failed(bool started) override;
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;

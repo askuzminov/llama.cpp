@@ -2250,13 +2250,15 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()),
     kv(kv) {
-    kv->update_rs_for_ubatches(this->ubatches);
+    // fork: update_rs_for_ubatches() runs per ubatch, when the ubatch is applied (llama_kv_cache_dsv4::ubatch_save)
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
 
 bool llama_kv_cache_dsv4_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    kv->ubatch_done(); // fork
 
     ctx_raw->next();
     ctx_csa->next();
@@ -2274,6 +2276,11 @@ bool llama_kv_cache_dsv4_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
     bool res = true;
+
+    // fork: what ubatch_failed() puts back, and the rollback bookkeeping of this ubatch
+    if (!ubatches.empty()) {
+        kv->ubatch_save(ubatches[i_next]);
+    }
 
     res = res & ctx_raw->apply();
 

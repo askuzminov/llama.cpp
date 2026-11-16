@@ -579,6 +579,17 @@ bool server_debug_rollback_fail_fork() {
     return every > 0 && ++n_calls % every == 0;
 }
 
+bool server_keep_decoded_fork() {
+    static const bool value = server_env_int_fork("LLAMA_SLOT_KEEP_DECODED", 1) != 0;
+    return value;
+}
+
+bool server_debug_encode_fail_fork() {
+    static const int32_t n_fail = server_env_int_fork("LLAMA_SERVER_DEBUG_ENCODE_FAIL", 0);
+    static int64_t n_calls = 0;
+    return n_fail > 0 && ++n_calls == n_fail;
+}
+
 int32_t server_answer_room_fork() {
     static const int32_t value = std::max(0, server_env_int_fork("LLAMA_SLOT_ANSWER_ROOM", 8192));
     return value;

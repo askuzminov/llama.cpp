@@ -72,7 +72,7 @@ public:
     void     kv_alloc_deferred_fork() override;
 
     // the pool rows of a failed pass may be half written
-    void ubatch_failed() override;
+    void ubatch_failed(bool started) override;
 
     void clear(bool data) override;
 

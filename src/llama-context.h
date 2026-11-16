@@ -633,4 +633,26 @@ private:
 
     // node count of a graph that did not fit the buffer plan at the full KV either (see process_ubatch)
     int replan_failed_n_nodes = -1;
+
+    // process_ubatch: the graph of the ubatch was submitted, see llama_memory_i::ubatch_failed
+    bool ubatch_started = false;
+
+    // process_ubatch for decode. a backend can throw while the graph is built or submitted (Vulkan: no device memory
+    // for its work buffers). the exception then left the memory as apply() had made it, with the positions of a ubatch
+    // no graph computed and its cells moved, and the caller with no error code: here it is a failed ubatch
+    llm_graph_result * process_ubatch_fork(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret);
+
+    // LLAMA_DEBUG_UBATCH_FAIL=N (tests, 0 by default): the Nth counted ubatch of this context fails before its graph is
+    // built, as when the graph finds no memory; -N: its graph runs, then an exception. the count left.
+    // LLAMA_DEBUG_UBATCH_FAIL_SEQS (2): a ubatch is counted when it holds at least that many sequences, 1: every ubatch.
+    // LLAMA_DEBUG_UBATCH_FAIL_MTP=1: the knob is for the contexts of a draft head (LLAMA_CONTEXT_TYPE_MTP), not the others.
+    // LLAMA_DEBUG_UBATCH_FAIL_INPUTS=1: N fails after the inputs of the graph are set, with an exception, as a row
+    // cache that cannot read or a backend that cannot place an input: the memory has answered the inputs by then (the
+    // rollback that waited, the records of the deferred rollback), and the graph was not submitted
+    int32_t debug_ubatch_fail        = 0;
+    int32_t debug_ubatch_fail_seqs   = 2;
+    bool    debug_ubatch_fail_inputs = false;
+
+    // 1: this ubatch fails now, 2: once its inputs are set, -1: after its graph ran, 0: it does not
+    int debug_ubatch_fail_fork(const llama_ubatch & ubatch);
 };

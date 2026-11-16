@@ -1511,6 +1511,8 @@ llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 bool llama_memory_recurrent_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
+    mem->undo.valid = false; // fork: the ubatch is done, ubatch_failed() must not put back what was before it
+
     if (++i_next >= ubatches.size()) {
         return false;
     }
@@ -1529,6 +1531,7 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
+    mem->ubatch_save(ubatches[i_next]); // fork: what ubatch_failed() puts back
     mem->find_slot(ubatches[i_next]);
 
     return true;

@@ -917,6 +917,28 @@ void llama_context::fork_prefetch_first() {
     llama_fork_prefetch_first(model, memory.get(), llama_fork_tokens_ubatch(batch.token, n, batch.pos[0], seq));
 }
 
+llm_graph_result * llama_context::process_ubatch_fork(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    try {
+        return process_ubatch(ubatch, gtype, mctx, ret);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: the graph of a ubatch of %u tokens failed: %s\n", __func__, ubatch.n_tokens, err.what());
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+}
+
+int llama_context::debug_ubatch_fail_fork(const llama_ubatch & ubatch) {
+    if (debug_ubatch_fail == 0 || (int32_t) ubatch.n_seqs_unq < debug_ubatch_fail_seqs) {
+        return 0;
+    }
+    const int kind = debug_ubatch_fail > 0 ? 1 : -1;
+    debug_ubatch_fail -= kind;
+    if (debug_ubatch_fail != 0) {
+        return 0;
+    }
+    return kind > 0 && debug_ubatch_fail_inputs ? 2 : kind;
+}
+
 bool llama_memory_rs_lazy_fork(const llama_context * ctx) {
     llama_memory_t mem = llama_get_memory(ctx);
     if (const auto * recr = dynamic_cast<const llama_memory_recurrent *>(mem)) {

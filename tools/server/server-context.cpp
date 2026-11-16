@@ -449,6 +449,58 @@ struct server_slot {
         prompt.clear();
     }
 
+    // fork: after a decode that failed the slot keeps the tokens the memory still holds of it: what was decoded before
+    // the ubatch that failed, which the memory takes back (llama_memory_i::ubatch_failed). upstream clears the slot,
+    // and its next request reads the whole prompt again. false: nothing to keep, the caller clears the slot.
+    // - cells past the tokens of the slot (a part of an image whose decode failed, the slot lists an image when it is
+    //   whole): a plain attention cache takes them back (tgt_part), another memory cannot tell them from its state
+    // - the draft context got nothing of the batch that failed: the target goes back to where the draft is when it
+    //   can, else a draft head starts its window anew (dft_restart; a draft model would go on without the conversation)
+    bool keep_decoded_fork(bool tgt_part, bool dft_restart) {
+        llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+        llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+
+        llama_pos pos = llama_memory_seq_pos_max(mem_tgt, id);
+
+        const llama_pos pos_end = prompt.tokens.pos_next();
+        if (pos >= pos_end) {
+            if (!tgt_part || !llama_memory_seq_rm(mem_tgt, id, pos_end, -1)) {
+                return false;
+            }
+            pos = llama_memory_seq_pos_max(mem_tgt, id);
+        }
+
+        if (pos >= 0 && mem_dft != nullptr) {
+            const llama_pos pos_dft = llama_memory_seq_pos_max(mem_dft, id);
+            if (pos_dft > pos) {
+                if (!llama_memory_seq_rm(mem_dft, id, pos + 1, -1)) {
+                    pos = -1;
+                }
+            } else if (pos_dft < pos) {
+                if (pos_dft >= 0 && llama_memory_seq_rm(mem_tgt, id, pos_dft + 1, -1)) {
+                    pos = llama_memory_seq_pos_max(mem_tgt, id);
+                } else if (dft_restart) {
+                    llama_memory_seq_rm(mem_dft, id, -1, -1);
+                } else {
+                    pos = -1;
+                }
+            }
+        }
+
+        // the tokens up to that position, and one of them is at it: the memory holds them and no part of an image
+        const size_t n_all = prompt.tokens.size();
+        const size_t n     = pos < 0 ? 0 : prompt.tokens.size_up_to_pos(pos + 1);
+        if (n == 0 || prompt.tokens.size_up_to_pos(pos) >= n) {
+            return false;
+        }
+
+        // the checkpoints of the slot stay: each was made before the decode of its batch, so none lies past these tokens
+        prompt.tokens.keep_first(n);
+
+        SLT_WRN(*this, "the batch failed: the slot keeps %zu of its %zu tokens\n", n, n_all);
+        return true;
+    }
+
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
@@ -995,6 +1047,12 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
 
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
+
+    // fork: a test of what the slot keeps after an encode that fails
+    if (server_debug_encode_fail_fork()) {
+        SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu (LLAMA_SERVER_DEBUG_ENCODE_FAIL)\n", idx);
+        return -1;
+    }
 
     const int64_t t_encode_us = ggml_time_us(); // fork: print_timings
     res = mtmd_batch_encode(mbatch.get());
@@ -4482,6 +4540,8 @@ private:
             batch.truncate(n_tokens_prev);
             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
             slot.release();
+            // the text of this step is counted in the tokens of the slot and will not be decoded
+            keep_or_clear_fork(slot);
             return -1;
         }
 
@@ -4524,6 +4584,32 @@ private:
         }
         batch.clear();
         batch_building_fork = false;
+    }
+
+    // fork: a slot whose batch failed goes back to what the memory holds of it, or it is cleared (keep_decoded_fork). a
+    // draft head only fills a window and may start anew, a draft model must have seen every token of the conversation
+    void keep_or_clear_fork(server_slot & slot) {
+        const bool tgt_part    = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+        const bool dft_restart = std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) == params_base.speculative.types.end();
+        if (!server_keep_decoded_fork() || !slot.keep_decoded_fork(tgt_part, dft_restart)) {
+            slot.prompt_clear();
+        }
+    }
+
+    // fork: after a decode that failed the memory gives up the sequences whose state the graph of the failed ubatch
+    // can have written, those of slots outside the batch too (llama_memory_i::ubatch_failed: the recurrent state of an
+    // idle slot whose cell lay between the cells of the batch). such a slot forgets its prompt and reads it again:
+    // with its tokens kept its next request would find no cells. a slot paused for room has none by design, its state
+    // is in host memory (room_pause_fork)
+    void drop_lost_slots_fork() {
+        for (auto & slot : slots) {
+            if (slot.room_paused || slot.prompt.n_tokens() == 0 || llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= 0) {
+                continue;
+            }
+            SLT_WRN(slot, "the failed decode took the state of this slot (%d tokens), its prompt is read again\n", (int) slot.prompt.n_tokens());
+            slot.prompt_clear();
+        }
     }
 
     void abort_all_slots(const std::string & reason) {
@@ -5719,6 +5805,9 @@ private:
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
                             slot.release();
+                            // fork: the memory can hold a part of the image now, or nothing of the slot (a recurrent
+                            // state after a ubatch that failed), while the tokens of the slot end before the image
+                            keep_or_clear_fork(slot);
                             return; // the slot is done, skip it entirely
                         }
 
@@ -6036,9 +6125,16 @@ private:
 
                             // note: it's complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
+                            // fork: unless it was a compute error: the memory then tells what it holds of the slot
+                            if (ret < -1) {
+                                keep_or_clear_fork(slot);
+                            } else {
+                                slot.prompt_clear();
+                            }
                         }
                     }
+
+                    drop_lost_slots_fork(); // fork: the slots that were not in the batch
 
                     // stop, do not retry with smaller batch size
                     throw std::runtime_error(err);
@@ -6074,6 +6170,17 @@ private:
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
+
+                // fork: the target holds the batch and the draft context does not. upstream ends the tasks and keeps the
+                // tokens of the slots: a draft that needs consecutive positions then refuses every next batch of the
+                // slot. the slots go back to what both contexts hold, as after a compute error (keep_decoded_fork)
+                for (auto & slot : slots) {
+                    if (slot.is_processing() && !slot.room_paused) {
+                        send_error(slot, "failed to process speculative batch");
+                        slot.release();
+                        keep_or_clear_fork(slot);
+                    }
+                }
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");

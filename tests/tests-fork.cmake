@@ -136,11 +136,34 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-gdn-flatten-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
     set_tests_properties(test-gdn-flatten-fork PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # a rollback of the recurrent state after a decode with sequences of unequal length: refused or right, never the
-    # plane of another sequence (llama_memory_recurrent::find_slot)
+    # the cells of the recurrent state a decode with several sequences moves (llama_memory_recurrent::find_slot): a
+    # rollback after sequences of unequal length is refused or right, never the plane of another sequence; after a
+    # ubatch that fails (LLAMA_DEBUG_UBATCH_FAIL, an abort) a sequence the memory still holds is as it was before
     llama_build(test-rs-rollback-fork.cpp)
     llama_test(test-rs-rollback-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
     set_tests_properties(test-rs-rollback-fork PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # the failed ubatch on the other memories (--failed): a plain recurrent state, the hybrids of a state and attention
+    # (plain, with a rollback, with a window of attention, the upstream one of sparse attention), a plain attention
+    # cache and one with a window
+    foreach(FAILED_MODEL mamba2-dense granitehybrid-dense qwen35-dense lfm3-dense kimi-k31-moe llama-dense gemma2-dense)
+        llama_test(test-rs-rollback-fork NAME test-rs-rollback-fork-failed-${FAILED_MODEL} LABEL main ARGS -m "${MODEL_DIR}/${FAILED_MODEL}.gguf" --failed)
+        set_tests_properties(test-rs-rollback-fork-failed-${FAILED_MODEL} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+
+    # a ubatch that fails on the DSV4 memory (LLAMA_DEBUG_UBATCH_FAIL, an abort): the sequence where it was and the same
+    # tokens after it as in a context that never failed, or the sequence gone whole (llama_kv_cache_dsv4::ubatch_failed)
+    llama_build(test-dsv4-failed-fork.cpp)
+    foreach(DSV4_MODEL deepseek4-moe deepseek41-moe)
+        llama_test(test-dsv4-failed-fork NAME test-dsv4-failed-fork-${DSV4_MODEL} LABEL main ARGS -m "${MODEL_DIR}/${DSV4_MODEL}.gguf")
+        set_tests_properties(test-dsv4-failed-fork-${DSV4_MODEL} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+
+    # an image cut by the ubatch size: the n-gram history of the patches after the cut (llama_kv_cache::get_prev_tokens)
+    # on the cells, and the logits against the image in one ubatch; internal classes, so only where they link
+    llama_build(test-image-split-fork.cpp LINK llama)
+    llama_test(test-image-split-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-image-split-fork PROPERTIES FIXTURES_REQUIRED generate-models)
 
     # partial (PARTIAL_ONLY) context checkpoints, one test per memory family:
     # plain attention, iSWA, hybrid (attention + recurrent), pure recurrent and the hybrid of qwen4exp (QSA + GDN)

@@ -68,6 +68,7 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 set(LLAMA_FORK_SOURCES
     fork/llama-fork.cpp
     fork/llama-context-fork.cpp
+    fork/llama-kv-dsv4-fork.cpp
     fork/llama-kv-elastic-fork.cpp
     fork/llama-kv-window-fork.cpp
     fork/llama-impl-fork.cpp
@@ -78,6 +79,7 @@ set(LLAMA_FORK_SOURCES
     fork/llama-moecache-fork.cpp
     fork/llama-row-cache-fork.cpp
     fork/llama-memory-hybrid-idx-fork.cpp
+    fork/llama-memory-recurrent-fork.cpp
     fork/qwen4exp-fork.cpp
 )
 target_sources(llama PRIVATE ${LLAMA_FORK_SOURCES})

@@ -160,6 +160,33 @@ public:
     // copy the sources into their mirrors after a state read
     void refill_comp_mirrors();
 
+    // fork: a ubatch that fails (src/fork/llama-kv-dsv4-fork.cpp). the positions of a failed ubatch went back through
+    // seq_rm(), which took them for the rollback of a draft: over snapshots the graph never wrote (the sequence then
+    // went on from the compressor state of an older ubatch), or refused past n_rs_seq tokens, with the positions of a
+    // ubatch no graph computed left in the cache. and update_rs_for_ubatches() ran for the whole batch when its context
+    // was made, so a batch that stopped early took the pending rollback of the sequences of its later ubatches.
+    // ubatch_save() keeps what apply() changes and moves the rollback bookkeeping on for this ubatch alone
+    struct ubatch_undo {
+        bool valid = false;
+
+        std::vector<uint32_t> rs_idx;
+        std::vector<uint32_t> rs_max;
+
+        // the sequences of the ubatch with the lowest position of each
+        std::vector<std::pair<llama_seq_id, llama_pos>> seqs;
+    };
+
+    ubatch_undo undo;
+
+    void ubatch_save(const llama_ubatch & ubatch);
+
+    // the ubatch is done, ubatch_failed() must not take it back
+    void ubatch_done() { undo.valid = false; }
+
+    // the raw cells of the ubatch go and the rollback bookkeeping is as before it. started (its graph was submitted,
+    // the compressed rows and the compressor state can be half written): its sequences go whole
+    void ubatch_failed(bool started) override;
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;

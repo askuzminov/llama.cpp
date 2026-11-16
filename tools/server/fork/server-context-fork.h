@@ -139,6 +139,17 @@ int32_t server_slot_tail_max_fork();
 // rollback of the rejected tokens of a draft, as if the memory had refused it (rollback_recover_fork)
 bool server_debug_rollback_fail_fork();
 
+// LLAMA_SLOT_KEEP_DECODED (16.11, 1 by default, 0: the slot is cleared): after a decode that failed with a compute
+// error a slot of the batch keeps the tokens the memory still holds of it (server_slot::keep_decoded_fork), and so does
+// a slot after a batch the draft context failed on or an image whose decode failed. upstream clears the slots of the
+// batch after a compute error, the next request of each reads its whole prompt again; in the two other cases it leaves
+// the tokens of the slot as they are, whatever the memory still holds
+bool server_keep_decoded_fork();
+
+// LLAMA_SERVER_DEBUG_ENCODE_FAIL=N (tests, 0 by default): true at the Nth call. the encode of an image by the projector
+// then fails before it runs
+bool server_debug_encode_fail_fork();
+
 // LLAMA_SLOT_ANSWER_ROOM (23.10, default 8192, 0: none): the room a running answer is counted at when a new task asks
 // for room in a unified cache (server_slot_room_fork)
 int32_t server_answer_room_fork();

@@ -149,9 +149,10 @@ struct llama_memory_i {
     // the caches built without memory (llama_kv_defer_scope_fork) that did not become elastic, allocated in full
     virtual void     kv_alloc_deferred_fork() {}
 
-    // the last ubatch failed or was aborted: drop what the module derived from its compute
+    // the last ubatch failed or was aborted: put back what its apply() changed and drop what the module derived from
+    // its compute. started: its graph was submitted, the rows it writes can hold a part of the result
     // its positions are then removed with seq_rm
-    virtual void ubatch_failed() {}
+    virtual void ubatch_failed(bool started) { (void) started; }
 
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update

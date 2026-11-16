@@ -422,6 +422,13 @@ llama_context::llama_context(
 
         graph_cache_size = (uint32_t) std::min<int64_t>(std::max<int64_t>(0, llama_fork_env_int("LLAMA_GRAPH_CACHE", graph_cache_size)), UINT32_MAX);
         graph_cache_size = graph_reuse_disable ? 0 : graph_cache_size;
+
+        // fork: the context of a draft head decodes the same batches after the target, so the test knob is for one kind
+        if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) == (llama_fork_env_int("LLAMA_DEBUG_UBATCH_FAIL_MTP", 0) != 0)) {
+            debug_ubatch_fail        = (int32_t) llama_fork_env_int("LLAMA_DEBUG_UBATCH_FAIL", 0);
+            debug_ubatch_fail_seqs   = (int32_t) llama_fork_env_int("LLAMA_DEBUG_UBATCH_FAIL_SEQS", 2);
+            debug_ubatch_fail_inputs = llama_fork_env_int("LLAMA_DEBUG_UBATCH_FAIL_INPUTS", 0) != 0;
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1951,9 +1958,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool timing = timing_env || timeline;
     const int64_t t_start_us = timing ? ggml_time_us() : 0;
 
+    ubatch_started = false; // fork
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    // fork: LLAMA_DEBUG_UBATCH_FAIL (tests): this ubatch fails as one whose graph finds no memory, or its graph runs and
+    // then throws, as a backend does (see process_ubatch_fork)
+    const int debug_fail = debug_ubatch_fail_fork(ubatch);
+    if (debug_fail == 1) {
+        LLAMA_LOG_ERROR("%s: failed to allocate graph (LLAMA_DEBUG_UBATCH_FAIL)\n", __func__);
+        ret = GGML_STATUS_ALLOC_FAILED;
         return nullptr;
     }
 
@@ -2064,10 +2082,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
     }
 
+    // fork: LLAMA_DEBUG_UBATCH_FAIL_INPUTS (tests)
+    if (debug_fail == 2) {
+        throw std::runtime_error("LLAMA_DEBUG_UBATCH_FAIL_INPUTS");
+    }
+
     const int64_t t_inputs_us = timing ? ggml_time_us() : 0;
 
     // fork: work for the next ubatch that runs while this graph computes (the PLE rows of qwen4exp)
     fork_before_compute(mctx);
+
+    ubatch_started = true; // fork: a failure from here on can leave the rows of the memory half written
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
@@ -2092,6 +2117,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // fork: LLAMA_DEBUG_UBATCH_FAIL (tests)
+    if (debug_fail < 0) {
+        ggml_backend_sched_synchronize(sched.get());
+        throw std::runtime_error("LLAMA_DEBUG_UBATCH_FAIL");
     }
 
     if (moe_cache_fork && moe_cache_fork->is_init()) {
@@ -2612,11 +2643,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        // fork: an exception of a backend is a failed ubatch too (process_ubatch_fork)
+        const auto * res = process_ubatch_fork(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            memory->ubatch_failed();
+            memory->ubatch_failed(ubatch_started);
 
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {

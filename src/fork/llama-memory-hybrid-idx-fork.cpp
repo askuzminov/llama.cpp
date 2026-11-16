@@ -372,8 +372,10 @@ llama_memory_context_ptr llama_memory_hybrid_idx_fork::init_update(llama_context
     return std::make_unique<llama_memory_hybrid_idx_fork_context>(this, lctx, optimize);
 }
 
-void llama_memory_hybrid_idx_fork::ubatch_failed() {
+void llama_memory_hybrid_idx_fork::ubatch_failed(bool started) {
     qsa_pool_drop();
+
+    llama_memory_hybrid::ubatch_failed(started);
 }
 
 void llama_memory_hybrid_idx_fork::clear(bool data) {

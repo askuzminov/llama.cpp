@@ -2174,12 +2174,26 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
     std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
 
+    // fork: cells of an earlier ubatch at the position of the first token (the ubatch goes on inside an image)
+    std::unordered_map<llama_seq_id, int64_t> seq_same;
+
     if (by_order) {
         ord.resize(n_tokens);
         for (uint32_t i = 0; i < n_tokens; ++i) {
             auto & v = seq_idx[ubatch.seq_id[i][0]];
             ord[i] = v.size();
             v.push_back(i);
+        }
+
+        for (const auto & [seq_id, v] : seq_idx) {
+            const llama_pos p0 = ubatch.pos[v[0]];
+            const auto &    sp = v_cells[seq_to_stream[seq_id]].seq_pos_get(seq_id);
+
+            int64_t n_same = std::distance(sp.lower_bound({ p0, 0 }), sp.upper_bound({ p0, std::numeric_limits<uint32_t>::max() }));
+            for (const uint32_t i : v) {
+                n_same -= ubatch.pos[i] == p0;
+            }
+            seq_same[seq_id] = std::max<int64_t>(n_same, 0);
         }
     }
 
@@ -2196,7 +2210,9 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
                 const auto & v = seq_idx[seq_id];
                 const int64_t k = (int64_t) ord[i] - d;
                 // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
-                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
+                // fork: the patches of the same image an earlier ubatch stored come first, then the tokens before it
+                const int64_t n_same = k >= 0 ? 0 : seq_same[seq_id];
+                p = k >= 0 ? ubatch.pos[v[k]] : -k <= n_same ? ubatch.pos[v[0]] : ubatch.pos[v[0]] + (llama_pos) (k + n_same);
             } else {
                 p = ubatch.pos[i] - d;
             }
