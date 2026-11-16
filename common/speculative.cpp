@@ -1844,8 +1844,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                for (int32_t off = 0; off < n_all; off += n_chunk) {
-                    const int32_t n = std::min(n_chunk, n_all - off);
+                for (int32_t off = 0; off < n_all; ) {
+                    int32_t n = std::min(n_chunk, n_all - off);
+                    // fork: a target batch of tokens and image embeddings (the server puts the images of a prompt next
+                    // to its text): the head takes tokens or embeddings in one call, not both
+                    for (int32_t k = 1; k < n; ++k) {
+                        if ((batch_in.tokens[off + k].id == LLAMA_TOKEN_NULL) != (batch_in.tokens[off].id == LLAMA_TOKEN_NULL)) {
+                            n = k;
+                            break;
+                        }
+                    }
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE,
                                                      n == n_all ? batch.get() : batch.get_sub_batch(off, n));
                     if (rc != 0) {
@@ -1854,6 +1862,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         ok = false;
                         break;
                     }
+                    off += n; // fork: the chunks differ in size
                 }
             }
 

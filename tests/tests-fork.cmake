@@ -136,6 +136,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-gdn-flatten-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
     set_tests_properties(test-gdn-flatten-fork PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # a rollback of the recurrent state after a decode with sequences of unequal length: refused or right, never the
+    # plane of another sequence (llama_memory_recurrent::find_slot)
+    llama_build(test-rs-rollback-fork.cpp)
+    llama_test(test-rs-rollback-fork LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-rs-rollback-fork PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # partial (PARTIAL_ONLY) context checkpoints, one test per memory family:
     # plain attention, iSWA, hybrid (attention + recurrent), pure recurrent and the hybrid of qwen4exp (QSA + GDN)
     foreach(CKPT_MODEL llama-dense gemma2-dense phi3-dense granitehybrid-dense nemotron_h-dense falcon-h1-dense mamba2-dense qwen4exp-moe)

@@ -480,18 +480,48 @@ int32_t server_ckpt_system_break_fork() {
     return value;
 }
 
-int32_t server_ckpt_system_end_fork(const common_chat_msg_spans & spans) {
-    const int32_t min_tokens = server_ckpt_system_break_fork();
-    if (min_tokens <= 0 || spans.spans.empty()) {
+std::vector<int32_t> server_ckpt_tail_fork(const server_tokens & tokens, int32_t n_ubatch, int32_t n_batch, int32_t n_tail) {
+    static const bool media_on = server_env_int_fork("LLAMA_CKPT_TAIL", 1) != 0;
+    const int32_t n_total = (int32_t) tokens.size();
+
+    std::vector<int32_t> res;
+    for (const int32_t offset : { 4 + n_ubatch, 4, media_on ? n_tail : 0 }) {
+        int32_t t = n_total - std::min(n_batch, offset);
+        if (offset <= 0 || t <= 0) {
+            continue;
+        }
+        while (media_on && t > 0 && tokens[t - 1] == LLAMA_TOKEN_NULL) {
+            --t;
+        }
+        if (t > 0) {
+            res.push_back(t);
+        }
+    }
+    std::sort(res.begin(), res.end());
+    res.erase(std::unique(res.begin(), res.end()), res.end());
+    return res;
+}
+
+int32_t server_system_end_fork(const common_chat_msg_spans & spans) {
+    if (spans.spans.empty()) {
         return -1;
     }
     // a template with a delimiter of the system role (Qwen3.5 and the like): the message after it. else the system
     // block stands before the first message the delimiters find (the autoparser has only user and assistant ones); a
-    // template that puts the system prompt into the first user message leaves only its start there, below the minimum
+    // template that puts the system prompt into the first user message leaves only its start there
     int32_t end = (int32_t) spans.spans[0].pos;
     if (spans.spans[0].role == COMMON_CHAT_ROLE_SYSTEM) {
         end = spans.spans.size() > 1 ? (int32_t) spans.spans[1].pos : -1;
     }
+    return end;
+}
+
+int32_t server_ckpt_system_end_fork(const common_chat_msg_spans & spans) {
+    const int32_t min_tokens = server_ckpt_system_break_fork();
+    if (min_tokens <= 0) {
+        return -1;
+    }
+    const int32_t end = server_system_end_fork(spans);
     return end >= min_tokens ? end : -1;
 }
 
@@ -505,9 +535,48 @@ bool server_prefill_exclusive_fork() {
     return value;
 }
 
+int64_t server_prefill_gen_wait_us_fork() {
+    static const int64_t value = 1000 * (int64_t) std::max(0, server_env_int_fork("LLAMA_PREFILL_GEN_WAIT", 10000));
+    return value;
+}
+
+int64_t server_prefill_gen_run_us_fork() {
+    static const int64_t value = 1000 * (int64_t) std::max(1, server_env_int_fork("LLAMA_PREFILL_GEN_RUN", 3000));
+    return value;
+}
+
+bool server_prefill_order_fork() {
+    static const bool value = server_env_int_fork("LLAMA_PREFILL_ORDER", 1) != 0;
+    return value;
+}
+
 bool server_slot_continue_fork() {
     static const bool value = server_env_int_fork("LLAMA_SLOT_CONTINUE", 1) != 0;
     return value;
+}
+
+int32_t server_slot_tail_max_fork() {
+    static const int32_t value = std::max(0, server_env_int_fork("LLAMA_SLOT_CONTINUE_TAIL", 8192));
+    return value;
+}
+
+bool server_slot_continues_fork(size_t n_shared, size_t n_keep, size_t n_req, int32_t sys_end) {
+    const size_t tail_max = (size_t) server_slot_tail_max_fork();
+    if (n_shared + 16 >= n_keep) {
+        return true;
+    }
+    const size_t lost = n_keep - n_shared;
+    const size_t sys  = sys_end > 0 ? (size_t) sys_end : 0;
+    if (lost > tail_max || n_shared < sys || n_req < n_shared + lost) {
+        return false;
+    }
+    return 2*lost <= n_keep - sys;
+}
+
+bool server_debug_rollback_fail_fork() {
+    static const int32_t every = server_env_int_fork("LLAMA_SERVER_DEBUG_ROLLBACK_FAIL", 0);
+    static int64_t n_calls = 0;
+    return every > 0 && ++n_calls % every == 0;
 }
 
 int32_t server_answer_room_fork() {
@@ -546,6 +615,52 @@ bool server_slot_room_fork() {
         return common_fork_env_int("LLAMA_SLOT_ROOM", 1) != 0;
     }();
     return room;
+}
+
+bool server_mtmd_mixed_fork(const llama_model * model) {
+    const int32_t mode = server_env_int_fork("LLAMA_MTMD_MIXED", -1);
+    if (mode >= 0) {
+        return mode != 0;
+    }
+    char arch[64] = {};
+    const int32_t n = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    return n > 0 && std::string(arch) == "qwen4exp";
+}
+
+server_embd_cache_fork::server_embd_cache_fork() {
+    limit = (size_t) std::max(0, server_env_int_fork("LLAMA_MTMD_EMBD_CACHE", 256)) * 1024 * 1024;
+}
+
+const float * server_embd_cache_fork::find(const std::string & key, size_t n) {
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->key == key && it->embd.size() == n) {
+            entries.splice(entries.begin(), entries, it);
+            n_hit++;
+            return entries.front().embd.data();
+        }
+    }
+    n_miss++;
+    return nullptr;
+}
+
+void server_embd_cache_fork::put(const std::string & key, const float * embd, size_t n) {
+    const size_t size = n * sizeof(float);
+    if (key.empty() || size == 0 || size > limit) {
+        return;
+    }
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->key == key) {
+            bytes -= it->embd.size() * sizeof(float);
+            entries.erase(it);
+            break;
+        }
+    }
+    while (bytes + size > limit && !entries.empty()) {
+        bytes -= entries.back().embd.size() * sizeof(float);
+        entries.pop_back();
+    }
+    entries.push_front({ key, std::vector<float>(embd, embd + n) });
+    bytes += size;
 }
 
 bool server_mmproj_device_room_fork(ggml_backend_dev_t dev, size_t bytes, void * user_data) {

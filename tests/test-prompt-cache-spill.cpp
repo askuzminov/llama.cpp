@@ -995,6 +995,130 @@ static void test_ram_limit_spill_failure(const std::string & dir) {
     assert(dir_empty(dir));
 }
 
+// a conversation: the first n_head tokens of a shared history, then n_tail tokens of its own
+static server_tokens make_conv(size_t n_head, int32_t tail_base, size_t n_tail) {
+    llama_tokens t = make_tokens(n_head, 100000);
+    const llama_tokens tail = make_tokens(n_tail, tail_base);
+    t.insert(t.end(), tail.begin(), tail.end());
+    return server_tokens(t, false);
+}
+
+// a checkpoint of a recurrent memory after n_tokens text tokens
+static void add_ckpt(server_prompt & prompt, int64_t n_tokens) {
+    common_prompt_checkpoint cp;
+    cp.n_tokens = n_tokens;
+    cp.pos_min  = (llama_pos) n_tokens - 1;
+    cp.pos_max  = (llama_pos) n_tokens - 1;
+    const server_state_buf blob = make_blob(4096, (uint32_t) n_tokens);
+    cp.data_tgt.assign(blob.begin(), blob.end());
+    prompt.checkpoints.push_back(std::make_shared<common_prompt_checkpoint>(std::move(cp)));
+}
+
+static server_prompt_cache_state make_conv_state(size_t n_head, int32_t tail_base, size_t n_tail, std::initializer_list<int64_t> ckpts) {
+    server_prompt_cache_state st;
+    st.prompt.tokens = make_conv(n_head, tail_base, n_tail);
+    st.data.main     = make_blob(20000, (uint32_t) tail_base);
+    for (int64_t n : ckpts) {
+        add_ckpt(st.prompt, n);
+    }
+    return st;
+}
+
+// find_best_fork: the state a request goes on from the furthest
+static void test_find_best(const std::string & dir) {
+    const server_tokens request = make_conv(1000, 5000, 60);
+    const server_prompt slot_other; // a slot that holds nothing of the request
+
+    // a rewritten tail: the older state keeps more of itself (it lost a short tail), the newer one shares more with the
+    // request and holds a checkpoint further on
+    {
+        server_prompt_cache cache(0, 0);
+        cache.need_ckpt = true;
+        cache.states.push_back(make_conv_state(900, 6000,  40, {100, 880}));
+        cache.states.push_back(make_conv_state(960, 7000, 200, {100, 940}));
+        const auto it = cache.find_best_fork(slot_other, request);
+        assert(it != cache.states.end() && it->prompt.tokens.size() == 1160);
+
+        // the slot holds the conversation with a checkpoint further on than both: nothing to load
+        server_prompt slot;
+        slot.tokens = make_conv(980, 8000, 30);
+        add_ckpt(slot, 970);
+        assert(cache.find_best_fork(slot, request) == cache.states.end());
+        // not with a checkpoint before theirs
+        slot.checkpoints.clear();
+        add_ckpt(slot, 500);
+        assert(cache.find_best_fork(slot, request) != cache.states.end());
+
+        // a memory that rolls back by itself goes on from the shared prefix, no checkpoint needed
+        cache.need_ckpt = false;
+        assert(cache.find_best_fork(slot_other, request)->prompt.tokens.size() == 1160);
+        assert(cache.find_best_fork(slot, request) == cache.states.end());
+        clear_cache(cache);
+    }
+
+    // the checkpoint decides, not the shared prefix: a state that shares 980 tokens goes back to token 100, one that
+    // shares 700 goes on from 690
+    {
+        server_prompt_cache cache(0, 0);
+        cache.need_ckpt = true;
+        cache.states.push_back(make_conv_state(980, 6000, 10, {100}));
+        cache.states.push_back(make_conv_state(700, 7000, 10, {100, 690}));
+        assert(cache.find_best_fork(slot_other, request)->prompt.tokens.size() == 710);
+        // a checkpoint past the shared prefix is of no use
+        cache.states.push_back(make_conv_state(600, 8000, 300, {100, 800}));
+        assert(cache.find_best_fork(slot_other, request)->prompt.tokens.size() == 710);
+        clear_cache(cache);
+    }
+
+    // two states the request continues in full: the longer one, whichever comes first
+    for (int order = 0; order < 2; ++order) {
+        server_prompt_cache cache(0, 0);
+        cache.need_ckpt = true;
+        cache.states.push_back(make_conv_state(order == 0 ? 500 : 800, 0, 0, {}));
+        cache.states.push_back(make_conv_state(order == 0 ? 800 : 500, 0, 0, {}));
+        assert(cache.find_best_fork(slot_other, request)->prompt.tokens.size() == 800);
+        clear_cache(cache);
+    }
+
+    // a state that would lose more than three quarters of itself stays out, however far the request gets with it
+    {
+        server_prompt_cache cache(0, 0);
+        cache.need_ckpt = true;
+        cache.states.push_back(make_conv_state(900, 6000, 4000, {890}));
+        cache.states.push_back(make_conv_state(300, 7000,   10, {290}));
+        assert(cache.find_best_fork(slot_other, request)->prompt.tokens.size() == 310);
+        clear_cache(cache);
+    }
+
+    // a state on disk without its list in RAM: the marks of its file say where its checkpoints stand, after a restart
+    // too. equal ground: the state in RAM
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        cache.need_ckpt = true;
+        cache.states.push_back(make_conv_state(960, 7000, 200, {100, 940}));
+        cache.states.push_back(make_conv_state(900, 6000,  40, {100, 880}));
+        server_prompt_cache_state & on_disk = cache.states.front();
+        assert(cache.spill_state(on_disk));
+        on_disk.prompt.checkpoints.clear(); // as after a load that left a record of the file
+        assert(on_disk.data.size() == 0 && on_disk.ckpt_marks.size() == 2);
+        assert(cache.find_best_fork(slot_other, request)->prompt.tokens.size() == 1160);
+
+        cache.states.push_back(make_conv_state(950, 9000, 10, {940}));
+        assert(cache.find_best_fork(slot_other, request)->prompt.tokens.size() == 960);
+        cache.states.pop_back();
+
+        cache.persist();
+    }
+    {
+        server_prompt_cache cache(0, 0, 0, dir, 0, SIG);
+        cache.need_ckpt = true;
+        assert(cache.restore_spilled() == 2);
+        const auto it = cache.find_best_fork(slot_other, request);
+        assert(it != cache.states.end() && it->prompt.tokens.size() == 1160 && it->ckpt_marks.size() == 2);
+        clear_cache(cache);
+    }
+}
+
 static void test_cache_compatibility(const char * model_path) {
     llama_backend_init();
     auto mp = llama_model_default_params();
@@ -1084,6 +1208,7 @@ int main(int argc, char ** argv) {
         { "shared-lru",         test_shared_lru         },
         { "no-rewrite-evicted", test_no_rewrite_after_eviction },
         { "ram-spill-failure",  test_ram_limit_spill_failure },
+        { "find-best",          test_find_best          },
     };
 
     for (const auto & t : tests) {

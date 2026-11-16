@@ -1853,6 +1853,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
             /*.n_used      =*/ prompt.n_used,
+            /*.n_prompt    =*/ prompt.n_prompt, // fork
+            /*.n_turns     =*/ prompt.n_turns,  // fork
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1863,7 +1865,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new) {
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(const server_prompt & prompt_cur, const server_tokens & tokens_new) {
+    // fork: the state the request goes on from the furthest (find_best_fork)
+    if (find_best_fork_on()) {
+        return find_best_fork(prompt_cur, tokens_new);
+    }
+
+    const server_tokens & tokens_cur = prompt_cur.tokens;
+
     int lcp_best = tokens_cur.get_common_prefix(tokens_new);
 
     float f_keep_best = tokens_cur.size() > 0 ? float(lcp_best) / tokens_cur.size() : -1.0f; // empty slot: any cache entry wins
@@ -1904,9 +1913,12 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(co
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    auto it_best = find_best(prompt.tokens, tokens_new);
+    auto it_best = find_best(prompt, tokens_new);
+
+    last_load = 0; // fork
 
     if (it_best != states.end()) {
+        const bool from_disk = it_best->data.size() == 0; // fork: last_load
         // pull the state back from disk if it was spilled
         if (it_best->on_disk && !unspill_state(*it_best)) {
             SRV_ERR("%s", "failed to load spilled prompt-cache state\n");
@@ -1975,6 +1987,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         prompt = std::move(it_best->prompt);
         prompt.n_used++;
+        last_load = from_disk ? 2 : 1; // fork
 
         if (it_best->on_disk) {
             // the blobs went into the slot but the file is untouched and costs nothing to keep, so

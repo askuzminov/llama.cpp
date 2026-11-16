@@ -817,6 +817,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
+            // fork: the state that moves out of the way leaves its snapshots in the old row (see below)
+            src_cell.rs_max = 0;
+
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
                 int32_t & tail = cells[j].tail;
@@ -849,6 +852,23 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
             cell.seq_id.insert(seq_id);
             cells[seq_id].tail = cell_id;
+        }
+    }
+
+    // fork: the cells between the sequences of the ubatch are copied along (build_rs): the row of plane 0 only, read
+    // through a pending rollback, with the records of a deferred rollback replayed into it. a cell that moved, had a
+    // rollback pending or held records has no snapshots of its last batch after this, so no later rollback: before
+    // (16.11) rs_max stayed (and did not move with the cell), and a rollback asked after such a ubatch was accepted and
+    // read the plane of another sequence or of an older batch - the verify of one slot in a decode with the prompt
+    // pieces of two others: logits off by up to 26
+    for (int32_t c = min + (int32_t) n_seqs; c <= max; ++c) {
+        auto & cell = cells[c];
+        bool gone = lazy_on() && rec_n[cell.src >= 0 ? cell.src : c] > 0;
+        for (const llama_seq_id seq_id : cell.seq_id) {
+            gone = gone || rs_idx[seq_id] != 0;
+        }
+        if (gone) {
+            cell.rs_max = 0;
         }
     }
 
@@ -1075,10 +1095,11 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
         set_rs_idx(seq_id, 0);
     }
 
-    // fork: the restored rows hold the state as the plain net does
+    // fork: the restored rows hold the state as the plain net does, and no snapshots of a batch before it
     for (uint32_t i = 0; i < size; ++i) {
         if (seq_id == -1 || cells[i].has_seq_id(seq_id)) {
             rec_n[i] = 0;
+            cells[i].rs_max = 0;
         }
     }
 }

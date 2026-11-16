@@ -12,9 +12,11 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct server_prompt_cache;
+struct server_tokens;
 
 // host-RAM bounds of the prompt cache and the context checkpoints
 struct server_ckpt_limits {
@@ -60,8 +62,22 @@ bool server_ckpt_user_break_fork();
 int32_t server_ckpt_system_break_fork();
 
 // where the leading system block of a prompt ends (the start of the message after it, as the message delimiters of the
-// chat template find it) when the system break is on and that block is long enough, else -1
+// chat template find it), -1: unknown
+int32_t server_system_end_fork(const common_chat_msg_spans & spans);
+
+// the same when the system break is on and that block is long enough, else -1
 int32_t server_ckpt_system_end_fork(const common_chat_msg_spans & spans);
+
+// LLAMA_CKPT_TAIL (16.11, 1 by default, 0: upstream): where the batch of a prompt stops for a context checkpoint near
+// its end, as token counts, ascending. upstream stops 4 + n_ubatch and 4 tokens before the end while it adds text tokens,
+// and makes no checkpoint after an image, so a prompt with an image over such a point gets none there. the 395, 14.11:
+// an image over the first point left a prompt with no checkpoint near its end, and the next turn read 132669 tokens
+// again (10 turns of 3.6 h went back further than the last prompt for it). with this:
+// - a point inside or right after a run of images moves back to the start of the run: the checkpoint before an image
+//   holds the text up to it, as any other one does
+// - one more point n_tail tokens before the end: the tail of its last prompt that the request before this one rewrote
+//   (a client that ends every request with the same images rewrites as much each turn), 0: none
+std::vector<int32_t> server_ckpt_tail_fork(const server_tokens & tokens, int32_t n_ubatch, int32_t n_batch, int32_t n_tail);
 
 // LLAMA_SLOT_ROOM (1 by default since 23.10, 0: upstream): the room of a unified KV cache (--kv-unified), where every
 // slot may grow to the whole cache (agents, no --kv-unified-per-slot) but all of them together cannot. upstream
@@ -85,9 +101,43 @@ int32_t server_prefill_budget_fork();
 // gets about a token per chunk (0.3 t/s on the 395 at depth) and the prompt runs slower too
 bool server_prefill_exclusive_fork();
 
+// LLAMA_PREFILL_GEN_WAIT, LLAMA_PREFILL_GEN_RUN (16.11, ms, 10000 and 3000 by default; wait 0: the prompts never give
+// way): with LLAMA_PREFILL_EXCLUSIVE the generating slots wait for the prompts, but no longer than the first: then they
+// generate for the second while the prompts wait, and so on in turns. a prompt shorter than the wait runs as before.
+// without it an answer waited for the whole prompt of another slot, however long: on the Mac, 4 slots, a query of 3.5K
+// tokens whose prompt was read at once got its answer after 80 s, when the prompts of 65K and 45K were done
+int64_t server_prefill_gen_wait_us_fork();
+int64_t server_prefill_gen_run_us_fork();
+
+// LLAMA_PREFILL_ORDER (16.11, 1 by default, 0: the order of the slots): the prompts go into the batch in the order of
+// the tokens they have left, the shortest first. in the order of the slots the first one filled every batch until its
+// prompt was done: on the Mac, 4 slots, a query of 3.5K tokens waited 188 s behind a prompt of 125K
+bool server_prefill_order_fork();
+
 // LLAMA_SLOT_CONTINUE (23.10, 1 by default, 0: upstream's similarity): a slot takes a request for what it holds only
 // when the request continues it, otherwise a free slot or the least recently used one
 bool server_slot_continue_fork();
+
+// whether a request of n_req tokens continues what a slot holds: it shares n_shared tokens with the slot, n_keep is the
+// prompt of the slot's last task (the answer after it may come back rendered otherwise), sys_end where the system block
+// of the request ends (server_system_end_fork, -1: not known). the request keeps that prompt less the 16 tokens a
+// template may render otherwise once the answer is in the history, or (16.11) it rewrites a tail of it:
+// LLAMA_SLOT_CONTINUE_TAIL (default 8192 tokens, 0: off), no more than half of what the prompt holds past the system
+// block, and no more than the request brings after the shared part. the last two keep a new session with the same
+// system prompt out of the slot of another one: where the template puts the system prompt into the first user message
+// (gemma) the system block is not known, and such a session shares most of a short prompt (the pool test
+// test_pool_measures_no_reuse_without_a_checkpoint). the 395, 14.11: a client that ends every request with the same
+// three images (3259 tokens, the new text goes before them) went to the least recently used slot in 46 turns of
+// 3.6 h; each of them saved the whole state first (median 0.73 s, the RAM cache gave back 272 GB in 51 evictions),
+// and with several slots it would have left its slot
+bool server_slot_continues_fork(size_t n_shared, size_t n_keep, size_t n_req, int32_t sys_end);
+
+// LLAMA_SLOT_CONTINUE_TAIL: the longest tail of its last prompt a request may rewrite and still continue the slot
+int32_t server_slot_tail_max_fork();
+
+// LLAMA_SERVER_DEBUG_ROLLBACK_FAIL=N (tests, 0 by default): true at every Nth call. the server then leaves out the
+// rollback of the rejected tokens of a draft, as if the memory had refused it (rollback_recover_fork)
+bool server_debug_rollback_fail_fork();
 
 // LLAMA_SLOT_ANSWER_ROOM (23.10, default 8192, 0: none): the room a running answer is counted at when a new task asks
 // for room in a unified cache (server_slot_room_fork)
@@ -177,6 +227,40 @@ const common_prompt_checkpoint * server_ckpt_restore(
         llama_context * ctx_tgt,
         llama_context * ctx_dft,
         llama_seq_id seq_id);
+
+// LLAMA_MTMD_MIXED (16.11; -1 by default: on for qwen4exp, 1: every model, 0: upstream): the images of a prompt go into
+// the batch as embeddings next to its text tokens, in place of a decode of their own each. a decode of a few tens of
+// tokens or more costs a pass over all the experts whatever its size (the 395, 14.11, at 125K-220K: 29 tokens between
+// two images 0.30 s, an image of 1058 tokens 1.49 s where as many text tokens take about 1.1 s), and a tail of three
+// images with the text between them took six decodes. the logits agree with the decodes one by one as far as two
+// splits of plain text into batches agree (Mac CPU: 1.2e-4 against 0.7e-4..2.8e-4); such a ubatch takes its mask from
+// the KQ mask, as a ubatch of an image does (qsa_mask_pos_ubatch). an image that does not fit into the batch whole is
+// decoded on its own as before
+bool server_mtmd_mixed_fork(const llama_model * model);
+
+// LLAMA_MTMD_EMBD_CACHE (16.11, MiB, default 256, 0: off): what the projector made of an image, kept by the hash of
+// the image and its token count while it fits, the least recently used ones out first. an image that comes again at
+// another place of the prompt (the 395, 14.11: the same three images end every request, the new text goes before
+// them) was encoded again each time, 0.69 s for 1058 tokens there; its embeddings do not depend on where it stands
+struct server_embd_cache_fork {
+    server_embd_cache_fork();
+
+    // the embeddings of `n` floats kept under the key, nullptr: none. they stay valid until the next put()
+    const float * find(const std::string & key, size_t n);
+    void put(const std::string & key, const float * embd, size_t n);
+
+    size_t n_hit  = 0;
+    size_t n_miss = 0;
+
+private:
+    struct entry {
+        std::string        key;
+        std::vector<float> embd;
+    };
+    std::list<entry> entries; // the most recently used first
+    size_t           bytes = 0;
+    size_t           limit = 0;
+};
 
 // --mmproj-on-demand: the device memory of an encode of the projector, from the moe-cache of the target context
 // (llama_device_make_room_fork). user_data is the address of the server's llama_context pointer, read at the call

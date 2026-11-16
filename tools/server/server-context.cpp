@@ -302,6 +302,27 @@ struct server_slot {
     // answer after it may come back rendered otherwise (a reasoning dropped from the history)
     int32_t n_prompt_last = 0;
 
+    // fork: the prompt cache gave the slot its state at the launch of the task: 1 from RAM, 2 from disk, 0 it did not
+    int8_t n_cache_load = 0;
+
+    // fork: the context checkpoints made for the task and the time they took, the time of a restore and of the encodes
+    // of its images, for print_timings
+    int32_t n_ckpt_made       = 0;
+    int64_t t_ckpt_made_us    = 0;
+    int64_t t_ckpt_restore_us = 0;
+    mutable int64_t t_mtmd_encode_us = 0;
+
+    // fork: the memory refused to take back the rejected tokens of a draft, it holds more than the tokens of the slot
+    // until rollback_recover_fork brings it back
+    bool rollback_failed = false;
+
+    // fork: where the batch of the prompt stops for a checkpoint near its end (server_ckpt_tail_fork)
+    std::vector<int32_t> ckpt_tail;
+
+    bool is_ckpt_tail(int64_t n_tokens) const {
+        return std::binary_search(ckpt_tail.begin(), ckpt_tail.end(), (int32_t) n_tokens);
+    }
+
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
@@ -835,6 +856,11 @@ struct server_slot {
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
 
+        // fork: the part of the prompt time that does not depend on its length (the 395, 14.11: ~0.75 s a turn)
+        SLT_INF(*this,
+                "     checkpoints = %10d created in %.2f ms, restored in %.2f ms; images encoded in %.2f ms\n",
+                n_ckpt_made, t_ckpt_made_us / 1e3, t_ckpt_restore_us / 1e3, t_mtmd_encode_us / 1e3);
+
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
@@ -970,7 +996,9 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t t_encode_us = ggml_time_us(); // fork: print_timings
     res = mtmd_batch_encode(mbatch.get());
+    slot.t_mtmd_encode_us += ggml_time_us() - t_encode_us;
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -984,17 +1012,31 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+// fork: pos >= 0: where the chunk starts, else after the tokens of the slot (rollback_recover_fork decodes a chunk again).
+// embd_cache: the embeddings of the chunks encoded before (server_embd_cache_fork), nullptr: none
+static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out, llama_pos pos = -1,
+                              server_embd_cache_fork * embd_cache = nullptr) {
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
     int32_t res = 0;
 
+    // fork: the key and the size of the embeddings of the chunk in the cache
+    const char *      chunk_id  = mtmd_input_chunk_get_id(chunk.get());
+    const std::string embd_key  = embd_cache && chunk_id ? std::string(chunk_id) : std::string();
+    const size_t      embd_size = mtmd_input_chunk_get_n_tokens(chunk.get()) * (size_t) llama_model_n_embd_inp(llama_get_model(slot.ctx_tgt));
+    const float *     embd_kept = embd_key.empty() ? nullptr : embd_cache->find(embd_key, embd_size);
+
     auto try_decode = [&]() -> int32_t {
-        if (mbatch) {
-            float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
+        if (mbatch || embd_kept) {
+            float * embd = embd_kept ? const_cast<float *>(embd_kept) : mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
+                if (embd_kept) {
+                    SLT_TRC(slot, "mtmd chunk idx = %zu: its embeddings come from the cache\n", idx);
+                } else if (!embd_key.empty()) {
+                    embd_cache->put(embd_key, embd, embd_size);
+                }
                 struct cb_data_t {
                     common_speculative * spec;
                     llama_context * ctx;
@@ -1021,7 +1063,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     slot.ctx_tgt,
                     chunk.get(),
                     embd,
-                    slot.prompt.tokens.pos_next(),
+                    pos >= 0 ? pos : slot.prompt.tokens.pos_next(),
                     slot.id,
                     llama_n_batch(slot.ctx_tgt),
                     &new_n_past,
@@ -1692,6 +1734,10 @@ private:
 
         if (params_base.cache_ram_mib != 0) {
             server_prompt_cache_init(prompt_cache, params_base, n_ctx, ckpt_limits.reserve_bytes, model_tgt, ctx_tgt, ctx_dft, mctx != nullptr);
+            // fork: how far a request gets with a cached state (find_best_fork)
+            prompt_cache->need_ckpt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                      ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0;
+            prompt_cache->n_swa     = n_swa;
             // fork: the states of the slots paused for room count against the RAM limit of the cache (room_ram_fork)
             if (prompt_cache) {
                 prompt_cache->ram_outside = [this]() { return room_ram_held_fork(); };
@@ -1705,6 +1751,12 @@ private:
             ckpt_limits.init_ckpt(params_base, model_tgt, model_dft);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        // fork: the images of a prompt next to its text in one batch (server_mtmd_mixed_fork)
+        mtmd_mixed_fork = mctx != nullptr && !use_mixed_batch() && server_mtmd_mixed_fork(model_tgt);
+        if (mtmd_mixed_fork) {
+            SRV_INF("%s", "the images of a prompt go into its batches next to the text (LLAMA_MTMD_MIXED=0: each in a decode of its own)\n");
         }
 
         if (!params_base.model_alias.empty()) {
@@ -1911,20 +1963,22 @@ private:
         }
 
         // fork: a slot takes a request for what it holds only when the request continues it: it keeps the prompt of the
-        // slot's last task, less 16 tokens a template may render otherwise once the answer is in the history. upstream's
+        // slot's last task, less 16 tokens a template may render otherwise once the answer is in the history, or a tail
+        // of it that the client rewrote (server_slot_continues_fork). upstream's
         // choice by similarity let a new agent session take the slot of another one that shares its system prompt and
         // cut that history (Rulith Inference, apply_agent_slots_027); anything else goes to a free slot, else the least
         // recently used one (server_slot_continue_fork)
         const bool by_continue = server_slot_continue_fork() && task.id_slot == -1;
         if (by_continue) {
             size_t lcp_best = 0;
+            const int32_t sys_end = server_system_end_fork(task.params.message_spans);
             for (server_slot & slot : slots) {
                 if (slot.is_processing() || slot.prompt.tokens.empty()) {
                     continue;
                 }
                 const size_t lcp_len = slot.prompt.tokens.get_common_prefix(task.tokens);
                 const size_t n_keep  = std::min<size_t>(slot.prompt.tokens.size(), slot.n_prompt_last > 0 ? (size_t) slot.n_prompt_last : slot.prompt.tokens.size());
-                if (lcp_len + 16 >= n_keep && lcp_len > lcp_best) {
+                if (server_slot_continues_fork(lcp_len, n_keep, task.tokens.size(), sys_end) && lcp_len > lcp_best) {
                     lcp_best = lcp_len;
                     ret      = &slot;
                 }
@@ -2005,8 +2059,10 @@ private:
         }
 
         if (ret) {
+            ret->n_cache_load = 0; // fork
+
             // the slot keeps most of its prompt, but a conversation that comes back can find more of itself in the cache
-            update_cache = update_cache || (prompt_cache && prompt_cache->find_best(ret->prompt.tokens, task.tokens) != prompt_cache->states.end());
+            update_cache = update_cache || (prompt_cache && prompt_cache->find_best(ret->prompt, task.tokens) != prompt_cache->states.end());
 
             update_cache = update_cache && prompt_cache;
 
@@ -2031,6 +2087,7 @@ private:
                     if (evict_for_load_fork(*ret, task.tokens) && !ret->prompt_load(*prompt_cache, task.tokens)) {
                         ret->prompt_clear();
                     }
+                    ret->n_cache_load = (int8_t) prompt_cache->last_load; // fork
                 }
                 prompt_cache->update(!others_run);
 
@@ -2279,11 +2336,25 @@ private:
         }
     }
 
+    // fork: of two idle slots, the one that gives way first: a request that nothing continued (a side query of an
+    // agent, a title, a summary: server_prompt::n_turns) before a conversation, then the one used least recently. by the
+    // time of use alone a side query took the slot of a long conversation while the slots of older side queries stood
+    // by (the Mac, 4 slots, two conversations of 65K and 45K with side queries: 10 such takeovers, each a state of
+    // gigabytes saved and loaded again)
+    static bool evict_before_fork(const server_slot & a, const server_slot & b) {
+        const bool once_a = a.prompt.n_turns == 1;
+        const bool once_b = b.prompt.n_turns == 1;
+        if (once_a != once_b) {
+            return once_a;
+        }
+        return a.t_last_used < b.t_last_used;
+    }
+
     bool evict_idle_lru_fork(const server_slot * keep) {
         server_slot * lru = nullptr;
         for (auto & slot : slots) {
             if (&slot != keep && !slot.is_processing() && slot.prompt.n_tokens() > 0 &&
-                    (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
+                    (lru == nullptr || evict_before_fork(slot, *lru))) {
                 lru = &slot;
             }
         }
@@ -2320,7 +2391,7 @@ private:
         const int64_t n_ctx = llama_n_ctx(ctx_tgt);
 
         while (true) {
-            const auto it = prompt_cache->find_best(dst.prompt.tokens, tokens);
+            const auto it = prompt_cache->find_best(dst.prompt, tokens);
             if (it == prompt_cache->states.end()) {
                 return true;
             }
@@ -3396,7 +3467,7 @@ private:
             if ((a->prompt.n_tokens() == 0) != (b->prompt.n_tokens() == 0)) {
                 return a->prompt.n_tokens() == 0;
             }
-            return a->t_last_used < b->t_last_used;
+            return evict_before_fork(*a, *b); // fork
         });
 
         free_slots.resize(std::min(free_slots.size(), n_slots_needed));
@@ -3598,6 +3669,9 @@ private:
                         (float) freed / 1024 / 1024, budget >> 20);
             }
         }
+
+        slot.n_ckpt_made++;                                  // fork: print_timings
+        slot.t_ckpt_made_us += ggml_time_us() - t_start_us;
 
         SLT_TRC(slot,
                 "created context checkpoint %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %s, budget %zu MiB per slot, %.1f ms)\n",
@@ -4280,6 +4354,73 @@ private:
         }
     }
 
+    // fork: since when the generating slots wait for the prompts of other slots, and since when they have their turn
+    // (prefill_gen_turn_fork); 0: they do not
+    int64_t t_gen_wait_us_fork = 0;
+    int64_t t_gen_turn_us_fork = 0;
+
+    // fork: with the prompts first (server_prefill_exclusive_fork), true while the generating slots have their turn and
+    // the prompts wait: after server_prefill_gen_wait_us_fork of waiting, for server_prefill_gen_run_us_fork
+    bool prefill_gen_turn_fork(bool prompts_wait) {
+        const int64_t wait_us = server_prefill_gen_wait_us_fork();
+        const bool generating = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_GENERATING && !slot.room_paused && slot.task &&
+                   slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_REALTIME && !slot.audio_stream;
+        });
+        if (!prompts_wait || !generating || wait_us <= 0) {
+            t_gen_wait_us_fork = 0;
+            t_gen_turn_us_fork = 0;
+            return false;
+        }
+        const int64_t now = ggml_time_us();
+        if (t_gen_turn_us_fork != 0) {
+            if (now - t_gen_turn_us_fork < server_prefill_gen_run_us_fork()) {
+                return true;
+            }
+            t_gen_turn_us_fork = 0;
+            t_gen_wait_us_fork = now;
+            return false;
+        }
+        if (t_gen_wait_us_fork == 0) {
+            t_gen_wait_us_fork = now;
+        }
+        if (now - t_gen_wait_us_fork >= wait_us) {
+            t_gen_turn_us_fork = now;
+            return true;
+        }
+        return false;
+    }
+
+    // fork: the slots in the order their prompts go into the batch (server_prefill_order_fork): as iterate() goes, the
+    // children after the others, and within each group the prompt with the fewest tokens left first
+    std::vector<server_slot *> prompt_order_fork() {
+        struct entry {
+            bool          is_child;
+            int64_t       n_left;
+            server_slot * slot;
+        };
+        std::vector<entry> order;
+        for (auto & slot : slots) {
+            int64_t n_left = -1; // no prompt to read: its turn costs nothing
+            if (server_prefill_order_fork() && slot.is_processing() && slot.task) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    n_left = slot.task->n_tokens() - slot.prompt.n_tokens();
+                } else if (slot.state == SLOT_STATE_STARTED) {
+                    n_left = slot.task->n_tokens() - (int64_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                }
+            }
+            order.push_back({ slot.is_processing() && slot.task && slot.task->is_child(), n_left, &slot });
+        }
+        std::stable_sort(order.begin(), order.end(), [](const entry & a, const entry & b) {
+            return a.is_child != b.is_child ? !a.is_child : a.n_left < b.n_left;
+        });
+        std::vector<server_slot *> res;
+        for (const entry & e : order) {
+            res.push_back(e.slot);
+        }
+        return res;
+    }
+
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
@@ -4295,6 +4436,58 @@ private:
 
     // fork: true while pre_decode() builds the batch, from its batch.clear() until update_slots() takes the batch
     bool batch_building_fork = false;
+
+    // fork: the embeddings of the images the projector encoded (server_embd_cache_fork)
+    server_embd_cache_fork embd_cache_fork;
+
+    // fork: the images of a prompt go into the batch next to its text (server_mtmd_mixed_fork), set with the model
+    bool mtmd_mixed_fork = false;
+
+    // fork: the image at the next place of the prompt of the slot goes into the batch as embeddings, from the cache
+    // of the embeddings or encoded now. 1: added, 0: it does not fit in the batch whole, -1: failed, the slot is released
+    int add_image_mixed_fork(server_slot & slot, int32_t n_tokens_prev, int32_t n_batch_prompt) {
+        const auto & input_tokens = slot.task->tokens;
+        const size_t idx     = slot.prompt.n_tokens();
+        const auto & chunk   = input_tokens.find_chunk(idx);
+        const size_t n_chunk = mtmd_input_chunk_get_n_tokens(chunk.get());
+        if (batch.size() + (int32_t) n_chunk > n_batch_prompt) {
+            return 0;
+        }
+
+        const char *      chunk_id  = mtmd_input_chunk_get_id(chunk.get());
+        const std::string embd_key  = chunk_id ? std::string(chunk_id) : std::string();
+        const size_t      embd_size = n_chunk * (size_t) llama_model_n_embd_inp(model_tgt);
+
+        const float * embd = embd_key.empty() ? nullptr : embd_cache_fork.find(embd_key, embd_size);
+        if (embd) {
+            SLT_TRC(slot, "mtmd chunk idx = %zu: its embeddings come from the cache\n", idx);
+        } else {
+            embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            if (!embd) {
+                // encode on the worker thread, so we can still handle metrics tasks
+                int32_t res = 0;
+                queue_tasks.yield_to_queue([&]() {
+                    res = encode_mtmd_chunk(slot, slot.mbatch, idx);
+                });
+                embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            }
+            if (embd && !embd_key.empty()) {
+                embd_cache_fork.put(embd_key, embd, embd_size);
+            }
+        }
+
+        if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch)) {
+            SLT_ERR(slot, "%s", "failed to process mtmd chunk\n");
+            // the batch must not keep the entries of a released slot
+            batch.truncate(n_tokens_prev);
+            send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+            slot.release();
+            return -1;
+        }
+
+        slot.prompt.tokens.push_back_placeholder(chunk.get());
+        return 1;
+    }
 
     // fork: an error released the slot while the batch was being built. its entries leave the batch, or the batch
     // would hold the tokens of no slot (395, 04.11: a bad_alloc in create_checkpoint, then the GGML_ASSERT on
@@ -4775,11 +4968,14 @@ private:
         std::vector<server_slot *> drafting;
 
         // fork: the generating slots wait while a slot reads its prompt (server_prefill_exclusive_fork)
-        const bool prompt_only = server_prefill_exclusive_fork() && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+        const bool prompts_wait = server_prefill_exclusive_fork() && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
             return slot.is_processing() && !slot.room_paused && slot.task &&
                    slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_TRANSCRIBE_RT &&
                    (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
         });
+        // fork: unless they have waited long enough: then the prompts wait for a while (prefill_gen_turn_fork)
+        const bool gen_only    = prefill_gen_turn_fork(prompts_wait);
+        const bool prompt_only = prompts_wait && !gen_only;
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
@@ -4983,7 +5179,10 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            // fork: the shortest prompt first (prompt_order_fork)
+            std::vector<server_slot *> prompt_order = prompt_order_fork();
+
+            iterate(prompt_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch_prompt) { // fork: n_batch_prompt
                     return; // batch is full, skip remaining slots
                 }
@@ -5007,6 +5206,11 @@ private:
                 // fork: the generating slots wait (server_prefill_exclusive_fork). they take no part in the batch either: one
                 // set as slot_batched here would keep out a prompt it cannot batch with, and the steps would stay empty
                 if (prompt_only && slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                    return;
+                }
+
+                // fork: the turn of the generating slots, the prompts wait (prefill_gen_turn_fork)
+                if (gen_only && (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT)) {
                     return;
                 }
 
@@ -5051,6 +5255,17 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+
+                        // fork: print_timings
+                        slot.n_ckpt_made       = 0;
+                        slot.t_ckpt_made_us    = 0;
+                        slot.t_ckpt_restore_us = 0;
+                        slot.t_mtmd_encode_us  = 0;
+
+                        // fork: for the log line of where the prompt goes on from
+                        int     n_shared  = 0;
+                        int64_t n_ckpt    = -1;
+                        bool    ckpt_none = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -5204,6 +5419,7 @@ private:
 
                             // number of cached tokens shared with the new prompt, before any checkpoint is restored
                             const int n_prefix = n_past;
+                            n_shared = n_past; // fork
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
@@ -5299,6 +5515,8 @@ private:
 
                                             pos_next = std::min(pos_next, std::max(cp->pos_min + 1, cp->pos_max));
                                             n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cp->n_tokens);
+                                            n_ckpt   = cp->n_tokens; // fork
+                                            slot.t_ckpt_restore_us += ggml_time_us() - t_restore_us; // fork
                                             SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, %.1f ms)\n",
                                                     cp->pos_min, cp->pos_max, cp->n_tokens, n_past,
                                                     (float) cp->size() / 1024 / 1024, 1e-3 * (ggml_time_us() - t_restore_us));
@@ -5310,6 +5528,7 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        ckpt_none = true; // fork
                                     }
                                 }
                             }
@@ -5333,6 +5552,32 @@ private:
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                        }
+
+                        // fork: the points for the checkpoints near the end of this prompt, one of them where the request
+                        // left the last prompt of the state (server_ckpt_tail_fork)
+                        {
+                            // a turn of the conversation the state holds, or another request in its slot
+                            const int32_t n_state = slot.prompt.n_tokens();
+                            slot.prompt.n_turns = n_state > 0 && 2*n_shared >= n_state ? std::max(slot.prompt.n_turns, 1) + 1 : 1;
+
+                            const int32_t n_prev = slot.prompt.n_prompt;
+                            // up to 16 tokens are a template that renders the end of the prompt otherwise: the last point covers them
+                            const int32_t n_tail = n_prev > n_shared + 16 && n_prev - n_shared <= server_slot_tail_max_fork() ? n_prev - n_shared : 0;
+                            slot.prompt.n_prompt = slot.task->n_tokens();
+                            slot.ckpt_tail       = server_ckpt_tail_fork(input_tokens, n_ubatch, n_batch, n_tail);
+                        }
+
+                        // fork: where the prompt goes on from. on the 395 (14.11) nothing in the log said why a turn read
+                        // 132669 tokens again (no checkpoint near the end of the last prompt) or 3770 more than the turn
+                        // before (an older state taken from the cache): the lines of a restore are trace lines
+                        {
+                            const char * src = slot.n_cache_load == 2 ? "a state the prompt cache had on disk" :
+                                               slot.n_cache_load == 1 ? "a state the prompt cache had in RAM"  : "the slot";
+                            const std::string how = ckpt_none   ? "no checkpoint to go back to" :
+                                                    n_ckpt >= 0 ? string_format("back to the checkpoint at %" PRId64, n_ckpt) : "goes on from there";
+                            SLT_INF(slot, "prompt of %d tokens: %d shared with %s, %s, %d to read\n",
+                                    slot.task->n_tokens(), n_shared, src, how.c_str(), slot.task->n_tokens() - n_past);
                         }
 
                         slot.stats.n_prompt_cached    = n_past;
@@ -5428,6 +5673,11 @@ private:
 
                     bool has_mtmd = false;
 
+                    // fork: the images of the prompt go into the batch next to its text (server_mtmd_mixed_fork). not for
+                    // a prompt whose batch stops at places of its own (a shared prefix, an alora)
+                    const bool mixed_fork = mtmd_mixed_fork && input_tokens.has_mtmd && slot.can_split() &&
+                        slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->n_tokens_shared == 0 && !lora_all_alora(slot.lora);
+
                     // check if we should process the mtmd chunk
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -5436,6 +5686,21 @@ private:
                             input_tokens[cur_token_idx] != LLAMA_TOKEN_NULL // encountered a text token
                         ) {
                             break;
+                        }
+
+                        // fork: an image that fits into the batch whole goes there next to the text (add_image_mixed_fork)
+                        if (mixed_fork && batch.size() + (int32_t) mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(cur_token_idx).get()) <= n_batch_prompt) {
+                            break;
+                        }
+
+                        // fork: a checkpoint near the end of the prompt that an image stands on goes before the image
+                        // (server_ckpt_tail_fork): the state holds the text up to it
+                        if (do_checkpoint && !has_mtmd && slot.is_ckpt_tail(cur_token_idx)) {
+                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            if (pos_min >= 0) {
+                                create_checkpoint(slot, 0, pos_min, pos_max);
+                            }
                         }
 
                         // process the mtmd chunk
@@ -5447,7 +5712,7 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out, -1, &embd_cache_fork);
                         });
 
                         if (res != 0) {
@@ -5488,7 +5753,19 @@ private:
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
-                            break; // end of text chunk
+                            // fork: the image goes into this batch (add_image_mixed_fork), unless a checkpoint is due
+                            // before it: that one is made at the start of the next batch
+                            if (!mixed_fork || (do_checkpoint && batch.size() > n_tokens_prev && slot.is_ckpt_tail(slot.prompt.n_tokens()))) {
+                                break; // end of text chunk
+                            }
+                            const int added = add_image_mixed_fork(slot, n_tokens_prev, n_batch_prompt);
+                            if (added < 0) {
+                                return;
+                            }
+                            if (added == 0 || (do_checkpoint && slot.is_ckpt_tail(slot.prompt.n_tokens()))) {
+                                break;
+                            }
+                            continue;
                         }
 
                         // stop at the end of the shared prefix, the children are started from this state
@@ -5543,20 +5820,9 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
-                                }
-                            }
-                            if (should_break) {
-                                break;
-                            }
+                        // fork: the points come from server_ckpt_tail_fork, which keeps them off the images
+                        if (do_checkpoint && slot.is_ckpt_tail(slot.prompt.n_tokens())) {
+                            break;
                         }
                     }
 
@@ -5570,6 +5836,7 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
                     const bool is_system_end = sys_end >= 0 && n_tokens_start == sys_end; // fork
+                    const bool is_tail       = slot.is_ckpt_tail(n_tokens_start);         // fork
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -5588,7 +5855,7 @@ private:
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
                         // fork: or the batch starts after a long system prompt
-                        if (!is_user_start && !near_prompt_end && !is_system_end) {
+                        if (!is_user_start && !near_prompt_end && !is_system_end && !is_tail) { // fork: is_tail
                             do_checkpoint = false;
                         }
                     }
@@ -5604,11 +5871,13 @@ private:
 
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
+                    // fork: nor at a batch that starts right after one that went into the batch before (add_image_mixed_fork)
+                    do_checkpoint = do_checkpoint && !(n_tokens_start > 0 && input_tokens[n_tokens_start - 1] == LLAMA_TOKEN_NULL);
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end || is_system_end || // fork: is_system_end
+                            is_last_user_message || near_prompt_end || is_system_end || is_tail || // fork: is_system_end, is_tail
                             n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -6101,13 +6370,17 @@ private:
                 }
 
                 const llama_pos end = slot.prompt.tokens.pos_next();
-                bool ok = llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, end, -1);
+                // fork: a test can have the rollback of rejected tokens left out (server_debug_rollback_fail_fork)
+                const bool skip = n_keep < n_draft && server_debug_rollback_fail_fork();
+                bool ok = !skip && llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, end, -1);
                 if (slot.ctx_dft) {
                     ok = llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, end, -1) && ok;
                 }
-                // Recurrent models may not support this rollback. A cache miss keeps the next request correct.
+                // Recurrent models may not support this rollback.
+                // fork: the slot went on with an empty context here, and the rest of its answer came from nothing.
+                // rollback_recover_fork brings the memory back once every slot has sampled from this batch
                 if (!ok) {
-                    slot.prompt_clear();
+                    slot.rollback_failed = true;
                 }
                 return n_accepted;
             };
@@ -6149,6 +6422,99 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        // fork: every slot has read its logits, the memory of a slot can be decoded again now
+        for (auto & slot : slots) {
+            if (slot.rollback_failed) {
+                rollback_recover_fork(slot);
+            }
+        }
+    }
+
+    // fork: the memory refused to take back the rejected tokens of a draft (a recurrent state whose snapshots another
+    // ubatch of the decode took: llama_memory_recurrent::find_slot), so it holds more than the tokens of the slot. the
+    // slot goes back to its newest checkpoint; one that still generates decodes again what it holds after it, the
+    // prompt from its task (the images are there) and the accepted tokens from its own list. one that is done keeps
+    // the tokens up to the checkpoint. until 16.11 the slot was cleared and generated on from an empty context
+    void rollback_recover_fork(server_slot & slot) {
+        slot.rollback_failed = false;
+
+        const int32_t n_all  = slot.prompt.n_tokens();
+        const bool    replay = slot.state == SLOT_STATE_GENERATING && slot.task != nullptr;
+
+        const common_prompt_checkpoint * cp = nullptr;
+        for (auto it = slot.prompt.checkpoints.end(); it != slot.prompt.checkpoints.begin(); ) {
+            --it;
+            if ((*it)->n_tokens <= n_all && !(*it)->data_tgt.empty()) {
+                cp = server_ckpt_restore(slot.prompt.checkpoints, it, ctx_tgt, ctx_dft, slot.id);
+                break;
+            }
+        }
+
+        int32_t n_from = 0;
+        if (cp != nullptr) {
+            common_speculative_set_state(spec.get(), slot.id, cp->data_spec);
+            n_from = (int32_t) std::min(slot.prompt.tokens.size_up_to_pos(std::max(cp->pos_min + 1, cp->pos_max)), (size_t) cp->n_tokens);
+            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(n_from), -1);
+        } else {
+            slot.mem.seq_rm(slot.id, -1, -1);
+        }
+
+        SLT_WRN(slot, "the memory did not take back the rejected tokens of a draft: back to %d of %d tokens%s\n",
+                n_from, n_all, replay ? ", the rest is decoded again" : "");
+
+        if (!replay) {
+            slot.prompt.tokens.keep_first(n_from);
+            if (n_from == 0) {
+                slot.prompt.clear();
+            }
+            return;
+        }
+
+        const auto & task_tokens = slot.task->tokens;
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+
+        common_batch cb(ctx_tgt);
+        const auto flush = [&]() {
+            if (cb.size() == 0) {
+                return true;
+            }
+            bool ok = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, cb.get()) == 0;
+            ok = ok && common_speculative_process(spec.get(), cb);
+            cb.clear();
+            return ok;
+        };
+
+        bool ok = true;
+        llama_pos pos = slot.prompt.tokens.pos_next(n_from);
+        for (int32_t i = n_from; i < n_all && ok; ) {
+            const llama_token tok = slot.prompt.tokens[i];
+            if (tok != LLAMA_TOKEN_NULL) {
+                cb.add(tok, pos++, slot.id, slot.need_embd());
+                ++i;
+                if ((int32_t) cb.size() >= n_batch) {
+                    ok = flush();
+                }
+                continue;
+            }
+            // an image: the slot keeps a placeholder, the chunk is in the prompt of the task
+            ok = flush() && i < slot.task->n_tokens() && task_tokens[i] == LLAMA_TOKEN_NULL;
+            if (ok) {
+                const auto & chunk = task_tokens.find_chunk(i);
+                size_t n_chunk = 0;
+                ok   = process_mtmd_chunk(slot, slot.mbatch, i, n_chunk, pos, &embd_cache_fork) == 0;
+                pos += mtmd_input_chunk_get_n_pos(chunk.get());
+                i   += (int32_t) n_chunk;
+            }
+        }
+        ok = ok && flush();
+
+        if (!ok) {
+            SLT_ERR(slot, "%s", "failed to decode the context again after a refused rollback\n");
+            send_error(slot, "failed to restore the context after a refused rollback", ERROR_TYPE_SERVER);
+            slot.release();
+            slot.prompt_clear();
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

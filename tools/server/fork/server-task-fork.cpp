@@ -4,6 +4,7 @@
 
 #include "common.h"
 #include "file-lock.h"
+#include "fork/env-fork.h"
 #include "llama.h"
 #include "server-common.h"
 
@@ -71,6 +72,16 @@ struct spill_ckpt {
 };
 
 static_assert(sizeof(spill_ckpt) == 56, "unexpected spill_ckpt layout");
+
+// the marks of the checkpoints of a file, from its index
+std::vector<server_ckpt_mark_fork> spill_marks_of(const std::vector<spill_ckpt> & index) {
+    std::vector<server_ckpt_mark_fork> res;
+    res.reserve(index.size());
+    for (const auto & e : index) {
+        res.push_back({e.n_tokens, e.pos_min, e.pos_max, e.base_pos >= 0, e.n_tgt > 0});
+    }
+    return res;
+}
 
 constexpr char     SPILL_MAGIC[8] = { 'L', 'C', 'P', 'C', 'A', 'C', 'H', 'E' };
 // 5 (11.11): the sums of the sections, a damaged file (the disk, a copy, the network of a pool) is not loaded as a state
@@ -932,6 +943,13 @@ size_t server_prompt_cache::restore_spilled() {
             std::filesystem::remove(path, ec);
             continue;
         }
+        // where its checkpoints stand (find_best_fork)
+        std::vector<spill_ckpt> index(h.n_ckpt);
+        if (h.n_ckpt && !f.read_at(lay.off_index, index.data(), index.size()*sizeof(spill_ckpt))) {
+            f.close();
+            std::filesystem::remove(path, ec);
+            continue;
+        }
         f.close();
 
         server_prompt_cache_state st;
@@ -948,6 +966,7 @@ size_t server_prompt_cache::restore_spilled() {
         st.prompt.n_used = h.n_used;
         st.on_disk       = true;
         st.ckpt_on_disk  = h.n_ckpt;
+        st.ckpt_marks    = spill_marks_of(index);
         st.disk_bytes    = lay.size;
 
         next_uid = std::max(next_uid, h.uid + 1);
@@ -1174,6 +1193,7 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
 
     st.disk_bytes   = spill_layout_of(h).size;
     st.ckpt_on_disk = h.n_ckpt;
+    st.ckpt_marks   = spill_marks_of(index);
     st.on_disk      = true;
     st.disk_evicted = false;
     if (!spill_exists(st)) {
@@ -1197,6 +1217,115 @@ bool server_prompt_cache::write_state(server_prompt_cache_state & st, const std:
         it = states.erase(it);
     }
     return true;
+}
+
+// the checkpoint a slot restores for a request of n_req tokens that shares n_match of them with the state, as
+// server_context_impl searches for it: the newest that ends within the shared prefix and starts before the first
+// position computed again (minus the window of a SWA memory); the slot goes on from its last position. k < 0: none,
+// or the base of its chain is gone
+struct spill_pick {
+    int    k       = -1;
+    int    base    = -1;
+    size_t n_reuse = 0;
+};
+
+static spill_pick spill_ckpt_pick(const server_tokens & tokens, const std::vector<server_ckpt_mark_fork> & ckpts,
+                                  size_t n_match, size_t n_req, int32_t n_swa) {
+    spill_pick res;
+    const llama_pos pos_next = tokens.pos_next((int64_t) n_match);
+    const llama_pos pos_eval = pos_next - (n_match < n_req ? 0 : 1);
+    const llama_pos thold    = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+    for (size_t k = ckpts.size(); k-- > 0; ) {
+        const server_ckpt_mark_fork & c = ckpts[k];
+        if (!c.data || c.pos_max > pos_next || !(c.pos_min < thold || c.pos_min == 0)) {
+            continue;
+        }
+        size_t b = k;
+        while (b > 0 && (ckpts[b].delta || !ckpts[b].data)) {
+            --b;
+        }
+        if (!ckpts[b].delta && ckpts[b].data) {
+            res.k       = (int) k;
+            res.base    = (int) b;
+            res.n_reuse = std::min(tokens.size_up_to_pos(std::min(pos_next, std::max(c.pos_min + 1, c.pos_max))), (size_t) c.n_tokens);
+        }
+        break;
+    }
+    return res;
+}
+
+std::vector<server_ckpt_mark_fork> server_prompt_cache::ckpt_marks(const std::list<std::shared_ptr<const common_prompt_checkpoint>> & ckpts) {
+    std::vector<server_ckpt_mark_fork> res;
+    res.reserve(ckpts.size());
+    for (const auto & cp_ptr : ckpts) {
+        const common_prompt_checkpoint & cp = *cp_ptr;
+        res.push_back({cp.n_tokens, cp.pos_min, cp.pos_max, cp.is_delta(), !cp.data_tgt.empty()});
+    }
+    return res;
+}
+
+std::vector<server_ckpt_mark_fork> server_prompt_cache::ckpt_marks(const server_prompt_cache_state & st) const {
+    if (st.on_disk && st.ckpt_marks.size() >= st.prompt.checkpoints.size()) {
+        return st.ckpt_marks;
+    }
+    return ckpt_marks(st.prompt.checkpoints);
+}
+
+size_t server_prompt_cache::n_reuse(const server_tokens & tokens, const std::vector<server_ckpt_mark_fork> & ckpts, size_t n_match, size_t n_req) const {
+    if (!need_ckpt) {
+        return n_match;
+    }
+    if (n_match >= tokens.size() && n_req > tokens.size()) {
+        return tokens.size();
+    }
+    return spill_ckpt_pick(tokens, ckpts, n_match, n_req, n_swa).n_reuse;
+}
+
+bool server_prompt_cache::find_best_fork_on() {
+    static const bool on = common_fork_env_int("LLAMA_CACHE_BEST", 1) != 0;
+    return on;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best_fork(const server_prompt & prompt_cur, const server_tokens & tokens_new) {
+    const size_t n_req = tokens_new.size();
+
+    size_t n_best      = n_reuse(prompt_cur.tokens, ckpt_marks(prompt_cur.checkpoints), prompt_cur.tokens.get_common_prefix(tokens_new), n_req);
+    float  f_keep_best = 0.0f;
+    bool   ram_best    = false;
+
+    SRV_TRC(" - looking for a state the prompt goes on from past %zu tokens\n", n_best);
+
+    auto it_best = states.end();
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const size_t lcp_cur    = it->prompt.tokens.get_common_prefix(tokens_new);
+        const float  f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+
+        // don't trash large prompts
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+
+        const size_t n_cur   = n_reuse(it->prompt.tokens, ckpt_marks(*it), lcp_cur, n_req);
+        const bool   ram_cur = it->data.size() > 0;
+
+        SRV_TRC("   - prompt with length %7zu, lcp = %7zu, goes on from %7zu, %s\n", (size_t) it->prompt.tokens.size(), lcp_cur, n_cur, ram_cur ? "RAM" : "disk");
+
+        const bool tie = it_best != states.end() && n_cur == n_best;
+        if (n_cur > n_best || (tie && ram_cur && !ram_best) || (tie && ram_cur == ram_best && f_keep_cur > f_keep_best)) {
+            n_best      = n_cur;
+            f_keep_best = f_keep_cur;
+            ram_best    = ram_cur;
+
+            it_best = it;
+        }
+    }
+
+    if (it_best != states.end()) {
+        SRV_TRC(" - found a state the prompt goes on from at %zu tokens\n", n_best);
+    }
+
+    return it_best;
 }
 
 // fork: --pool. a state leaves for another node in the layout of a spill file, with nothing written for it: a state on
@@ -1238,28 +1367,14 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
 
     // the checkpoints, oldest first: those of the file, unless the disk budget left some only in RAM
     const bool ckpt_file = on_disk && fh.n_ckpt >= st.prompt.checkpoints.size();
-    struct ckpt_ref {
-        int64_t   n_tokens;
-        llama_pos pos_min;
-        llama_pos pos_max;
-        bool      delta; // applied on top of the ones before it
-        bool      data;  // not a failed capture
-    };
-    std::vector<ckpt_ref> ckpts;
+    std::vector<server_ckpt_mark_fork> ckpts;
     if (ckpt_file) {
-        for (const auto & e : findex) {
-            ckpts.push_back({e.n_tokens, e.pos_min, e.pos_max, e.base_pos >= 0, e.n_tgt > 0});
-        }
+        ckpts = spill_marks_of(findex);
     } else {
-        for (const auto & cp_ptr : st.prompt.checkpoints) {
-            const common_prompt_checkpoint & cp = *cp_ptr;
-            ckpts.push_back({cp.n_tokens, cp.pos_min, cp.pos_max, cp.is_delta(), !cp.data_tgt.empty()});
-        }
+        ckpts = ckpt_marks(st.prompt.checkpoints);
     }
 
-    // the checkpoints that go along: [k_first, k_end). the one a slot restores, as server_context_impl searches for it:
-    // it ends within the shared prefix and starts before the first position computed again (minus the window of a SWA
-    // memory), and the slot goes on from its last position
+    // the checkpoints that go along: [k_first, k_end), the one a slot restores after the base of its chain
     const size_t n_state = st.prompt.tokens.size();
     size_t k_first = 0;
     size_t k_end   = 0;
@@ -1268,25 +1383,11 @@ bool server_prompt_cache::pool_export(std::list<server_prompt_cache_state>::iter
         plan.n_reuse = n_state;
     } else if (need_ckpt) {
         plan.n_reuse = 0;
-        const llama_pos pos_next = st.prompt.tokens.pos_next((int64_t) n_match);
-        const llama_pos pos_eval = pos_next - (n_match < n_req ? 0 : 1);
-        const llama_pos thold    = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
-        for (size_t k = ckpts.size(); k-- > 0; ) {
-            const ckpt_ref & c = ckpts[k];
-            if (!c.data || c.pos_max > pos_next || !(c.pos_min < thold || c.pos_min == 0)) {
-                continue;
-            }
-            size_t b = k;
-            while (b > 0 && (ckpts[b].delta || !ckpts[b].data)) {
-                --b;
-            }
-            if (!ckpts[b].delta && ckpts[b].data) {
-                k_first      = b;
-                k_end        = k + 1;
-                plan.n_reuse = std::min(st.prompt.tokens.size_up_to_pos(std::min(pos_next, std::max(c.pos_min + 1, c.pos_max))),
-                                        (size_t) c.n_tokens);
-            }
-            break;
+        const spill_pick pick = spill_ckpt_pick(st.prompt.tokens, ckpts, n_match, n_req, n_swa);
+        if (pick.k >= 0) {
+            k_first      = (size_t) pick.base;
+            k_end        = (size_t) pick.k + 1;
+            plan.n_reuse = pick.n_reuse;
         }
     }
     plan.n_ckpt     = k_end - k_first;
@@ -1643,6 +1744,7 @@ bool server_prompt_cache::spill_exists(server_prompt_cache_state & st) {
             st.on_disk = false;
             st.disk_bytes = 0;
             st.ckpt_on_disk = 0;
+            st.ckpt_marks.clear();
             st.disk_evicted = true;
         }
     }
@@ -1706,6 +1808,7 @@ bool server_prompt_cache::unspill_state(server_prompt_cache_state & st) {
         st.on_disk      = false;
         st.disk_bytes   = 0;
         st.ckpt_on_disk = 0;
+        st.ckpt_marks.clear();
 
         return st.data.size() > 0;
     };

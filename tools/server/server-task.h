@@ -712,6 +712,8 @@ struct server_prompt {
         tokens.clear();
         checkpoints.clear();
         n_used = 0;
+        n_prompt = 0; // fork
+        n_turns  = 0; // fork
     }
 
     int n_tokens() const {
@@ -723,6 +725,8 @@ struct server_prompt {
             tokens.clone(),
             checkpoints,
             n_used,
+            n_prompt, // fork
+            n_turns,  // fork
         };
     }
 
@@ -730,6 +734,14 @@ struct server_prompt {
     // and out of the cache and survives a restart via the spill file, so the disk budget can keep
     // the most frequently used prompts.
     uint32_t n_used = 0;
+
+    // fork: the tokens of the prompt of the last task on this state, the answer comes after them; 0: not known (a state
+    // from disk). what the next request leaves of it tells the tail it rewrote (server_ckpt_tail_fork)
+    int32_t n_prompt = 0;
+
+    // fork: the tasks that went on from this state one after another, 0: not known. 1 is a request nothing continued
+    // yet: its slot gives way before the slot of a conversation (server_context_impl::evict_before_fork)
+    int32_t n_turns = 0;
 };
 
 struct server_prompt_data {
@@ -768,6 +780,9 @@ struct server_prompt_cache_state {
     // context checkpoints the file holds. The RAM copy is complete only when the list matches it,
     // and only then is dropping the list free
     size_t   ckpt_on_disk = 0;
+
+    // fork: the checkpoints the file holds, as marks (server_prompt_cache::ckpt_marks)
+    std::vector<server_ckpt_mark_fork> ckpt_marks = {};
 
     // the disk copy is up to date and the blobs are still in RAM: dropping the RAM costs no I/O,
     // and a cache hit needs no read back
@@ -837,7 +852,33 @@ struct server_prompt_cache {
     size_t disk_size() const; // completed cache bytes in the shared directory
 
     // the cached state that load() restores for tokens_new: it keeps more of itself and of tokens_new than tokens_cur does. states.end() when there is none
-    std::list<server_prompt_cache_state>::iterator find_best(const server_tokens & tokens_cur, const server_tokens & tokens_new);
+    // fork: prompt_cur with its checkpoints (find_best_fork)
+    std::list<server_prompt_cache_state>::iterator find_best(const server_prompt & prompt_cur, const server_tokens & tokens_new);
+
+    // fork: LLAMA_CACHE_BEST (16.11, 1 by default, 0: upstream). the state a request goes on from the furthest: the
+    // tokens it takes from the state as the slot restores it (n_reuse), of equal ones the state in RAM, then the one
+    // that keeps more of itself. upstream wants a state to keep more of itself and of the request at once: a client
+    // that rewrites the tail of its last message (the 395, 14.11: three images that end every request) then gets an
+    // older state, whose lost tail is shorter, in place of the one saved last (3770 tokens read again in one turn),
+    // and of two states that the request continues in full (a record on disk and the fresh state in RAM) the first
+    std::list<server_prompt_cache_state>::iterator find_best_fork(const server_prompt & prompt_cur, const server_tokens & tokens_new);
+    static bool find_best_fork_on();
+
+    // fork: what the last load() took: 0 nothing, 1 a state in RAM, 2 a state read from disk
+    int last_load = 0;
+
+    // fork: the memory goes back only to a context checkpoint (recurrent, hybrid, SWA with its window n_swa)
+    bool    need_ckpt = false;
+    int32_t n_swa     = 0;
+
+    // fork: the tokens a request of n_req tokens takes from a state of `tokens` that shares n_match of them, when a slot
+    // restores the state as server_context_impl does: all it shares when the memory rolls back by itself or the request
+    // goes on from the end of the state, else up to the checkpoint the slot goes back to (0: none)
+    size_t n_reuse(const server_tokens & tokens, const std::vector<server_ckpt_mark_fork> & ckpts, size_t n_match, size_t n_req) const;
+
+    // fork: the marks of the checkpoints of a state: of its file, unless RAM holds more of them
+    std::vector<server_ckpt_mark_fork> ckpt_marks(const server_prompt_cache_state & st) const;
+    static std::vector<server_ckpt_mark_fork> ckpt_marks(const std::list<std::shared_ptr<const common_prompt_checkpoint>> & ckpts);
 
     // evict oldest cached prompts until host RAM stays above the reserve, assuming `extra`
     // more bytes are about to be allocated. No-op when the reserve is disabled/unknown.

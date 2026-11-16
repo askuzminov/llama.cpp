@@ -13,6 +13,16 @@
 // a UTF-8 path as the file system takes it (a narrow path on Windows is in the ANSI codepage)
 std::filesystem::path server_fs_path_fork(const std::string & utf8);
 
+// fork: where a context checkpoint of a cached state stands. the list of a state that is only on disk is not in RAM,
+// its marks are: find_best reads from them how far a request gets with the state
+struct server_ckpt_mark_fork {
+    int64_t n_tokens;
+    int32_t pos_min;
+    int32_t pos_max;
+    bool    delta; // applied on top of the ones before it
+    bool    data;  // not a failed capture
+};
+
 // fork: --pool, the bytes of a state that moves to another node, in the layout of a spill file, with nothing written
 // to disk for it: a state on disk goes as pieces of its file, a state only in RAM as a copy of its blobs. the header
 // and the index of the checkpoints that go along are new
