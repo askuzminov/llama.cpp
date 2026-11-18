@@ -207,9 +207,9 @@ td .bar { min-width: 90px; }
 
 /* toolbars, pages */
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-bottom: 12px; }
-.seg { display: inline-flex; background: var(--soft); border-radius: 9px; padding: 2px; }
 )POOLUI",
-R"POOLUI(.seg button { border: 0; background: transparent; padding: 4px 12px; border-radius: 7px; color: var(--muted); font-weight: 600; }
+R"POOLUI(.seg { display: inline-flex; background: var(--soft); border-radius: 9px; padding: 2px; }
+.seg button { border: 0; background: transparent; padding: 4px 12px; border-radius: 7px; color: var(--muted); font-weight: 600; }
 .seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, .08); }
 .ph { display: flex; align-items: center; gap: 10px; margin: 0 0 14px; flex-wrap: wrap; min-width: 0; }
 .ph h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; overflow-wrap: anywhere; }
@@ -384,6 +384,13 @@ function drainBtn(n) {
     (n.draining ? "take new conversations again" : "take no new conversations, the running ones finish") + '">' +
     (n.draining ? "Resume" : "Drain") + '</button>';
 }
+// pool-reprobe-s is 0 by default: a link is measured once and its moves keep the number after it. the button asks for
+// the same sample of every link of the card now, 16 MiB each way over each one of them
+function reprobeBtn(n) {
+  return '<button data-reprobe="' + esc(n.self ? "" : n.name) + '" title="measure again now, without waiting for pool-reprobe-s: ' +
+    (n.self ? "every link of this router" : "the links of this router to it") + ', 16 MiB each way over each one of them">' +
+    'Measure again</button>';
+}
 function slotRow(s) {
   const used = (s.n_prompt || 0) + (s.n_decoded || 0);
   let frac = s.n_ctx > 0 ? Math.min(1, used / s.n_ctx) : 0;
@@ -435,15 +442,15 @@ function nodeCard(n) {
   const title = [n.model, mi.ftype, n.signature ? "cache " + n.signature : ""].filter(Boolean).join(DOT);
   let h = '<article class="node s-' + esc(st) + (st === "up" ? "" : " dim") + '">' +
     '<div class="nhead"><a class="nname" href="' + nodeHref(n.name) + '">' + esc(n.name) + '</a>' +
-    (n.self ? '<span class="tag">this router</span>' : '') + badges(n) + '<span class="grow"></span>' + drainBtn(n) + '</div>' +
+)POOLUI",
+R"POOLUI(    (n.self ? '<span class="tag">this router</span>' : '') + badges(n) + '<span class="grow"></span>' + drainBtn(n) + '</div>' +
     '<div class="nsub" title="' + esc(title) + '">' + esc(sub || n.url) + '</div><div class="body">';
   const b = busyOf(n);
   h += '<div class="metrics">' +
     metric("gen", tps(n.gen_tps), "t/s", n.gen_tps > 0 ? "gen" : "zero", "tokens its slots generate per second now") +
     metric("prompt", tps(n.prompt_tps), "t/s", n.prompt_tps > 0 ? "prompt" : "zero", "prompt tokens its slots compute per second now, each over its last batches (from its second batch on, up to ~20 s); before that, the prefill speed of the node") +
     metric("busy", b, "/ " + (n.slots || 0), "", "requests in its slots: from this router" + (n.external ? ", " + n.external + " from other routers and clients" : "")) +
-)POOLUI",
-R"POOLUI(    metric("waiting", n.queued_for || 0, "", "", "requests in the queue of the pool that wait for this node") + '</div>';
+    metric("waiting", n.queued_for || 0, "", "", "requests in the queue of the pool that wait for this node") + '</div>';
   h += '<canvas class="spark" data-spark="node" data-name="' + esc(n.name) + '" title="the last 5 minutes: generation (fill) and prompt (line), each on its own scale"></canvas>';
   if (n.slot_list && n.slot_list.length) h += '<div class="sec">Slots</div>' + n.slot_list.map(slotRow).join("");
   const mem = (n.devices || []).map(d => memRow(d, false)).join("") + roomRow(n, false);
@@ -614,7 +621,8 @@ function pageDecisions(s) {
   setHTML("e-note", "the last " + s.events.length + " decisions of the pool, the newest first");
 }
 // a node
-function pageNode(s, name) {
+)POOLUI",
+R"POOLUI(function pageNode(s, name) {
   const n = s.nodes.find(x => x.name === name);
   if (!n) { setHTML("nd", '<div class="crumb"><a href="#/">Overview</a></div><div class="card empty">no node ' + esc(name) + ' in this pool</div>'); return; }
   const st = nodeState(n), mi = n.model_info || {}, sx = n.stats || {}, gh = nhist[n.name] || { gen: [], pp: [] };
@@ -623,8 +631,7 @@ function pageNode(s, name) {
   if (st !== "up" && n.error) h += '<div class="err mb">' + esc(n.error) + '</div>';
   h += '<div class="mgrid mb">' +
     metric("gen now", tps(n.gen_tps), "t/s", n.gen_tps > 0 ? "gen" : "zero") + metric("prompt now", tps(n.prompt_tps), "t/s", n.prompt_tps > 0 ? "prompt" : "zero") +
-)POOLUI",
-R"POOLUI(    metric("busy", busyOf(n), "/ " + (n.slots || 0), "", n.external ? n.external + " from other routers and clients" : "") +
+    metric("busy", busyOf(n), "/ " + (n.slots || 0), "", n.external ? n.external + " from other routers and clients" : "") +
     metric("waiting for it", n.queued_for || 0, "") +
     metric("decode", n.decode_tps > 0 ? tps(n.decode_tps) : "-", n.decode_tps > 0 ? "t/s" : "", "", "one request alone: its last ~16 answers of 16 tokens and more (" + (n.decode_n || 0) + " so far)") +
     metric("prefill", tps(n.prefill_tps > 0 ? n.prefill_tps : n.prefill_cfg), n.prefill_tps > 0 ? "t/s" : "t/s default", "", "one request: the average of its prompts of move_tokens and more") +
@@ -679,10 +686,28 @@ R"POOLUI(    metric("busy", busyOf(n), "/ " + (n.slots || 0), "", n.external ? n
         (g.fan_rpm != null ? g.fan_rpm + " rpm" : "-") + '</td></tr>'), "") + '</div>';
   }
   const mb = x => x > 0 ? (x / 8).toFixed(0) + " MB/s" : "-";
-  h += '<div class="card"><div class="ch"><h2>Links</h2></div>' + table([{ t: "address" }, { t: "" }, { t: "from it", n: 1 }, { t: "to it", n: 1 }],
-    (n.links || []).map(l => '<tr><td class="mono">' + esc(l.url) + (l.error ? '<div class="err">' + esc(l.error) + '</div>' : '') + '</td><td>' +
-      (l.active ? '<span class="badge ok">in use</span>' : l.error ? '<span class="badge ba">error</span>' : '<span class="badge">standby</span>') +
-      '</td><td class="n">' + mb(l.mbps_read) + '</td><td class="n">' + mb(l.mbps_write) + '</td></tr>'), "no link") + '</div>';
+  // in use: the requests go over it, and a move takes it too; moves: a move reads its blocks over it as well; slow: a
+  // move leaves it out, under a quarter of the fastest link of the machine; error: it did not answer when last tried
+  const link_badge = l => l.error ? '<span class="badge ba" title="it did not answer the last time it was tried">error</span>'
+    : l.active ? '<span class="badge ok" title="requests go over it, and a move takes it too">in use</span>'
+    : l.moves ? '<span class="badge ok" title="a move reads its blocks over this link too, at the same time as the others">moves</span>'
+    : '<span class="badge" title="a move leaves it out: under a quarter of the fastest link, it would hold up the blocks it carries">slow</span>';
+  const link_table = ls => table([{ t: "address" }, { t: "" }, { t: "from it", n: 1 }, { t: "to it", n: 1 }],
+    ls.map(l => '<tr><td class="mono">' + esc(l.url) + (l.error ? '<div class="err">' + esc(l.error) + '</div>' : '') +
+      '</td><td>' + link_badge(l) + '</td><td class="n">' + mb(l.mbps_read) + '</td><td class="n">' + mb(l.mbps_write) +
+      '</td></tr>'), "none");
+  // a block per machine, the same on every one of them: how this router reaches it over its links, and how its router
+  // reaches this machine over the addresses it answers on. the second table is measured there, so an address that no
+  // router of the pool uses is not a link of the pool and stays out
+  const machines = (n.self ? s.nodes.filter(x => !x.self) : [n]).filter(x => !x.self);
+  const blocks = machines.map(p =>
+    '<div class="sec">' + esc(p.name) + ' <span class="muted">- this router reaches it there, the speeds are ours</span></div>' +
+    link_table(p.links || []) +
+    '<div class="sec">' + esc(p.name) + ' <span class="muted">- reaches this router there, the speeds are its own</span></div>' +
+    ((p.links_in || []).length ? link_table(p.links_in) :
+      '<div class="empty">its router has not reported a link to this machine yet</div>')).join("");
+  h += '<div class="card"><div class="ch"><h2>Links</h2><span class="grow"></span>' + reprobeBtn(n) + '</div>' +
+    (blocks || '<div class="empty">no other machine answers: this router reaches only itself</div>') + '</div>';
   if (sx.uptime_s > 0) {
     const avg = (k, t) => sx[t] > 0 ? tps(sx[k] / sx[t]) + " t/s" : "-";
     const share = sx.cached_tokens + sx.prompt_tokens > 0 ? Math.round(100 * sx.cached_tokens / (sx.cached_tokens + sx.prompt_tokens)) + "%" : "-";
@@ -748,7 +773,8 @@ function skeleton(r) {
   }
   if (r.page === "decisions") {
     const seg = [["all", "All"], ["routing", "Routing"], ["requests", "Requests"], ["nodes", "Nodes"]];
-    return '<div class="toolbar"><span class="seg">' + seg.map(g => '<button data-eg="' + g[0] + '"' + (ui.eg === g[0] ? ' class="on"' : '') + '>' + g[1] + '</button>').join("") +
+)POOLUI",
+R"POOLUI(    return '<div class="toolbar"><span class="seg">' + seg.map(g => '<button data-eg="' + g[0] + '"' + (ui.eg === g[0] ? ' class="on"' : '') + '>' + g[1] + '</button>').join("") +
       '</span><input type="search" placeholder="kind, conversation, node, detail" data-ui="eq" value="' + esc(ui.eq) + '"><select id="e-node" data-ui="enode"></select>' +
       '<span class="grow"></span><span class="muted" id="e-note"></span></div><div class="chips mb" id="e-sum"></div><div class="card"><div id="e-table"></div></div>';
   }
@@ -807,8 +833,7 @@ function draw(cv, series) {
     const d = sr.data;
     if (!d || d.length < 2) continue;
     const max = Math.max(1, ...d);
-)POOLUI",
-R"POOLUI(    const x0 = 1 + (span - d.length) * step;
+    const x0 = 1 + (span - d.length) * step;
     c.beginPath();
     d.forEach((v, i) => { const x = x0 + i * step, y = h - 1.5 - (v / max) * (h - 4); if (i) c.lineTo(x, y); else c.moveTo(x, y); });
     c.lineWidth = sr.fill ? 1.6 : 1.3; c.lineJoin = "round"; c.strokeStyle = sr.color; c.stroke();
@@ -850,6 +875,14 @@ document.addEventListener("click", ev => {
     fetch(base + "/pool/drain", {
       method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, H),
       body: JSON.stringify({ node: b.dataset.node, drain: b.dataset.drain === "1" })
+    }).then(() => tick(true));
+    return;
+  }
+  const rb = ev.target.closest("button[data-reprobe]");
+  if (rb) {
+    fetch(base + "/pool/reprobe", {
+      method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, H),
+      body: JSON.stringify(rb.dataset.reprobe ? { node: rb.dataset.reprobe } : {})
     }).then(() => tick(true));
     return;
   }

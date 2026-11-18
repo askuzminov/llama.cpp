@@ -25,8 +25,8 @@ struct server_pool_fork {
     ~server_pool_fork();
 
     // the requests for a model of a pool go through it; /pool (the dashboard, ?model= for one of several pools),
-    // /pool/status, /pool/drain and the routes of the other routers of the pools (/pool/router, /pool/pull, /pool/probe)
-    // are added
+    // /pool/status, /pool/drain, /pool/reprobe and the routes of the other routers of the pools (/pool/router,
+    // /pool/pull, /pool/probe) are added
     void attach(server_http_context & ctx_http, server_routes & routes);
 
     // the discovery of the other routers and the polling of the nodes
@@ -64,8 +64,19 @@ std::filesystem::path server_pool_xfer_path_fork(const std::string & spill_dir, 
 // the pieces an export sends (server_prompt_cache::pool_export), kept until POST /pool/export/done
 void server_pool_xfer_plan_fork(const std::string & id, server_pool_plan_fork plan);
 void server_pool_xfer_forget_fork(const std::string & id);
-// up to `size` bytes of export `id` from `offset`, fewer at the end
-bool server_pool_xfer_read_fork(const std::string & id, uint64_t offset, uint64_t size, std::string & out, std::string & error);
+// a reader of an export: it keeps the plan and its file open, so that reading a state in chunks does not look the plan
+// up and open the file again for every chunk; the bytes are copied once, into `out` of read()
+struct server_pool_xfer_reader_fork {
+    virtual ~server_pool_xfer_reader_fork() = default;
+
+    // appends `n` bytes of what is left of the export, fewer when the export ends: an empty `out` after a call means
+    // its end. false only when a read failed, with `error` set
+    virtual bool read(std::string & out, uint64_t n, std::string & error) = 0;
+};
+
+// nullptr with `error` set when `id` is not an export of this node; the reader starts at `offset`
+std::shared_ptr<server_pool_xfer_reader_fork> server_pool_xfer_open_fork(const std::string & id, uint64_t offset,
+                                                                         std::string & error);
 // the chunks of import `id` come in order, offset 0 starts it. max_bytes: the largest state the node takes
 // (server_context_meta::pool_import_max_fork), 0 = any
 bool server_pool_inbox_write_fork(const std::string & id, uint64_t offset, const std::string & data, uint64_t max_bytes,

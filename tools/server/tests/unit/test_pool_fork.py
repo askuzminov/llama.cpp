@@ -820,6 +820,27 @@ def test_pool_moves_the_state_with_one_http_thread():
     assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
 
 
+@pytest.mark.parametrize("streams,links", [(1, 0), (4, 1), (8, 0)])
+def test_pool_moves_the_state_by_streams(streams: int, links: int):
+    # the chunks of a move are read by several threads at once (pool-move-streams) and, with pool-move-links, over
+    # every link of the node; the import still takes them one after another, so a move that is split at all has to
+    # hand them over in order. 1 = the old one-thread path, 8 = what the option clamps to its cap
+    start_pool(f"move_tokens=16 wait_max=0 prefill_tps=1 move_streams={streams} move_links={links}")
+    st = status()
+    assert st["config"]["move_streams"] == min(streams, 8) and st["config"]["move_links"] == bool(links)
+    msgs = [{"role": "user", "content": "once upon a time there was a little girl who " * 12}]
+    t1 = {}
+    msgs.append({"role": "assistant", "content": chat(msgs, timings=t1)})
+    msgs.append({"role": "user", "content": "and then?"})
+    first = events("new")[0]["node"]
+    drain(first)
+    t2 = {}
+    chat(msgs, timings=t2)
+    moved = events("migrate")
+    assert len(moved) == 1 and moved[0]["node"] != first, events("recompute")
+    assert t2["cache_n"] >= t1["prompt_n"] + t1["predicted_n"] - 1, (t1, t2)
+
+
 def test_pool_moved_state_reaches_the_disk_of_its_new_node():
     # review 10.11 (B1.4 #3): the import marks the state disk_evicted (write_behind leaves it alone until its request
     # takes it), the request it came for clears that (unspill_state), and what the slot keeps afterwards goes to the
@@ -1228,6 +1249,58 @@ def test_pool_probes_its_links():
         time.sleep(0.1)
 
 
+def test_pool_measures_its_links_again():
+    # one probe that ran while a machine was busy is not the speed of a link: it used to decide pool_link_rank for the
+    # life of the router. pool-reprobe-s takes the sample again, and the counter of the probes shows it
+    def probes() -> list:
+        return [l["probes"] for n in status()["nodes"] for l in n["links"]]
+
+    start_pool("reprobe_s=1")
+    deadline = time.time() + 10
+    while not all(p > 0 for p in probes()):
+        assert time.time() < deadline, probes()
+        time.sleep(0.1)
+    first = probes()
+    deadline = time.time() + 10
+    while not all(p > f for p, f in zip(probes(), first)):
+        assert time.time() < deadline, f"{probes()} stayed at {first}: the links are measured once"
+        time.sleep(0.1)
+
+
+def test_pool_measures_a_link_once_by_default():
+    # the default pool-reprobe-s = 0: a link is measured when it answers, and after that only the moves that crossed
+    # it change its number. A probe every couple of minutes is what the pool used to pay for it on every link it has
+    start_pool()
+    deadline = time.time() + 10
+    while not all(p > 0 for p in (l["probes"] for n in status()["nodes"] for l in n["links"])):
+        assert time.time() < deadline, [n["links"] for n in status()["nodes"]]
+        time.sleep(0.1)
+    time.sleep(3)  # a few rounds of the poller, which is every poll_ms
+    assert all(p == 1 for p in (l["probes"] for n in status()["nodes"] for l in n["links"])), \
+        [n["links"] for n in status()["nodes"]]
+
+
+def test_pool_reprobes_the_links_when_asked():
+    # the button of the dashboard for a number that was taken on a busy machine: the links of the node are measured
+    # again at the next poll, without waiting for pool-reprobe-s
+    def probes() -> list:
+        return [l["probes"] for n in status()["nodes"] if not n["self"] for l in n["links"]]
+
+    start_pool()
+    deadline = time.time() + 10
+    while not all(p > 0 for p in probes()):
+        assert time.time() < deadline, [n["links"] for n in status()["nodes"]]
+        time.sleep(0.1)
+    res = routers[0].make_request("POST", "/pool/reprobe", headers=headers(), data={"node": "n1"})
+    assert res.status_code == 200, res.text
+    deadline = time.time() + 20
+    while not all(p > 1 for p in probes()):
+        assert time.time() < deadline, f"{probes()}: POST /pool/reprobe measured nothing again"
+        time.sleep(0.1)
+    assert routers[0].make_request("POST", "/pool/reprobe", headers=headers(),
+                                   data={"node": "nowhere"}).status_code == 400
+
+
 def test_pool_router_node_by_alias():
     # the model may have another name on another router (the 3090: [tiny-other] with alias = tiny-alias): the routers
     # share it under the alias they both have, and send the requests under it
@@ -1525,6 +1598,42 @@ def test_pool_export_done_ends_the_transfer():
     assert res.status_code == 404, (res.status_code, res.text)
     assert not os.path.exists(link)
     assert sorted(f for f in os.listdir(spill) if f.startswith("state-")) == states
+
+
+def test_pool_export_gives_the_same_bytes_in_any_pieces():
+    # since 17.11 an export goes out in pieces of 1 MiB of its own: how a reader cuts it must not change its bytes, in
+    # particular where a read ends in the middle of one of the pieces of the plan (the header, the index, a blob)
+    spill = tempfile.mkdtemp()
+    src, _ = plain_nodes(cache_spill_dir=spill, cache_idle_write=True, cache_min_tokens=16)
+    msgs = [{"role": "user", "content": "a story about a lighthouse keeper " * 8}]
+    res = src.make_request("POST", "/v1/chat/completions", data={"messages": msgs, "max_tokens": 8, "temperature": 0})
+    assert res.status_code == 200, res.body
+    msgs.append({"role": "assistant", "content": res.body["choices"][0]["message"]["content"]})
+    msgs.append({"role": "user", "content": "and then?"})
+    ex = src.make_request("POST", "/pool/export", data={"kind": "chat", "body": {"messages": msgs, "max_tokens": 4}}).body
+    assert ex["from_disk"] and ex["size"] > 8192, ex
+    url = f"http://{src.server_host}:{src.server_port}"
+
+    def read(offset, size):
+        res = requests.get(f"{url}/pool/export/data?id={ex['id']}&offset={offset}&size={size}")
+        assert res.status_code == 200, (res.status_code, res.text[:200])
+        return res.content
+
+    whole = read(0, 1 << 26)
+    assert len(whole) == ex["size"], (len(whole), ex["size"])
+    step = (4096, 65503, 8192, 3)
+    got  = b""
+    i    = 0
+    while len(got) < ex["size"]:
+        n = min(step[i % len(step)], ex["size"] - len(got))
+        part = read(len(got), n)
+        assert len(part) == n, (len(part), n)
+        got += part
+        i += 1
+    assert got == whole
+    assert read(ex["size"] - 10, 4096) == whole[-10:]  # a read that goes past the end stops at it
+    assert read(ex["size"], 4096) == b""               # nothing after it
+    src.make_request("POST", "/pool/export/done", data={"id": ex["id"]})
 
 
 def test_pool_node_without_a_prompt_cache_moves_nothing():

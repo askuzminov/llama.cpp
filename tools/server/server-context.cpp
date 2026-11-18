@@ -8329,6 +8329,10 @@ void server_routes::init_routes() {
     // a transfer the pool stopped midway: it posts a chunk every few seconds and gives one up after 60 s
     static constexpr int POOL_XFER_IDLE_S_FORK = 120;
 
+    // the bytes of a move go out in pieces of this size, so that the router starts taking a chunk while the rest of it
+    // is still read from disk
+    static constexpr uint64_t POOL_SEND_PIECE_FORK = 1ull << 20;
+
     this->get_pool_node_fork = [this](const server_http_req &) {
         auto res = create_response(true);
         // the pool polls this: the RAM a pool that stopped midway left goes even when no other move comes
@@ -8443,10 +8447,29 @@ void server_routes::init_routes() {
             return res;
         }
         std::string error;
-        if (!server_pool_xfer_read_fork(req.get_param("id"), offset, size, res->data, error)) {
+        auto rd = server_pool_xfer_open_fork(req.get_param("id"), offset, error);
+        if (!rd) {
             res->error(format_error_response(error, ERROR_TYPE_NOT_FOUND));
             return res;
         }
+        // out in pieces, not in one block: the router takes the first bytes while the rest is still read from disk,
+        // and a move costs this much memory per stream instead of a whole chunk
+        uint64_t left = size;
+        res->next = [rd, left](std::string & out) mutable {
+            out.clear();
+            if (left == 0) {
+                return false;
+            }
+            const uint64_t n = std::min<uint64_t>(left, POOL_SEND_PIECE_FORK);
+            left -= n;
+            std::string error;
+            if (!rd->read(out, n, error)) {
+                // the stream ends short here, the router notices the size of what it got
+                SRV_WRN("pool: %s\n", error.c_str());
+                return false;
+            }
+            return left > 0 && !out.empty();
+        };
         res->status       = 200;
         res->content_type = "application/octet-stream";
         return res;
@@ -8466,7 +8489,17 @@ void server_routes::init_routes() {
             res->error(format_error_response("bad size", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        res->data.assign(size, '\0');
+        // the same shape as an export of the same size, so that the probe measures the path of a move
+        uint64_t left = size;
+        res->next = [left](std::string & out) mutable {
+            out.clear();
+            if (left == 0) {
+                return false;
+            }
+            out.assign((size_t) std::min<uint64_t>(left, POOL_SEND_PIECE_FORK), '\0');
+            left -= out.size();
+            return left > 0;
+        };
         res->status       = 200;
         res->content_type = "application/octet-stream";
         return res;

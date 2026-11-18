@@ -193,6 +193,12 @@ void common_fork_add_preset_options(std::vector<common_arg> & args) {
         {"pool-drain-move",  COMMON_ARG_PRESET_POOL_FORK "_DRAIN_MOVE",  "0|1",
          "a drained node hands its active conversations (a request in the last 30 minutes) over to other nodes with "
          "their states at once, not at their next requests (default: 1)"},
+        {"pool-move-streams", COMMON_ARG_PRESET_POOL_FORK "_MOVE_STREAMS", "N",
+         "chunks of a move read at the same time, never fewer than the links they go over: one HTTP stream reaches "
+         "about the speed of one 10G link (default: 4, at most 8)"},
+        {"pool-move-links",  COMMON_ARG_PRESET_POOL_FORK "_MOVE_LINKS",  "0|1",
+         "a move spreads its chunks over the links of the node that are not far behind its fastest one; 0 = only the "
+         "link the node is reached by (default: 1)"},
         {"pool-link-mbps",   COMMON_ARG_PRESET_POOL_FORK "_LINK_MBPS",   "N",
          "the speed of a link until it is measured, Mbit/s (default: 500)"},
         {"pool-prefill-tps", COMMON_ARG_PRESET_POOL_FORK "_PREFILL_TPS", "N",
@@ -201,6 +207,9 @@ void common_fork_add_preset_options(std::vector<common_arg> & args) {
          "how often each node is polled, ms (default: 1000)"},
         {"pool-probe-s",     COMMON_ARG_PRESET_POOL_FORK "_PROBE_S",     "N",
          "how often a node on a slower link tries the faster ones, seconds (default: 10)"},
+        {"pool-reprobe-s",   COMMON_ARG_PRESET_POOL_FORK "_REPROBE_S",   "SECONDS",
+         "how often a link that answered is measured again: the moves already refresh the speed of the links they "
+         "carried, which is enough where the cables do not change (default: 0 = measure each link once)"},
         {"pool-same-model",  COMMON_ARG_PRESET_POOL_FORK "_SAME_MODEL",  "0|1",
          "a node of another model than the most of the others takes no request (default: 1)"},
         {"pool-rebalance-s", COMMON_ARG_PRESET_POOL_FORK "_REBALANCE_S", "SECONDS",

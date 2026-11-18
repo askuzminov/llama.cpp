@@ -284,11 +284,22 @@ static std::map<std::string, std::string> child_request_headers(const std::map<s
     return out;
 }
 
+// the requests the router makes to a child by itself, not a proxy of a client request: the client one already
+// carries the key, since the router checked it before proxying. the child has the key of the router too
+// (unset_reserved_args), so these need it as well
+static httplib::Headers child_auth_headers(const common_params & params) {
+    httplib::Headers headers;
+    if (!params.api_keys.empty()) {
+        headers.emplace("Authorization", "Bearer " + params.api_keys.front());
+    }
+    return headers;
+}
+
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
-    preset.unset_option("LLAMA_API_KEY");
-    preset.unset_option("LLAMA_ARG_API_KEY_FILE");
+    // the api key of the router is deliberately not unset: it reaches the child, so the port of the instance is not
+    // open to the machine but to the router (it listens on 127.0.0.1 only, and the router brings the key)
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_MEMORY_MARGIN");
@@ -2525,7 +2536,7 @@ void server_models_routes::init_routes() {
             cli.set_connection_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_read_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
-            auto resp = cli.Post("/v1/streams/lookup", child_body.dump(), "application/json");
+            auto resp = cli.Post("/v1/streams/lookup", child_auth_headers(params), child_body.dump(), "application/json");
             if (!resp || resp->status != 200) {
                 continue;
             }
@@ -2563,7 +2574,7 @@ void server_models_routes::init_routes() {
             cli.set_connection_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_read_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
-            auto resp = cli.Delete(child_path.c_str());
+            auto resp = cli.Delete(child_path.c_str(), child_auth_headers(params));
             (void) resp; // the child logs its own miss when the session is unknown there
         } else if (auto tracked = models.conv_models.lookup(conv_id); tracked.has_value()) {
             // the entry exists but its model is still loading: the forget below erases it,
